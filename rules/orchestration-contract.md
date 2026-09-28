@@ -93,19 +93,20 @@ either, regardless of what the operator's standing override says.
 
 ## No Orca / no Codex
 
-If `orca` is not on `PATH`, or Codex has never produced a readable `rate_limits` reading
-(see `codexRemaining()` in `hooks/lib/exec-route-by-quota.cjs`), and
-`execFallbackWhenCodexUnavailable` is `"sonnet"` (the default), automatic routing falls
-back to the configured code model instead of defaulting to Codex — either condition alone
-is enough, because a missing `orca` binary means Codex can never actually be dispatched to
-regardless of how much quota it has left. Set `execFallbackWhenCodexUnavailable` to `null`
-to disable this and keep preferring Codex even when its quota is simply unknown (as
-opposed to known and merely under the handoff threshold, which always prefers Codex
-either way).
+Codex is the deliberately-preferred default, so **only a missing binary triggers the
+fallback — never merely an unknown quota reading.** A fresh Codex install that has not
+completed a first turn yet has no `rate_limits` event to read (see `codexRemaining()` in
+`hooks/lib/exec-route-by-quota.cjs`); that unknown reading is not evidence Codex is
+unusable, and routing still prefers it. If `orca` or `codex` itself is not on `PATH`,
+though, Codex genuinely cannot be dispatched to at all, and with
+`execFallbackWhenCodexUnavailable` at `"sonnet"` (the default) automatic routing falls
+back to the configured code model instead. Set `execFallbackWhenCodexUnavailable` to
+`null` to disable this and always prefer Codex regardless of either binary's presence.
 
-The gate checks `orca` reachability itself (an absolute `ORCA_BIN` path is checked with a
-file-exists test; the bare default name via `which`/`where`) — no per-invocation cost
-beyond that one lookup, and never a live `worker-list` call just to decide routing.
+The gate checks `orca`/`codex` reachability itself (an absolute `ORCA_BIN`/`CODEX_BIN`
+path is checked with a file-exists test; the bare default name via `which`/`where`) — no
+per-invocation cost beyond those two lookups, and never a live `worker-list` call just to
+decide routing.
 
 Independent of that automatic fallback, the operator can always route explicitly:
 

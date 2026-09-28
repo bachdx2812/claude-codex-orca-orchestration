@@ -191,21 +191,24 @@ Rollback without the uninstaller: every settings.json mutation is preceded by a
   `ORCA_TERMINAL_HANDLE` at all (i.e., one launched inside Orca). A plain `claude` session
   outside Orca is left completely alone by default — set `"activation": "always"` to gate
   every session regardless of environment.
-- **`invokesOrca()`/`orcaCandidates()` are regex-based**, not a proper shell parser — see
-  the "Known limitation" note in `README.md` and the `TODO` comment in
-  `hooks/orchestrator-gate.cjs`.
+- **`orcaInvocations()` (`hooks/lib/shell-orca-invocations.cjs`) is a real linear-time
+  shell tokenizer, not a full shell interpreter.** Three known detection gaps (never false
+  positives — a real invocation can pass unnoticed): `! orca ...` (negation is not a
+  recognized wrapper), `time -p orca ...` (the `time` builtin's own flags are not
+  skipped; bare `time orca ...` is), and an orca invocation inside a heredoc body that is
+  itself piped into another shell interpreter (heredoc bodies are deliberately treated as
+  opaque data). See "Known limitations" in `README.md`.
 
-## `ANTHROPIC_DEFAULT_OPUS_MODEL` — verified against current docs
+## `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_FABLE_MODEL` — verified against current docs
 
 Confirmed via <https://code.claude.com/docs/en/model-config> (fetched 2026-09-29, the
-`docs.claude.com/en/docs/claude-code/model-config` URL 301-redirects there): this is a
-real, currently-documented Claude Code environment variable — "the model to use for the
-`opus` alias." The same page also documents `ANTHROPIC_DEFAULT_SONNET_MODEL`,
-`ANTHROPIC_DEFAULT_HAIKU_MODEL`, and, as of this writing, **`ANTHROPIC_DEFAULT_FABLE_MODEL`**
-("the model to use for the `fable` alias, and the model ID Claude Code recognizes as a
-Fable model for automatic model fallback") — cross-checked with a web search that returned
-the same four variables independently. This installer only pins
-`ANTHROPIC_DEFAULT_OPUS_MODEL` (the review model), per the shipped config's scope; it does
-not pin a Fable model, even though the current docs indicate that variable now exists too
-— extending the pin to escalation is a deliberate scope decision for a future change, not
-a limitation of the underlying Claude Code mechanism.
+`docs.claude.com/en/docs/claude-code/model-config` URL 301-redirects there): both are
+real, currently-documented Claude Code environment variables — `ANTHROPIC_DEFAULT_OPUS_MODEL`
+is "the model to use for the `opus` alias," `ANTHROPIC_DEFAULT_FABLE_MODEL` is "the model
+to use for the `fable` alias, and the model ID Claude Code recognizes as a Fable model for
+automatic model fallback." The same page also documents `ANTHROPIC_DEFAULT_SONNET_MODEL`
+and `ANTHROPIC_DEFAULT_HAIKU_MODEL` — cross-checked with a web search that returned the
+same four variables independently. This installer pins **both** by default (step 5 above):
+`ANTHROPIC_DEFAULT_OPUS_MODEL` to `models.review.id`, `ANTHROPIC_DEFAULT_FABLE_MODEL` to
+`models.escalation.id`, each independently skipped if already set to something else, and
+both together skipped by `--no-pin-models`.

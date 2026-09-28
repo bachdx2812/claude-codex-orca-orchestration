@@ -119,15 +119,29 @@ exact-match removal (never a blind restore, so edits you made after installing s
   `rules/orchestration-contract.md`) let the operator override coding-model routing
   without a full bypass.
 
-## Known limitation
+## Known limitations
 
-`hooks/orchestrator-gate.cjs`'s `invokesOrca()`/`orcaCandidates()` shell-parsing helpers
-are regex-based. They are covered by this repo's test suite (including several
-adversarial shapes: `env`/`exec`/`nohup` wrappers, `$( )`/backtick subshells, absolute
-paths, `VAR=` prefixes) and a length cap bounds worst-case regex work per call, but they
-have not been proven immune to catastrophic backtracking on some pathological input a
-linear-time scanner would rule out by construction. See the `TODO` comment beside
-`invokesOrca()` in `hooks/orchestrator-gate.cjs`.
+`hooks/lib/shell-orca-invocations.cjs`'s `orcaInvocations()` is a real linear-time shell
+tokenizer (no backtracking-capable regex; see its own header comment for the design and
+what it replaced), not a regex heuristic — but it is still not a full shell interpreter.
+Three shapes it does not detect, each covered by a code comment at the relevant point in
+the scanner rather than a blanket disclaimer:
+
+- **`! orca ...`** — the `!` negation keyword is not in its recognized wrapper list, so a
+  negated orca invocation is not detected.
+- **`time -p orca ...`** — `time` is recognized and skipped, but the flags some shells'
+  `time` accepts (`-p`, etc.) are not, so `time -p orca ...` is not detected (bare
+  `time orca ...` is).
+- **Heredoc bodies fed to another interpreter** — e.g. `bash <<'EOF'` / `orca ...` /
+  `EOF`. The scanner deliberately treats heredoc bodies as opaque data (see
+  `skipHeredocBodies`), which is correct when the body is just text (a markdown code
+  span, a config file) but means an orca invocation inside a heredoc that is itself piped
+  into a shell is not detected.
+
+None of these are false positives (nothing is wrongly flagged); they are detection gaps
+where a real orca invocation could pass the code-brief-verify and worker-registration
+checks unnoticed. Widening the wrapper/keyword list, or fully parsing heredoc bodies
+handed to a shell interpreter, is future work.
 
 ## Development
 
