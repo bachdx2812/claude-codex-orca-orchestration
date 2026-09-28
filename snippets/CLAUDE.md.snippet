@@ -1,0 +1,23 @@
+<!-- orchestration:start -->
+## Enforced Orchestration Contract
+
+This session's orchestration workflow is mechanically enforced by
+`~/.claude/hooks/orchestration/orchestrator-gate.cjs` (installed by the
+`claude-codex-orca-orchestration` installer), not merely described here. Full contract,
+config reference and escape hatches: `~/.claude/rules/orchestration-contract.md`.
+
+Summary — every value is config-driven (`~/.claude/orchestration.config.json`), so treat
+the SessionStart banner printed each session as the exact current numbers, not this file:
+
+- The main panel orchestrates only: it dispatches and supervises, and does not itself
+  Edit/Write or run mutating shell commands outside `.claude/`, `plans/`, `docs/`, scratch.
+- Planning, review and verification run on the configured review model, in-session.
+- Code goes to Codex in an Orca worker first, then the configured in-session code model
+  once Codex has used the configured handoff percentage of its quota. The operator can
+  override with `--code-model <alias|codex|codex:<model>|auto>` or the `--exec-*` shortcuts.
+- Every code brief names a verify command.
+- A heartbeat daemon must supervise any live Orca worker; `Stop` refuses to end the
+  session with one still live and unwatched.
+
+Escape hatches (operator-only): `ORCHESTRATOR_GATE=off` (env), `--no-orchestrate` (prompt).
+<!-- orchestration:end -->
