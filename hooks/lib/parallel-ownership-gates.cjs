@@ -25,6 +25,8 @@ const OWNS_BRIEF_HELP =
   'A code brief in a shared worktree must declare the files it will edit, on its own line:\n' +
   '  "Owns: src/api/**, src/models/user.ts" (repo-relative, globs ok), or\n' +
   '  "Owns: n/a <reason>".\n' +
+  '(The line must START with Owns: — optionally after "-"/"*" — case-insensitively; a ' +
+  'markdown-bold "**Owns:**" or an "Owns:" appearing mid-sentence is not read.)\n' +
   'Or isolate it: --worktree new-child / Agent isolation:"worktree".';
 
 /**

@@ -1277,6 +1277,15 @@ rmState(`${SID}-hard-off`);
     else failures.push(`item13: both Owns: lines must be recorded (${JSON.stringify(st && st.reservations)})`);
   }
   rmState(M13SID);
+
+  // A markdown-bold `**Owns:**` is not read as a declaration — and the refusal explains why.
+  const MdSID = `${SID}-item13-md`;
+  rmState(MdSID);
+  const mdR = invoke(mainBash('orca orchestration worker-start --agent codex --spec "implement w.\nVerify: npm test\n**Owns:** src/item13/w.ts"',
+    { sid: MdSID, cwd: FAKE_REPO }), B13);
+  if (mdR.code === DENY && /code-brief-needs-owns/.test(mdR.err) && /mid-sentence.*not read|not read.*mid-sentence/i.test(mdR.err)) pass += 1;
+  else failures.push(`item13: a markdown-bold **Owns:** must not be read as a declaration, and the refusal must say why (exit ${mdR.code}, err ${mdR.err.slice(0, 300)})`);
+  rmState(MdSID);
 }
 
 console.log(`${pass} passed, ${failures.length} failed`);
