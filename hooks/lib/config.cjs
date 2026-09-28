@@ -66,13 +66,27 @@ function configPath() {
   return path.join(os.homedir(), '.claude', 'orchestration.config.json');
 }
 
+/**
+ * Reads the config file, distinguishing "does not exist" (normal; not worth a warning)
+ * from "exists but is not valid JSON" (a real mistake the operator should hear about,
+ * even though the gate still degrades to defaults rather than crashing).
+ */
 function readRaw() {
+  let text;
   try {
-    const text = fs.readFileSync(configPath(), 'utf8');
-    return JSON.parse(text);
+    text = fs.readFileSync(configPath(), 'utf8');
   } catch {
-    return {};
+    return { value: {}, parseError: null };
   }
+  try {
+    return { value: JSON.parse(text), parseError: null };
+  } catch (err) {
+    return { value: {}, parseError: err.message };
+  }
+}
+
+function isPlainObject(v) {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 /**
@@ -81,9 +95,35 @@ function readRaw() {
  * rest of the config. `warnings` is surfaced once, in the SessionStart banner.
  */
 function loadConfig() {
-  const raw = readRaw();
-  const merged = deepMerge(DEFAULT_CONFIG, raw);
+  const { value: raw, parseError } = readRaw();
+  const merged = deepMerge(DEFAULT_CONFIG, isPlainObject(raw) ? raw : {});
   const warnings = [];
+
+  if (parseError) {
+    warnings.push(`config unparsable: ${parseError}; using defaults.`);
+  } else if (raw !== null && typeof raw === 'object' && !isPlainObject(raw)) {
+    warnings.push('config must be a JSON object; using defaults.');
+  }
+
+  // Each models.<role> must be a {alias, id} object; a role that isn't (e.g. a bare
+  // string) would otherwise crash the first place that reads `.alias` off it deeper in
+  // the gate (onSessionStart building a banner, currentExecRoute, ...). Falls back to
+  // that role's own default rather than the whole models block, so one bad role does not
+  // take three good ones down with it.
+  for (const role of Object.keys(DEFAULT_CONFIG.models)) {
+    const v = merged.models[role];
+    if (!isPlainObject(v)) {
+      warnings.push(`models.${role} must be an object with "alias"/"id"; using the default.`);
+      merged.models[role] = { ...DEFAULT_CONFIG.models[role] };
+      continue;
+    }
+    for (const field of ['alias', 'id']) {
+      if (v[field] !== undefined && v[field] !== null && typeof v[field] !== 'string') {
+        warnings.push(`models.${role}.${field} must be a string or null; using the default.`);
+        v[field] = DEFAULT_CONFIG.models[role][field];
+      }
+    }
+  }
 
   if (!ACTIVATION_VALUES.has(merged.activation)) {
     warnings.push(`activation "${merged.activation}" is not one of orca-only|always|off; using "orca-only".`);

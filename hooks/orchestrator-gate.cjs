@@ -46,6 +46,11 @@ function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** `model "opus" (claude-opus-5-5)` when an exact id is configured, else just the alias. */
+function modelLabel(role) {
+  return role && role.id ? `"${role.alias}" (${role.id})` : `"${role && role.alias}"`;
+}
+
 // --- classification ---------------------------------------------------------
 
 // Paths the main panel may always write: the harness itself, plans, docs, scratch.
@@ -267,37 +272,11 @@ function parseCodeModel(cfg, v) {
   return 'invalid';
 }
 
-/**
- * True when a shell segment actually invokes `orca <sub>`: bare `orca`, an absolute path
- * (/opt/.../orca), leading VAR=value assignments, env/command/exec/nohup/time wrappers, or
- * inside `(`, `$(` or a backtick. A grep/echo that only mentions it is text and does not match.
- */
-// Upstream (~/.claude/hooks/) is migrating this pattern-based check to a linear-time
-// scanner (lib/shell-orca-invocations.cjs) because the nested `(assign|wrapper)+`
-// quantifier is a plausible catastrophic-backtracking shape on pathological input.
-// TODO: port that scanner here and drop this regex once it lands upstream.
-// Until then, MAX_INVOKES_ORCA_LEN bounds the worst case: every call site here only
-// ever tests one shell segment or one subshell body, which in real commands is short,
-// so capping it costs nothing in practice while bounding regex work absolutely.
-const MAX_INVOKES_ORCA_LEN = 4000;
-function invokesOrca(seg, sub) {
-  if (seg.length > MAX_INVOKES_ORCA_LEN) return false; // never a bare `orca ...` invocation anyway
-  const assign = '[A-Za-z_][A-Za-z0-9_]*=(?:\\$\\([^)]*\\)|"[^"]*"|\'[^\']*\'|\\S*)';
-  const wrapper = '(?:env(?:\\s+-\\S+)*|command|exec|nohup|time)';
-  return new RegExp(
-    `^\\s*(?:\\(\\s*)*(?:(?:${assign}|${wrapper})\\s+)*(?:[A-Za-z_][A-Za-z0-9_]*=)?(?:\\$\\(|\`)?(?:\\S*/)?orca\\s+${sub}(?=\\s|$|\\)|\`)`
-  ).test(seg);
-}
-
-/**
- * Everything in a command line that could be an orca invocation: each shell segment
- * (quoted text blanked, so echo/grep mentions stay text) plus the body of every $( )
- * and backtick subshell, which quoting would otherwise hide - `id="$(orca ...)"`.
- */
-function orcaCandidates(cmd) {
-  const bodies = [...cmd.matchAll(/\$\(([^()]*)\)|`([^`]*)`/g)].map((m) => m[1] || m[2] || '');
-  return [...shellSegments(cmd), ...bodies.flatMap((b) => shellSegments(b))];
-}
+// Linear-time shell scanner: every real `orca <sub>` invocation a shell would actually
+// execute in a command line (see lib/shell-orca-invocations.cjs for the tokenizer and why
+// a previous regex-based detector was replaced - it had a plausible catastrophic-
+// backtracking shape on adversarial input, among other correctness gaps).
+const { orcaInvocations } = require('./lib/shell-orca-invocations.cjs');
 
 function describeOverride(cfg, o) {
   if (o === 'codex') return 'Codex in an Orca worker';
@@ -326,9 +305,38 @@ function currentExecRoute(cfg, s) {
   try {
     const r = require('./lib/exec-route-by-quota.cjs').execRoute(handoffUsed(cfg));
     if (r.route === 'sonnet') return { route: 'code', alias: cfg.models.code.alias, why: `auto: ${r.summary}` };
+    // execFallbackWhenCodexUnavailable: an unread Codex quota or a missing `orca` binary
+    // is not, on its own, evidence Codex should still be tried - it is exactly the "no
+    // Orca / no Codex" case the config option exists to name. Only fires when Codex's
+    // quota is genuinely unknown (never when it is known and simply under the handoff
+    // threshold - that case already returned 'codex' above via r.route).
+    if (cfg.execFallbackWhenCodexUnavailable === 'sonnet' && (r.codexLeft === null || !orcaOnPath())) {
+      return {
+        route: 'code', alias: cfg.models.code.alias,
+        why: `auto: ${r.summary}; no Orca/Codex reading, falling back to "${cfg.models.code.alias}" per execFallbackWhenCodexUnavailable`,
+      };
+    }
     return { route: 'codex', why: `auto: ${r.summary}` };
   } catch {
     return { route: 'codex', why: 'auto: quota unreadable, default Codex' };
+  }
+}
+
+/**
+ * True when the configured `orca` binary is reachable: an absolute/relative ORCA_BIN path
+ * (tests point this at a stub, or a deliberately missing file) is checked directly; the
+ * bare default name is resolved with `which`/`where`. Never throws.
+ */
+function orcaOnPath() {
+  try {
+    if (ORCA_BIN.includes(path.sep)) return fs.existsSync(ORCA_BIN);
+    require('child_process').execFileSync(
+      process.platform === 'win32' ? 'where' : 'which', [ORCA_BIN],
+      { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }
+    );
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -498,10 +506,10 @@ function onSessionStart(p, s, cfg) {
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
-    `- Model routing: ${review} plans + red-teams -> Codex (${code} once Codex >= ${threshold}% used) codes -> ${review} reviews.\n` +
-    `- Planning / red-team / review / verification -> in-session subagent on model "${review}".\n` +
-    `  Model "${escalation}" only after "${review}" failed even at high effort; say both in the dispatch.\n` +
-    `- Light lookups (find/locate code, read logs or test output, explore) -> model "${lookup}".\n` +
+    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> Codex (${code} once Codex >= ${threshold}% used) codes -> ${review} reviews.\n` +
+    `- Planning / red-team / review / verification -> in-session subagent on model ${modelLabel(cfg.models.review)}.\n` +
+    `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
+    `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (Codex spec or in-session prompt) names the exact test / build command to run green.\n' +
     `- Code: Codex first; "${code}" once Codex has used >= ${threshold}% of its quota (the per-prompt reminder names it):\n` +
     '    Codex  -> Orca worker: orca orchestration task-create ... && worker-start ...\n' +
@@ -569,10 +577,12 @@ function onUserPromptSubmit(p, s, cfg) {
   const live = liveWorkers(s);
   const parts = [languageSentence(cfg, false) + 'Delegate; do not implement here.'];
   const ex = currentExecRoute(cfg, s);
+  const codexModelShown = ex.codexModel || cfg.models.codex.id;
+  const roleByAlias = (alias) => Object.values(cfg.models).find((m) => m.alias === alias) || { alias, id: null };
   const codeRoute = ex.route === 'codex'
-    ? `Codex in an Orca worker${ex.codexModel ? ` (worker-start --agent codex --model ${ex.codexModel})` : ''}`
-    : `in-session subagent (Agent model "${ex.alias}")`;
-  parts.push(`Model routing: plan/red-team/review -> model "${cfg.models.review.alias}"; code -> ${codeRoute} [${ex.why}].`);
+    ? `Codex in an Orca worker${codexModelShown ? ` (worker-start --agent codex --model ${codexModelShown})` : ''}`
+    : `in-session subagent (Agent model ${modelLabel(ex.route === 'claude' ? roleByAlias(ex.alias) : cfg.models.code)})`;
+  parts.push(`Model routing: plan/red-team/review -> model ${modelLabel(cfg.models.review)}; code -> ${codeRoute} [${ex.why}].`);
   if (live.length) {
     const baseline = s.last_heartbeat || Math.min(...live.map(([, w]) => w.started || Date.now()));
     const stale = Math.round((Date.now() - baseline) / 1000);
@@ -634,11 +644,12 @@ function onPreToolUse(p, s, cfg) {
         'Moving or deleting files under .claude/, plans/, docs/ or a temp dir is still allowed.');
     }
     // Code briefs handed to Codex through Orca must let it check itself. Judged on the
-    // actual orca segment (quoted mentions in grep/echo are text), and only for code work:
-    // research / review / publish specs are not code briefs.
-    const orcaSeg = orcaCandidates(cmd).find((seg) =>
-      invokesOrca(seg, 'orchestration\\s+(task-create|worker-start)\\b') && /--spec\b/.test(seg));
-    if (orcaSeg && !/--help\b/.test(orcaSeg)) {
+    // real orca invocation's own args (quoted mentions in grep/echo never match), and
+    // only for code work: research / review / publish specs are not code briefs.
+    const orcaInv = orcaInvocations(cmd).find((inv) =>
+      (inv.sub === 'orchestration task-create' || inv.sub === 'orchestration worker-start') &&
+      inv.args.includes('--spec') && !inv.args.includes('--help'));
+    if (orcaInv) {
       const brief = briefText(cmd, p.cwd);
       if (EXEC_INTENT.test(brief.text) && !VERIFY_COMMAND.test(brief.text)) {
         d('code-brief-needs-verify', CODE_BRIEF_HELP +
@@ -657,9 +668,12 @@ function onPreToolUse(p, s, cfg) {
     // Advisory only: a Codex worker-start that omits --model gets no model pin, so a
     // fleet can silently drift onto whatever Codex defaults to. Skipped when --terminal
     // targets an existing terminal (its model is already fixed) or --model is already given.
-    const codexSeg = orcaCandidates(cmd).find((seg) =>
-      invokesOrca(seg, 'orchestration\\s+worker-start\\b') && /--agent\s+codex\b/.test(seg));
-    if (codexSeg && !/--terminal\b/.test(codexSeg) && !/--model\b/.test(codexSeg) && cfg.models.codex.id) {
+    const codexInv = orcaInvocations(cmd).find((inv) => {
+      if (inv.sub !== 'orchestration worker-start') return false;
+      const at = inv.args.indexOf('--agent');
+      return at >= 0 && inv.args[at + 1] === 'codex';
+    });
+    if (codexInv && !codexInv.args.includes('--terminal') && !codexInv.args.includes('--model') && cfg.models.codex.id) {
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
         additionalContext: `orchestrator-gate advice: pin the Codex model explicitly - add --model ${cfg.models.codex.id} ` +
           'to this worker-start so the fleet cannot silently drift onto a different default.' } }));
@@ -765,24 +779,35 @@ function onPostToolUse(p, s, cfg) {
     // Orca's own reply rather than parsed out of the command line, because the
     // operator does not use a fixed invocation - whatever flags the panel chose,
     // the dispatchId in the response is authoritative.
-    // Only an actual orca segment counts: a grep/echo that merely mentions worker-start
-    // (from the panel or a subagent) must not register a phantom worker.
-    const startsWorker = orcaCandidates(cmd).some((seg) =>
-      invokesOrca(seg, '(orchestration\\s+worker-start|terminal\\s+create)\\b') && !/--help\b/.test(seg));
+    // Only a real orca invocation counts: a grep/echo that merely mentions worker-start
+    // (from the panel or a subagent) must not register a phantom worker. --help is judged
+    // on that invocation's own args, not the whole command line.
+    const startsWorker = orcaInvocations(cmd).some((inv) =>
+      (inv.sub === 'orchestration worker-start' || inv.sub === 'terminal create') &&
+      !inv.args.includes('--help'));
     if (startsWorker) {
       const ids = new Set();
       for (const m of out.matchAll(/"(?:dispatchId|taskId|handle)"\s*:\s*"([^"]+)"/g)) ids.add(m[1]);
       for (const m of out.matchAll(/\b((?:ctx|task|term)_[A-Za-z0-9_-]+)\b/g)) ids.add(m[1]);
-      if (!ids.size) ids.add(`unlabelled-${Date.now()}`); // still track it; never lose a worker
-      for (const id of ids) {
-        s.workers[id] = { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(), rate_limited_until: 0 };
-      }
-      dirty = true;
-      if (!heartbeatAlive(s.session_id)) {
+      if (!ids.size) {
+        // No id in Orca's own reply: do not invent one. A phantom "unlabelled-<ts>" worker
+        // cannot ever be reconciled against `orca orchestration worker-list`, so it just
+        // nags the panel forever instead of tracking anything real.
         process.stdout.write(
-          'orchestrator-gate: worker dispatched. Start the heartbeat now so it cannot sit IDLE unnoticed:\n' +
-          `  ${heartbeatStartCommand()}\n`
+          'orchestrator-gate: orca worker-start ran but no dispatch id was found in its output; ' +
+          'run `orca orchestration worker-list` to track it.\n'
         );
+      } else {
+        for (const id of ids) {
+          s.workers[id] = { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(), rate_limited_until: 0 };
+        }
+        dirty = true;
+        if (!heartbeatAlive(s.session_id)) {
+          process.stdout.write(
+            'orchestrator-gate: worker dispatched. Start the heartbeat now so it cannot sit IDLE unnoticed:\n' +
+            `  ${heartbeatStartCommand()}\n`
+          );
+        }
       }
     }
 

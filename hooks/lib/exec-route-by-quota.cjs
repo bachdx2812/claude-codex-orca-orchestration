@@ -43,12 +43,19 @@ function claudeUsageCachePath() {
   return fs.existsSync(fallback) ? fallback : null;
 }
 
-/** Percent used by one window, 0 once its reset time has passed. */
-function windowUsed(pct, resetsAtMs, now) {
+/**
+ * Percent used by one window, 0 once its reset time has passed.
+ *
+ * `allowFraction` applies the Claude usage cache's own convention that a value in (0,1)
+ * is a fraction rather than an already-a-percentage number - a convention that belongs
+ * to that cache's format alone. Codex's `used_percent` is never a fraction by contract
+ * (it is always 0-100), so applying the same heuristic there would silently 100x a
+ * genuine low-single-digits reading (e.g. 0.5% actually used) into "50% used".
+ */
+function windowUsed(pct, resetsAtMs, now, allowFraction) {
   if (typeof pct !== 'number' || !Number.isFinite(pct)) return null;
   if (resetsAtMs && resetsAtMs < now) return 0;
-  // Same convention as the source cache: a value in (0,1) is a fraction.
-  return pct > 0 && pct < 1 ? pct * 100 : pct;
+  return allowFraction && pct > 0 && pct < 1 ? pct * 100 : pct;
 }
 
 /** Percent of Claude quota left, or null when no cache is present/parseable/stale. */
@@ -62,7 +69,7 @@ function claudeRemaining(now = Date.now()) {
     const d = cache.data;
     const used = [d.five_hour, d.seven_day, d.seven_day_sonnet]
       .filter(Boolean)
-      .map((w) => windowUsed(w.utilization, w.resets_at ? Date.parse(w.resets_at) : 0, now))
+      .map((w) => windowUsed(w.utilization, w.resets_at ? Date.parse(w.resets_at) : 0, now, true))
       .filter((v) => v !== null);
     if (!used.length) return null;
     return Math.max(0, 100 - Math.max(...used));
@@ -131,7 +138,7 @@ function codexRemaining(now = Date.now()) {
       if (!rl) continue; // e.g. a session that has not finished its first turn yet
       const used = [rl.primary, rl.secondary]
         .filter(Boolean)
-        .map((w) => windowUsed(w.used_percent, w.resets_at ? w.resets_at * 1000 : 0, now))
+        .map((w) => windowUsed(w.used_percent, w.resets_at ? w.resets_at * 1000 : 0, now, false))
         .filter((v) => v !== null);
       if (used.length) return Math.max(0, 100 - Math.max(...used));
     }
