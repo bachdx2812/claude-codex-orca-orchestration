@@ -39,6 +39,16 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
 7. **Codex rate-limits under parallel load.** On a rate-limit signal the correct response
    is to back off and retry the *same* dispatch (`worker-start --retry-of <id>`), never to
    re-dispatch immediately or start a replacement.
+8. **No more than `maxParallelCodexWorkers` (default 3) live Codex workers at once.** A
+   `worker-start` that would exceed it is refused; wait for one to finish and release it,
+   reuse its terminal (`--terminal <handle>`), or retry it (`--retry-of <id>`) — neither
+   replaces an existing group, so neither counts as a new dispatch against the cap.
+9. **A code brief in a shared workspace declares the files it will touch.** `Owns: <paths>`
+   (repo-relative, globs ok) or `Owns: n/a <reason>`, on its own line, for every code
+   brief that already needs a verify command (an Orca `--spec` or an in-session code
+   dispatch) — unless the work is isolated (`--worktree new-child`/`new-top-level`, or
+   Agent `isolation:"worktree"`), which needs no `Owns:` at all. A claim that overlaps
+   another live claim in the same workspace is refused.
 
 ## Activation
 
@@ -141,6 +151,8 @@ as the installed hooks would actually read it.
   "codexHandoffUsedPercent": 40,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
+  "maxParallelCodexWorkers": 3,
+  "ownershipClaimTtlMinutes": 120,
   "disabledGates": []
 }
 ```
@@ -161,6 +173,16 @@ as the installed hooks would actually read it.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
   the SessionStart banner.
+- `maxParallelCodexWorkers`: integer 0-32, default 3. How many live Codex worker *groups*
+  (see "Section 0 fixes" below — one worker-start reply's dispatch id, task id and
+  terminal handle together are one group, never three) this session may hold at once; `0`
+  is unlimited. Only Codex-agent worker-starts are counted — a `--terminal <h>` or
+  `--retry-of <id>` that replaces an existing tracked group is not a new dispatch and does
+  not count, and a non-Codex agent is never counted at all. Overridable for one process
+  with `ORCH_MAX_PARALLEL_CODEX_WORKERS`.
+- `ownershipClaimTtlMinutes`: integer 1-10080, default 120. How long a background
+  in-session Agent's `Owns:` claim survives without an explicit release before it
+  auto-expires. Overridable for one process with `ORCH_CLAIM_TTL_MINUTES`.
 
 Env overrides: `ORCH_CONFIG_PATH` (which file to read), `ORCH_STATE_DIR` (where session
 state, the violations log and heartbeat liveness files live — default
@@ -189,6 +211,52 @@ seconds pass with a live worker and no poll of either kind, the gate says so on 
 When a worker is finished: retain it if it will be reused, otherwise release it. `Stop`
 refuses to end a session with workers still live and unwatched.
 
+## Parallel Codex workers and file ownership
+
+**Section 0 fixes (pre-existing bugs).** Two bugs in the worker-tracking state predate
+this feature and are fixed as part of it: (1) a single `worker-start` reply can name a
+dispatch id (`ctx_*`), a task id (`task_*`) and a terminal handle (`term_*`) for the SAME
+worker — every tracked entry now carries a `group` (shared by every id from one reply) and
+a `kind` (`'worker'` or `'terminal'`), so a worker *count* counts distinct groups, never
+distinct keys; a legacy entry with no `group` is its own group. (2)
+`worker-release --dispatch <id> --json` used to be matched by taking the command line's
+*last shell token* — `--json` — which matched no worker and fell back to settling every
+live worker in the session. The release matcher (`worker-stop`/`worker-release`/
+`worker-abandon`/`terminal close`) now reads the specific orca invocation's own parsed
+`--dispatch`/positional argument; an unrecognised label settles nothing and prints a hint.
+
+**`max-parallel-codex-workers`.** Every real `orchestration worker-start` invocation with
+agent Codex (explicit `--agent codex`, or `--terminal <h>` with no `--agent` when `<h>`
+does not belong to a tracked non-Codex group) counts against `maxParallelCodexWorkers`. The
+count is this session's own state, reconciled against `orca orchestration worker-list
+--json` (5s timeout) only once the local count is at or over the cap — a healthy session
+under the cap never pays that round trip. A race between two parallel `Bash` calls is
+closed by a short-lived file lock around "count, then reserve": the losing call sees the
+winner's reservation and is refused before either registers a real worker.
+
+**`code-brief-needs-owns` / `ownership-overlap`.** The same code briefs that already need a
+verify command (an Orca `--spec`, or an in-session `Agent`/`Task` exec dispatch) — when
+running in a *shared* workspace, not an isolated worktree/Agent — must also declare
+`Owns: <repo-relative paths, globs ok>` or `Owns: n/a <reason>`, **on its own line**. A
+claim that overlaps another live claim in the same workspace (`repoRoot|--worktree value`,
+or `repoRoot|current` with no `--worktree`) is refused, naming the holder and its age. A
+`task-create --spec`'s `Owns:` is inherited by a later `worker-start --task <id>` that
+supplies no `--spec` of its own; an unresolvable `--task` value (an unexpanded shell
+variable) is allowed with an advisory note rather than refused. Isolated work
+(`--worktree new-child`/`new-top-level`, or Agent `isolation:"worktree"`) needs no `Owns:`
+at all and never conflicts with anything, since each isolated dispatch gets a unique
+workspace key.
+
+A claim releases when its holder does: a settled worker group frees its claim; a
+foreground `Agent`/`Task` dispatch frees it at the matching `PostToolUse`; a background
+dispatch is released best-effort by a `<task-notification>` naming its id, by
+`ownershipClaimTtlMinutes` if nothing else ever does, or by the operator's
+`--release-claims <id>` / `--release-claims all`.
+
+**Known limits.** Ownership is *declared*, not observed — nothing checks that a worker
+actually only touched the files it claimed. Workers started by a subagent (not the main
+panel) are not tracked or capped, the same boundary every other gate here respects.
+
 ## Codex rate limits
 
 When a worker's output matches a rate-limit signal (`rate limit`, `429`, `quota
@@ -212,12 +280,26 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
   "execAgent": null,
   "workers": { "<label>": { "role": "codex-exec", "started": 0,
                              "status": "live|settled", "last_seen": 0,
-                             "rate_limited_until": 0 } },
+                             "rate_limited_until": 0,
+                             "group": "ctx_x", "kind": "worker|terminal", "agent": "codex",
+                             "owns": ["src/api/**"], "ws": "<repoRoot>|current" } },
+  "reservations": { "<toolUseId>#<idx>": { "ts": 0, "agent": "codex",
+                                            "owns": ["src/api/**"], "ws": "<repoRoot>|current",
+                                            "codexSlot": true } },
+  "agentClaims": { "<toolUseId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current", "ts": 0 } },
+  "tasks": { "<taskId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current" } },
   "last_heartbeat": 0, "rate_limit_hits": 0 }
 ```
 
 `execAgent` is one of `null` (automatic, by quota), `"code"` (the configured code model),
 `"codex"`, `"codex:<model>"`, or `"claude:<alias>"`.
+
+`group`/`kind`/`agent`/`owns`/`ws` on a worker entry, `reservations`, `agentClaims` and
+`tasks` are the parallel-Codex-worker cap and file-ownership bookkeeping (see "Parallel
+Codex workers and file ownership" above). `reservations` and `agentClaims` are both
+transient — a reservation is consumed by the matching `PostToolUse` (or expires after 10
+minutes if nothing ever does), and an `agentClaims` entry is removed at release, whichever
+of the paths above fires first.
 
 ## Escape hatches
 
@@ -229,6 +311,11 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
   quotes `--no-orchestrate` can never toggle this.
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` toggle only
   execution routing, honestly — narrower than a full bypass.
+- `--release-claims <toolUseId>` / `--release-claims all` manually frees one or every
+  tracked `Owns:` claim — the deliberate manual override alongside the automatic release
+  paths (matching `PostToolUse`, a `<task-notification>`, `ownershipClaimTtlMinutes`).
+- `maxParallelCodexWorkers: 0` (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env, one
+  process) makes the parallel-Codex-worker cap unlimited.
 
 Only the operator invokes these from the main panel's own prompt.
 

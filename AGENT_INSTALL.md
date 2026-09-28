@@ -27,7 +27,11 @@ directly and are never tracked by these hooks — no heartbeat needed. Orca work
 (Codex) run in their own terminal/worktree and must be supervised by
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
 terminal, an orphan, or a rate limit; `Stop` refuses to end the session with one live and
-unwatched, or finished and unreleased. Full detail: `README.md#subagents-and-parallel-work`.
+unwatched, or finished and unreleased. No more than `maxParallelCodexWorkers` (default 3)
+live Codex workers at once, and any shared-workspace code brief must declare
+`Owns: <files>` (or `Owns: n/a <reason>`) so overlapping claims are caught before either
+dispatch starts — isolate with `--worktree new-child` / Agent `isolation:"worktree"` to
+skip both. Full detail: `README.md#subagents-and-parallel-work`.
 
 ## 1. Prerequisite checks
 
@@ -49,7 +53,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 194 tests, fully hermetic
+npm test                       # 408 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -150,6 +154,19 @@ The file is plain JSON — no comments — parsed as-is:
 (`codexHandoffUsedPercent: 60` is up from the default 40; `replyLanguage` accepts any
 language name, or `null` for no language sentence at all.)
 
+Two more keys gate parallel work: `maxParallelCodexWorkers` (integer 0-32, default 3, `0`
+= unlimited) caps how many live Codex `worker-start` dispatches this session may hold at
+once — a `--terminal`/`--retry-of` that replaces an existing worker does not count as new,
+and a non-Codex agent is never counted; `ownershipClaimTtlMinutes` (default 120) is how
+long a background in-session Agent's `Owns:` file claim survives without an explicit
+release before it auto-expires. Both are overridable for one process with
+`ORCH_MAX_PARALLEL_CODEX_WORKERS` / `ORCH_CLAIM_TTL_MINUTES`. Every code brief that already
+needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` dispatch)
+running in a *shared* workspace must also declare `Owns: <repo-relative paths>` or
+`Owns: n/a <reason>` on its own line, unless it is isolated
+(`--worktree new-child`/`new-top-level`, or Agent `isolation:"worktree"`) — full detail in
+`rules/orchestration-contract.md#parallel-codex-workers-and-file-ownership`.
+
 ## 5. Override the coding model from the main panel
 
 The operator can pick who writes code for the rest of the session directly from a prompt:
@@ -193,6 +210,8 @@ state up front so this is diagnosed before it becomes a mid-session refusal.
 ORCHESTRATOR_GATE=off <your command>     # disables the gate for one invocation/session
 # or, inside a Claude Code prompt:
 --no-orchestrate
+--release-claims <toolUseId>             # manually frees one stuck Owns: claim
+--release-claims all                     # manually frees every tracked Owns: claim
 
 node install.mjs --uninstall             # removes hooks, settings.json entries, CLAUDE.md block; keeps config.json
 node install.mjs --uninstall --purge     # also removes config.json
@@ -212,6 +231,10 @@ Rollback without the uninstaller: every settings.json mutation is preceded by a
 - **Orca worker detection** uses `orca orchestration worker-list --json`'s
   `resource.id` field; a context-only `orchestration dispatch --to <handle>` (no
   `resource`) is never treated as a worker, so it stays gated like the main panel.
+- **File ownership (`Owns:`) is declared, not observed** — nothing checks that a worker's
+  actual edits stayed within what it claimed. Workers started by a subagent, not the main
+  panel, are not tracked or capped by `maxParallelCodexWorkers`, the same boundary every
+  other gate here respects.
 - **Main-panel gating requires an Orca terminal environment** under the default
   `activation: "orca-only"` config: the gate only governs a session that carries
   `ORCA_TERMINAL_HANDLE` at all (i.e., one launched inside Orca). A plain `claude` session

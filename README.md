@@ -63,9 +63,26 @@ orca orchestration worker-start --retry-of <dispatchId> ...
 **Enforced vs advisory.** Enforced: gates apply to the main panel only (subagents and
 Orca-worker sessions are never gated); `Stop` refuses to end the session while a worker is
 running and unwatched (`workers-unwatched` — no live heartbeat) or finished but still
-holding a terminal (`workers-unreconciled` — needs `worker-retain` or `worker-release`).
-Advisory only, never checked by the gate: how much to parallelize, and whether two
-workers' file ownership overlaps.
+holding a terminal (`workers-unreconciled` — needs `worker-retain` or `worker-release`);
+**no more than `maxParallelCodexWorkers` (default 3) live Codex workers at once**
+(`max-parallel-codex-workers`); **every code brief in a shared workspace declares the
+files it will touch** (`code-brief-needs-owns` — `Owns: <paths>` or `Owns: n/a <reason>`,
+on its own line) **and a claim that overlaps another live one is refused**
+(`ownership-overlap`, naming the holder and its age).
+
+Prefer `--worktree new-child` (Orca) or Agent `isolation:"worktree"` for genuinely
+parallel workers: isolated work needs no `Owns:` at all and can never conflict with
+anything, since each isolated dispatch gets a unique workspace key — narrowing an `Owns:`
+claim in a *shared* workspace only avoids that specific conflict, not the next one.
+
+| Gate | Refuses when | Escape |
+|---|---|---|
+| `max-parallel-codex-workers` | a new Codex `worker-start` would exceed `maxParallelCodexWorkers` | release/reuse/retry an existing worker; raise the cap; `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` |
+| `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
+| `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
+
+Advisory only, never blocked by the gate: whether the files a worker actually touched
+matched what it declared (ownership is *declared*, not observed).
 
 ## What it is
 
@@ -98,7 +115,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 194 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 408 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -145,13 +162,17 @@ The file is plain JSON — no comments — parsed as-is:
 {
   "codexHandoffUsedPercent": 60,
   "replyLanguage": "Vietnamese",
+  "maxParallelCodexWorkers": 5,
+  "ownershipClaimTtlMinutes": 60,
   "disabledGates": ["code-brief-needs-verify"]
 }
 ```
 
 (`codexHandoffUsedPercent: 60` means Codex keeps coding until 60% of its quota is used,
 up from the default 40; `replyLanguage` accepts any language name, or `null` for no
-language instruction at all.)
+language instruction at all; `maxParallelCodexWorkers` raises or lowers how many live
+Codex workers this session may hold at once (`0` = unlimited); `ownershipClaimTtlMinutes`
+changes how long a background Agent's `Owns:` claim survives before it auto-expires.)
 
 See `rules/orchestration-contract.md#config` for every field.
 
@@ -174,6 +195,9 @@ exact-match removal (never a blind restore, so edits you made after installing s
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` (see
   `rules/orchestration-contract.md`) let the operator override coding-model routing
   without a full bypass.
+- `--release-claims <toolUseId>` / `--release-claims all` manually frees a stuck `Owns:`
+  claim; `maxParallelCodexWorkers: 0` (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0`
+  (env) makes the parallel-Codex-worker cap unlimited.
 
 ## Known limitations
 
@@ -198,6 +222,14 @@ None of these are false positives (nothing is wrongly flagged); they are detecti
 where a real orca invocation could pass the code-brief-verify and worker-registration
 checks unnoticed. Widening the wrapper/keyword list, or fully parsing heredoc bodies
 handed to a shell interpreter, is future work.
+
+File ownership is *declared*, not observed: `Owns:` is trusted at face value, and nothing
+checks that a worker's actual edits stayed within what it claimed. Workers started by a
+subagent (not the main panel) are not tracked and do not count toward
+`maxParallelCodexWorkers`, the same boundary every other gate here respects — these hooks
+gate the main panel's own dispatches. `orchestration dispatch --to <handle>` (a
+context-only send to an existing terminal, not a new worker) is out of scope for both the
+parallel-limit and ownership gates.
 
 ## Development
 
