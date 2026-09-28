@@ -37,6 +37,9 @@ const LOG = path.join(DIR, 'violations.log');
 const ORCA_DOWN_FLAG = process.env.ORCA_DOWN_FLAG_PATH || path.join(DIR, 'orca-unavailable');
 // ORCA_BIN lets the test suite point at a stub instead of a real `orca` on PATH.
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
+// CODEX_BIN lets the test suite point at a stub or a deliberately missing path, exactly
+// like ORCA_BIN, so "codex is not on PATH" is testable without touching a real install.
+const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 
 // --- tunables ---------------------------------------------------------------
 const RATE_LIMIT_BACKOFF_SECONDS = 120; // wait before retrying a rate-limited worker
@@ -49,6 +52,23 @@ function escapeRegex(s) {
 /** `model "opus" (claude-opus-5-5)` when an exact id is configured, else just the alias. */
 function modelLabel(role) {
   return role && role.id ? `"${role.alias}" (${role.id})` : `"${role && role.alias}"`;
+}
+
+/**
+ * `orcaInvocations()` args are shell words, not a parsed flag table: `--spec=x.md` is one
+ * word, not `--spec` followed by `x.md`. `args.includes('--spec')` therefore misses the
+ * `=` form entirely - the same gap applies to `--model=`, `--terminal=`, `--agent=codex`.
+ * hasFlag/flagValue understand both the space-separated and `=`-joined forms.
+ */
+function hasFlag(args, flag) {
+  return args.some((a) => a === flag || a.startsWith(`${flag}=`));
+}
+function flagValue(args, flag) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag) return args[i + 1];
+    if (args[i].startsWith(`${flag}=`)) return args[i].slice(flag.length + 1);
+  }
+  return undefined;
 }
 
 // --- classification ---------------------------------------------------------
@@ -305,15 +325,17 @@ function currentExecRoute(cfg, s) {
   try {
     const r = require('./lib/exec-route-by-quota.cjs').execRoute(handoffUsed(cfg));
     if (r.route === 'sonnet') return { route: 'code', alias: cfg.models.code.alias, why: `auto: ${r.summary}` };
-    // execFallbackWhenCodexUnavailable: an unread Codex quota or a missing `orca` binary
-    // is not, on its own, evidence Codex should still be tried - it is exactly the "no
-    // Orca / no Codex" case the config option exists to name. Only fires when Codex's
-    // quota is genuinely unknown (never when it is known and simply under the handoff
-    // threshold - that case already returned 'codex' above via r.route).
-    if (cfg.execFallbackWhenCodexUnavailable === 'sonnet' && (r.codexLeft === null || !orcaOnPath())) {
+    // execFallbackWhenCodexUnavailable fires only when Codex genuinely cannot be
+    // dispatched to at all - `orca` or `codex` itself missing from PATH - never merely
+    // because its quota reading is unknown (e.g. a fresh Codex install that has not run a
+    // first turn yet). Codex is the deliberately-preferred default: an unknown quota is
+    // not evidence Codex is unusable, only a missing binary is. (A quota that IS known and
+    // simply under the handoff threshold already returned 'codex' above via r.route.)
+    if (cfg.execFallbackWhenCodexUnavailable === 'sonnet' && (!orcaOnPath() || !codexOnPath())) {
+      const missing = [!orcaOnPath() && 'orca', !codexOnPath() && 'codex'].filter(Boolean).join('/');
       return {
         route: 'code', alias: cfg.models.code.alias,
-        why: `auto: ${r.summary}; no Orca/Codex reading, falling back to "${cfg.models.code.alias}" per execFallbackWhenCodexUnavailable`,
+        why: `auto: ${r.summary}; ${missing} not on PATH, falling back to "${cfg.models.code.alias}" per execFallbackWhenCodexUnavailable`,
       };
     }
     return { route: 'codex', why: `auto: ${r.summary}` };
@@ -323,15 +345,16 @@ function currentExecRoute(cfg, s) {
 }
 
 /**
- * True when the configured `orca` binary is reachable: an absolute/relative ORCA_BIN path
- * (tests point this at a stub, or a deliberately missing file) is checked directly; the
- * bare default name is resolved with `which`/`where`. Never throws.
+ * True when `bin` (an ORCA_BIN/CODEX_BIN-style override, or the bare default name) is
+ * reachable: an absolute/relative path (tests point this at a stub, or a deliberately
+ * missing file) is checked directly; a bare name is resolved with `which`/`where`. Never
+ * throws.
  */
-function orcaOnPath() {
+function binOnPath(bin) {
   try {
-    if (ORCA_BIN.includes(path.sep)) return fs.existsSync(ORCA_BIN);
+    if (bin.includes(path.sep)) return fs.existsSync(bin);
     require('child_process').execFileSync(
-      process.platform === 'win32' ? 'where' : 'which', [ORCA_BIN],
+      process.platform === 'win32' ? 'where' : 'which', [bin],
       { stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }
     );
     return true;
@@ -339,6 +362,8 @@ function orcaOnPath() {
     return false;
   }
 }
+function orcaOnPath() { return binOnPath(ORCA_BIN); }
+function codexOnPath() { return binOnPath(CODEX_BIN); }
 
 /**
  * True when this hook payload came from the main panel rather than a subagent
@@ -648,7 +673,7 @@ function onPreToolUse(p, s, cfg) {
     // only for code work: research / review / publish specs are not code briefs.
     const orcaInv = orcaInvocations(cmd).find((inv) =>
       (inv.sub === 'orchestration task-create' || inv.sub === 'orchestration worker-start') &&
-      inv.args.includes('--spec') && !inv.args.includes('--help'));
+      hasFlag(inv.args, '--spec') && !hasFlag(inv.args, '--help'));
     if (orcaInv) {
       const brief = briefText(cmd, p.cwd);
       if (EXEC_INTENT.test(brief.text) && !VERIFY_COMMAND.test(brief.text)) {
@@ -668,12 +693,9 @@ function onPreToolUse(p, s, cfg) {
     // Advisory only: a Codex worker-start that omits --model gets no model pin, so a
     // fleet can silently drift onto whatever Codex defaults to. Skipped when --terminal
     // targets an existing terminal (its model is already fixed) or --model is already given.
-    const codexInv = orcaInvocations(cmd).find((inv) => {
-      if (inv.sub !== 'orchestration worker-start') return false;
-      const at = inv.args.indexOf('--agent');
-      return at >= 0 && inv.args[at + 1] === 'codex';
-    });
-    if (codexInv && !codexInv.args.includes('--terminal') && !codexInv.args.includes('--model') && cfg.models.codex.id) {
+    const codexInv = orcaInvocations(cmd).find((inv) =>
+      inv.sub === 'orchestration worker-start' && flagValue(inv.args, '--agent') === 'codex');
+    if (codexInv && !hasFlag(codexInv.args, '--terminal') && !hasFlag(codexInv.args, '--model') && cfg.models.codex.id) {
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
         additionalContext: `orchestrator-gate advice: pin the Codex model explicitly - add --model ${cfg.models.codex.id} ` +
           'to this worker-start so the fleet cannot silently drift onto a different default.' } }));
@@ -773,6 +795,28 @@ function onPostToolUse(p, s, cfg) {
     if (/\borca\b/.test(cmd) && /(worker-list|worker-read|worker-show|terminal (list|read|show)|worktree ps|task-list|inbox|check)\b/.test(cmd)) {
       s.last_heartbeat = Date.now();
       dirty = true;
+
+      // Resolve any "pending-<ts>" placeholders (a worker-start whose reply carried no
+      // id) against this poll's real ids: adopt any id this poll surfaces that is not
+      // already tracked, one placeholder per new id; a placeholder nothing resolves it
+      // for settles instead of nagging forever, since it can never be reconciled once a
+      // poll has already come back empty for it.
+      const pendingIds = Object.entries(s.workers).filter(([k, w]) => k.startsWith('pending-') && w.status === 'live').map(([k]) => k);
+      if (pendingIds.length) {
+        const seenIds = new Set();
+        for (const m of out.matchAll(/"(?:dispatchId|taskId|handle)"\s*:\s*"([^"]+)"/g)) seenIds.add(m[1]);
+        for (const m of out.matchAll(/\b((?:ctx|task|term)_[A-Za-z0-9_-]+)\b/g)) seenIds.add(m[1]);
+        const newIds = [...seenIds].filter((id) => !s.workers[id]);
+        for (const pendingId of pendingIds) {
+          const real = newIds.shift();
+          if (real) {
+            s.workers[real] = { ...s.workers[pendingId], role: 'codex-exec', unverified: false };
+            delete s.workers[pendingId];
+          } else {
+            s.workers[pendingId].status = 'settled';
+          }
+        }
+      }
     }
 
     // Starting a worker registers it as live. The identifier is taken from
@@ -784,18 +828,24 @@ function onPostToolUse(p, s, cfg) {
     // on that invocation's own args, not the whole command line.
     const startsWorker = orcaInvocations(cmd).some((inv) =>
       (inv.sub === 'orchestration worker-start' || inv.sub === 'terminal create') &&
-      !inv.args.includes('--help'));
+      !hasFlag(inv.args, '--help'));
     if (startsWorker) {
       const ids = new Set();
       for (const m of out.matchAll(/"(?:dispatchId|taskId|handle)"\s*:\s*"([^"]+)"/g)) ids.add(m[1]);
       for (const m of out.matchAll(/\b((?:ctx|task|term)_[A-Za-z0-9_-]+)\b/g)) ids.add(m[1]);
       if (!ids.size) {
-        // No id in Orca's own reply: do not invent one. A phantom "unlabelled-<ts>" worker
-        // cannot ever be reconciled against `orca orchestration worker-list`, so it just
-        // nags the panel forever instead of tracking anything real.
+        // No id in Orca's own reply: track it as an explicitly-marked placeholder rather
+        // than inventing a fake dispatch id or dropping it silently. `unverified: true`
+        // means the Stop gate still refuses to end the session over it (a real worker may
+        // well be running), and the next worker-list/worker-read poll resolves it - either
+        // adopting a real id this poll surfaces, or settling it once a poll comes back
+        // with nothing new to match it to.
+        const pendingId = `pending-${Date.now()}`;
+        s.workers[pendingId] = { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(), rate_limited_until: 0, unverified: true };
+        dirty = true;
         process.stdout.write(
           'orchestrator-gate: orca worker-start ran but no dispatch id was found in its output; ' +
-          'run `orca orchestration worker-list` to track it.\n'
+          `tracked as ${pendingId} until \`orca orchestration worker-list\` resolves it.\n`
         );
       } else {
         for (const id of ids) {
@@ -893,31 +943,43 @@ function onStop(p, s, cfg) {
   if (!live.length) return;
   const d = (gate, reason) => { if (!gateDisabled(cfg, gate)) { logViolation(s, gate, reason); process.stderr.write(reason); process.exit(2); } };
 
-  const ids = live.map(([k]) => k);
-  const confirmed = unsettledPerOrca(ids);
+  // "pending-<ts>" placeholders (a worker-start whose reply carried no dispatch id, see
+  // onPostToolUse) are never in Orca's own worker-list by construction - Orca was never
+  // given an id to answer about. They must never be auto-settled by an empty `confirmed`
+  // result the way a real, Orca-confirmed-released id would be; they stay in the
+  // "must be watched" path until a poll resolves them (adopts a real id, or settles them
+  // once a poll comes back with nothing new to match).
+  const pending = live.filter(([k]) => k.startsWith('pending-'));
+  const trackable = live.filter(([k]) => !k.startsWith('pending-'));
 
-  // Orca is the authority. If it says every dispatch of ours is released, the
-  // session's own bookkeeping was simply stale - settle it and let the panel go.
+  const ids = trackable.map(([k]) => k);
+  const confirmed = trackable.length ? unsettledPerOrca(ids) : [];
+
+  // Orca is the authority for trackable ids. If it says every one of ours is released,
+  // the session's own bookkeeping was simply stale - settle those (never the pending
+  // ones) and, if nothing pending remains either, let the panel go.
   if (confirmed && confirmed.length === 0) {
-    for (const [, w] of live) w.status = 'settled';
+    for (const [, w] of trackable) w.status = 'settled';
+    if (!pending.length) { save(s); return; }
     save(s);
-    return;
   }
 
   // Workers still running are a legitimate wait - but only while the heartbeat daemon
   // watches them, so the panel is woken on the first event instead of going AFK.
   // Finished workers still holding a terminal must be released first, heartbeat or not.
   const DONE = /\[(succeeded|failed|stopped|cancelled|canceled)\//;
-  if (confirmed && confirmed.length) {
-    const finished = confirmed.filter((c) => DONE.test(c));
-    if (!finished.length) {
-      if (heartbeatAlive(s.session_id)) return;
-      d('workers-unwatched',
-        `[orchestrator-gate:workers-unwatched] ${confirmed.length} worker(s) still running: ${confirmed.join(', ')}.\n` +
-        'You may wait for them, but not unwatched. Start the heartbeat first, then end the turn:\n' +
-        `  ${heartbeatStartCommand()}\n`);
-      return;
-    }
+  const finished = confirmed ? confirmed.filter((c) => DONE.test(c)) : [];
+  const stillRunning = confirmed ? confirmed.length - finished.length : ids.length;
+  if (stillRunning > 0 || pending.length) {
+    if (heartbeatAlive(s.session_id)) return;
+    const runningList = confirmed ? confirmed.filter((c) => !DONE.test(c)) : ids;
+    const pendingList = pending.map(([k]) => `${k} (no dispatch id yet - run \`orca orchestration worker-list\` to resolve)`);
+    const allShown = [...runningList, ...pendingList];
+    d('workers-unwatched',
+      `[orchestrator-gate:workers-unwatched] ${allShown.length} worker(s) still running: ${allShown.join(', ')}.\n` +
+      'You may wait for them, but not unwatched. Start the heartbeat first, then end the turn:\n' +
+      `  ${heartbeatStartCommand()}\n`);
+    return;
   }
 
   const shown = confirmed && confirmed.length ? confirmed : ids;
@@ -962,4 +1024,5 @@ process.stdin.on('end', () => {
 module.exports = {
   shellSyntaxOnly, redirectTargets, isExemptPath, movesOnlyExemptPaths, shellSegments,
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
+  hasFlag, flagValue,
 };

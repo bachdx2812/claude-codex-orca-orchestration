@@ -330,6 +330,16 @@ check('a released worker holds nothing',
       gate.activationApplies({ activation: 'orca-only' }), true);
     if (had === undefined) delete process.env.ORCA_TERMINAL_HANDLE; else process.env.ORCA_TERMINAL_HANDLE = had;
   }
+
+  // hasFlag / flagValue: orcaInvocations() args are shell words, so `--spec=x.md` is one
+  // word, not `--spec` followed by `x.md` - these must recognise both forms.
+  check('hasFlag: space-separated form', gate.hasFlag(['--spec', 'x.md'], '--spec'), true);
+  check('hasFlag: =-joined form', gate.hasFlag(['--spec=x.md'], '--spec'), true);
+  check('hasFlag: absent', gate.hasFlag(['--other'], '--spec'), false);
+  check('hasFlag: does not match a longer flag name as a prefix', gate.hasFlag(['--spectacular'], '--spec'), false);
+  check('flagValue: space-separated form', gate.flagValue(['--agent', 'codex'], '--agent'), 'codex');
+  check('flagValue: =-joined form', gate.flagValue(['--agent=codex'], '--agent'), 'codex');
+  check('flagValue: absent is undefined', gate.flagValue(['--other'], '--agent'), undefined);
 }
 
 // Exec routing by quota left: pure decision table.

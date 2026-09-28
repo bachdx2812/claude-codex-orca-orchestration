@@ -85,7 +85,7 @@ function quotaEnv(name, claudeUsed, codexUsed, extraCfg) {
     ORCA_DOWN_FLAG_PATH: FLAG,
     ORCH_STATE_DIR: STATE_DIR,
     ORCH_CONFIG_PATH: configFile,
-    ORCA_BIN: STUB,
+    ORCA_BIN: STUB, CODEX_BIN: STUB,
   };
 }
 const CODEX_WINS = quotaEnv('codex-wins', 10, 30);   // Codex 30% used (< 40) -> Codex codes
@@ -236,6 +236,10 @@ expect('orca spec without a verify command is refused',
   mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser"'), DENY);
 expect('orca spec with a verify command is allowed',
   mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: venv/bin/python -m pytest tests/parser -q"'), ALLOW);
+expect('an =-joined --spec is still recognised as a code brief needing a verify command',
+  mainBash('orca orchestration task-create --task-title=x --spec="implement the parser"'), DENY);
+expect('an =-joined --spec with a verify command is allowed',
+  mainBash('orca orchestration task-create --task-title=x --spec="implement the parser. Verify: npm test"'), ALLOW);
 {
   const specFile = path.join(RUN_DIR, 'spec.md');
   fs.writeFileSync(specFile, 'Implement the parser.\nVerify: cargo test -p parser\n');
@@ -283,13 +287,40 @@ expect('fable escalation naming opus (xhigh) is allowed',
   }
   if (!registered('echo "orca orchestration worker-start" | cat')) pass += 1;
   else failures.push('an echo of worker-start registered a phantom worker');
+  // A worker-start whose reply carries no dispatch id is tracked as an explicit
+  // "pending-<ts>" placeholder (live, unverified) rather than silently dropped or given a
+  // fake id - and the next worker-list/worker-read poll resolves it one way or the other.
   {
     rmState(RS);
     const r = invoke(post('orca orchestration worker-start --task t --agent codex', '{"no_id_here":true}'), CODEX_WINS);
-    const st = readState(RS) || { workers: {} };
-    const gotPhantom = Object.keys(st.workers || {}).some((k) => k.startsWith('unlabelled-'));
-    if (!gotPhantom && r.out && /no dispatch id was found/.test(r.out)) pass += 1;
-    else failures.push(`a worker-start with no id in the reply must print a notice and register nothing (workers: ${JSON.stringify(st.workers)})`);
+    const st1 = readState(RS) || { workers: {} };
+    const pendingKeys = Object.keys(st1.workers || {}).filter((k) => k.startsWith('pending-'));
+    if (pendingKeys.length === 1 && st1.workers[pendingKeys[0]].status === 'live' && st1.workers[pendingKeys[0]].unverified === true
+      && r.out && /tracked as pending-/.test(r.out)) pass += 1;
+    else failures.push(`a worker-start with no id in the reply must register one live, unverified pending-* entry (workers: ${JSON.stringify(st1.workers)}, out: ${r.out})`);
+
+    // A poll that surfaces no matching new id settles the pending placeholder instead of
+    // nagging forever (it can never be reconciled with real Orca data by id).
+    const emptyPoll = ({ session_id: RS, hook_event_name: 'PostToolUse', effort: 'high', tool_name: 'Bash',
+      tool_input: { command: 'orca orchestration worker-list --json' }, tool_response: { stdout: '{"result":{"workers":[]}}', stderr: '' } });
+    invoke(emptyPoll, CODEX_WINS);
+    const st2 = readState(RS);
+    const pendingKey = pendingKeys[0];
+    if (st2.workers[pendingKey] && st2.workers[pendingKey].status === 'settled') pass += 1;
+    else failures.push(`an empty worker-list poll must settle the pending placeholder (${JSON.stringify(st2.workers[pendingKey])})`);
+  }
+  // A poll that DOES surface a real, not-yet-tracked id adopts it in place of the pending
+  // placeholder rather than settling it unresolved.
+  {
+    rmState(RS);
+    invoke(post('orca orchestration worker-start --task t --agent codex', '{"no_id_here":true}'), CODEX_WINS);
+    const pendingKey = Object.keys(readState(RS).workers).find((k) => k.startsWith('pending-'));
+    const pollWithId = ({ session_id: RS, hook_event_name: 'PostToolUse', effort: 'high', tool_name: 'Bash',
+      tool_input: { command: 'orca orchestration worker-list --json' }, tool_response: { stdout: '{"result":{"workers":[{"dispatchId":"ctx_adopted_1"}]}}', stderr: '' } });
+    invoke(pollWithId, CODEX_WINS);
+    const st = readState(RS);
+    if (st.workers.ctx_adopted_1 && st.workers.ctx_adopted_1.status === 'live' && !st.workers[pendingKey]) pass += 1;
+    else failures.push(`a worker-list poll surfacing a real id must adopt it and drop the pending placeholder (${JSON.stringify(st.workers)})`);
   }
   rmState(RS);
 }
@@ -352,6 +383,14 @@ expect('fable escalation naming opus (xhigh) is allowed',
   if (!/pin the Codex model/.test(withTerminal)) pass += 1; else failures.push('worker-start --terminal should get no advice');
   const withSpecFile = advise('orca orchestration worker-start --task t --agent codex --spec @briefs/foo.md');
   if (/pin the Codex model/.test(withSpecFile)) pass += 1; else failures.push('a --spec file should not suppress the advice');
+  // =-joined forms (regression: the scanner keeps `--model=x` as one word, so a naive
+  // args.includes('--model') would miss it and wrongly keep advising).
+  const agentEquals = advise('orca orchestration worker-start --task t --agent=codex');
+  if (/pin the Codex model/.test(agentEquals)) pass += 1; else failures.push('--agent=codex should still be recognised as a codex worker-start');
+  const modelEquals = advise('orca orchestration worker-start --task t --agent=codex --model=gpt-4');
+  if (!/pin the Codex model/.test(modelEquals)) pass += 1; else failures.push('an =-joined --model should suppress the advice');
+  const terminalEquals = advise('orca orchestration worker-start --task t --agent=codex --terminal=term_1');
+  if (!/pin the Codex model/.test(terminalEquals)) pass += 1; else failures.push('an =-joined --terminal should suppress the advice');
 }
 
 // Light lookups: advised toward the lookup model, never blocked.
@@ -454,35 +493,42 @@ expect('auto: Codex at/over 40% used -> code on another model is refused',
 expect('a neutral scouting dispatch is allowed',
   dispatch({ subagent_type: 'scout', description: 'search docs for the config key' }), ALLOW);
 
-// execFallbackWhenCodexUnavailable: when Codex's quota is genuinely unknown (no session
-// data at all) and `orca` cannot be found, auto-routing falls back to the code model
-// instead of defaulting to Codex; with a real orca binary present, it still defaults to
-// Codex despite the unknown quota (unknown is not evidence Codex is unusable).
+// execFallbackWhenCodexUnavailable: fires ONLY when `orca` or `codex` itself is missing
+// from PATH - Codex is the deliberately-preferred default, so an unknown quota reading
+// alone (a fresh Codex install that has not run a first turn yet) must never fall back;
+// both binaries present, no quota file at all, still routes to Codex.
 {
   const dir = path.join(RUN_DIR, 'no-codex-data');
   fs.mkdirSync(path.join(dir, 'empty-codex'), { recursive: true });
-  const noQuotaEnv = (orcaBin) => ({
+  const noOrcaBin = path.join(dir, 'no-such-orca-binary');
+  const noCodexBin = path.join(dir, 'no-such-codex-binary');
+  const noQuotaEnv = (orcaBin, codexBin) => ({
     ...BASE_ENV, CODEX_SESSIONS_DIR: path.join(dir, 'empty-codex'),
     CK_USAGE_CACHE_PATH: path.join(dir, 'no-such-claude-cache.json'),
-    ORCA_DOWN_FLAG_PATH: FLAG, ORCH_STATE_DIR: STATE_DIR, ORCH_CONFIG_PATH: CONFIG_FILE, ORCA_BIN: orcaBin,
+    ORCA_DOWN_FLAG_PATH: FLAG, ORCH_STATE_DIR: STATE_DIR, ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCA_BIN: orcaBin, CODEX_BIN: codexBin,
   });
   const FSID = `${SID}-fallback-nodata`;
   const codeBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).' };
-  expect('unknown Codex quota + no orca binary falls back to the code model',
-    dispatch(codeBrief, FSID), ALLOW, noQuotaEnv(path.join(dir, 'no-such-orca-binary')));
+
+  expect('orca missing (quota unknown too) falls back to the code model',
+    dispatch(codeBrief, FSID), ALLOW, noQuotaEnv(noOrcaBin, STUB));
   rmState(FSID);
-  expect('unknown Codex quota + a reachable orca binary still falls back (quota alone is never known to favour Codex)',
-    dispatch(codeBrief, FSID), ALLOW, noQuotaEnv(STUB));
+  expect('codex missing (quota unknown too) falls back to the code model',
+    dispatch(codeBrief, FSID), ALLOW, noQuotaEnv(STUB, noCodexBin));
   rmState(FSID);
+  expect('both orca and codex present, quota simply unknown, stays on Codex',
+    dispatch(codeBrief, FSID), DENY, noQuotaEnv(STUB, STUB));
+  rmState(FSID);
+
   // Codex quota IS known and under the handoff threshold (favours Codex) - a missing
   // orca binary still forces the fallback, because Codex cannot be dispatched to at all
   // without Orca, regardless of how much of its quota is left.
-  const knownQuotaNoOrca = { ...CODEX_WINS, ORCA_BIN: path.join(dir, 'no-such-orca-binary-2') };
   expect('known quota favouring Codex + no orca binary still falls back to the code model',
-    dispatch(codeBrief, FSID), ALLOW, knownQuotaNoOrca);
+    dispatch(codeBrief, FSID), ALLOW, { ...CODEX_WINS, ORCA_BIN: noOrcaBin, CODEX_BIN: STUB });
   rmState(FSID);
-  expect('known quota favouring Codex + a reachable orca binary stays on Codex',
-    dispatch(codeBrief, FSID), DENY, CODEX_WINS);
+  expect('known quota favouring Codex + both binaries reachable stays on Codex',
+    dispatch(codeBrief, FSID), DENY, { ...CODEX_WINS, CODEX_BIN: STUB });
   rmState(FSID);
 }
 
