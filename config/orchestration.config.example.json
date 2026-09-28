@@ -1,0 +1,19 @@
+{
+  "replyLanguage": null,
+  "activation": "orca-only",
+  "models": {
+    "review": { "alias": "opus", "id": "claude-opus-5-5" },
+    "escalation": { "alias": "fable", "id": "claude-fable-5-1" },
+    "code": { "alias": "sonnet", "id": null },
+    "lookup": { "alias": "haiku", "id": null },
+    "codex": { "alias": null, "id": "gpt-5.6-sol" }
+  },
+  "agents": {
+    "escalation": [],
+    "lookup": ["Explore"]
+  },
+  "codexHandoffUsedPercent": 40,
+  "execFallbackWhenCodexUnavailable": "sonnet",
+  "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
+  "disabledGates": []
+}
