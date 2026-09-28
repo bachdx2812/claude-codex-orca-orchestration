@@ -960,7 +960,11 @@ rmState(`${SID}-hard-off`);
       const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
       st.agentClaims.toolu_bg_1 = { owns: ['src/agent-claim/bg.ts'], ws: `${FAKE_REPO}|current`, ts: Date.now() };
       fs.writeFileSync(stateFile, JSON.stringify(st));
-      invoke(promptSubmit(ASID, '<task-notification>Background task toolu_bg_1 finished successfully.</task-notification>'), OWNS_AGENT_ENV);
+      // The id must sit inside its own <tool-use-id> tag (the real notification shape) —
+      // matching it anywhere in the free-text body is exactly the false-positive round 2's
+      // item 7 fix closed (a sibling's id merely mentioned in <result> text must NOT release).
+      invoke(promptSubmit(ASID, '<task-notification><tool-use-id>toolu_bg_1</tool-use-id><status>completed</status>' +
+        '<result>Background task finished successfully.</result></task-notification>'), OWNS_AGENT_ENV);
       const st2 = readState(ASID);
       if (!st2.agentClaims.toolu_bg_1) pass += 1; else failures.push('owns: a <task-notification> naming a claim id must release it');
     }
@@ -1286,6 +1290,126 @@ rmState(`${SID}-hard-off`);
   if (mdR.code === DENY && /code-brief-needs-owns/.test(mdR.err) && /mid-sentence.*not read|not read.*mid-sentence/i.test(mdR.err)) pass += 1;
   else failures.push(`item13: a markdown-bold **Owns:** must not be read as a declaration, and the refusal must say why (exit ${mdR.code}, err ${mdR.err.slice(0, 300)})`);
   rmState(MdSID);
+}
+
+// --- Second Opus 5.5 review round -------------------------------------------------------
+
+// Round 2, item 3: a REAL PostToolUseFailure event (Claude Code's actual failure event,
+// distinct from PostToolUse) drops the reservation/claim its PreToolUse made.
+{
+  const CAP3b = quotaEnv('round2-item3-failure-event', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G3bSID = `${SID}-round2-item3`;
+  rmState(G3bSID);
+  const tu3b = 'toolu_round2_item3';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task round2item3a', { sid: G3bSID, tool_use_id: tu3b }), CAP3b);
+  invoke({ session_id: G3bSID, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+    tool_input: { command: 'orca orchestration worker-start --agent codex --task round2item3a' },
+    tool_use_id: tu3b }, CAP3b);
+  expect('round2 item3: a real PostToolUseFailure event drops the reservation, freeing the cap',
+    mainBash('orca orchestration worker-start --agent codex --task round2item3b', { sid: G3bSID }), ALLOW, CAP3b);
+  rmState(G3bSID);
+}
+
+// Round 2, item 6: a "pending-<ts>" placeholder (a worker-start reply that carried no id at
+// all — Orca was never given this key as an id) must survive the at-cap reconcile's "not
+// mentioned by Orca and older than 10 minutes" rule. Only a later worker-list/worker-read
+// poll may resolve it; this blanket timeout must never apply to it.
+{
+  const CAP6b = quotaEnv('round2-item6-pending', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G6bSID = `${SID}-round2-item6`;
+  rmState(G6bSID);
+  const oldTs = Date.now() - 11 * 60 * 1000;
+  const pendingKey = `pending-${oldTs}`;
+  fs.writeFileSync(path.join(STATE_DIR, `${G6bSID}.json`), JSON.stringify({
+    session_id: G6bSID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { [pendingKey]: { role: 'codex-exec', started: oldTs, status: 'live', last_seen: oldTs,
+      rate_limited_until: 0, unverified: true, group: pendingKey, kind: 'worker', agent: 'codex', owns: null, ws: null } },
+    reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  const r6b = invoke(mainBash('orca orchestration worker-start --agent codex --task round2item6', { sid: G6bSID }),
+    { ...CAP6b, STUB_WORKERS_JSON: '[]' });
+  if (r6b.code === DENY && /max-parallel-codex-workers/.test(r6b.err)) pass += 1;
+  else failures.push(`round2 item6: a pending-* placeholder must NOT be settled by the 10-minute ` +
+    `"Orca never mentioned it" reconcile rule (exit ${r6b.code}, err ${r6b.err.slice(0, 200)})`);
+  {
+    const st = readState(G6bSID);
+    if (st.workers[pendingKey] && st.workers[pendingKey].status === 'live') pass += 1;
+    else failures.push(`round2 item6: the pending-* entry must still be live after the reconcile pass (${JSON.stringify(st.workers)})`);
+  }
+  rmState(G6bSID);
+}
+
+// Round 2, item 7: the <task-notification> release matcher must only release the id inside
+// its own <tool-use-id> tag — not any id merely MENTIONED in the notification's free-text
+// <result> body (e.g. a finished task's own result text naming a still-running sibling's id).
+{
+  const savedFlag = fs.existsSync(FLAG) ? fs.readFileSync(FLAG, 'utf8') : null;
+  fs.writeFileSync(FLAG, new Date().toISOString()); // permit in-session exec so the Agent dispatch reaches the Owns claim path
+  const B7b = quotaEnv('round2-item7-notif-scope', 10, 30, {});
+  const N7SID = `${SID}-round2-item7`;
+  rmState(N7SID);
+  const dA = dispatch({ subagent_type: 'general-purpose', model: 'sonnet', description: 'implement a', prompt: 'Implement a.\nVerify: npm test\nOwns: src/round2item7/a.ts', run_in_background: true }, N7SID, { tool_use_id: 'toolu_r2_A' });
+  invoke(dA, B7b);
+  invoke({ ...dA, hook_event_name: 'PostToolUse', tool_response: { status: 'async_launched' } }, B7b);
+  const dB = dispatch({ subagent_type: 'general-purpose', model: 'sonnet', description: 'implement b', prompt: 'Implement b.\nVerify: npm test\nOwns: src/round2item7/b.ts', run_in_background: true }, N7SID, { tool_use_id: 'toolu_r2_B' });
+  invoke(dB, B7b);
+  invoke({ ...dB, hook_event_name: 'PostToolUse', tool_response: { status: 'async_launched' } }, B7b);
+  const notif = '<task-notification>\n<task-id>x</task-id>\n<tool-use-id>toolu_r2_A</tool-use-id>\n<status>completed</status>\n' +
+    '<result>done; note sibling toolu_r2_B still running</result>\n</task-notification>';
+  invoke(promptSubmit(N7SID, notif), B7b);
+  {
+    const st = readState(N7SID);
+    if (st.agentClaims && !st.agentClaims.toolu_r2_A && st.agentClaims.toolu_r2_B) pass += 1;
+    else failures.push(`round2 item7: only the id inside <tool-use-id> must be released, not one merely ` +
+      `mentioned in <result> text (${JSON.stringify(st && st.agentClaims)})`);
+  }
+  rmState(N7SID);
+  if (savedFlag !== null) fs.writeFileSync(FLAG, savedFlag); else { try { fs.unlinkSync(FLAG); } catch {} }
+}
+
+// Round 2, item 8: the "is this worker done" check must test workerState and dispatchStatus
+// INDEPENDENTLY — a truthy-but-non-matching workerState (e.g. "running") must never
+// short-circuit away from also checking dispatchStatus (e.g. "completed").
+{
+  const CAP8b = quotaEnv('round2-item8-done-or', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G8bSID = `${SID}-round2-item8`;
+  rmState(G8bSID);
+  const tu8b = 'toolu_round2_item8';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task round2item8a', { sid: G8bSID, tool_use_id: tu8b }), CAP8b);
+  invoke(postBash('orca orchestration worker-start --agent codex --task round2item8a', '{"dispatchId":"ctx_r2_8"}', { sid: G8bSID, tool_use_id: tu8b }), CAP8b);
+  const doneOrEnv = { ...CAP8b, STUB_WORKERS_JSON: JSON.stringify([
+    { dispatchId: 'ctx_r2_8', terminalState: 'live', workerState: 'running', dispatchStatus: 'completed' },
+  ]) };
+  expect('round2 item8: dispatchStatus "completed" alone marks a worker done even when workerState is a non-matching truthy string ("running")',
+    mainBash('orca orchestration worker-start --agent codex --task round2item8b', { sid: G8bSID }), ALLOW, doneOrEnv);
+  rmState(G8bSID);
+}
+
+// Round 2, item 2 (e2e): two worker-starts in ONE command, each reply PRETTY-PRINTED
+// (multi-line, nested envelope, as real `orca --json` actually formats) must still land in
+// two distinct groups.
+{
+  const B2b = quotaEnv('round2-item2-pretty', 10, 30, { maxParallelCodexWorkers: 5 });
+  const G2bSID = `${SID}-round2-item2`;
+  rmState(G2bSID);
+  const cmd2b = 'orca orchestration worker-start --agent codex --spec @a.md --json; orca orchestration worker-start --agent codex --spec @b.md --json';
+  const prettyEnv = (ctx, task, term) => JSON.stringify({
+    id: 'r', ok: true, result: { dispatchId: ctx, taskId: task, handle: term, mutation: { requestId: 'x' } }, _meta: { runtimeId: 'y' },
+  }, null, 2);
+  invoke(mainBash(cmd2b, { sid: G2bSID, cwd: FAKE_REPO }), B2b);
+  invoke(postBash(cmd2b, `${prettyEnv('ctx_r2_1', 'task_r2_1', 'term_r2_1')}\n${prettyEnv('ctx_r2_2', 'task_r2_2', 'term_r2_2')}`,
+    { sid: G2bSID, cwd: FAKE_REPO }), B2b);
+  {
+    const st = readState(G2bSID);
+    const w = st && st.workers || {};
+    const g1 = w.ctx_r2_1 && w.ctx_r2_1.group;
+    const g2 = w.ctx_r2_2 && w.ctx_r2_2.group;
+    if (g1 && g2 && g1 !== g2 && w.task_r2_1 && w.task_r2_1.group === g1 && w.term_r2_1 && w.term_r2_1.group === g1
+        && w.task_r2_2 && w.task_r2_2.group === g2 && w.term_r2_2 && w.term_r2_2.group === g2) pass += 1;
+    else failures.push(`round2 item2: two pretty-printed worker-start replies in one command must land ` +
+      `in two distinct groups, never merged (${JSON.stringify(w)})`);
+  }
+  rmState(G2bSID);
 }
 
 console.log(`${pass} passed, ${failures.length} failed`);

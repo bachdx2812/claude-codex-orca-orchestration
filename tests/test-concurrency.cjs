@@ -66,6 +66,69 @@ function spawnOne(i) {
   });
 }
 
+/**
+ * Second review round, item 1: the at-cap reconcile's own Orca round trip must never let a
+ * stale post-reconcile save clobber a concurrent process's real-time, lock-protected write.
+ * Process A hits the cap and starts a SLOW reconcile (a stub that sleeps 2.5s before
+ * replying "no workers"); while A is mid-reconcile, process B releases the one live worker
+ * via a normal, fast PostToolUse. B's release must stick — A's reconcile must never
+ * resurrect it back to live by saving a snapshot taken before B's write landed.
+ */
+async function raceReconcileTest() {
+  let pass = 0;
+  const failures = [];
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-race-'));
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const configFile = path.join(dir, 'orchestration.config.json');
+  fs.writeFileSync(configFile, JSON.stringify({ activation: 'always', maxParallelCodexWorkers: 1, disabledGates: [] }));
+  const slowOrca = path.join(dir, 'slow-orca.cjs');
+  fs.writeFileSync(slowOrca,
+    '#!/usr/bin/env node\n' +
+    'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2500);\n' +
+    'process.stdout.write(JSON.stringify({ result: { workers: [] } }));\n');
+  fs.chmodSync(slowOrca, 0o755);
+  const env = {
+    ...BASE_ENV, ORCH_STATE_DIR: stateDir, ORCH_CONFIG_PATH: configFile,
+    ORCA_BIN: slowOrca, CODEX_BIN: slowOrca, ORCA_DOWN_FLAG_PATH: path.join(dir, 'flag'),
+  };
+  const raceSid = 'race-reconcile';
+  const base = (ev, cmd, id, extra) => ({
+    session_id: raceSid, hook_event_name: ev, effort: 'high', tool_name: 'Bash',
+    tool_input: { command: cmd }, tool_use_id: id, ...(extra || {}),
+  });
+  const runSync = (payload) => require('child_process').spawnSync(process.execPath, [GATE], {
+    input: JSON.stringify(payload), encoding: 'utf8', env,
+  });
+  const runAsync = (payload) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [GATE], { env });
+    child.on('close', (code) => resolve(code));
+    child.stdin.end(JSON.stringify(payload));
+  });
+
+  // Seed one live codex worker.
+  runSync(base('PreToolUse', 'orca orchestration worker-start --spec x --agent codex --json', 's1'));
+  runSync(base('PostToolUse', 'orca orchestration worker-start --spec x --agent codex --json', 's1',
+    { tool_response: { stdout: '{"ok":true,"result":{"dispatchId":"ctx_race_1"}}' } }));
+
+  // A: another worker-start at cap -> triggers the slow reconcile, unlocked, up to 2.5s.
+  const aPromise = runAsync(base('PreToolUse', 'orca orchestration worker-start --spec y --agent codex --json', 'a1'));
+  // While A is mid-reconcile, B releases ctx_race_1 via a fast, normal PostToolUse.
+  await new Promise((r) => setTimeout(r, 800));
+  runSync(base('PostToolUse', 'orca orchestration worker-release --dispatch ctx_race_1 --json', 'b1',
+    { tool_response: { stdout: '{"ok":true}' } }));
+  await aPromise;
+
+  const st = JSON.parse(fs.readFileSync(path.join(stateDir, `${raceSid}.json`), 'utf8'));
+  if (st.workers.ctx_race_1 && st.workers.ctx_race_1.status === 'settled') pass += 1;
+  else failures.push(`race-reconcile: B's release of ctx_race_1 must stick even though A's slow ` +
+    `reconcile was in flight concurrently (final status: ${JSON.stringify(st.workers.ctx_race_1)})`);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { pass, failures };
+}
+
 async function main() {
   let pass = 0;
   const failures = [];
@@ -107,6 +170,10 @@ async function main() {
   }
 
   fs.rmSync(RUN_DIR, { recursive: true, force: true });
+
+  const phase2 = await raceReconcileTest();
+  pass += phase2.pass;
+  failures.push(...phase2.failures);
 
   console.log(`${pass} passed, ${failures.length} failed`);
   for (const f of failures) console.log(`  FAIL ${f}`);

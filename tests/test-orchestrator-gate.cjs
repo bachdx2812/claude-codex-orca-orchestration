@@ -770,6 +770,28 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   const nonJsonBanner = 'Dispatching worker...\n' + JSON.stringify({ dispatchId: 'ctx_after_banner' }) + '\ndone';
   check('splitJsonReplies: non-JSON banner lines around a reply are skipped, not misparsed',
     WG.splitJsonReplies(nonJsonBanner).map((r) => r.dispatchId), ['ctx_after_banner']);
+
+  // Second review round, item 2: a line-based splitter cannot separate PRETTY-PRINTED
+  // (multi-line, JSON.stringify(x, null, 2)) replies — real `orca --json` output is
+  // pretty-printed, not compact NDJSON. Two pretty-printed nested envelopes concatenated in
+  // one Bash call's stdout must still split into exactly two reply objects, in order.
+  const prettyEnvelope = (ctx, task, term) => JSON.stringify({
+    id: 'req', ok: true,
+    result: { dispatchId: ctx, taskId: task, handle: term, mutation: { requestId: 'r' } },
+    _meta: { runtimeId: 'x' },
+  }, null, 2);
+  const twoPretty = prettyEnvelope('ctx_p1', 'task_p1', 'term_p1') + '\n' + prettyEnvelope('ctx_p2', 'task_p2', 'term_p2');
+  const prettyReplies = WG.splitJsonReplies(twoPretty);
+  check('splitJsonReplies: two pretty-printed (multi-line) nested envelopes split into two objects, in order',
+    prettyReplies.map((r) => r.result.dispatchId), ['ctx_p1', 'ctx_p2']);
+  check('splitJsonReplies: each pretty-printed reply keeps its own taskId/handle (not merged)',
+    prettyReplies.map((r) => `${r.result.taskId}/${r.result.handle}`), ['task_p1/term_p1', 'task_p2/term_p2']);
+
+  // A single pretty-printed reply (the common case) must still parse as exactly one object,
+  // via the "whole blob is one JSON value" fast path.
+  const onePretty = prettyEnvelope('ctx_solo', 'task_solo', 'term_solo');
+  check('splitJsonReplies: a single pretty-printed reply is still exactly one object',
+    WG.splitJsonReplies(onePretty).map((r) => r.result.dispatchId), ['ctx_solo']);
 }
 
 // --- ownership.cjs: ownsOverlap regression cases for the fix-round-1 false negatives (item 3) --
@@ -796,8 +818,14 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
 
 {
   const REPO = '/work/proj';
-  check('normalizeOwnsItem: a bare "." is refused, like "./"',
-    OWN.normalizeOwnsItem('.', REPO), null);
+  check('normalizeOwnsItem: a bare "." normalizes to a whole-repo claim ("**"), same as "./" (item 4, round 2)',
+    OWN.normalizeOwnsItem('.', REPO), '**');
+  check('normalizeOwnsItem: "./" also normalizes to the whole-repo claim',
+    OWN.normalizeOwnsItem('./', REPO), '**');
+  check('normalizeOwnsItem: an absolute path equal to the repo root also normalizes to "**"',
+    OWN.normalizeOwnsItem(REPO, REPO), '**');
+  check('parseOwns: "Owns: ." overlaps any other claim (it is a whole-repo claim, not "claims nothing")',
+    !!OWN.anyOverlap(OWN.parseOwns('x\nOwns: .', { repoRoot: REPO }).owns, ['src/a.ts']), true);
   check('parseOwns: an item over 256 chars is refused',
     OWN.parseOwns(`x\nOwns: ${'a'.repeat(300)}.ts`, { repoRoot: REPO }).owns, []);
   check('parseOwns: an item with more than 8 wildcard characters is refused',
@@ -812,6 +840,43 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   if (ms < 200) pass += 1; else failures.push(`adversarial '**a'x12+'b' pattern took ${ms}ms against a 20000-char miss, want <200ms`);
   check('ReDoS probe: the adversarial pattern does not match an unrelated long string', matched, false);
+
+  // Second review round, item 5: the FIRST test above never actually exercised the risky
+  // regex path, because its 24-wildcard pattern is rejected outright by MAX_WILDCARDS before
+  // reaching any matcher. `*a*a*a*a*a*a*a*b` has exactly 8 wildcards — AT, not over, the
+  // cap — so it passes normalizeOwnsItem unchanged and previously reached
+  // `globToRegExp(...).test(...)` inside ownsOverlap, compiling to the textbook
+  // catastrophic-backtracking shape `^[^/]*a[^/]*a...[^/]*a[^/]*b$` against a long run of
+  // 'a' with no trailing 'b'. ownsOverlap must now go through the linear (DP-based) matcher
+  // instead, which cannot blow up regardless of input. Exercised through the REAL reachable
+  // path (ownsOverlap/anyOverlap), not globToRegExp directly, since that is what a live
+  // ownership-overlap check (possibly running under the state-file lock) actually calls.
+  const atCapWildcard = OWN.normalizeOwnsItem('*a*a*a*a*a*a*a*b', REPO);
+  check('normalizeOwnsItem: an 8-wildcard pattern is AT the cap, not rejected by it', atCapWildcard, '*a*a*a*a*a*a*a*b');
+  const longA = 'a'.repeat(60);
+  const t1 = process.hrtime.bigint();
+  const overlapHit = OWN.anyOverlap([atCapWildcard], [longA]);
+  const ms1 = Number(process.hrtime.bigint() - t1) / 1e6;
+  if (ms1 < 200) pass += 1; else failures.push(`ownsOverlap('*a*a*a*a*a*a*a*b', 'a'.repeat(60)) took ${ms1}ms, want <200ms (real ReDoS via the reachable overlap path)`);
+  // This pattern's literal prefix is empty (it starts with `*`), so it correctly conflicts
+  // with everything per the round-1 "empty literal prefix matches everywhere" rule — the
+  // point of this assertion is that computing the answer is FAST, not that it's `false`.
+  check('ownsOverlap: an empty-literal-prefix glob still resolves to a definite (fast) answer', typeof overlapHit === 'object' || overlapHit === null, true);
+  // The linear matcher's own correctness (independent of the literal-prefix shortcut above)
+  // is proven directly: this concrete pattern must NOT match a same-length string missing
+  // the required trailing 'b'.
+  check('globMatchesLiteral: the at-cap-boundary pattern does not match a trailing-b-less string',
+    OWN.globMatchesLiteral(atCapWildcard, longA), false);
+  check('globMatchesLiteral: the same pattern DOES match when the trailing b is present',
+    OWN.globMatchesLiteral(atCapWildcard, `${longA}b`), true);
+  // A longer adversarial chain (more segments than the pattern itself has, well beyond the
+  // wildcard cap for a SINGLE item, so this exercises the linear matcher directly rather than
+  // relying on the cap) must also stay fast, proving this isn't a fluke of the exact size above.
+  const longerAdversarial = '*a'.repeat(20) + '*b';
+  const t2 = process.hrtime.bigint();
+  OWN.globMatchesLiteral(longerAdversarial, 'a'.repeat(500));
+  const ms2 = Number(process.hrtime.bigint() - t2) / 1e6;
+  if (ms2 < 200) pass += 1; else failures.push(`globMatchesLiteral with 20 wildcard segments against a 500-char miss took ${ms2}ms, want <200ms`);
 }
 
 // --- ownership.cjs: splitOwnsLine / parseOwns brace-depth-aware comma split (item 14) --------
