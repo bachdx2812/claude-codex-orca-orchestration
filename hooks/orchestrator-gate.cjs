@@ -953,12 +953,121 @@ function dropFailedToolState(s, toolUseId) {
   return dirty;
 }
 
+// Sub-commands whose reply must be scanned for a real dispatch id, shared by the success
+// path (onPostToolUseLocked) and the failure path (onPostToolUseFailure) below — a command
+// like `orca orchestration worker-start ... --json && false` genuinely dispatches a worker
+// even though the overall Bash call reports non-zero, so both paths must recognise the same
+// set of dispatch-shaped sub-commands.
+const DISPATCH_SUBS = new Set(['orchestration worker-start', 'orchestration task-create', 'terminal create']);
+
+/**
+ * Scans `out` (stdout+stderr on a success, or the failure event's own `error` text on a
+ * failure) for every DISPATCH_SUBS invocation in `cmd` and registers whatever it finds,
+ * exactly like a successful dispatch would: a real id found anywhere in that invocation's
+ * own reply registers the worker/task and clears its reservation, and an explicit
+ * `"ok":false` clears the reservation without registering anything, in both cases regardless
+ * of whether the overall tool call itself reported success or failure.
+ *
+ * The one place the two callers must differ is what happens when NEITHER a real id nor
+ * `"ok":false` is found for an invocation: `assumeDispatched: true` (the ordinary success
+ * path) treats that as "it definitely ran, Orca's reply just didn't carry an id" and tracks
+ * an unverified `pending-*` placeholder; `assumeDispatched: false` (the failure path) means
+ * we genuinely do not know whether it dispatched — silently under-counting a worker that IS
+ * actually running would blow through the parallel-Codex cap, so it leaves the reservation
+ * untouched and lets the existing 10-minute TTL be the safety net instead of guessing.
+ *
+ * Returns true when anything in `s` changed.
+ */
+function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
+  const dispatchInvs = orcaInvocations(cmd).filter((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
+  if (!dispatchInvs.length) return false;
+  const toolUseId = p.tool_use_id || p.toolUseId || null;
+  const replies = dispatchInvs.length > 1 ? WG.splitJsonReplies(out) : null;
+  const replySlice = (idx) => (replies ? (replies[idx] !== undefined ? JSON.stringify(replies[idx]) : '') : out);
+  let dirty = false;
+
+  dispatchInvs.forEach((inv, idx) => {
+    const resId = toolUseId ? `${toolUseId}#${idx}` : null;
+    const reservation = resId ? s.reservations[resId] : null;
+    const replyText = replySlice(idx);
+
+    if (inv.sub === 'orchestration task-create') {
+      const idMatch = replyText.match(/"taskId"\s*:\s*"([^"]+)"/) || replyText.match(/\b(task_[A-Za-z0-9_-]+)\b/);
+      const taskId = idMatch && idMatch[1];
+      if (taskId) {
+        s.tasks[taskId] = { owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null };
+        if (resId) delete s.reservations[resId];
+        dirty = true;
+      } else if (assumeDispatched && resId && s.reservations[resId]) {
+        delete s.reservations[resId];
+        dirty = true;
+      } // failure path with no id at all: leave the reservation for the TTL to resolve.
+      return;
+    }
+
+    // Only a MAIN-PANEL, reservation-backed dispatch is ever registered here (item 13).
+    if (!isMainPanel(p)) return;
+
+    const failed = /"ok"\s*:\s*false/i.test(replyText);
+    const agent = reservation ? reservation.agent
+      : (inv.sub === 'orchestration worker-start' ? resolveWorkerStartAgent(inv, s) : null);
+
+    if (failed) {
+      if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
+      process.stdout.write('orchestrator-gate: orca worker-start reported "ok": false; nothing was registered.\n');
+      return;
+    }
+
+    const ids = WG.idsFromOutput(replyText);
+    if (!ids.size) {
+      if (!assumeDispatched) return; // unknown outcome on a failure event: keep the reservation.
+      const pendingId = `pending-${Date.now()}-${idx}`;
+      s.workers[pendingId] = {
+        role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+        rate_limited_until: 0, unverified: true, group: pendingId, kind: 'worker', agent,
+        owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+      };
+      dirty = true;
+      process.stdout.write(
+        'orchestrator-gate: orca worker-start ran but no dispatch id was found in its output; ' +
+        `tracked as ${pendingId} until \`orca orchestration worker-list\` resolves it.\n`
+      );
+    } else {
+      const group = WG.canonicalGroup(ids) || `start-${Date.now()}-${idx}`;
+      for (const id of ids) {
+        s.workers[id] = {
+          role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+          rate_limited_until: 0, group, kind: WG.kindOf(id), agent,
+          owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+        };
+      }
+      dirty = true;
+      if (!heartbeatAlive(s.session_id)) {
+        process.stdout.write(
+          'orchestrator-gate: worker dispatched. Start the heartbeat now so it cannot sit IDLE unnoticed:\n' +
+          `  ${heartbeatStartCommand()}\n`
+        );
+      }
+    }
+    if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
+  });
+  return dirty;
+}
+
 /**
  * `PostToolUseFailure` — Claude Code's actual event for a tool call that errored out
  * (code.claude.com/docs/en/hooks; claude-code issue #6371), distinct from `PostToolUse`.
  * Runs under the same lock-reload-mutate-save discipline as every other state write (item
- * 1 of the prior round): a failed Bash/Agent dispatch's reservation/claim is dropped
- * immediately rather than waiting out the reservation TTL / ownershipClaimTtlMinutes.
+ * 1 of the prior round).
+ *
+ * A failed/interrupted Bash call that actually invoked a dispatch sub-command (e.g.
+ * `orca orchestration worker-start ... --json && false`, or the same command Ctrl-C'd after
+ * Orca already answered) may well have dispatched a real worker before the failure — the
+ * non-zero exit or interrupt says nothing about whether the dispatch itself succeeded.
+ * `p.error` carries the command's actual output on this event, so it is scanned exactly like
+ * a successful reply would be via `registerDispatchReplies`. Only a Bash call with NO
+ * dispatch sub-command at all, or an Agent/Task claim (which has no such ambiguity), gets its
+ * reservation/claim dropped immediately.
  */
 function onPostToolUseFailure(p, s, cfg) {
   const lockDir = path.join(DIR, '.lock');
@@ -966,7 +1075,19 @@ function onPostToolUseFailure(p, s, cfg) {
   try {
     s = load(p.session_id);
     const toolUseId = p.tool_use_id || p.toolUseId;
-    if (dropFailedToolState(s, toolUseId)) save(s);
+    let dirty = false;
+    if (p.tool_name === 'Bash') {
+      const cmd = String((p.tool_input && p.tool_input.command) || '');
+      const hasDispatch = orcaInvocations(cmd).some((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
+      if (hasDispatch) {
+        if (registerDispatchReplies(s, p, cmd, String(p.error || ''), { assumeDispatched: false })) dirty = true;
+      } else if (dropFailedToolState(s, toolUseId)) {
+        dirty = true;
+      }
+    } else if (dropFailedToolState(s, toolUseId)) {
+      dirty = true;
+    }
+    if (dirty) save(s);
   } finally {
     if (locked) releaseLock(lockDir);
   }
@@ -1064,111 +1185,10 @@ function onPostToolUseLocked(p, s, cfg) {
     // command chaining several of them (`task-create ... && worker-start --task "$ID"`,
     // or two worker-starts back to back) never has invocation N's reply attributed to
     // invocation M. `--help` is judged per invocation, never the whole command line.
-    const DISPATCH_SUBS = new Set(['orchestration worker-start', 'orchestration task-create', 'terminal create']);
-    const dispatchInvs = orcaInvocations(cmd).filter((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
-    // One non-worker-list-shaped JSON object per output line, in command order — used ONLY
-    // to disambiguate MULTIPLE dispatch invocations in one command (item 2: nested Orca
-    // envelopes and two worker-starts in one command line must never be merged into one
-    // group). A single dispatch invocation keeps using the whole raw `out` blob exactly as
-    // before, so every existing id-extraction path (including the regex fallback that finds
-    // an id in non-strict-JSON banner text) is unaffected.
-    const replies = dispatchInvs.length > 1 ? WG.splitJsonReplies(out) : null;
-    const replySlice = (idx) => (replies ? (replies[idx] !== undefined ? JSON.stringify(replies[idx]) : '') : out);
-
-    dispatchInvs.forEach((inv, idx) => {
-      const resId = toolUseId ? `${toolUseId}#${idx}` : null;
-      const reservation = resId ? s.reservations[resId] : null;
-      const replyText = replySlice(idx);
-
-      if (inv.sub === 'orchestration task-create') {
-        // task-create resolves its own id only in the reply. Transfer THIS invocation's
-        // ownership reservation (recorded at PreToolUse — see handleOrcaDispatchGates) onto
-        // `s.tasks[id]` so a later `worker-start --task <id>` (no --spec of its own)
-        // inherits the claim, then drop the reservation — the claim now lives under the
-        // task id instead.
-        const idMatch = replyText.match(/"taskId"\s*:\s*"([^"]+)"/) || replyText.match(/\b(task_[A-Za-z0-9_-]+)\b/);
-        const taskId = idMatch && idMatch[1];
-        if (taskId) {
-          s.tasks[taskId] = { owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null };
-          if (resId) delete s.reservations[resId];
-          dirty = true;
-        } else if (resId && s.reservations[resId]) {
-          // task-create produced no id at all (it failed, or its reply couldn't be parsed):
-          // drop the reservation rather than leaking it until the 10-minute TTL.
-          delete s.reservations[resId];
-          dirty = true;
-        }
-        return;
-      }
-
-      // Starting a worker registers it as live. The identifier is taken from Orca's own
-      // reply rather than parsed out of the command line, because the operator does not use
-      // a fixed invocation - whatever flags the panel chose, the dispatchId in the response
-      // is authoritative. Only a MAIN-PANEL, reservation-backed dispatch is ever registered
-      // here (item 13): a subagent's own Bash worker-start is that subagent's business, and
-      // was never reserved/capped at PreToolUse (isMainPanel already gates that) — letting
-      // it still be registered here would silently make it count anyway.
-      if (!isMainPanel(p)) return;
-
-      // "ok": false in Orca's own reply means the dispatch never actually started: drop
-      // the reservation without registering any worker, even if error text happens to
-      // contain something that looks like an id.
-      const failed = /"ok"\s*:\s*false/i.test(replyText);
-      // A pure `terminal create` (no matching worker-start invocation) is not tagged
-      // 'codex' by default - it must never inflate the parallel-Codex-worker count.
-      const agent = reservation ? reservation.agent
-        : (inv.sub === 'orchestration worker-start' ? resolveWorkerStartAgent(inv, s) : null);
-
-      if (failed) {
-        if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
-        process.stdout.write('orchestrator-gate: orca worker-start reported "ok": false; nothing was registered.\n');
-        return;
-      }
-
-      // Section 0 fix #1 (triple worker records): every id THIS invocation's OWN reply
-      // names (dispatch id, task id, terminal handle) shares one `group`, so a worker count
-      // only counts it once even though each id is still kept as its own `s.workers` key
-      // (Orca reconciliation and the Stop gate need every individual id). Scoping to this
-      // invocation's own reply (rather than the whole command's concatenated output) is
-      // exactly what keeps two chained worker-starts as two groups, not one merged group.
-      const ids = WG.idsFromOutput(replyText);
-      if (!ids.size) {
-        // No id in Orca's own reply: track it as an explicitly-marked placeholder rather
-        // than inventing a fake dispatch id or dropping it silently. `unverified: true`
-        // means the Stop gate still refuses to end the session over it (a real worker may
-        // well be running), and the next worker-list/worker-read poll resolves it - either
-        // adopting a real id this poll surfaces, or settling it once a poll comes back
-        // with nothing new to match it to.
-        const pendingId = `pending-${Date.now()}-${idx}`;
-        s.workers[pendingId] = {
-          role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
-          rate_limited_until: 0, unverified: true, group: pendingId, kind: 'worker', agent,
-          owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
-        };
-        dirty = true;
-        process.stdout.write(
-          'orchestrator-gate: orca worker-start ran but no dispatch id was found in its output; ' +
-          `tracked as ${pendingId} until \`orca orchestration worker-list\` resolves it.\n`
-        );
-      } else {
-        const group = WG.canonicalGroup(ids) || `start-${Date.now()}-${idx}`;
-        for (const id of ids) {
-          s.workers[id] = {
-            role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
-            rate_limited_until: 0, group, kind: WG.kindOf(id), agent,
-            owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
-          };
-        }
-        dirty = true;
-        if (!heartbeatAlive(s.session_id)) {
-          process.stdout.write(
-            'orchestrator-gate: worker dispatched. Start the heartbeat now so it cannot sit IDLE unnoticed:\n' +
-            `  ${heartbeatStartCommand()}\n`
-          );
-        }
-      }
-      if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
-    });
+    // Shared with the `PostToolUseFailure` path (see registerDispatchReplies above) so a
+    // dispatch that actually succeeded despite the overall Bash call failing is still
+    // recognised the same way there.
+    if (registerDispatchReplies(s, p, cmd, out, { assumeDispatched: true })) dirty = true;
 
     // Stopping, releasing or closing a worker settles its whole group. Section 0 fix #2:
     // the target id comes from the SPECIFIC orca invocation's own parsed args

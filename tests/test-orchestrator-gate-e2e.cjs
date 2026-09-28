@@ -1295,7 +1295,12 @@ rmState(`${SID}-hard-off`);
 // --- Second Opus 5.5 review round -------------------------------------------------------
 
 // Round 2, item 3: a REAL PostToolUseFailure event (Claude Code's actual failure event,
-// distinct from PostToolUse) drops the reservation/claim its PreToolUse made.
+// distinct from PostToolUse) drops the reservation/claim its PreToolUse made, UNLESS the
+// failed Bash command was itself dispatch-shaped and no id can be found in its `error`
+// text — round 3 item 1 tightened that: an unresolvable dispatch outcome must not be
+// assumed to have failed (see the round-3 block below), so this bare-failure case (no
+// `error` text at all) now correctly LEAVES the reservation in place rather than freeing
+// the cap, and the next worker-start at the same cap is refused.
 {
   const CAP3b = quotaEnv('round2-item3-failure-event', 10, 30, { maxParallelCodexWorkers: 1 });
   const G3bSID = `${SID}-round2-item3`;
@@ -1305,9 +1310,79 @@ rmState(`${SID}-hard-off`);
   invoke({ session_id: G3bSID, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
     tool_input: { command: 'orca orchestration worker-start --agent codex --task round2item3a' },
     tool_use_id: tu3b }, CAP3b);
-  expect('round2 item3: a real PostToolUseFailure event drops the reservation, freeing the cap',
-    mainBash('orca orchestration worker-start --agent codex --task round2item3b', { sid: G3bSID }), ALLOW, CAP3b);
+  expect('round2 item3: a dispatch-shaped PostToolUseFailure with no id in `error` keeps the reservation (round 3 item 1)',
+    mainBash('orca orchestration worker-start --agent codex --task round2item3b', { sid: G3bSID }), DENY, CAP3b);
   rmState(G3bSID);
+}
+
+// Round 2, item 3b: a PostToolUseFailure for a NON-dispatch Bash command (nothing to
+// preserve) still drops the reservation/claim immediately, same as before round 3.
+{
+  const CAP3c = quotaEnv('round2-item3-nondispatch-failure', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G3cSID = `${SID}-round2-item3-nondispatch`;
+  rmState(G3cSID);
+  const tu3c = 'toolu_round2_item3_nondispatch';
+  // Seed a reservation directly (a plain `npm test` failure never goes through the
+  // dispatch-gate PreToolUse path, so there is nothing realistic to reserve here — this
+  // proves the CLEANUP side only: a stray reservation under this tool_use_id must still be
+  // dropped when the failing command has no dispatch sub-command in it at all).
+  const st3c = { session_id: G3cSID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: {}, reservations: { [tu3c]: { ts: Date.now(), agent: 'codex', owns: null, ws: null, codexSlot: true } },
+    agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0 };
+  fs.writeFileSync(path.join(STATE_DIR, `${G3cSID}.json`), JSON.stringify(st3c));
+  invoke({ session_id: G3cSID, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+    tool_input: { command: 'npm test' }, tool_use_id: tu3c, error: 'Exit code 1\nfailures: 2' }, CAP3c);
+  const after3c = JSON.parse(fs.readFileSync(path.join(STATE_DIR, `${G3cSID}.json`), 'utf8'));
+  if (!after3c.reservations[tu3c]) pass += 1;
+  else failures.push('round2 item3b: a non-dispatch PostToolUseFailure must still drop the reservation');
+  rmState(G3cSID);
+}
+
+// --- Third Opus 5.5 review round --------------------------------------------------------
+
+// Round 3, item 1a: `orca orchestration worker-start ... --json && false` genuinely
+// dispatches the worker before the trailing `&& false` makes the overall Bash call report
+// non-zero — Claude Code's PostToolUseFailure carries that real output in `p.error`. A real
+// dispatch id found there must be registered and count against the cap exactly like a
+// successful PostToolUse would, not be dropped.
+{
+  const CAP1a = quotaEnv('round3-item1-real-dispatch', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G1aSID = `${SID}-round3-item1a`;
+  rmState(G1aSID);
+  const tu1a = 'toolu_round3_item1a';
+  const cmd1a = 'orca orchestration worker-start --spec @a.md --agent codex --json && false';
+  invoke(mainBash(cmd1a, { sid: G1aSID, tool_use_id: tu1a }), CAP1a);
+  invoke({ session_id: G1aSID, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+    tool_input: { command: cmd1a }, tool_use_id: tu1a,
+    error: 'Exit code 1\n{"ok":true,"result":{"dispatchId":"ctx_round3_1a","taskId":"task_round3_1a"}}' }, CAP1a);
+  const after1a = readState(G1aSID);
+  if (after1a && after1a.workers.ctx_round3_1a && after1a.workers.ctx_round3_1a.status === 'live' && !after1a.reservations[tu1a]) pass += 1;
+  else failures.push(`round3 item1a: a real dispatch id in PostToolUseFailure's error text must be registered as a live worker (${JSON.stringify(after1a && after1a.workers)})`);
+  expect('round3 item1a: the next worker-start at the same cap is correctly refused (the earlier dispatch really is live)',
+    mainBash('orca orchestration worker-start --spec @b.md --agent codex --json', { sid: G1aSID }), DENY, CAP1a);
+  rmState(G1aSID);
+}
+
+// Round 3, item 1b: a genuinely failed dispatch (no id anywhere in `p.error`) must not be
+// assumed to have failed OR succeeded — the reservation survives immediately and is only
+// ever cleaned up by its TTL (covered by round2 item3 above), never dropped outright here.
+// Already covered by the updated round2-item3 test; this case is intentionally the same
+// code path, kept here only as a named cross-reference for item 1b of round 3.
+
+// Round 3, item 1c: an interrupted dispatch-shaped Bash call (`is_interrupt: true`) with no
+// id in `error` must be treated the same conservative way — reservation kept, not dropped.
+{
+  const CAP1c = quotaEnv('round3-item1-interrupt', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G1cSID = `${SID}-round3-item1c`;
+  rmState(G1cSID);
+  const tu1c = 'toolu_round3_item1c';
+  const cmd1c = 'orca orchestration worker-start --spec @a.md --agent codex --json';
+  invoke(mainBash(cmd1c, { sid: G1cSID, tool_use_id: tu1c }), CAP1c);
+  invoke({ session_id: G1cSID, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+    tool_input: { command: cmd1c }, tool_use_id: tu1c, is_interrupt: true, error: '' }, CAP1c);
+  expect('round3 item1c: an interrupted dispatch with no id keeps the reservation (cap still refuses)',
+    mainBash('orca orchestration worker-start --spec @b.md --agent codex --json', { sid: G1cSID }), DENY, CAP1c);
+  rmState(G1cSID);
 }
 
 // Round 2, item 6: a "pending-<ts>" placeholder (a worker-start reply that carried no id at
