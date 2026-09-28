@@ -8,7 +8,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs"
+    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-concurrency.cjs"
   },
   "files": [
     "hooks",
