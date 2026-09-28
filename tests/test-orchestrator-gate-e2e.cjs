@@ -60,6 +60,12 @@ const DEFAULT_CFG = {
   agents: { escalation: ['escalation-agent'], lookup: ['Explore', 'scout'] },
   codexHandoffUsedPercent: 40,
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
+  // Unlimited by default so the many unrelated tests sharing SID/state below (most never
+  // issue the matching PostToolUse that would consume a reservation) cannot spuriously hit
+  // the cap. The dedicated max-parallel-codex-workers tests further down set a small,
+  // explicit maxParallelCodexWorkers via their own env.
+  maxParallelCodexWorkers: 0,
+  ownershipClaimTtlMinutes: 120,
   disabledGates: [],
 };
 const CONFIG_FILE = path.join(RUN_DIR, 'orchestration.config.json');
@@ -110,9 +116,9 @@ function expect(name, payload, wantCode, env) {
   else failures.push(`${name}\n    expected exit ${wantCode}, got ${code}\n    ${err.split('\n')[0]}`);
 }
 
-const mainBash = (command) => ({
-  session_id: SID, hook_event_name: 'PreToolUse', effort: 'high',
-  tool_name: 'Bash', tool_input: { command },
+const mainBash = (command, opts = {}) => ({
+  session_id: opts.sid || SID, hook_event_name: 'PreToolUse', effort: 'high',
+  tool_name: 'Bash', tool_input: { command }, cwd: opts.cwd, tool_use_id: opts.tool_use_id,
 });
 const mainEdit = (file_path, sid = SID) => ({
   session_id: sid, hook_event_name: 'PreToolUse', effort: 'high',
@@ -123,13 +129,25 @@ const subEdit = (file_path) => ({
   agent_id: 'ag_1', agent_type: 'general-purpose',
   tool_name: 'Edit', tool_input: { file_path },
 });
-const dispatch = (tool_input, sid = SID) => ({
+const dispatch = (tool_input, sid = SID, opts = {}) => ({
   session_id: sid, hook_event_name: 'PreToolUse', effort: 'high',
-  tool_name: 'Agent', tool_input,
+  tool_name: 'Agent', tool_input, cwd: opts.cwd, tool_use_id: opts.tool_use_id,
 });
 const promptSubmit = (sid, promptText) => ({
   session_id: sid, hook_event_name: 'UserPromptSubmit', effort: 'high', prompt: promptText,
 });
+// A PostToolUse for a Bash tool call — same session/cwd/tool_use_id as the PreToolUse that
+// admitted it, since that correlation is exactly what lets the gate attach a reservation's
+// owns/ws/agent onto the worker entry it registers.
+const postBash = (command, stdout, opts = {}) => ({
+  session_id: opts.sid || SID, hook_event_name: 'PostToolUse', effort: 'high',
+  tool_name: 'Bash', tool_input: { command }, cwd: opts.cwd, tool_use_id: opts.tool_use_id,
+  tool_response: { stdout: stdout || '', stderr: '' },
+});
+// A synthetic fake repo root (its own `.git` marker) so ownership tests resolve a real,
+// stable repoRoot without depending on — or touching — this project's own checkout.
+const FAKE_REPO = fs.mkdtempSync(path.join(RUN_DIR, 'fake-repo-'));
+fs.mkdirSync(path.join(FAKE_REPO, '.git'));
 
 function readState(sid) {
   const file = path.join(STATE_DIR, `${sid}.json`);
@@ -231,18 +249,18 @@ expect('fable escalation without the effort tried is refused',
 expect('sonnet code brief without a verify command is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it.' }), DENY, SONNET_WINS);
 expect('sonnet code brief with an explicit verify n/a reason is allowed',
-  dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Rename copy. verify: n/a text-only change' }), ALLOW, SONNET_WINS);
+  dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Rename copy. verify: n/a text-only change.\nOwns: n/a (pre-existing gate test).' }), ALLOW, SONNET_WINS);
 expect('orca spec without a verify command is refused',
   mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser"'), DENY);
 expect('orca spec with a verify command is allowed',
-  mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: venv/bin/python -m pytest tests/parser -q"'), ALLOW);
+  mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: venv/bin/python -m pytest tests/parser -q.\nOwns: n/a (pre-existing gate test, unrelated to ownership)."'), ALLOW);
 expect('an =-joined --spec is still recognised as a code brief needing a verify command',
   mainBash('orca orchestration task-create --task-title=x --spec="implement the parser"'), DENY);
 expect('an =-joined --spec with a verify command is allowed',
-  mainBash('orca orchestration task-create --task-title=x --spec="implement the parser. Verify: npm test"'), ALLOW);
+  mainBash('orca orchestration task-create --task-title=x --spec="implement the parser. Verify: npm test.\nOwns: n/a (pre-existing gate test, unrelated to ownership)."'), ALLOW);
 {
   const specFile = path.join(RUN_DIR, 'spec.md');
-  fs.writeFileSync(specFile, 'Implement the parser.\nVerify: cargo test -p parser\n');
+  fs.writeFileSync(specFile, 'Implement the parser.\nVerify: cargo test -p parser\nOwns: n/a (pre-existing gate test, unrelated to ownership).\n');
   expect('orca spec read from a file is judged by the file content',
     mainBash(`orca orchestration task-create --task-title "x" --spec "$(cat ${specFile})"`), ALLOW);
 }
@@ -330,7 +348,7 @@ expect('fable escalation naming opus (xhigh) is allowed',
   const OSID = `${SID}-cm`;
   const d = (tool_input) => dispatch(tool_input, OSID);
   const code = (model) => d({ subagent_type: 'fullstack-developer', description: 'implement the plan', model,
-    prompt: 'Implement it. Verify: npm test (all pass).' });
+    prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' });
   invoke(promptSubmit(OSID, 'use opus to code this --code-model opus'), CODEX_WINS);
   expect('--code-model opus: code on opus is allowed (no review-model-scope refusal)', code('opus'), ALLOW, CODEX_WINS);
   expect('--code-model opus: code on sonnet is refused', code('sonnet'), DENY, CODEX_WINS);
@@ -418,7 +436,7 @@ expect('--exec-sonnet prompt is accepted',
   else failures.push(`--exec-sonnet did not persist execAgent='code' in state (got ${JSON.stringify(st && st.execAgent)})`);
 }
 expect('exec-intent dispatch on sonnet is allowed once --exec-sonnet is set',
-  dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).' }), ALLOW);
+  dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' }), ALLOW);
 expect('--exec-sonnet still requires model sonnet',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan' }), DENY);
 expect('plan/review routing to Opus is unaffected by --exec-sonnet',
@@ -445,7 +463,7 @@ expect('--exec-auto prompt is accepted', promptSubmit(SID, 'ok --exec-auto'), AL
 expect('auto: Codex under 40% used -> in-session sonnet code is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet' }), DENY, CODEX_WINS);
 expect('auto: Codex at/over 40% used -> in-session sonnet code is allowed',
-  dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).' }), ALLOW, SONNET_WINS);
+  dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' }), ALLOW, SONNET_WINS);
 expect('auto: Codex at/over 40% used -> code on another model is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan' }), DENY, SONNET_WINS);
 
@@ -472,12 +490,12 @@ expect('auto: Codex at/over 40% used -> code on another model is refused',
 
   fs.writeFileSync(FLAG, new Date().toISOString());
   expect('a fresh fallback declaration permits in-session execution',
-    dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).' }), ALLOW);
+    dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' }), ALLOW);
   {
     const CSID = `${SID}-fallback-codex`;
     invoke(promptSubmit(CSID, '--code-model codex'), CODEX_WINS);
     expect('an explicit codex override still falls back to the code model while Orca is down',
-      dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).' }, CSID), ALLOW, CODEX_WINS);
+      dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' }, CSID), ALLOW, CODEX_WINS);
     rmState(CSID);
   }
 
@@ -509,7 +527,7 @@ expect('a neutral scouting dispatch is allowed',
     ORCA_BIN: orcaBin, CODEX_BIN: codexBin,
   });
   const FSID = `${SID}-fallback-nodata`;
-  const codeBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).' };
+  const codeBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' };
 
   expect('orca missing (quota unknown too) falls back to the code model',
     dispatch(codeBrief, FSID), ALLOW, noQuotaEnv(noOrcaBin, STUB));
@@ -625,6 +643,367 @@ rmState(`${SID}-hard-off`);
   const out2 = spawnSync(process.execPath, [GATE], { input: JSON.stringify(p1), encoding: 'utf8', env: CODEX_WINS }).stdout;
   if (/NO heartbeat daemon/.test(out2)) pass += 1; else failures.push(`reminder trusted a dead heartbeat pid: ${out2.slice(0, 120)}`);
   for (const f of [stateF, beatF]) { try { fs.unlinkSync(f); } catch {} }
+}
+
+// =====================================================================================
+// Gate A: max-parallel-codex-workers
+// =====================================================================================
+{
+  const CAP2 = quotaEnv('cap-2', 10, 30, { maxParallelCodexWorkers: 2 });
+  const GSID = `${SID}-cap`;
+
+  /** Registers a live codex worker group under GSID via a real Pre+Post round trip. */
+  function registerCodexWorker(n, env = CAP2) {
+    const tu = `toolu_cap_${n}`;
+    const dispatchId = `ctx_cap_${n}`;
+    invoke(mainBash(`orca orchestration worker-start --agent codex --task t${n}`, { sid: GSID, tool_use_id: tu }), env);
+    invoke(postBash(`orca orchestration worker-start --agent codex --task t${n}`,
+      JSON.stringify({ dispatchId, taskId: `task_cap_${n}`, agentTerminalHandle: `term_cap_${n}` }),
+      { sid: GSID, tool_use_id: tu }), env);
+    return dispatchId;
+  }
+
+  rmState(GSID);
+  expect('cap: below the cap is allowed', mainBash('orca orchestration worker-start --agent codex --task t0', { sid: GSID, tool_use_id: 'toolu_cap_probe' }), ALLOW, CAP2);
+  // Clean up the probe's reservation (a failed start drops it) so it cannot leak into the
+  // cap accounting for the rest of this block.
+  invoke(postBash('orca orchestration worker-start --agent codex --task t0', '{"ok":false}', { sid: GSID, tool_use_id: 'toolu_cap_probe' }), CAP2);
+  const first = registerCodexWorker(1);
+  expect('cap: one live codex worker, cap 2 -> a second is still allowed',
+    mainBash('orca orchestration worker-start --agent codex --task t2', { sid: GSID, tool_use_id: 'toolu_cap_probe2' }), ALLOW, CAP2);
+  invoke(postBash('orca orchestration worker-start --agent codex --task t2', '{"ok":false}', { sid: GSID, tool_use_id: 'toolu_cap_probe2' }), CAP2);
+  const second = registerCodexWorker(2);
+  {
+    const r = invoke(mainBash('orca orchestration worker-start --agent codex --task t3', { sid: GSID }), CAP2);
+    if (r.code === DENY && /max-parallel-codex-workers/.test(r.err) && /2\/2/.test(r.err)) pass += 1;
+    else failures.push(`cap: at 2/2 a third codex worker-start must be refused by name (exit ${r.code}, err ${r.err.slice(0, 200)})`);
+  }
+  expect('cap: --retry-of a tracked group replaces it, not new, so it is allowed at the cap',
+    mainBash(`orca orchestration worker-start --agent codex --retry-of ${first}`, { sid: GSID }), ALLOW, CAP2);
+  expect('cap: --terminal of a tracked group replaces it, not new, so it is allowed at the cap',
+    mainBash('orca orchestration worker-start --agent codex --terminal term_cap_2', { sid: GSID }), ALLOW, CAP2);
+  expect('cap: a non-codex agent is never counted, so it is allowed at the cap',
+    mainBash('orca orchestration worker-start --agent claude --task t4', { sid: GSID }), ALLOW, CAP2);
+  expect('cap: maxParallelCodexWorkers 0 means unlimited even past the configured cap',
+    mainBash('orca orchestration worker-start --agent codex --task t5', { sid: GSID }), ALLOW, { ...CAP2, ORCH_MAX_PARALLEL_CODEX_WORKERS: '0' });
+  expect('cap: an env override raises the effective cap above what the config says',
+    mainBash('orca orchestration worker-start --agent codex --task t6', { sid: GSID }), ALLOW, { ...CAP2, ORCH_MAX_PARALLEL_CODEX_WORKERS: '5' });
+  expect('cap: disabledGates lets an over-cap dispatch through',
+    mainBash('orca orchestration worker-start --agent codex --task t7', { sid: GSID }), ALLOW,
+    quotaEnv('cap-disabled', 10, 30, { maxParallelCodexWorkers: 2, disabledGates: ['max-parallel-codex-workers'] }));
+  rmState(GSID);
+
+  // At-cap reconciliation: Orca's own worker-list is consulted only once the local count
+  // is at/over the cap, and a row it reports released is dropped before recounting.
+  {
+    const RSID = `${SID}-cap-reconcile`;
+    rmState(RSID);
+    registerCodexWorker(90, CAP2);
+    // Locally this session also believes ctx_cap_90 is live. Orca's own worker-list says
+    // otherwise, only because we've set the "worker" env's id to ctx_cap_90 with a
+    // terminalState the reconciler treats as released. Swap the session id onto RSID by
+    // re-registering under RSID specifically.
+    const tu = 'toolu_reconcile_1';
+    invoke(mainBash('orca orchestration worker-start --agent codex --task tr1', { sid: RSID, tool_use_id: tu }), CAP2);
+    invoke(postBash('orca orchestration worker-start --agent codex --task tr1',
+      JSON.stringify({ dispatchId: 'ctx_reconcile_1' }), { sid: RSID, tool_use_id: tu }), CAP2);
+    const tu2 = 'toolu_reconcile_2';
+    invoke(mainBash('orca orchestration worker-start --agent codex --task tr2', { sid: RSID, tool_use_id: tu2 }), CAP2);
+    invoke(postBash('orca orchestration worker-start --agent codex --task tr2',
+      JSON.stringify({ dispatchId: 'ctx_reconcile_2' }), { sid: RSID, tool_use_id: tu2 }), CAP2);
+    // Locally: 2/2 live, at cap. Orca reports ctx_reconcile_1 released.
+    const reconcileEnv = { ...CAP2, STUB_WORKERS_JSON: JSON.stringify([
+      { dispatchId: 'ctx_reconcile_1', terminalState: 'released', workerState: 'succeeded' },
+      { dispatchId: 'ctx_reconcile_2', terminalState: 'active', workerState: 'running' },
+    ]) };
+    expect('cap: at-cap reconciliation drops a row Orca reports released, freeing capacity',
+      mainBash('orca orchestration worker-start --agent codex --task tr3', { sid: RSID }), ALLOW, reconcileEnv);
+    rmState(RSID);
+  }
+
+  // Race: two PreToolUse calls for the same command line, before either's PostToolUse has
+  // run, at cap 1 — the FIRST reserves the only opening; the SECOND must see that reservation
+  // and be refused, proving the reservation (not just a registered worker) counts.
+  {
+    const CAP1 = quotaEnv('cap-1-race', 10, 30, { maxParallelCodexWorkers: 1 });
+    const RaceSID = `${SID}-cap-race`;
+    rmState(RaceSID);
+    expect('cap race: the first of two parallel codex worker-starts reserves the only opening',
+      mainBash('orca orchestration worker-start --agent codex --task race1', { sid: RaceSID, tool_use_id: 'toolu_race_1' }), ALLOW, CAP1);
+    expect('cap race: the second, before the first resolved, is refused by the reservation',
+      mainBash('orca orchestration worker-start --agent codex --task race2', { sid: RaceSID, tool_use_id: 'toolu_race_2' }), DENY, CAP1);
+    rmState(RaceSID);
+  }
+
+  // A failed start ("ok": false) drops its reservation instead of leaving it live forever.
+  {
+    const CAP1 = quotaEnv('cap-1-fail', 10, 30, { maxParallelCodexWorkers: 1 });
+    const FSID = `${SID}-cap-fail`;
+    rmState(FSID);
+    const tu = 'toolu_fail_1';
+    invoke(mainBash('orca orchestration worker-start --agent codex --task fail1', { sid: FSID, tool_use_id: tu }), CAP1);
+    invoke(postBash('orca orchestration worker-start --agent codex --task fail1', '{"ok":false,"error":"boom"}', { sid: FSID, tool_use_id: tu }), CAP1);
+    expect('cap: a failed start\'s reservation is dropped, freeing capacity for the next dispatch',
+      mainBash('orca orchestration worker-start --agent codex --task fail2', { sid: FSID, tool_use_id: 'toolu_fail_2' }), ALLOW, CAP1);
+    rmState(FSID);
+  }
+
+  // A subagent payload is never gated by the new gates either, even hopelessly over cap.
+  {
+    const SubSID = `${SID}-cap-sub`;
+    rmState(SubSID);
+    const subBash = (command) => ({
+      session_id: SubSID, hook_event_name: 'PreToolUse',
+      agent_id: 'ag_1', agent_type: 'general-purpose',
+      tool_name: 'Bash', tool_input: { command },
+    });
+    for (let i = 0; i < 5; i++) {
+      expect(`cap: a subagent's codex worker-start is never gated (${i})`,
+        subBash(`orca orchestration worker-start --agent codex --task sub${i}`), ALLOW, CAP2);
+    }
+    rmState(SubSID);
+  }
+}
+
+// =====================================================================================
+// Gate B: code-brief-needs-owns / ownership-overlap
+// =====================================================================================
+{
+  const OWNS_ENV = quotaEnv('owns', 10, 30, {});
+  // In-session Agent exec dispatches also have to clear the execution-routing gates
+  // (route-execution-to-codex / execution-model-mismatch) before Owns: is ever reached —
+  // this quota favours the code model (Codex >= 40% used), same shape as SONNET_WINS.
+  const OWNS_AGENT_ENV = quotaEnv('owns-agent', 10, 75, {});
+  const OSID = `${SID}-owns`;
+
+  rmState(OSID);
+  expect('owns: an exec-intent code brief in a shared workspace without Owns: is refused',
+    mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: npm test"',
+      { sid: OSID, cwd: FAKE_REPO }), DENY, OWNS_ENV);
+  expect('owns: Owns: n/a satisfies the requirement',
+    mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: npm test\nOwns: n/a research spike"',
+      { sid: OSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
+  expect('owns: --worktree new-child needs no Owns: at all (isolated)',
+    mainBash('orca orchestration worker-start --worktree new-child --spec "implement the parser. Verify: npm test"',
+      { sid: OSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
+  expect('owns: a research spec (no exec intent) needs no Owns:',
+    mainBash('orca orchestration task-create --task-title "r" --spec "Research: summarize the docs"',
+      { sid: OSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
+  rmState(OSID);
+
+  // Same-workspace overlap is refused; the same claim isolated in --worktree new-child
+  // never conflicts, since every isolated dispatch gets its own unique workspace key.
+  {
+    const OvSID = `${SID}-owns-overlap`;
+    rmState(OvSID);
+    const tu1 = 'toolu_ov_1';
+    invoke(mainBash('orca orchestration task-create --task-title "a" --spec "implement a.\nVerify: npm test\nOwns: src/shared/a.ts"',
+      { sid: OvSID, cwd: FAKE_REPO, tool_use_id: tu1 }), OWNS_ENV);
+    invoke(postBash('orca orchestration task-create --task-title "a" --spec "implement a.\nVerify: npm test\nOwns: src/shared/a.ts"',
+      '{"taskId":"task_ov_1"}', { sid: OvSID, cwd: FAKE_REPO, tool_use_id: tu1 }), OWNS_ENV);
+    // The reservation is consumed by the matching PostToolUse above (transferred onto
+    // s.tasks), so it no longer holds the workspace on its own — start the SAME claim as a
+    // live worker instead, which is what actually holds a workspace claim.
+    const tu2 = 'toolu_ov_2';
+    invoke(mainBash('orca orchestration worker-start --agent codex --task task_ov_1', { sid: OvSID, cwd: FAKE_REPO, tool_use_id: tu2 }), OWNS_ENV);
+    invoke(postBash('orca orchestration worker-start --agent codex --task task_ov_1',
+      '{"dispatchId":"ctx_ov_1"}', { sid: OvSID, cwd: FAKE_REPO, tool_use_id: tu2 }), OWNS_ENV);
+
+    const conflict = invoke(mainBash('orca orchestration task-create --task-title "b" --spec "implement b.\nVerify: npm test\nOwns: src/shared/a.ts"',
+      { sid: OvSID, cwd: FAKE_REPO }), OWNS_ENV);
+    if (conflict.code === DENY && /ownership-overlap/.test(conflict.err)) pass += 1;
+    else failures.push(`owns: a same-workspace overlapping claim must be refused (exit ${conflict.code}, err ${conflict.err.slice(0, 200)})`);
+
+    expect('owns: the SAME overlapping claim, isolated in its own worktree, never conflicts',
+      mainBash('orca orchestration worker-start --worktree new-child --spec "implement b.\nVerify: npm test\nOwns: src/shared/a.ts"',
+        { sid: OvSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
+
+    expect('owns: disabledGates lets an overlapping claim through',
+      mainBash('orca orchestration task-create --task-title "c" --spec "implement c.\nVerify: npm test\nOwns: src/shared/a.ts"',
+        { sid: OvSID, cwd: FAKE_REPO }), ALLOW,
+      quotaEnv('owns-disabled', 10, 30, { disabledGates: ['ownership-overlap'] }));
+
+    // Releasing the worker via --dispatch frees the claim, so a fresh overlapping claim is
+    // then allowed again.
+    invoke(mainBash(`orca orchestration worker-release --dispatch ctx_ov_1`, { sid: OvSID }), OWNS_ENV);
+    invoke(postBash('orca orchestration worker-release --dispatch ctx_ov_1', '{"ok":true}', { sid: OvSID }), OWNS_ENV);
+    expect('owns: releasing the worker frees its claim; the same claim is allowed again',
+      mainBash('orca orchestration task-create --task-title "d" --spec "implement d.\nVerify: npm test\nOwns: src/shared/a.ts"',
+        { sid: OvSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
+    rmState(OvSID);
+  }
+
+  // task-create's Owns: is inherited by `worker-start --task <id>` (no --spec of its own),
+  // and that inherited claim is then enforced against a later overlapping dispatch.
+  {
+    const TSID = `${SID}-owns-task`;
+    rmState(TSID);
+    const tu1 = 'toolu_task_1';
+    invoke(mainBash('orca orchestration task-create --task-title "e" --spec "implement e.\nVerify: npm test\nOwns: src/task-inherit/a.ts"',
+      { sid: TSID, cwd: FAKE_REPO, tool_use_id: tu1 }), OWNS_ENV);
+    invoke(postBash('orca orchestration task-create --task-title "e" --spec "implement e.\nVerify: npm test\nOwns: src/task-inherit/a.ts"',
+      '{"taskId":"task_inherit_1"}', { sid: TSID, cwd: FAKE_REPO, tool_use_id: tu1 }), OWNS_ENV);
+    {
+      const st = readState(TSID);
+      if (st && st.tasks && st.tasks.task_inherit_1 && st.tasks.task_inherit_1.owns && st.tasks.task_inherit_1.owns.includes('src/task-inherit/a.ts')) pass += 1;
+      else failures.push(`owns: task-create must record its Owns: onto s.tasks (${JSON.stringify(st && st.tasks)})`);
+    }
+    const tu2 = 'toolu_task_2';
+    expect('owns: worker-start --task <id> with no --spec inherits the task\'s Owns and needs no re-declaration',
+      mainBash('orca orchestration worker-start --agent codex --task task_inherit_1', { sid: TSID, cwd: FAKE_REPO, tool_use_id: tu2 }), ALLOW, OWNS_ENV);
+    invoke(postBash('orca orchestration worker-start --agent codex --task task_inherit_1',
+      '{"dispatchId":"ctx_inherit_1"}', { sid: TSID, cwd: FAKE_REPO, tool_use_id: tu2 }), OWNS_ENV);
+
+    const conflict = invoke(mainBash('orca orchestration task-create --task-title "f" --spec "implement f.\nVerify: npm test\nOwns: src/task-inherit/a.ts"',
+      { sid: TSID, cwd: FAKE_REPO }), OWNS_ENV);
+    if (conflict.code === DENY && /ownership-overlap/.test(conflict.err)) pass += 1;
+    else failures.push(`owns: an inherited task claim, once running as a worker, must be enforced (exit ${conflict.code}, err ${conflict.err.slice(0, 200)})`);
+
+    expect('owns: worker-start --task $VAR (unresolvable) is allowed, not refused',
+      mainBash('orca orchestration worker-start --agent codex --task $SOME_VAR', { sid: TSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
+    rmState(TSID);
+  }
+
+  // code-brief-needs-owns / ownership-overlap for in-session Agent dispatches.
+  {
+    const ASID = `${SID}-owns-agent`;
+    rmState(ASID);
+    const execBrief = (owns) => ({
+      subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet',
+      prompt: `Implement it. Verify: npm test (all pass).${owns ? `\nOwns: ${owns}` : ''}`,
+    });
+    expect('owns: an in-session exec dispatch without Owns: is refused',
+      dispatch(execBrief(null), ASID, { cwd: FAKE_REPO }), DENY, OWNS_AGENT_ENV);
+    expect('owns: isolation:"worktree" needs no Owns: at all',
+      dispatch({ ...execBrief(null), isolation: 'worktree' }, ASID, { cwd: FAKE_REPO }), ALLOW, OWNS_AGENT_ENV);
+
+    const tuA = 'toolu_agent_a';
+    expect('owns: an in-session exec dispatch with Owns: is allowed and claims it',
+      dispatch(execBrief('src/agent-claim/a.ts'), ASID, { cwd: FAKE_REPO, tool_use_id: tuA }), ALLOW, OWNS_AGENT_ENV);
+    {
+      const st = readState(ASID);
+      if (st && st.agentClaims && st.agentClaims[tuA] && st.agentClaims[tuA].owns.includes('src/agent-claim/a.ts')) pass += 1;
+      else failures.push(`owns: a successful exec Agent dispatch must record its claim (${JSON.stringify(st && st.agentClaims)})`);
+    }
+
+    const overlapping = invoke(dispatch(execBrief('src/agent-claim/a.ts'), ASID, { cwd: FAKE_REPO }), OWNS_AGENT_ENV);
+    if (overlapping.code === DENY && /ownership-overlap/.test(overlapping.err)) pass += 1;
+    else failures.push(`owns: a second overlapping in-session claim must be refused (exit ${overlapping.code}, err ${overlapping.err.slice(0, 200)})`);
+
+    // Foreground release: the matching PostToolUse (same tool_use_id) frees the claim.
+    invoke({ session_id: ASID, hook_event_name: 'PostToolUse', effort: 'high', tool_name: 'Agent',
+      tool_input: execBrief('src/agent-claim/a.ts'), tool_use_id: tuA, tool_response: { result: 'done' } }, OWNS_AGENT_ENV);
+    {
+      const st = readState(ASID);
+      if (!st || !st.agentClaims || !st.agentClaims[tuA]) pass += 1;
+      else failures.push('owns: the matching PostToolUse must release the foreground claim');
+    }
+    expect('owns: after the foreground claim is released, the same claim is allowed again',
+      dispatch(execBrief('src/agent-claim/a.ts'), ASID, { cwd: FAKE_REPO, tool_use_id: 'toolu_agent_b' }), ALLOW, OWNS_AGENT_ENV);
+
+    // TTL expiry: an old claim written directly into state (simulating a background
+    // dispatch nothing ever released) no longer counts once it is older than the TTL.
+    {
+      const stateFile = path.join(STATE_DIR, `${ASID}.json`);
+      const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      st.agentClaims.toolu_stale = { owns: ['src/agent-claim/stale.ts'], ws: st.agentClaims['toolu_agent_b'].ws, ts: Date.now() - 121 * 60 * 1000 };
+      fs.writeFileSync(stateFile, JSON.stringify(st));
+      expect('owns: a claim older than ownershipClaimTtlMinutes no longer blocks an overlapping dispatch',
+        dispatch(execBrief('src/agent-claim/stale.ts'), ASID, { cwd: FAKE_REPO, tool_use_id: 'toolu_agent_c' }), ALLOW, OWNS_AGENT_ENV);
+    }
+
+    // --release-claims: the operator's manual escape hatch.
+    {
+      const stateFile = path.join(STATE_DIR, `${ASID}.json`);
+      const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      const ws = st.agentClaims['toolu_agent_c'] ? st.agentClaims['toolu_agent_c'].ws : `${FAKE_REPO}|current`;
+      st.agentClaims.toolu_release_me = { owns: ['src/agent-claim/release-me.ts'], ws, ts: Date.now() };
+      fs.writeFileSync(stateFile, JSON.stringify(st));
+      const blocked = invoke(dispatch(execBrief('src/agent-claim/release-me.ts'), ASID, { cwd: FAKE_REPO }), OWNS_AGENT_ENV);
+      if (blocked.code === DENY) pass += 1; else failures.push('owns: --release-claims setup: the claim should still block before release');
+      invoke(promptSubmit(ASID, '--release-claims all'), OWNS_AGENT_ENV);
+      {
+        const st2 = readState(ASID);
+        if (!st2.agentClaims.toolu_release_me) pass += 1; else failures.push('owns: --release-claims all must clear every tracked claim');
+      }
+      expect('owns: after --release-claims all, the same claim is allowed again',
+        dispatch(execBrief('src/agent-claim/release-me.ts'), ASID, { cwd: FAKE_REPO, tool_use_id: 'toolu_agent_d' }), ALLOW, OWNS_AGENT_ENV);
+    }
+
+    // <task-notification> best-effort background release, by id.
+    {
+      const stateFile = path.join(STATE_DIR, `${ASID}.json`);
+      const st = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+      st.agentClaims.toolu_bg_1 = { owns: ['src/agent-claim/bg.ts'], ws: `${FAKE_REPO}|current`, ts: Date.now() };
+      fs.writeFileSync(stateFile, JSON.stringify(st));
+      invoke(promptSubmit(ASID, '<task-notification>Background task toolu_bg_1 finished successfully.</task-notification>'), OWNS_AGENT_ENV);
+      const st2 = readState(ASID);
+      if (!st2.agentClaims.toolu_bg_1) pass += 1; else failures.push('owns: a <task-notification> naming a claim id must release it');
+    }
+
+    // Subagent payloads are never gated.
+    expect('owns: a subagent exec dispatch is never gated by code-brief-needs-owns',
+      { session_id: ASID, hook_event_name: 'PreToolUse', agent_id: 'ag_1', agent_type: 'general-purpose',
+        tool_name: 'Agent', tool_input: execBrief(null) }, ALLOW, OWNS_AGENT_ENV);
+
+    expect('owns: disabledGates lets an in-session exec dispatch without Owns: through',
+      dispatch(execBrief(null), ASID, { cwd: FAKE_REPO }), ALLOW,
+      quotaEnv('owns-agent-disabled', 10, 75, { disabledGates: ['code-brief-needs-owns'] }));
+
+    rmState(ASID);
+  }
+}
+
+// Section 0 bug fixes: triple worker records, and the release matcher settling every live
+// worker instead of just its target.
+{
+  const B0 = quotaEnv('bug0', 10, 30, {});
+  const B0SID = `${SID}-bug0`;
+  rmState(B0SID);
+
+  // Bug #1: one worker-start reply naming a dispatch id, task id AND terminal handle for
+  // the SAME worker must be tracked as one group, not three separate live workers.
+  const tu = 'toolu_bug0_1';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task tb1', { sid: B0SID, tool_use_id: tu }), B0);
+  invoke(postBash('orca orchestration worker-start --agent codex --task tb1',
+    JSON.stringify({ dispatchId: 'ctx_bug0_1', taskId: 'task_bug0_1', agentTerminalHandle: 'term_bug0_1' }),
+    { sid: B0SID, tool_use_id: tu }), B0);
+  {
+    const st = readState(B0SID);
+    const keys = ['ctx_bug0_1', 'task_bug0_1', 'term_bug0_1'];
+    const allTracked = keys.every((k) => st.workers[k] && st.workers[k].status === 'live');
+    const sameGroup = new Set(keys.map((k) => st.workers[k].group)).size === 1;
+    if (allTracked && sameGroup) pass += 1;
+    else failures.push(`bug0#1: triple ids must share one group (${JSON.stringify(st && st.workers)})`);
+  }
+  // A cap-1 worker-start must now be refused: this is ONE worker, not three.
+  expect('bug0#1: three ids from one worker-start still count as exactly one toward the cap',
+    mainBash('orca orchestration worker-start --agent codex --task tb2', { sid: B0SID }), DENY,
+    quotaEnv('bug0-cap1', 10, 30, { maxParallelCodexWorkers: 1 }));
+
+  // Bug #2: `worker-release --dispatch <id> --json` must settle only that worker's group,
+  // never fall back to settling every live worker because a trailing flag looked like the
+  // target. Register a second, unrelated worker first.
+  const tu2 = 'toolu_bug0_2';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task tb3', { sid: B0SID, tool_use_id: tu2 }), B0);
+  invoke(postBash('orca orchestration worker-start --agent codex --task tb3',
+    '{"dispatchId":"ctx_bug0_2"}', { sid: B0SID, tool_use_id: tu2 }), B0);
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_bug0_1 --json', '{"ok":true}', { sid: B0SID }), B0);
+  {
+    const st = readState(B0SID);
+    const released = ['ctx_bug0_1', 'task_bug0_1', 'term_bug0_1'].every((k) => st.workers[k].status === 'settled');
+    const stillLive = st.workers.ctx_bug0_2.status === 'live';
+    if (released && stillLive) pass += 1;
+    else failures.push(`bug0#2: --dispatch <id> --json must settle only that group, not every live worker (${JSON.stringify(st && st.workers)})`);
+  }
+  // An unrecognised label settles nothing.
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_bug0_unknown --json', '{"ok":true}', { sid: B0SID }), B0);
+  {
+    const st = readState(B0SID);
+    if (st.workers.ctx_bug0_2.status === 'live') pass += 1;
+    else failures.push('bug0#2: an unrecognised release target must settle nothing');
+  }
+  rmState(B0SID);
 }
 
 console.log(`${pass} passed, ${failures.length} failed`);

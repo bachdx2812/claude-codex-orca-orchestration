@@ -22,6 +22,10 @@ const gate = require('../hooks/orchestrator-gate.cjs');
 const heartbeat = require('../hooks/orca-heartbeat.cjs');
 const config = require('../hooks/lib/config.cjs');
 const { orcaInvocations } = require('../hooks/lib/shell-orca-invocations.cjs');
+const WG = require('../hooks/lib/worker-groups.cjs');
+const OWN = require('../hooks/lib/ownership.cjs');
+const OC = require('../hooks/lib/ownership-claims.cjs');
+const { acquireLock, releaseLock } = require('../hooks/lib/file-lock.cjs');
 
 let pass = 0;
 const failures = [];
@@ -402,6 +406,333 @@ check('a released worker holds nothing',
   eq('claude: cache older than 6h is unknown', q.claudeRemaining(now), null);
   delete process.env.CODEX_SESSIONS_DIR; delete process.env.CK_USAGE_CACHE_PATH;
   fs.rmSync(root, { recursive: true, force: true });
+}
+
+// --- ownership.cjs: parseOwns ------------------------------------------------
+
+{
+  const REPO = '/work/proj'; // synthetic repo root — never resolved against real fs
+
+  check('parseOwns: no Owns: line at all',
+    OWN.parseOwns('Implement the thing.', { repoRoot: REPO }),
+    { present: false, isNA: false, owns: [], reason: null });
+
+  check('parseOwns: a simple list, comma and space separated',
+    OWN.parseOwns('Do the work.\nOwns: src/api/**, src/models/user.ts foo/bar.py', { repoRoot: REPO }).owns,
+    ['src/api/**', 'src/models/user.ts', 'foo/bar.py']);
+
+  check('parseOwns: multi-line Owns: contributes to one combined, deduped list',
+    OWN.parseOwns('x\nOwns: src/api/**\ny\nOwns: src/api/**, src/models/user.ts', { repoRoot: REPO }).owns,
+    ['src/api/**', 'src/models/user.ts']);
+
+  check('parseOwns: n/a claims nothing and captures the reason',
+    OWN.parseOwns('x\nOwns: n/a text-only change', { repoRoot: REPO }),
+    { present: true, isNA: true, owns: [], reason: 'text-only change' });
+
+  check('parseOwns: n/a on any one of several Owns: lines wins for the whole brief',
+    OWN.parseOwns('x\nOwns: src/api/**\ny\nOwns: n/a research only', { repoRoot: REPO }).isNA,
+    true);
+
+  check('parseOwns: a `..` segment is refused, not partially resolved',
+    OWN.parseOwns('x\nOwns: ../../etc/passwd, src/ok.ts', { repoRoot: REPO }).owns,
+    ['src/ok.ts']);
+
+  check('parseOwns: an absolute path under the repo root is made relative',
+    OWN.parseOwns(`x\nOwns: ${REPO}/src/api/handler.ts`, { repoRoot: REPO }).owns,
+    ['src/api/handler.ts']);
+
+  check('parseOwns: an absolute path outside the repo root is refused',
+    OWN.parseOwns('x\nOwns: /etc/passwd', { repoRoot: REPO }).owns,
+    []);
+
+  check('parseOwns: an absolute path with no known repo root is refused (cannot relativize)',
+    OWN.parseOwns(`x\nOwns: ${REPO}/src/api/handler.ts`, {}).owns,
+    []);
+
+  check('parseOwns: leading ./ and trailing / are cosmetic',
+    OWN.parseOwns('x\nOwns: ./src/api/, `src/models/`', { repoRoot: REPO }).owns,
+    ['src/api', 'src/models']);
+
+  check('parseOwns: a `- Owns:` / `* owns:` bullet prefix is recognised, case-insensitively',
+    OWN.parseOwns('- Owns: a.ts\n* owns: b.ts', { repoRoot: REPO }).owns,
+    ['a.ts', 'b.ts']);
+
+  const many = OWN.parseOwns(`x\nOwns: ${Array.from({ length: 80 }, (_, i) => `f${i}.ts`).join(', ')}`, { repoRoot: REPO });
+  check('parseOwns: capped at 64 items', many.owns.length, 64);
+}
+
+// --- ownership.cjs: ownsOverlap (>= 15 cases) --------------------------------
+
+{
+  const cases = [
+    ['literal/literal: identical', 'src/api/user.ts', 'src/api/user.ts', true],
+    ['literal/literal: unrelated files', 'src/api/user.ts', 'src/api/order.ts', false],
+    ['literal/literal: directory is a prefix of a file inside it', 'src/api', 'src/api/user.ts', true],
+    ['literal/literal: file inside vs directory (order swapped)', 'src/api/user.ts', 'src/api', true],
+    ['literal/literal: sibling directory that merely shares a string prefix', 'src/api', 'src/api2/user.ts', false],
+    ['literal/literal: nested directories, one inside the other', 'src/api', 'src/api/v2', true],
+    ['glob/literal: file matches the glob', 'src/api/**', 'src/api/user.ts', true],
+    ['glob/literal (swapped): file matches the glob', 'src/api/user.ts', 'src/api/**', true],
+    ['glob/literal: the bare directory itself overlaps its own glob', 'src/api', 'src/api/**', true],
+    ['glob/literal: file outside the glob\'s directory', 'src/models/**', 'src/api/user.ts', false],
+    // Even though the literal doesn't match the glob's regex, it still shares the glob's
+    // own directory, so the "directory-prefix of the glob's literal prefix" fallback fires
+    // (a deliberate err-toward-conflict per the design) — only a genuinely different
+    // directory (sibling, not nested) escapes it, as the next case shows.
+    ['glob/literal: a non-matching file in the SAME directory as the glob still conflicts (directory-prefix fallback)',
+      'src/api/*.ts', 'src/api/sub/user.ts', true],
+    ['glob/literal: single-star matches within one segment', 'src/api/*.ts', 'src/api/user.ts', true],
+    ['glob/literal: a sibling directory that only shares a string prefix does not conflict',
+      'src/api/*.ts', 'src/api-other/user.ts', false],
+    ['glob/literal: question mark matches exactly one character', 'src/api/user?.ts', 'src/api/user1.ts', true],
+    ['glob/literal: question mark literal mismatch in the SAME directory still conflicts (directory-prefix fallback)',
+      'src/api/user?.ts', 'src/api/user.ts', true],
+    ['glob/literal: brace alternation', 'src/api/{user,order}.ts', 'src/api/order.ts', true],
+    ['glob/literal: brace alternation, no exact match, but SAME directory still conflicts (directory-prefix fallback)',
+      'src/api/{user,order}.ts', 'src/api/ticket.ts', true],
+    ['glob/literal: brace alternation in a different directory does not conflict',
+      'src/api/{user,order}.ts', 'src/models/ticket.ts', false],
+    ['glob/glob: nested glob directories conflict', 'src/api/**', 'src/api/user/**', true],
+    ['glob/glob: sibling glob directories do not conflict', 'src/api/**', 'src/models/**', false],
+    ['glob/glob: identical globs conflict', 'src/api/*.ts', 'src/api/*.ts', true],
+    ['`**` conflicts with everything else', '**', 'src/api/user.ts', true],
+    ['`**` conflicts with another `**`', '**', '**', true],
+  ];
+  for (const [name, a, b, want] of cases) {
+    check(`ownsOverlap: ${name}`, OWN.ownsOverlap(a, b), want);
+    check(`ownsOverlap (symmetric): ${name}`, OWN.ownsOverlap(b, a), want);
+  }
+}
+
+// --- ownership.cjs: workspaceKey ----------------------------------------------
+
+check('workspaceKey: non-isolated, no --worktree value, is "<root>|current"',
+  OWN.workspaceKey({ repoRootDir: '/work/proj', worktreeValue: null, isolated: false }),
+  '/work/proj|current');
+check('workspaceKey: non-isolated with a named worktree',
+  OWN.workspaceKey({ repoRootDir: '/work/proj', worktreeValue: 'feature-x', isolated: false }),
+  '/work/proj|feature-x');
+{
+  const a = OWN.workspaceKey({ repoRootDir: '/work/proj', worktreeValue: 'new-child', isolated: true });
+  const b = OWN.workspaceKey({ repoRootDir: '/work/proj', worktreeValue: 'new-child', isolated: true });
+  check('workspaceKey: isolated keys are unique per call (never conflict)', a === b, false);
+  check('workspaceKey: isolated keys are tagged iso:', a.startsWith('iso:'), true);
+}
+
+// --- worker-groups.cjs: countLiveGroups (Section 0 bug #1: triple worker records) --
+
+{
+  // One worker-start reply naming dispatch id, task id AND terminal handle for the SAME
+  // worker must count as ONE live codex group, not three.
+  const workers = {
+    ctx_a: { status: 'live', agent: 'codex', group: 'ctx_a' },
+    task_a: { status: 'live', agent: 'codex', group: 'ctx_a' },
+    term_a: { status: 'live', agent: 'codex', group: 'ctx_a' },
+  };
+  check('countLiveGroups: triple ids from one worker-start count once', WG.countLiveGroups(workers, 'codex'), 1);
+
+  const twoWorkers = {
+    ...workers,
+    ctx_b: { status: 'live', agent: 'codex', group: 'ctx_b' },
+  };
+  check('countLiveGroups: a second, distinct group counts separately', WG.countLiveGroups(twoWorkers, 'codex'), 2);
+
+  const withPending = { ...workers, 'pending-1': { status: 'live', agent: 'codex' } }; // no `group` (legacy) -> own group
+  check('countLiveGroups: a pending/legacy entry without `group` counts as its own group',
+    WG.countLiveGroups(withPending, 'codex'), 2);
+
+  const withClaude = { ...workers, ctx_c: { status: 'live', agent: 'claude', group: 'ctx_c' } };
+  check('countLiveGroups: a non-codex agent is never counted', WG.countLiveGroups(withClaude, 'codex'), 1);
+
+  const withSettled = { ...workers, ctx_d: { status: 'settled', agent: 'codex', group: 'ctx_d' } };
+  check('countLiveGroups: a settled entry is never counted', WG.countLiveGroups(withSettled, 'codex'), 1);
+}
+
+check('worker-groups: canonicalGroup prefers ctx_ over task_/term_',
+  WG.canonicalGroup(new Set(['term_z', 'task_y', 'ctx_x'])), 'ctx_x');
+check('worker-groups: canonicalGroup falls back to task_ when no ctx_',
+  WG.canonicalGroup(new Set(['term_z', 'task_y'])), 'task_y');
+check('worker-groups: canonicalGroup falls back to term_ when only a handle is present',
+  WG.canonicalGroup(new Set(['term_z'])), 'term_z');
+check('worker-groups: kindOf a terminal handle', WG.kindOf('term_x'), 'terminal');
+check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
+
+// --- worker-groups.cjs: releaseTarget / settleGroup (Section 0 bug #2) -------
+
+{
+  const flagValue = gate.flagValue;
+  const releaseInv = (cmd) => orcaInvocations(cmd).find((inv) => WG.RELEASE_SUBS.has(inv.sub));
+
+  check('releaseTarget: --dispatch flag, trailing --json never mistaken for the target',
+    WG.releaseTarget(releaseInv('orca orchestration worker-release --dispatch ctx_x --json'), flagValue),
+    'ctx_x');
+  check('releaseTarget: =-joined --dispatch',
+    WG.releaseTarget(releaseInv('orca orchestration worker-release --dispatch=ctx_x --json'), flagValue),
+    'ctx_x');
+  check('releaseTarget: positional fallback for worker-stop',
+    WG.releaseTarget(releaseInv('orca orchestration worker-stop ctx_x'), flagValue),
+    'ctx_x');
+  check('releaseTarget: positional fallback for worker-abandon',
+    WG.releaseTarget(releaseInv('orca orchestration worker-abandon ctx_x'), flagValue),
+    'ctx_x');
+  check('releaseTarget: terminal close, positional handle after the subcommand words',
+    WG.releaseTarget(releaseInv('orca terminal close term_x'), flagValue),
+    'term_x');
+  check('releaseTarget: a release command with nothing after it targets nothing',
+    WG.releaseTarget(releaseInv('orca orchestration worker-release --json'), flagValue),
+    null);
+  check('releaseTarget: a non-release invocation is never a release target',
+    WG.releaseTarget(orcaInvocations('orca orchestration worker-start --task t')[0], flagValue),
+    null);
+
+  const workers = {
+    ctx_a: { status: 'live', group: 'ctx_a' },
+    task_a: { status: 'live', group: 'ctx_a' },
+    term_a: { status: 'live', group: 'ctx_a' },
+    ctx_b: { status: 'live', group: 'ctx_b' },
+  };
+  check('settleGroup: settling one id settles every entry sharing its group',
+    (() => { WG.settleGroup(workers, WG.groupOf(workers.ctx_a, 'ctx_a')); return [workers.ctx_a.status, workers.task_a.status, workers.term_a.status, workers.ctx_b.status]; })(),
+    ['settled', 'settled', 'settled', 'live']);
+}
+
+// --- ownership-claims.cjs -----------------------------------------------------
+
+{
+  const s = { workers: {}, reservations: {}, agentClaims: {} };
+  check('liveClaims: empty state has no claims', OC.liveClaims(s, 120, null).length, 0);
+
+  s.workers.ctx_a = { status: 'live', group: 'ctx_a', owns: ['src/api/**'], ws: '/r|current', started: Date.now() };
+  s.reservations['r1'] = { ts: Date.now(), owns: ['src/models/x.ts'], ws: '/r|current' };
+  s.agentClaims['tu_1'] = { owns: ['docs/**'], ws: '/r|current', ts: Date.now() };
+  const claims = OC.liveClaims(s, 120, null);
+  check('liveClaims: gathers all three sources', claims.map((c) => c.id).sort(), ['ctx_a', 'r1', 'tu_1'].sort());
+
+  check('liveClaims: excludeGroup omits that worker group',
+    OC.liveClaims(s, 120, 'ctx_a').map((c) => c.id).sort(), ['r1', 'tu_1'].sort());
+
+  const conflict = OC.findOverlap(claims, '/r|current', ['src/api/handler.ts']);
+  check('findOverlap: finds the conflicting worker claim', conflict && conflict.id, 'ctx_a');
+  check('findOverlap: no conflict in a different workspace',
+    OC.findOverlap(claims, '/other|current', ['src/api/handler.ts']), null);
+  check('findOverlap: no conflict when nothing overlaps',
+    OC.findOverlap(claims, '/r|current', ['totally/unrelated.ts']), null);
+
+  const oldAgentClaim = { workers: {}, reservations: {}, agentClaims: { tu_2: { owns: ['x.ts'], ws: 'w', ts: Date.now() - 130 * 60 * 1000 } } };
+  check('claimExpired: an agent claim past ownershipClaimTtlMinutes is expired',
+    OC.liveClaims(oldAgentClaim, 120, null).length, 0);
+  const freshAgentClaim = { workers: {}, reservations: {}, agentClaims: { tu_3: { owns: ['x.ts'], ws: 'w', ts: Date.now() - 60 * 1000 } } };
+  check('claimExpired: a fresh agent claim within TTL is live',
+    OC.liveClaims(freshAgentClaim, 120, null).length, 1);
+
+  const oldReservation = { workers: {}, reservations: { r2: { ts: Date.now() - 11 * 60 * 1000, owns: ['x.ts'], ws: 'w' } }, agentClaims: {} };
+  check('reservationExpired: a reservation past the 10-minute TTL is expired',
+    OC.liveClaims(oldReservation, 120, null).length, 0);
+
+  check('countPendingCodexReservations: only unexpired reservations with codexSlot count',
+    OC.countPendingCodexReservations({ reservations: {
+      a: { ts: Date.now(), codexSlot: true },
+      b: { ts: Date.now(), codexSlot: false },
+      c: { ts: Date.now() - 20 * 60 * 1000, codexSlot: true }, // expired
+    } }),
+    1);
+}
+
+// --- gate.cjs: resolveWorkerStartAgent / liveCodexGroupIds --------------------
+
+{
+  const inv = (cmd) => orcaInvocations(cmd)[0];
+  check('resolveWorkerStartAgent: explicit --agent wins',
+    gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --agent codex --task t'), { workers: {} }), 'codex');
+  check('resolveWorkerStartAgent: explicit non-codex agent is respected',
+    gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --agent claude --task t'), { workers: {} }), 'claude');
+  check('resolveWorkerStartAgent: no --agent, no --terminal defaults to codex',
+    gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --task t'), { workers: {} }), 'codex');
+  {
+    const s = { workers: { term_x: { status: 'live', group: 'term_x', agent: 'claude' } } };
+    check('resolveWorkerStartAgent: --terminal of a tracked non-codex group uses its stored agent',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_x'), s), 'claude');
+  }
+  {
+    const s = { workers: {} };
+    check('resolveWorkerStartAgent: --terminal of an UNtracked handle defaults to codex',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_unknown'), s), 'codex');
+  }
+
+  check('liveCodexGroupIds: names distinct live codex groups',
+    gate.liveCodexGroupIds({ workers: { ctx_a: { status: 'live', agent: 'codex', group: 'ctx_a' }, task_a: { status: 'live', agent: 'codex', group: 'ctx_a' } }, reservations: {} }),
+    ['ctx_a']);
+}
+
+// --- file-lock.cjs -------------------------------------------------------------
+
+{
+  const lockRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-lock-'));
+  const lockDir = path.join(lockRoot, 'l');
+  const first = acquireLock(lockDir, { timeoutMs: 200 });
+  check('file-lock: first acquire succeeds', first, true);
+  const second = acquireLock(lockDir, { timeoutMs: 200, retryMs: 10 });
+  check('file-lock: a second acquire times out while the first still holds it', second, false);
+  releaseLock(lockDir);
+  const third = acquireLock(lockDir, { timeoutMs: 200 });
+  check('file-lock: acquire succeeds again after release', third, true);
+  releaseLock(lockDir);
+
+  // A lock directory older than staleMs is presumed abandoned and cleared.
+  fs.mkdirSync(lockDir);
+  const old = Date.now() / 1000 - 60;
+  fs.utimesSync(lockDir, old, old);
+  const afterStale = acquireLock(lockDir, { timeoutMs: 500, retryMs: 10, staleMs: 1000 });
+  check('file-lock: a stale lock directory is cleared and re-acquired', afterStale, true);
+  releaseLock(lockDir);
+
+  fs.rmSync(lockRoot, { recursive: true, force: true });
+}
+
+// --- config.cjs: maxParallelCodexWorkers / ownershipClaimTtlMinutes -----------
+
+{
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-config2-'));
+  const cfgFile = path.join(cfgDir, 'orchestration.config.json');
+  const withConfig = (obj, fn) => {
+    fs.writeFileSync(cfgFile, JSON.stringify(obj));
+    const prev = process.env.ORCH_CONFIG_PATH;
+    process.env.ORCH_CONFIG_PATH = cfgFile;
+    try { return fn(); } finally { process.env.ORCH_CONFIG_PATH = prev; }
+  };
+
+  const defaults = withConfig({}, () => config.loadConfig());
+  check('default maxParallelCodexWorkers is 3', defaults.maxParallelCodexWorkers, 3);
+  check('default ownershipClaimTtlMinutes is 120', defaults.ownershipClaimTtlMinutes, 120);
+  check('GATE_NAMES includes the new gates',
+    ['max-parallel-codex-workers', 'code-brief-needs-owns', 'ownership-overlap'].every((g) => config.GATE_NAMES.includes(g)),
+    true);
+
+  const badCap = withConfig({ maxParallelCodexWorkers: 99 }, () => config.loadConfig());
+  check('an out-of-range maxParallelCodexWorkers falls back to the default', badCap.maxParallelCodexWorkers, 3);
+  check('an out-of-range maxParallelCodexWorkers produces a warning', badCap.warnings.length > 0, true);
+
+  const zeroCap = withConfig({ maxParallelCodexWorkers: 0 }, () => config.loadConfig());
+  check('maxParallelCodexWorkers: 0 (unlimited) is kept as-is', zeroCap.maxParallelCodexWorkers, 0);
+  check('maxParallelCodexWorkers: 0 produces no warning', zeroCap.warnings, []);
+
+  const badTtl = withConfig({ ownershipClaimTtlMinutes: -5 }, () => config.loadConfig());
+  check('an out-of-range ownershipClaimTtlMinutes falls back to the default', badTtl.ownershipClaimTtlMinutes, 120);
+  check('an out-of-range ownershipClaimTtlMinutes produces a warning', badTtl.warnings.length > 0, true);
+
+  const before = process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS;
+  process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS = '5';
+  check('ORCH_MAX_PARALLEL_CODEX_WORKERS overrides the config value', config.maxParallelCodexWorkers(defaults), 5);
+  process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS = 'nope';
+  check('an invalid override falls back to the config value', config.maxParallelCodexWorkers(defaults), defaults.maxParallelCodexWorkers);
+  if (before === undefined) delete process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS; else process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS = before;
+
+  const beforeTtl = process.env.ORCH_CLAIM_TTL_MINUTES;
+  process.env.ORCH_CLAIM_TTL_MINUTES = '30';
+  check('ORCH_CLAIM_TTL_MINUTES overrides the config value', config.ownershipClaimTtlMinutes(defaults), 30);
+  if (beforeTtl === undefined) delete process.env.ORCH_CLAIM_TTL_MINUTES; else process.env.ORCH_CLAIM_TTL_MINUTES = beforeTtl;
+
+  fs.rmSync(cfgDir, { recursive: true, force: true });
 }
 
 // --- report -----------------------------------------------------------------
