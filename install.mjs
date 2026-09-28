@@ -512,10 +512,35 @@ function preflightInstall() {
   }
 }
 
+/**
+ * The installed hooks run under NODE_PATH (the stable PATH node), not necessarily the
+ * node this installer itself is running under (`process.version`) - the two can differ
+ * when this script was invoked via an absolute interpreter path while PATH points
+ * elsewhere, or vice versa. A warning here, before install proceeds, is cheaper than
+ * discovering it the first time a hook silently fails to run under an old Node.
+ */
+function checkTargetNodeVersion() {
+  let out;
+  try {
+    out = execFileSync(NODE_PATH, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
+  } catch (err) {
+    warn(`could not run "${NODE_PATH} --version" (${err.message}); proceeding anyway.`);
+    return;
+  }
+  const major = Number(out.replace(/^v/, '').split('.')[0]);
+  if (!Number.isInteger(major) || major < 18) {
+    warn(`the node the hooks will run under (${NODE_PATH}) reports ${out}, which is below the required >= 18.`);
+  }
+  if (out !== process.version) {
+    warn(`the node the hooks will run under (${NODE_PATH}, ${out}) differs from the node running this installer (${process.version}). This is usually fine, but if hooks misbehave, check both.`);
+  }
+}
+
 function install() {
   checkPlatform();
   const nodeOk = process.version.replace('v', '').split('.').map(Number)[0] >= 18;
   if (!nodeOk) { console.error(`Node >= 18 is required (found ${process.version}).`); process.exit(1); }
+  checkTargetNodeVersion();
   preflightInstall();
 
   const prevManifest = readJSONSafe(MANIFEST_FILE, null);
@@ -668,6 +693,10 @@ function repair() {
         }
         manifest.settings.events[event].command = newCommand;
       }
+      // A real settings.json mutation, same as any other - back it up first, same as
+      // install() does, rather than relying solely on whatever backup an earlier install
+      // happened to make.
+      if (!DRY_RUN) fs.writeFileSync(backupPath(SETTINGS_FILE), fs.readFileSync(SETTINGS_FILE, 'utf8'));
       writeJSON(SETTINGS_FILE, obj);
     }
   }
