@@ -735,6 +735,100 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   fs.rmSync(cfgDir, { recursive: true, force: true });
 }
 
+// --- worker-groups.cjs: splitJsonReplies / idsFromOutput on a nested Orca envelope (item 2) --
+
+{
+  // A real Orca reply is a nested envelope, not the flat {"dispatchId":"..."} shape the
+  // pre-fix regex-only extraction happened to also work against — the fields the gate
+  // actually reads still have to be found no matter how deep they're nested.
+  const nested = JSON.stringify({
+    id: 'req_1', ok: true,
+    result: {
+      dispatchId: 'ctx_nested_1',
+      mutation: { taskId: 'task_nested_1', resource: { id: 'res_1', kind: 'worker' } },
+    },
+    _meta: { latencyMs: 12 },
+  });
+  const ids = WG.idsFromOutput(nested);
+  check('idsFromOutput: finds dispatchId nested under result{}', ids.has('ctx_nested_1'), true);
+  check('idsFromOutput: finds taskId nested two levels under result.mutation{}', ids.has('task_nested_1'), true);
+  check('worker-groups: a nested envelope\'s ids still resolve to ONE canonical group',
+    WG.canonicalGroup(ids), 'ctx_nested_1');
+
+  const workerListShaped = JSON.stringify({ result: { workers: [{ dispatchId: 'ctx_should_be_skipped' }] } });
+  check('splitJsonReplies: a worker-list-shaped reply (carries a workers[] array) is excluded',
+    WG.splitJsonReplies(workerListShaped).length, 0);
+
+  const twoReplies = [
+    JSON.stringify({ ok: true, result: { dispatchId: 'ctx_first' } }),
+    JSON.stringify({ ok: true, result: { dispatchId: 'ctx_second' } }),
+  ].join('\n');
+  const replies = WG.splitJsonReplies(twoReplies);
+  check('splitJsonReplies: two JSON reply lines split into two objects, in order',
+    replies.map((r) => r.result.dispatchId), ['ctx_first', 'ctx_second']);
+
+  const nonJsonBanner = 'Dispatching worker...\n' + JSON.stringify({ dispatchId: 'ctx_after_banner' }) + '\ndone';
+  check('splitJsonReplies: non-JSON banner lines around a reply are skipped, not misparsed',
+    WG.splitJsonReplies(nonJsonBanner).map((r) => r.dispatchId), ['ctx_after_banner']);
+}
+
+// --- ownership.cjs: ownsOverlap regression cases for the fix-round-1 false negatives (item 3) --
+
+{
+  const cases = [
+    ["literal 'src' vs glob 'src/api/**' (directory-prefix, both directions)", 'src', 'src/api/**', true],
+    ["empty-prefix glob '**/*.ts' matches a nested file", 'foo/bar.ts', '**/*.ts', true],
+    ["empty-prefix glob '**/*.ts' matches a top-level file (zero directories)", 'bar.ts', '**/*.ts', true],
+    ["empty-prefix glob '*.ts' conflicts (err-toward-conflict for an empty literal prefix)", 'foo/bar.ts', '*.ts', true],
+    ["empty-prefix brace glob '{a,b}/x' matches directly via regex", 'a/x.ts', '{a,b}/x.ts', true],
+    ["'**/x.ts' matches the bare zero-directory file 'x.ts'", 'x.ts', '**/x.ts', true],
+    ["'**/x.ts' matches a nested 'a/b/x.ts'", 'a/b/x.ts', '**/x.ts', true],
+    ["two empty-prefix globs both match everywhere, so they conflict", '*.ts', '*.js', true],
+    ["unrelated literal directories never conflict", 'src/api', 'lib/api', false],
+  ];
+  for (const [name, a, b, want] of cases) {
+    check(`ownsOverlap (item 3): ${name}`, OWN.ownsOverlap(a, b), want);
+    check(`ownsOverlap (item 3, symmetric): ${name}`, OWN.ownsOverlap(b, a), want);
+  }
+}
+
+// --- ownership.cjs: normalizeOwnsItem / MAX_ITEM_LENGTH / wildcard cap (item 11) -------------
+
+{
+  const REPO = '/work/proj';
+  check('normalizeOwnsItem: a bare "." is refused, like "./"',
+    OWN.normalizeOwnsItem('.', REPO), null);
+  check('parseOwns: an item over 256 chars is refused',
+    OWN.parseOwns(`x\nOwns: ${'a'.repeat(300)}.ts`, { repoRoot: REPO }).owns, []);
+  check('parseOwns: an item with more than 8 wildcard characters is refused',
+    OWN.parseOwns(`x\nOwns: ${'*/'.repeat(9)}x.ts`, { repoRoot: REPO }).owns, []);
+
+  // ReDoS timing: globToRegExp must never exhibit a backtracking-regex-shaped cost, even
+  // against an adversarial run of `**` segments matched against a long non-matching string.
+  const adversarial = OWN.normalizeOwnsItem('**a'.repeat(12) + 'b', REPO);
+  const longMiss = 'x'.repeat(20000);
+  const t0 = process.hrtime.bigint();
+  const matched = adversarial ? OWN.globToRegExp(adversarial).test(longMiss) : false;
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  if (ms < 200) pass += 1; else failures.push(`adversarial '**a'x12+'b' pattern took ${ms}ms against a 20000-char miss, want <200ms`);
+  check('ReDoS probe: the adversarial pattern does not match an unrelated long string', matched, false);
+}
+
+// --- ownership.cjs: splitOwnsLine / parseOwns brace-depth-aware comma split (item 14) --------
+
+{
+  const REPO = '/work/proj';
+  check('parseOwns: a brace glob with an internal ", " survives as one item',
+    OWN.parseOwns('x\nOwns: src/{a, b}.ts', { repoRoot: REPO }).owns,
+    ['src/{a, b}.ts']);
+  check('parseOwns: whitespace-only separation (no commas) still splits into two items',
+    OWN.parseOwns('x\nOwns: src/api/** src/models/*.ts', { repoRoot: REPO }).owns,
+    ['src/api/**', 'src/models/*.ts']);
+  check('parseOwns: mixed comma-and-space list outside any brace splits on both, as before',
+    OWN.parseOwns('x\nOwns: src/api/**, src/models/user.ts foo/bar.py', { repoRoot: REPO }).owns,
+    ['src/api/**', 'src/models/user.ts', 'foo/bar.py']);
+}
+
 // --- report -----------------------------------------------------------------
 
 fs.rmSync(STATE_DIR, { recursive: true, force: true });
