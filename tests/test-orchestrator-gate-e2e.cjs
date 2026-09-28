@@ -777,9 +777,24 @@ rmState(`${SID}-hard-off`);
   const OSID = `${SID}-owns`;
 
   rmState(OSID);
-  expect('owns: an exec-intent code brief in a shared workspace without Owns: is refused',
+  // Ownership is enforced where the workspace is actually known — worker-start — not at
+  // task-create, which does not yet know whether its eventual worker-start will be
+  // isolated (item 9). A task-create with no Owns: therefore is NOT refused by itself...
+  expect('owns: task-create alone, missing Owns:, is not refused (enforcement is deferred to worker-start)',
     mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: npm test"',
-      { sid: OSID, cwd: FAKE_REPO }), DENY, OWNS_ENV);
+      { sid: OSID, cwd: FAKE_REPO, tool_use_id: 'toolu_defer_1' }), ALLOW, OWNS_ENV);
+  // ...but a later worker-start --task <id> referencing it, non-isolated, IS refused, since
+  // that is where the shared workspace is finally known.
+  {
+    const deferEnv = OWNS_ENV;
+    invoke(postBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: npm test"',
+      '{"taskId":"task_defer_1"}', { sid: OSID, cwd: FAKE_REPO, tool_use_id: 'toolu_defer_1' }), deferEnv);
+    const r = invoke(mainBash('orca orchestration worker-start --agent codex --task task_defer_1', { sid: OSID, cwd: FAKE_REPO }), deferEnv);
+    if (r.code === DENY && /code-brief-needs-owns/.test(r.err)) pass += 1;
+    else failures.push(`owns: worker-start --task <id> with no recorded Owns: must be refused, deferred from task-create (exit ${r.code}, err ${r.err.slice(0, 200)})`);
+    expect('owns: the SAME worker-start, isolated in its own worktree, needs no Owns: at all',
+      mainBash('orca orchestration worker-start --agent codex --task task_defer_1 --worktree new-child', { sid: OSID, cwd: FAKE_REPO }), ALLOW, deferEnv);
+  }
   expect('owns: Owns: n/a satisfies the requirement',
     mainBash('orca orchestration task-create --task-title "x" --spec "implement the parser. Verify: npm test\nOwns: n/a research spike"',
       { sid: OSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
@@ -818,10 +833,19 @@ rmState(`${SID}-hard-off`);
       mainBash('orca orchestration worker-start --worktree new-child --spec "implement b.\nVerify: npm test\nOwns: src/shared/a.ts"',
         { sid: OvSID, cwd: FAKE_REPO }), ALLOW, OWNS_ENV);
 
-    expect('owns: disabledGates lets an overlapping claim through',
-      mainBash('orca orchestration task-create --task-title "c" --spec "implement c.\nVerify: npm test\nOwns: src/shared/a.ts"',
-        { sid: OvSID, cwd: FAKE_REPO }), ALLOW,
-      quotaEnv('owns-disabled', 10, 30, { disabledGates: ['ownership-overlap'] }));
+    // A disabled gate still reserves (item 5: it must not silently skip the cap/claim
+    // bookkeeping for the dispatch it would otherwise have refused) — resolve that
+    // reservation the same way "a" was resolved above, so it cannot leak into the rest of
+    // this block's overlap checks.
+    {
+      const disabledEnv = quotaEnv('owns-disabled', 10, 30, { disabledGates: ['ownership-overlap'] });
+      const tuC = 'toolu_ov_c';
+      expect('owns: disabledGates lets an overlapping claim through',
+        mainBash('orca orchestration task-create --task-title "c" --spec "implement c.\nVerify: npm test\nOwns: src/shared/a.ts"',
+          { sid: OvSID, cwd: FAKE_REPO, tool_use_id: tuC }), ALLOW, disabledEnv);
+      invoke(postBash('orca orchestration task-create --task-title "c" --spec "implement c.\nVerify: npm test\nOwns: src/shared/a.ts"',
+        '{"taskId":"task_ov_c"}', { sid: OvSID, cwd: FAKE_REPO, tool_use_id: tuC }), disabledEnv);
+    }
 
     // Releasing the worker via --dispatch frees the claim, so a fresh overlapping claim is
     // then allowed again.

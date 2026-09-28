@@ -32,6 +32,25 @@ function stripQuotes(s) {
  *    resolved) — a claim is never allowed to point outside the repo.
  * Returns null for anything that normalizes to nothing or is refused.
  */
+// Bounds a single claimed pattern must stay within before it is even considered for glob
+// translation — a defense-in-depth cap, not evidence the matcher is exploitable as built
+// (globToRegExp translates each `**`/`*` into one flat, non-nested quantifier, so it has no
+// classic ReDoS shape); still, an absurdly long pattern or wildcard count serves no
+// legitimate Owns: claim and is refused outright rather than risking future regex changes
+// reintroducing a real cost.
+const MAX_ITEM_LENGTH = 256;
+const MAX_WILDCARDS = 8;
+
+/** Collapses consecutive `*`/`**` runs into a single `**` (they are equivalent for
+ * matching purposes) before the item is stored or turned into a regex — simplifies the
+ * pattern and further bounds the wildcard count a pathological input could carry. */
+function collapseWildcardRuns(item) {
+  return item.replace(/\*{2,}/g, '**').replace(/(\*\*)(\/\*\*)+/g, '$1');
+}
+
+/** Normalize `.` and `./` (a bare "current directory" reference, with nothing after it)
+ * to the repo root marker — treated the same as any other item that resolves to nothing
+ * claimable on its own (refused, not silently coerced into a literal "." path segment). */
 function normalizeOwnsItem(raw, repoRootDir) {
   let item = stripQuotes(String(raw || '').trim());
   if (!item) return null;
@@ -45,13 +64,43 @@ function normalizeOwnsItem(raw, repoRootDir) {
   }
   item = item.replace(/^\.\//, '');
   item = item.replace(/\/+$/, '');
+  if (item === '.') item = '';
   if (!item) return null;
   if (item.split('/').includes('..')) return null;
-  return item;
+  if (item.length > MAX_ITEM_LENGTH) return null;
+  const wildcardCount = (item.match(/[*?]/g) || []).length;
+  if (wildcardCount > MAX_WILDCARDS) return null;
+  return collapseWildcardRuns(item);
 }
 
 // `Owns:` / `- Owns:` / `* owns:` (case-insensitive), the rest of the line is the value.
 const OWNS_LINE = /^[ \t]*[-*]?[ \t]*owns[ \t]*:[ \t]*(.+)$/gim;
+
+/**
+ * Splits one `Owns:` line's value into candidate items on any run of commas/whitespace,
+ * exactly like the original `/[,\s]+/` split, EXCEPT that a comma or space INSIDE a
+ * `{...}` brace-alternation group is protected (brace-depth-aware) rather than treated as
+ * a separator — so a brace glob like `src/{a, b}.ts` (a space after the inner comma)
+ * survives as ONE item instead of being shattered into two broken fragments, while an
+ * ordinary comma-and-space-separated list (`a.ts, b.ts c.ts`) still splits exactly as
+ * before.
+ */
+function splitOwnsLine(line) {
+  const parts = [];
+  let cur = '';
+  let depth = 0;
+  for (const ch of line) {
+    if (ch === '{') depth += 1;
+    else if (ch === '}') depth = Math.max(0, depth - 1);
+    if (depth === 0 && /[,\s]/.test(ch)) {
+      if (cur) { parts.push(cur); cur = ''; }
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
 
 /**
  * Parses every `Owns:` line out of `text` (a code brief, inline or read from a spec
@@ -82,7 +131,7 @@ function parseOwns(text, opts = {}) {
 
   const items = [];
   outer: for (const line of lines) {
-    for (const raw of line.split(/[,\s]+/)) {
+    for (const raw of splitOwnsLine(line)) {
       if (!raw) continue;
       const norm = normalizeOwnsItem(raw, repoRootDir);
       if (norm) items.push(norm);
@@ -128,13 +177,17 @@ function literalPrefix(pattern) {
   return idx === -1 ? pattern : segs.slice(0, idx).join('/');
 }
 
-/** Small, dependency-free glob -> RegExp: `**` -> `.*`, `*` -> `[^/]*`, `?` -> `[^/]`,
- * `{a,b}` -> `(?:a|b)`, everything else escaped literally. Anchored full-string match. */
+/** Small, dependency-free glob -> RegExp: `**` immediately followed by a slash becomes an
+ * optional "zero or more whole path segments" group (so `**` + `/x.ts` also matches the
+ * zero-directory `x.ts`, not just something with at least one directory in front of it); a
+ * bare/trailing `**` -> `.*`; `*` -> `[^/]*`; `?` -> `[^/]`; `{a,b}` -> an alternation group;
+ * everything else escaped literally. Anchored full-string match. */
 function globToRegExp(pattern) {
   let re = '';
   let i = 0;
   while (i < pattern.length) {
     const c = pattern[i];
+    if (c === '*' && pattern[i + 1] === '*' && pattern[i + 2] === '/') { re += '(?:.*/)?'; i += 3; continue; }
     if (c === '*' && pattern[i + 1] === '*') { re += '.*'; i += 2; continue; }
     if (c === '*') { re += '[^/]*'; i += 1; continue; }
     if (c === '?') { re += '[^/]'; i += 1; continue; }
@@ -182,9 +235,15 @@ function ownsOverlap(a, b) {
   const aGlob = isGlobPattern(a);
   const bGlob = isGlobPattern(b);
   if (!aGlob && !bGlob) return directoryPrefixRelated(a, b);
-  if (aGlob && !bGlob) return globToRegExp(a).test(b) || directoryPrefixRelated(literalPrefix(a), b);
-  if (!aGlob && bGlob) return globToRegExp(b).test(a) || directoryPrefixRelated(literalPrefix(b), a);
-  return directoryPrefixRelated(literalPrefix(a), literalPrefix(b));
+  // A glob whose literal prefix is empty (the very first path segment already contains a
+  // glob character, e.g. `*.ts`, `**/*.ts`, `{a,b}/x`) has no real directory to anchor the
+  // directory-prefix fallback to — its own pattern space starts at the repo root, so it is
+  // treated as matching everywhere for conflict purposes (same "err toward conflict"
+  // philosophy as the rest of this matcher), rather than the empty string being compared
+  // as if it were a literal directory name that nothing can ever be "inside" of.
+  if (aGlob && !bGlob) return globToRegExp(a).test(b) || literalPrefix(a) === '' || directoryPrefixRelated(literalPrefix(a), b);
+  if (!aGlob && bGlob) return globToRegExp(b).test(a) || literalPrefix(b) === '' || directoryPrefixRelated(literalPrefix(b), a);
+  return literalPrefix(a) === '' || literalPrefix(b) === '' || directoryPrefixRelated(literalPrefix(a), literalPrefix(b));
 }
 
 /** True when any pattern in `ownsA` overlaps any pattern in `ownsB`. */

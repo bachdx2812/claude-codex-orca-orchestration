@@ -36,6 +36,28 @@ function idsFromOutput(out) {
   return ids;
 }
 
+/**
+ * Best-effort split of one Bash call's combined stdout+stderr into the individual JSON
+ * reply objects each real orca invocation in that command printed, in command order — one
+ * non-worker-list-shaped JSON object per line. Used only to disambiguate MULTIPLE dispatch
+ * invocations chained in a single command line; a line that fails to parse as JSON, or that
+ * carries a `workers` array (a worker-list-shaped reply, not a dispatch reply), is skipped
+ * rather than misattributed to a dispatch.
+ */
+function splitJsonReplies(out) {
+  const replies = [];
+  for (const line of String(out || '').split('\n')) {
+    const t = line.trim();
+    if (!t || (t[0] !== '{' && t[0] !== '[')) continue;
+    let obj;
+    try { obj = JSON.parse(t); } catch { continue; }
+    const r = (obj && obj.result) || obj;
+    if (r && Array.isArray(r.workers)) continue;
+    replies.push(obj);
+  }
+  return replies;
+}
+
 /** A terminal handle (`term_*`) is a distinct resource from a worker id (`ctx_*`/`task_*`). */
 function kindOf(id) {
   return /^term_/.test(String(id)) ? 'terminal' : 'worker';
@@ -57,12 +79,16 @@ function groupOf(entry, key) {
   return (entry && entry.group) || key;
 }
 
-/** Number of distinct *live* groups whose resolved agent is `agent` (default 'codex'). */
+/** Number of distinct *live* groups whose resolved agent is `agent` (default 'codex').
+ * A group flagged `capExempt` (done per Orca but still holding its terminal — see
+ * reconcileCodexGroupsWithOrca) is tracked/live for the Stop gate's sake but excluded here:
+ * it is not doing work anymore, so it must not block a new dispatch from being admitted. */
 function countLiveGroups(workers, agent = 'codex') {
   const groups = new Set();
   for (const [key, w] of Object.entries(workers || {})) {
     if (w.status !== 'live') continue;
     if (w.agent !== agent) continue;
+    if (w.capExempt) continue;
     groups.add(groupOf(w, key));
   }
   return groups.size;
@@ -126,6 +152,6 @@ function releaseTarget(inv, flagValue) {
 }
 
 module.exports = {
-  idsFromOutput, kindOf, canonicalGroup, groupOf, countLiveGroups,
+  idsFromOutput, splitJsonReplies, kindOf, canonicalGroup, groupOf, countLiveGroups,
   liveGroupByTerminal, groupById, settleGroup, RELEASE_SUBS, releaseTarget,
 };
