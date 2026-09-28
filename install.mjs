@@ -23,6 +23,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
 
 const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
 const HOME = os.homedir();
@@ -35,7 +38,7 @@ const CLAUDE_MD_FILE = path.join(CLAUDE_DIR, 'CLAUDE.md');
 const MANIFEST_FILE = path.join(HOOKS_DIR, 'install-manifest.json');
 
 const GATE_SCRIPT = 'orchestrator-gate.cjs';
-const HOOK_FILES = ['orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'lib/config.cjs', 'lib/exec-route-by-quota.cjs'];
+const HOOK_FILES = ['orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/shell-orca-invocations.cjs'];
 const EVENTS = {
   SessionStart: '*',
   UserPromptSubmit: '*',
@@ -45,6 +48,33 @@ const EVENTS = {
 };
 const START_MARK = '<!-- orchestration:start -->';
 const END_MARK = '<!-- orchestration:end -->';
+
+/**
+ * The `node` this installer should point settings.json's hook commands at: the stable
+ * PATH-resolved path (`which`/`where node`, left as the symlink it is - never resolved to
+ * its real target), not `process.execPath`. A version manager (nvm, Homebrew, volta, fnm)
+ * commonly puts `process.execPath` inside a version-numbered directory
+ * (`/usr/local/Cellar/node/23.11.0/bin/node`, `~/.nvm/versions/node/v23.11.0/bin/node`)
+ * that stops existing the moment that Node version is uninstalled, silently breaking every
+ * hook. The PATH entry (`/usr/local/bin/node`, `~/.nvm/.../current/bin/node`, ...) is
+ * the stable indirection those tools provide for exactly this reason. Falls back to
+ * `process.execPath` only when no `node` is found on PATH at all (e.g. this script was
+ * invoked with an absolute interpreter path and nothing is otherwise on PATH).
+ */
+function stableNodePath() {
+  try {
+    const out = execFileSync(process.platform === 'win32' ? 'where' : 'which', ['node'], { encoding: 'utf8', timeout: 5000 });
+    const first = out.split('\n').map((l) => l.trim()).find(Boolean);
+    if (first) return first;
+  } catch {}
+  return process.execPath;
+}
+const NODE_PATH = stableNodePath();
+
+/** Heuristic: a path that sits inside a version-numbered directory a Node upgrade/uninstall can remove out from under it. */
+function looksVersioned(p) {
+  return /[/\\](Cellar|versions|\.nvm|\.volta|fnm|n[/\\]versions)[/\\]/i.test(p) || /[/\\]v?\d+\.\d+\.\d+[/\\]/.test(p);
+}
 
 // --- CLI -------------------------------------------------------------------
 
@@ -187,8 +217,8 @@ function uninstallConfig(manifest, purge) {
 
 // --- install: settings.json ---------------------------------------------------
 
-function commandFor(scriptName) {
-  return `${JSON.stringify(process.execPath)} ${JSON.stringify(path.join(HOOKS_DIR, scriptName))}`;
+function commandFor(scriptName, nodePath = NODE_PATH) {
+  return `${JSON.stringify(nodePath)} ${JSON.stringify(path.join(HOOKS_DIR, scriptName))}`;
 }
 
 function entryMatches(entry, matcher, command) {
@@ -203,6 +233,37 @@ function entryMatches(entry, matcher, command) {
 // conclude it never owned it, which is exactly what silently broke `--uninstall` before
 // this was fixed: a second install overwrote the manifest with createdArray/created:false,
 // and uninstall then left every entry and the model-pin env var behind.
+/**
+ * Pin one env var to `desiredValue` in `obj.env`, with the same ownership rule the
+ * settings-entry tracking above uses: claim it when it is missing, or when it is already
+ * exactly the value *this installer* set last time (read from `prevPin`) - which is what
+ * lets ownership survive the pinned id itself changing between installs (M4): the id in
+ * config.json moved on, but the env var still holds our old value, so it is still ours to
+ * update. Never claims a value that pre-dates us or that something else changed it to.
+ */
+function pinModelEnv(obj, envKey, desiredValue, prevPin) {
+  const result = { attempted: true, created: false, value: desiredValue, skippedReason: null };
+  const current = obj.env[envKey];
+  const weOwnedItBefore = !!(prevPin && prevPin.created && current === prevPin.value);
+  if (current === undefined || weOwnedItBefore) {
+    obj.env[envKey] = desiredValue;
+    result.created = true;
+  } else if (current === desiredValue) {
+    result.created = false; // matches by coincidence (or pre-dates us); never claim it
+  } else {
+    result.skippedReason = `${envKey} is already set to "${current}"; leaving it (wanted "${desiredValue}").`;
+    warn(result.skippedReason);
+  }
+  return result;
+}
+
+// `prevManifest` is this repo's own record from an earlier install, if any. A re-install
+// (the idempotent case) must keep claiming ownership of keys it created the first time,
+// even though those keys now already exist *because we created them* - recomputing
+// "did this exist before me" fresh on every install would see its own prior work and
+// conclude it never owned it, which is exactly what silently broke `--uninstall` before
+// this was fixed: a second install overwrote the manifest with createdArray/created:false,
+// and uninstall then left every entry and the model-pin env vars behind.
 function installSettings(opts, prevManifest) {
   let obj;
   try {
@@ -214,9 +275,6 @@ function installSettings(opts, prevManifest) {
   const isNewFile = obj === null;
   if (isNewFile) obj = {};
   const originalText = isNewFile ? null : fs.readFileSync(SETTINGS_FILE, 'utf8');
-
-  const backupFile = isNewFile ? null : backupPath(SETTINGS_FILE);
-  if (backupFile && !DRY_RUN) fs.writeFileSync(backupFile, originalText);
 
   if (obj.disableAllHooks) warn('settings.json has "disableAllHooks": true — the installed hooks will not run until that is cleared.');
   if (obj.allowManagedHooksOnly) warn('settings.json has "allowManagedHooksOnly": true — verify the installed hooks are treated as managed, or they may be ignored.');
@@ -241,32 +299,22 @@ function installSettings(opts, prevManifest) {
 
   const cfg = readJSONSafe(CONFIG_FILE, null) || readJSONSafe(path.join(REPO_ROOT, 'config', 'orchestration.config.example.json'), {});
   const reviewId = cfg?.models?.review?.id;
-  let modelPin = { attempted: false, created: false, value: null, skippedReason: null };
+  const escalationId = cfg?.models?.escalation?.id;
+  let opusPin = { attempted: false, created: false, value: null, skippedReason: null };
+  let fablePin = { attempted: false, created: false, value: null, skippedReason: null };
   let createdEnvKey = prevSettings ? !!prevSettings.createdEnvKey : false;
-  if (opts.pinModels && reviewId) {
-    modelPin.attempted = true;
-    modelPin.value = reviewId;
+  if (opts.pinModels && (reviewId || escalationId)) {
     if (process.env.CLAUDE_CODE_USE_BEDROCK || process.env.CLAUDE_CODE_USE_VERTEX) {
-      modelPin.skippedReason = 'CLAUDE_CODE_USE_BEDROCK/VERTEX is set; model IDs differ per provider, so the pin was skipped.';
-      warn(modelPin.skippedReason);
+      const reason = 'CLAUDE_CODE_USE_BEDROCK/VERTEX is set; model IDs differ per provider, so the pin was skipped.';
+      if (reviewId) opusPin = { attempted: true, created: false, value: reviewId, skippedReason: reason };
+      if (escalationId) fablePin = { attempted: true, created: false, value: escalationId, skippedReason: reason };
+      warn(reason);
     } else {
       const envKeyWasMissing = obj.env === undefined;
       if (envKeyWasMissing) obj.env = {};
-      const current = obj.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
-      const prevCreatedPin = prevSettings && prevSettings.modelPin && prevSettings.modelPin.created
-        && prevSettings.modelPin.value === reviewId;
-      if (current === undefined) {
-        obj.env.ANTHROPIC_DEFAULT_OPUS_MODEL = reviewId;
-        modelPin.created = true;
-        createdEnvKey = createdEnvKey || envKeyWasMissing;
-      } else if (current === reviewId) {
-        // Already correct - either from a prior install of ours (keep owning it) or
-        // because it pre-dated us entirely (never claim it in that case).
-        modelPin.created = prevCreatedPin;
-      } else {
-        modelPin.skippedReason = `ANTHROPIC_DEFAULT_OPUS_MODEL is already set to "${current}"; leaving it (wanted "${reviewId}").`;
-        warn(modelPin.skippedReason);
-      }
+      if (reviewId) opusPin = pinModelEnv(obj, 'ANTHROPIC_DEFAULT_OPUS_MODEL', reviewId, prevSettings?.modelPin);
+      if (escalationId) fablePin = pinModelEnv(obj, 'ANTHROPIC_DEFAULT_FABLE_MODEL', escalationId, prevSettings?.fablePin);
+      createdEnvKey = createdEnvKey || (envKeyWasMissing && (opusPin.created || fablePin.created));
     }
   }
 
@@ -274,6 +322,19 @@ function installSettings(opts, prevManifest) {
   if (SET_MODEL) {
     setModelResult = { previous: obj.model === undefined ? null : obj.model, applied: SET_MODEL };
     obj.model = SET_MODEL;
+  }
+
+  // Back up only when this install actually changes the file's content (M1), and record
+  // only the FIRST backup this repo ever made in the manifest - re-installs still take a
+  // fresh timestamped backup on disk (never destroyed), but the manifest's pointer, and
+  // what any doc tells the operator to roll back to, stays the one true "before I ever
+  // touched this file" snapshot rather than churning forward on every re-install.
+  const newText = `${JSON.stringify(obj, null, 2)}\n`;
+  let backupFile = prevSettings ? prevSettings.backupPath || null : null;
+  if (!isNewFile && originalText !== newText) {
+    const freshBackup = backupPath(SETTINGS_FILE);
+    if (!DRY_RUN) fs.writeFileSync(freshBackup, originalText);
+    if (!backupFile) backupFile = freshBackup;
   }
 
   writeJSON(SETTINGS_FILE, obj);
@@ -285,9 +346,43 @@ function installSettings(opts, prevManifest) {
     createdHooksKey,
     events,
     createdEnvKey,
-    modelPin,
+    modelPin: opusPin,
+    fablePin,
     setModel: setModelResult,
   };
+}
+
+/**
+ * When the node path this installer would use has changed since the last install (a
+ * version manager moved on, or the operator switched Node installs), the settings.json
+ * entries this repo owns still carry the OLD path baked into their command string.
+ * Removing those exact old entries before `installSettings` adds the new ones keeps a
+ * re-install from ending up with two live copies of every hook - one per node path - both
+ * of which would fire on every tool call.
+ */
+function removeStaleNodeCommands(prevManifest) {
+  if (!prevManifest || !prevManifest.nodePath || prevManifest.nodePath === NODE_PATH) return false;
+  if (!prevManifest.settings || !prevManifest.settings.events) return false;
+  let obj;
+  try { obj = readJSON(SETTINGS_FILE); } catch { return false; }
+  if (!obj.hooks) return false;
+  let changed = false;
+  for (const [event, rec] of Object.entries(prevManifest.settings.events)) {
+    if (!Array.isArray(obj.hooks[event])) continue;
+    const oldCommand = commandFor(GATE_SCRIPT, prevManifest.nodePath);
+    const before = obj.hooks[event].length;
+    obj.hooks[event] = obj.hooks[event].filter((e) => !entryMatches(e, rec.matcher, oldCommand));
+    if (obj.hooks[event].length !== before) changed = true;
+  }
+  if (changed) {
+    log(`Node path changed since last install (${prevManifest.nodePath} -> ${NODE_PATH}); removing the old command entries before adding the new ones.`);
+    // A real mutation ahead of installSettings' own backup-on-change logic - take a
+    // safety backup here too (not referenced by the manifest as "the" rollback target;
+    // installSettings still owns that, inheriting the first one ever made).
+    if (!DRY_RUN) fs.writeFileSync(backupPath(SETTINGS_FILE), fs.readFileSync(SETTINGS_FILE, 'utf8'));
+    writeJSON(SETTINGS_FILE, obj);
+  }
+  return changed;
 }
 
 function uninstallSettings(manifest) {
@@ -308,14 +403,17 @@ function uninstallSettings(manifest) {
     if (s.createdHooksKey && Object.keys(obj.hooks).length === 0) delete obj.hooks;
   }
 
-  if (s.modelPin && s.modelPin.created && obj.env) {
-    if (obj.env.ANTHROPIC_DEFAULT_OPUS_MODEL === s.modelPin.value) {
-      delete obj.env.ANTHROPIC_DEFAULT_OPUS_MODEL;
-      if (s.createdEnvKey && Object.keys(obj.env).length === 0) delete obj.env;
+  const unpin = (envKey, pin) => {
+    if (!pin || !pin.created || !obj.env) return;
+    if (obj.env[envKey] === pin.value) {
+      delete obj.env[envKey];
     } else {
-      warn('ANTHROPIC_DEFAULT_OPUS_MODEL changed since install; leaving it as-is.');
+      warn(`${envKey} changed since install; leaving it as-is.`);
     }
-  }
+  };
+  unpin('ANTHROPIC_DEFAULT_OPUS_MODEL', s.modelPin);
+  unpin('ANTHROPIC_DEFAULT_FABLE_MODEL', s.fablePin);
+  if (s.createdEnvKey && obj.env && Object.keys(obj.env).length === 0) delete obj.env;
 
   // The top-level "model" set by --set-model is a deliberate, visible operator choice;
   // uninstall never reverts it silently. Mention it instead.
@@ -374,24 +472,54 @@ function uninstallClaudeMd(manifest) {
     warn(`${CLAUDE_MD_FILE}'s orchestration block was edited since install; leaving it in place.`);
     return;
   }
-  if (c.createdNewFile) {
+  const usesCRLF = /\r\n/.test(existing);
+  let updated = normalized.replace(blockRe, '\n').replace(/\n{3,}/g, '\n\n');
+  // Delete the file only when nothing but whitespace is left, regardless of whether we
+  // created it fresh: the operator may well have added content of their own below or
+  // above our block after installing, and that content must survive uninstall even if
+  // this file did not exist before we created it.
+  if (updated.trim().length === 0) {
     removeFile(CLAUDE_MD_FILE);
     return;
   }
-  const usesCRLF = /\r\n/.test(existing);
-  let updated = normalized.replace(blockRe, '\n').replace(/\n{3,}/g, '\n\n');
   if (usesCRLF) updated = updated.replace(/\n/g, '\r\n');
   writeText(CLAUDE_MD_FILE, updated);
 }
 
 // --- install / uninstall / check / repair --------------------------------------
 
+/**
+ * Validate everything that could make install() fail partway through, BEFORE it writes
+ * anything. Without this, a bad settings.json or an unbalanced CLAUDE.md could be
+ * discovered only after hook files, the rules file and config.json were already written -
+ * with no manifest yet on disk to record or later clean up that partial state (H1).
+ */
+function preflightInstall() {
+  if (fs.existsSync(SETTINGS_FILE)) {
+    try { readJSON(SETTINGS_FILE); } catch {
+      console.error(`${SETTINGS_FILE} exists but is not valid JSON. Fix or remove it, then re-run install. Nothing was written.`);
+      process.exit(1);
+    }
+  }
+  if (fs.existsSync(CLAUDE_MD_FILE)) {
+    const existing = fs.readFileSync(CLAUDE_MD_FILE, 'utf8').replace(/\r\n/g, '\n');
+    const startCount = (existing.match(new RegExp(START_MARK.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+    const endCount = (existing.match(new RegExp(END_MARK.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+    if (startCount !== endCount || startCount > 1) {
+      console.error(`${CLAUDE_MD_FILE} has unbalanced or duplicated orchestration markers (${startCount} start, ${endCount} end). Fix it by hand, then re-run install. Nothing was written.`);
+      process.exit(1);
+    }
+  }
+}
+
 function install() {
   checkPlatform();
   const nodeOk = process.version.replace('v', '').split('.').map(Number)[0] >= 18;
   if (!nodeOk) { console.error(`Node >= 18 is required (found ${process.version}).`); process.exit(1); }
+  preflightInstall();
 
   const prevManifest = readJSONSafe(MANIFEST_FILE, null);
+  removeStaleNodeCommands(prevManifest);
 
   log(`${DRY_RUN ? '[dry-run] ' : ''}Installing claude-codex-orca-orchestration...`);
   installHookFiles();
@@ -403,7 +531,7 @@ function install() {
   const manifest = {
     version: 1,
     installedAt: new Date().toISOString(),
-    nodePath: process.execPath,
+    nodePath: NODE_PATH,
     hooksDir: HOOKS_DIR,
     files: HOOK_FILES,
     rulesFile,
@@ -447,6 +575,7 @@ function versionOf(bin, args = ['--version']) {
 }
 
 function check() {
+  checkPlatform();
   log('--- prerequisites ---');
   log(`node: ${process.version} (${process.version.replace('v', '').split('.').map(Number)[0] >= 18 ? 'OK, >= 18' : 'TOO OLD, need >= 18'})`);
   log(`claude: ${which('claude') ? (versionOf('claude') || 'present') : 'NOT FOUND on PATH'}`);
@@ -481,24 +610,70 @@ function check() {
   log(`  ${fs.existsSync(SETTINGS_FILE) ? 'OK  ' : 'MISS'} ${SETTINGS_FILE}`);
   const nodeExists = fs.existsSync(manifest.nodePath);
   log(`  node path recorded at install: ${manifest.nodePath} (${nodeExists ? 'exists' : 'MISSING - run --repair'})`);
+  if (looksVersioned(manifest.nodePath)) {
+    warn(`the recorded node path sits inside a version-numbered directory (${manifest.nodePath}) - a Node ` +
+      'upgrade or uninstall can remove it out from under the hooks. Run --repair to re-point at the current PATH node.');
+  }
+
+  log('\n--- hook entries in settings.json ---');
+  const settingsNow = readJSONSafe(SETTINGS_FILE, {});
+  for (const [event, rec] of Object.entries(manifest.settings?.events || {})) {
+    const present = Array.isArray(settingsNow.hooks?.[event])
+      && settingsNow.hooks[event].some((e) => entryMatches(e, rec.matcher, rec.command));
+    log(`  ${present ? 'OK  ' : 'MISS'} ${event} (matcher "${rec.matcher}")`);
+  }
 
   log('\n--- effective environment ---');
   log(`ANTHROPIC_DEFAULT_OPUS_MODEL: ${process.env.ANTHROPIC_DEFAULT_OPUS_MODEL || '(not set in this shell; set via settings.json env on Claude Code launch)'}`);
+  log(`ANTHROPIC_DEFAULT_FABLE_MODEL: ${process.env.ANTHROPIC_DEFAULT_FABLE_MODEL || '(not set in this shell; set via settings.json env on Claude Code launch)'}`);
   if (process.env.CLAUDE_CODE_SUBAGENT_MODEL) {
     warn(`CLAUDE_CODE_SUBAGENT_MODEL=${process.env.CLAUDE_CODE_SUBAGENT_MODEL} is set - it overrides subagent model routing and may fight this gate's model instructions.`);
   }
+  log(`settings.json env.ANTHROPIC_DEFAULT_OPUS_MODEL: ${settingsNow.env?.ANTHROPIC_DEFAULT_OPUS_MODEL || '(not set)'}`);
+  log(`settings.json env.ANTHROPIC_DEFAULT_FABLE_MODEL: ${settingsNow.env?.ANTHROPIC_DEFAULT_FABLE_MODEL || '(not set)'}`);
+
+  log('\n--- effective config ---');
   try {
-    const settings = readJSON(SETTINGS_FILE);
-    log(`settings.json env.ANTHROPIC_DEFAULT_OPUS_MODEL: ${settings.env?.ANTHROPIC_DEFAULT_OPUS_MODEL || '(not set)'}`);
-  } catch {}
+    const cfgLib = require(path.join(HOOKS_DIR, 'lib', 'config.cjs'));
+    const cfg = cfgLib.loadConfig();
+    log(`  activation: ${cfg.activation}`);
+    log(`  codexHandoffUsedPercent: ${cfg.codexHandoffUsedPercent}`);
+    log(`  disabledGates: ${cfg.disabledGates.length ? cfg.disabledGates.join(', ') : '(none)'}`);
+    log(`  models: review=${cfg.models.review.alias}(${cfg.models.review.id}) escalation=${cfg.models.escalation.alias}(${cfg.models.escalation.id}) ` +
+      `code=${cfg.models.code.alias} lookup=${cfg.models.lookup.alias} codex=${cfg.models.codex.id}`);
+    for (const w of cfg.warnings) warn(`config: ${w}`);
+  } catch (err) {
+    warn(`could not evaluate the installed config: ${err.message}`);
+  }
 }
 
 function repair() {
+  checkPlatform();
   const manifest = readJSONSafe(MANIFEST_FILE, null);
   if (!manifest) { log('Nothing to repair: not installed.'); return; }
-  manifest.nodePath = process.execPath;
+  const oldNodePath = manifest.nodePath;
+  if (oldNodePath !== NODE_PATH) {
+    let obj;
+    try { obj = readJSON(SETTINGS_FILE); } catch { obj = null; }
+    if (obj && obj.hooks) {
+      for (const [event, rec] of Object.entries(manifest.settings?.events || {})) {
+        if (!Array.isArray(obj.hooks[event])) continue;
+        const oldCommand = commandFor(GATE_SCRIPT, oldNodePath);
+        const newCommand = commandFor(GATE_SCRIPT, NODE_PATH);
+        for (const entry of obj.hooks[event]) {
+          if (entry.matcher !== rec.matcher || !Array.isArray(entry.hooks)) continue;
+          for (const h of entry.hooks) {
+            if (h && h.type === 'command' && h.command === oldCommand) h.command = newCommand;
+          }
+        }
+        manifest.settings.events[event].command = newCommand;
+      }
+      writeJSON(SETTINGS_FILE, obj);
+    }
+  }
+  manifest.nodePath = NODE_PATH;
   writeJSON(MANIFEST_FILE, manifest);
-  log(`Repaired: nodePath set to ${process.execPath}.`);
+  log(`Repaired: nodePath set to ${NODE_PATH}${oldNodePath !== NODE_PATH ? ` (was ${oldNodePath}; settings.json commands rewritten)` : ''}.`);
 }
 
 // --- entry -----------------------------------------------------------------
