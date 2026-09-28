@@ -1523,6 +1523,91 @@ rmState(`${SID}-hard-off`);
   rmState(G2bSID);
 }
 
+// --- Fourth Opus 5.5 review round -------------------------------------------------------
+
+// Round 4, item 1a: two worker-starts in ONE command, replies printed with NO separator at
+// all on the same line (`{...}{...}`) — must still land in two distinct groups with correct
+// ids, exactly like the newline-separated case already covered above.
+{
+  const B4a = quotaEnv('round4-item1-nosep', 10, 30, { maxParallelCodexWorkers: 5 });
+  const G4aSID = `${SID}-round4-item1a`;
+  rmState(G4aSID);
+  const cmd4a = 'orca orchestration worker-start --agent codex --spec @a.md --json; orca orchestration worker-start --agent codex --spec @b.md --json';
+  const reply = (ctx, task) => JSON.stringify({ ok: true, result: { dispatchId: ctx, taskId: task } });
+  invoke(mainBash(cmd4a, { sid: G4aSID, cwd: FAKE_REPO }), B4a);
+  invoke(postBash(cmd4a, `${reply('ctx_r4_1', 'task_r4_1')}${reply('ctx_r4_2', 'task_r4_2')}`, { sid: G4aSID, cwd: FAKE_REPO }), B4a);
+  {
+    const st = readState(G4aSID);
+    const w = st && st.workers || {};
+    if (w.ctx_r4_1 && w.ctx_r4_2 && w.ctx_r4_1.group !== w.ctx_r4_2.group) pass += 1;
+    else failures.push(`round4 item1a: two same-line, no-separator replies must both register in distinct groups (${JSON.stringify(w)})`);
+  }
+  rmState(G4aSID);
+}
+
+// Round 4, item 1b: two worker-starts in ONE command, but the FIRST reply is preceded by a
+// log-line prefix on its own line (`Dispatched: {...}`) so only the second reply's line
+// starts with `{` — the extracted-reply COUNT (1) no longer matches the invocation count (2).
+// Positional zipping must not happen: neither invocation may be credited with the wrong
+// dispatch id. Both must fall back to their own id-less pending placeholder instead.
+{
+  const B4b = quotaEnv('round4-item1-mismatch', 10, 30, { maxParallelCodexWorkers: 5 });
+  const G4bSID = `${SID}-round4-item1b`;
+  rmState(G4bSID);
+  const cmd4b = 'orca orchestration worker-start --agent codex --spec @a.md --json; orca orchestration worker-start --agent codex --spec @b.md --json';
+  const reply = (ctx, task) => JSON.stringify({ ok: true, result: { dispatchId: ctx, taskId: task } });
+  invoke(mainBash(cmd4b, { sid: G4bSID, cwd: FAKE_REPO }), B4b);
+  invoke(postBash(cmd4b, `Dispatched: ${reply('ctx_r4_3', 'task_r4_3')}\n${reply('ctx_r4_4', 'task_r4_4')}`, { sid: G4bSID, cwd: FAKE_REPO }), B4b);
+  {
+    const st = readState(G4bSID);
+    const w = st && st.workers || {};
+    const pendingKeys = Object.keys(w).filter((k) => k.startsWith('pending-'));
+    if (!w.ctx_r4_3 && !w.ctx_r4_4 && pendingKeys.length === 2) pass += 1;
+    else failures.push(`round4 item1b: a reply-count mismatch must never positionally misattribute an id — both invocations must become id-less placeholders (${JSON.stringify(w)})`);
+  }
+  rmState(G4bSID);
+}
+
+// Round 4, item 2: PostToolUseFailure whose error text is NON-EMPTY plain text with no `{`
+// at all (e.g. a bad-flag CLI usage message) is affirmative evidence nothing was dispatched —
+// the reservation must be dropped immediately, freeing the cap for the very next worker-start
+// (contrast with the empty-error / is_interrupt case above, which still correctly keeps it).
+{
+  const CAP4c = quotaEnv('round4-item2-no-json-error', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G4cSID = `${SID}-round4-item2`;
+  rmState(G4cSID);
+  const tu4c = 'toolu_round4_item2';
+  const cmd4c = 'orca orchestration worker-start --bad-flag --agent codex --json';
+  invoke(mainBash(cmd4c, { sid: G4cSID, tool_use_id: tu4c }), CAP4c);
+  invoke({ session_id: G4cSID, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+    tool_input: { command: cmd4c }, tool_use_id: tu4c,
+    error: "Exit code 2\nerror: unrecognized argument '--bad-flag'\nUsage: orca orchestration worker-start [OPTIONS]" }, CAP4c);
+  const after4c = readState(G4cSID);
+  if (after4c && !after4c.reservations[`${tu4c}#0`]) pass += 1;
+  else failures.push(`round4 item2: a plain-text (no JSON) PostToolUseFailure error must drop the reservation immediately (${JSON.stringify(after4c && after4c.reservations)})`);
+  expect('round4 item2: the next worker-start at the same cap is now allowed (nothing was really dispatched)',
+    mainBash('orca orchestration worker-start --agent codex --json', { sid: G4cSID }), ALLOW, CAP4c);
+  rmState(G4cSID);
+}
+
+// Round 4, item 2b: the max-parallel-codex-workers refusal names each unresolved reservation
+// individually as "pending reservation <id> (expires in <N>m)", not a single generic
+// "(reserved, not yet listed by orca)" placeholder.
+{
+  const CAP4d = quotaEnv('round4-item2-named-reservation', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G4dSID = `${SID}-round4-item2b`;
+  rmState(G4dSID);
+  const resId4d = 'toolu_round4_item2b#0';
+  const st4d = { session_id: G4dSID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: {}, reservations: { [resId4d]: { ts: Date.now(), agent: 'codex', owns: null, ws: null, codexSlot: true } },
+    agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0 };
+  fs.writeFileSync(path.join(STATE_DIR, `${G4dSID}.json`), JSON.stringify(st4d));
+  const r4d = invoke(mainBash('orca orchestration worker-start --agent codex --json', { sid: G4dSID }), CAP4d);
+  if (r4d.code === DENY && new RegExp(`pending reservation ${resId4d.replace('#', '\\#')} \\(expires in \\d+m\\)`).test(r4d.err)) pass += 1;
+  else failures.push(`round4 item2b: the refusal must name the pending reservation specifically (exit ${r4d.code}, err ${r4d.err.slice(0, 300)})`);
+  rmState(G4dSID);
+}
+
 console.log(`${pass} passed, ${failures.length} failed`);
 for (const f of failures) console.log(`  FAIL ${f}`);
 

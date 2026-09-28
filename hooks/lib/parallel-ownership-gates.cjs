@@ -48,7 +48,11 @@ function resolveWorkerStartAgent(inv, s, flagValue) {
 /** Distinct live Codex group ids, for naming them in the parallel-limit refusal. A
  * cap-exempt group (done per Orca, still holding its terminal) is named with a suffix so
  * the operator knows RELEASING it — not waiting on it — is what frees capacity; it is never
- * counted toward the cap number itself (see countLiveGroups). */
+ * counted toward the cap number itself (see countLiveGroups). Every still-unresolved
+ * reservation (a dispatch admitted at PreToolUse whose PostToolUse hasn't yet turned it into
+ * a real registered worker or dropped it) is named individually, not folded into one generic
+ * placeholder, so the operator can see exactly which reservation is holding capacity and when
+ * it will self-expire if nothing ever resolves it. */
 function liveCodexGroupIds(s) {
   const groups = new Map(); // group -> capExempt
   for (const [key, w] of Object.entries(s.workers)) {
@@ -58,7 +62,11 @@ function liveCodexGroupIds(s) {
     }
   }
   const names = [...groups.entries()].map(([g, exempt]) => (exempt ? `${g} (done, release it)` : g));
-  if (OC.countPendingCodexReservations(s) && !names.length) names.push('(reserved, not yet listed by orca)');
+  for (const [id, r] of Object.entries(s.reservations || {})) {
+    if (!r || !r.codexSlot || OC.reservationExpired(r)) continue;
+    const remainingMinutes = Math.max(0, Math.round((OC.RESERVATION_TTL_MS - (Date.now() - r.ts)) / 60000));
+    names.push(`pending reservation ${id} (expires in ${remainingMinutes}m)`);
+  }
   return names;
 }
 
