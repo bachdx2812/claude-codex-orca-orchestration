@@ -53,7 +53,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 473 tests, fully hermetic
+npm test                       # 492 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -68,7 +68,9 @@ so `--uninstall` can reverse exactly this and nothing else:
    content actually changes, and only the *first* backup this installer ever makes is
    recorded as the rollback target; the command points at the current `node` found via
    `which`/`where`, not a version-manager path that can vanish on a Node upgrade):
-   `SessionStart`/`UserPromptSubmit`/`PostToolUse`/`Stop` on matcher `*`, `PreToolUse` on
+   `SessionStart`/`UserPromptSubmit`/`PostToolUse`/`PostToolUseFailure`/`Stop` on matcher
+   `*` (`PostToolUseFailure` drops a failed tool call's reservation/ownership claim instead
+   of leaking it until the TTL), `PreToolUse` on
    matcher `Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task`. Idempotent — re-running
    install detects its own entries by their exact command string and does not duplicate
    them; if the resolved `node` path changed since the last install, the old command
@@ -104,9 +106,9 @@ Expect:
   warning if it sits inside a version-numbered directory (`.../Cellar/node/23.11.0/...`,
   `.../nvm/versions/node/...`) that a later Node upgrade could remove — run `--repair` to
   re-point at the current PATH node if so.
-- Hook entries: each of the five events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
-  `PostToolUse`, `Stop`) is checked for real presence in `settings.json` — not just that
-  the manifest claims to have added it.
+- Hook entries: each of the six events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+  `PostToolUse`, `PostToolUseFailure`, `Stop`) is checked for real presence in
+  `settings.json` — not just that the manifest claims to have added it.
 - Effective environment: whether `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_FABLE_MODEL`
   are set in `settings.json`'s `env` block, a warning if `CLAUDE_CODE_SUBAGENT_MODEL` is
   set (it overrides subagent model routing and can fight this gate's instructions), and

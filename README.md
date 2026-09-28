@@ -87,7 +87,8 @@ matched what it declared (ownership is *declared*, not observed).
 ## What it is
 
 Claude Code hooks are just scripts your settings.json wires to lifecycle events
-(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`). This repo ships
+(`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`Stop`). This repo ships
 two of them, both zero-dependency Node:
 
 - **`hooks/orchestrator-gate.cjs`** — refuses (exit code 2) a main-panel tool call that
@@ -115,7 +116,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 473 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 492 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
