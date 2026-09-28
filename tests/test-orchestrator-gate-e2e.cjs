@@ -1030,6 +1030,255 @@ rmState(`${SID}-hard-off`);
   rmState(B0SID);
 }
 
+// =====================================================================================
+// fix-round-1 items 2, 4, 5, 6, 7, 8, 12, 13 — e2e regression coverage
+// =====================================================================================
+
+// Item 2: two worker-starts chained in ONE command must be tracked as two distinct
+// groups, each converted against its OWN reservation; releasing one must not settle
+// the other.
+{
+  const B2 = quotaEnv('item2-two-starts', 10, 30, {});
+  const T2SID = `${SID}-item2`;
+  rmState(T2SID);
+  const tu = 'toolu_item2_combo';
+  const cmd = 'orca orchestration worker-start --agent codex --task ta && orca orchestration worker-start --agent codex --task tb';
+  invoke(mainBash(cmd, { sid: T2SID, tool_use_id: tu }), B2);
+  const replyOut = [
+    JSON.stringify({ ok: true, result: { dispatchId: 'ctx_item2_a' } }),
+    JSON.stringify({ ok: true, result: { dispatchId: 'ctx_item2_b' } }),
+  ].join('\n');
+  invoke(postBash(cmd, replyOut, { sid: T2SID, tool_use_id: tu }), B2);
+  {
+    const st = readState(T2SID);
+    const groupsDistinct = st && st.workers.ctx_item2_a && st.workers.ctx_item2_b &&
+      st.workers.ctx_item2_a.group !== st.workers.ctx_item2_b.group;
+    if (groupsDistinct) pass += 1;
+    else failures.push(`item2: two worker-starts in one command must be tracked as two distinct groups (${JSON.stringify(st && st.workers)})`);
+  }
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_item2_a', '{"ok":true}', { sid: T2SID }), B2);
+  {
+    const st = readState(T2SID);
+    if (st.workers.ctx_item2_a.status === 'settled' && st.workers.ctx_item2_b.status === 'live') pass += 1;
+    else failures.push(`item2: releasing one group must not settle the other (${JSON.stringify(st.workers)})`);
+  }
+  rmState(T2SID);
+}
+
+// Item 4: a background Agent dispatch's Owns: claim must survive its own launch
+// PostToolUse, and release only via a matching <task-notification><tool-use-id>.
+{
+  const B4 = quotaEnv('item4-bg', 10, 75, {});
+  const BG4SID = `${SID}-item4-bg`;
+  rmState(BG4SID);
+  const bgBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet',
+    prompt: 'Implement it. Verify: npm test (all pass).\nOwns: src/item4-bg/a.ts', run_in_background: true };
+  const tuBg = 'toolu_item4_bg_1';
+  expect('item4: a background exec dispatch with Owns: is allowed and claims it',
+    dispatch(bgBrief, BG4SID, { cwd: FAKE_REPO, tool_use_id: tuBg }), ALLOW, B4);
+  {
+    const st = readState(BG4SID);
+    if (st && st.agentClaims && st.agentClaims[tuBg] && st.agentClaims[tuBg].background === true) pass += 1;
+    else failures.push(`item4: a background dispatch's claim must be recorded with background:true (${JSON.stringify(st && st.agentClaims)})`);
+  }
+  invoke({ session_id: BG4SID, hook_event_name: 'PostToolUse', effort: 'high', tool_name: 'Agent',
+    tool_input: bgBrief, tool_use_id: tuBg, tool_response: { result: 'dispatched' } }, B4);
+  {
+    const st = readState(BG4SID);
+    if (st && st.agentClaims && st.agentClaims[tuBg]) pass += 1;
+    else failures.push('item4: a background claim must survive its own launch PostToolUse');
+  }
+  const stillBlocked = invoke(dispatch({ ...bgBrief, run_in_background: false }, BG4SID, { cwd: FAKE_REPO }), B4);
+  if (stillBlocked.code === DENY) pass += 1; else failures.push('item4: the background claim must still block an overlapping dispatch');
+  invoke(promptSubmit(BG4SID, `<task-notification><tool-use-id>${tuBg}</tool-use-id>Background task finished.</task-notification>`), B4);
+  {
+    const st = readState(BG4SID);
+    if (!st.agentClaims[tuBg]) pass += 1; else failures.push('item4: a <task-notification><tool-use-id> tag must release the matching background claim');
+  }
+  rmState(BG4SID);
+}
+
+// Item 5: a disabled gate must still let the REST of the per-invocation checks run — in
+// particular the parallel-Codex cap, in both directions (Owns disabled must not silently
+// skip the cap; the cap disabled must not silently skip its own reservation/counting).
+{
+  const CAP5 = quotaEnv('item5-cap-disabled-owns', 10, 30, { maxParallelCodexWorkers: 1, disabledGates: ['code-brief-needs-owns'] });
+  const G5SID = `${SID}-item5a`;
+  rmState(G5SID);
+  const tu5 = 'toolu_item5_1';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task item5a', { sid: G5SID, tool_use_id: tu5 }), CAP5);
+  invoke(postBash('orca orchestration worker-start --agent codex --task item5a', '{"dispatchId":"ctx_item5_1"}', { sid: G5SID, tool_use_id: tu5 }), CAP5);
+  const r5 = invoke(mainBash('orca orchestration worker-start --agent codex --spec "implement item5b.\nVerify: npm test"', { sid: G5SID, cwd: FAKE_REPO }), CAP5);
+  if (r5.code === DENY && /max-parallel-codex-workers/.test(r5.err)) pass += 1;
+  else failures.push(`item5: a disabled code-brief-needs-owns must still let the cap check run and count the dispatch (exit ${r5.code}, err ${r5.err.slice(0, 200)})`);
+  rmState(G5SID);
+
+  const CAP5b = quotaEnv('item5-cap-disabled-cap', 10, 30, { maxParallelCodexWorkers: 1, disabledGates: ['max-parallel-codex-workers'] });
+  const G5bSID = `${SID}-item5b`;
+  rmState(G5bSID);
+  const tu5b1 = 'toolu_item5b_1';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task item5c', { sid: G5bSID, tool_use_id: tu5b1 }), CAP5b);
+  invoke(postBash('orca orchestration worker-start --agent codex --task item5c', '{"dispatchId":"ctx_item5b_1"}', { sid: G5bSID, tool_use_id: tu5b1 }), CAP5b);
+  expect('item5: disabledGates on the cap itself still allows an over-cap dispatch',
+    mainBash('orca orchestration worker-start --agent codex --task item5d', { sid: G5bSID }), ALLOW, CAP5b);
+  {
+    const st5b = readState(G5bSID);
+    const reservedCount = Object.values(st5b.reservations || {}).filter((r) => r.codexSlot).length +
+      Object.values(st5b.workers || {}).filter((w) => w.status === 'live' && w.agent === 'codex').length;
+    if (reservedCount >= 2) pass += 1; else failures.push(`item5: a disabled cap gate must still reserve/count the dispatch, not skip it silently (${JSON.stringify(st5b)})`);
+  }
+  rmState(G5bSID);
+}
+
+// Item 6: each invocation's Owns:/verify check is judged against its OWN --spec only —
+// two disjoint worker-starts in one command, only the second missing Owns:, must be
+// refused specifically on the second.
+{
+  const B6 = quotaEnv('item6-brief-scope', 10, 30, {});
+  const T6SID = `${SID}-item6`;
+  rmState(T6SID);
+  const cmd6 = 'orca orchestration worker-start --agent codex --spec "implement p.\nVerify: npm test\nOwns: src/item6/p.ts" && ' +
+    'orca orchestration worker-start --agent codex --spec "implement q.\nVerify: npm test"';
+  const r6 = invoke(mainBash(cmd6, { sid: T6SID, cwd: FAKE_REPO }), B6);
+  if (r6.code === DENY && /code-brief-needs-owns/.test(r6.err)) pass += 1;
+  else failures.push(`item6: the second worker-start (missing Owns) must be refused specifically, not silently inherit the first's Owns: line (exit ${r6.code}, err ${r6.err.slice(0, 200)})`);
+  rmState(T6SID);
+
+  expect('item6: a single spec with Owns: is unaffected by unrelated prose earlier on the same line',
+    mainBash('echo "not a spec, mentions Owns: nothing" ; orca orchestration worker-start --agent codex --spec "implement r.\nVerify: npm test\nOwns: src/item6/r.ts"',
+      { sid: T6SID, cwd: FAKE_REPO }), ALLOW, B6);
+  rmState(T6SID);
+}
+
+// Item 7: a worker Orca reports done (dispatchStatus "completed") but still holding its
+// terminal is cap-exempt (frees a slot) WITHOUT being settled, so the Stop gate still
+// catches it as a leak.
+{
+  const CAP7 = quotaEnv('item7-cap-exempt', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G7SID = `${SID}-item7`;
+  rmState(G7SID);
+  const tu7 = 'toolu_item7_1';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task item7a', { sid: G7SID, tool_use_id: tu7 }), CAP7);
+  invoke(postBash('orca orchestration worker-start --agent codex --task item7a', '{"dispatchId":"ctx_item7_1"}', { sid: G7SID, tool_use_id: tu7 }), CAP7);
+  const doneHeldEnv = { ...CAP7, STUB_WORKERS_JSON: JSON.stringify([
+    { dispatchId: 'ctx_item7_1', terminalState: 'live', workerState: 'succeeded', dispatchStatus: 'completed' },
+  ]) };
+  expect('item7: a done-but-terminal-held worker is cap-exempt (frees a slot without being settled)',
+    mainBash('orca orchestration worker-start --agent codex --task item7b', { sid: G7SID }), ALLOW, doneHeldEnv);
+  {
+    const st7 = readState(G7SID);
+    if (st7.workers.ctx_item7_1.status === 'live' && st7.workers.ctx_item7_1.capExempt) pass += 1;
+    else failures.push(`item7: a done-but-held worker must stay LIVE (for the Stop gate) and be marked capExempt, not settled (${JSON.stringify(st7.workers.ctx_item7_1)})`);
+  }
+  rmState(G7SID);
+}
+
+// Item 8: worker-start --task "$ID" (unresolved) resolves against the ONE task-create in
+// the same command; retrying an already-SETTLED group goes through the normal cap check
+// as brand-new capacity, never exempted as if it were replacing a still-live one.
+{
+  const B8 = quotaEnv('item8-var-resolve', 10, 30, {});
+  const T8SID = `${SID}-item8`;
+  rmState(T8SID);
+  const cmd8 = 'ID=$(orca orchestration task-create --task-title "s" --spec "implement s.\nVerify: npm test\nOwns: src/item8/s.ts") && ' +
+    'orca orchestration worker-start --agent codex --task "$ID"';
+  expect('item8: worker-start --task "$ID" resolves against the one task-create in the same command',
+    mainBash(cmd8, { sid: T8SID, cwd: FAKE_REPO }), ALLOW, B8);
+  rmState(T8SID);
+
+  const CAP8 = quotaEnv('item8-retry-settled', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G8SID = `${SID}-item8-retry`;
+  rmState(G8SID);
+  const tuA = 'toolu_item8_a';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task item8a', { sid: G8SID, tool_use_id: tuA }), CAP8);
+  invoke(postBash('orca orchestration worker-start --agent codex --task item8a', '{"dispatchId":"ctx_item8_a"}', { sid: G8SID, tool_use_id: tuA }), CAP8);
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_item8_a', '{"ok":true}', { sid: G8SID }), CAP8);
+  const tuB = 'toolu_item8_b';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task item8b', { sid: G8SID, tool_use_id: tuB }), CAP8);
+  invoke(postBash('orca orchestration worker-start --agent codex --task item8b', '{"dispatchId":"ctx_item8_b"}', { sid: G8SID, tool_use_id: tuB }), CAP8);
+  const r8 = invoke(mainBash('orca orchestration worker-start --agent codex --retry-of ctx_item8_a', { sid: G8SID }), CAP8);
+  if (r8.code === DENY && /max-parallel-codex-workers/.test(r8.err)) pass += 1;
+  else failures.push(`item8: retrying an already-settled group must not be exempted from the cap as if it were replacing a live one (exit ${r8.code}, err ${r8.err.slice(0, 200)})`);
+  rmState(G8SID);
+}
+
+// Item 12: a failed tool call drops its reservation instead of leaking it until the TTL;
+// --release-claims=all also clears reservations, not just agentClaims.
+{
+  const CAP12 = quotaEnv('item12-fail-release', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G12SID = `${SID}-item12`;
+  rmState(G12SID);
+  const tu12 = 'toolu_item12_1';
+  invoke(mainBash('orca orchestration worker-start --agent codex --task item12a', { sid: G12SID, tool_use_id: tu12 }), CAP12);
+  invoke({ session_id: G12SID, hook_event_name: 'PostToolUse', effort: 'high', tool_name: 'Bash',
+    tool_input: { command: 'orca orchestration worker-start --agent codex --task item12a' },
+    tool_use_id: tu12, tool_response: { stdout: '', stderr: 'connection reset', is_error: true } }, CAP12);
+  expect('item12: a failed Bash tool call drops its reservation, freeing the cap',
+    mainBash('orca orchestration worker-start --agent codex --task item12b', { sid: G12SID }), ALLOW, CAP12);
+  rmState(G12SID);
+
+  const R12SID = `${SID}-item12-release`;
+  rmState(R12SID);
+  const r12StateFile = path.join(STATE_DIR, `${R12SID}.json`);
+  fs.writeFileSync(r12StateFile, JSON.stringify({
+    session_id: R12SID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: {}, reservations: { r_stuck: { ts: Date.now(), agent: 'codex', owns: null, ws: 'w', codexSlot: true } },
+    agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  invoke(promptSubmit(R12SID, '--release-claims=all'), CAP12);
+  {
+    const st12 = readState(R12SID);
+    if (!st12.reservations.r_stuck) pass += 1; else failures.push('item12: --release-claims=all must also clear reservations, not only agentClaims');
+  }
+  rmState(R12SID);
+}
+
+// Item 13: --worktree active/current normalize onto the "current" workspace key; a
+// subagent's own worker-start is never registered at PostToolUse either (not only never
+// gated/capped at PreToolUse); multiple Owns: lines in one brief all contribute.
+{
+  const B13 = quotaEnv('item13-worktree-normalize', 10, 30, {});
+  const W13SID = `${SID}-item13-ws`;
+  rmState(W13SID);
+  const tu13 = 'toolu_item13_1';
+  invoke(mainBash('orca orchestration worker-start --agent codex --worktree active --spec "implement t.\nVerify: npm test\nOwns: src/item13/t.ts"',
+    { sid: W13SID, cwd: FAKE_REPO, tool_use_id: tu13 }), B13);
+  invoke(postBash('orca orchestration worker-start --agent codex --worktree active --spec "implement t.\nVerify: npm test\nOwns: src/item13/t.ts"',
+    '{"dispatchId":"ctx_item13_1"}', { sid: W13SID, cwd: FAKE_REPO, tool_use_id: tu13 }), B13);
+  const r13 = invoke(mainBash('orca orchestration worker-start --agent codex --worktree current --spec "implement u.\nVerify: npm test\nOwns: src/item13/t.ts"',
+    { sid: W13SID, cwd: FAKE_REPO }), B13);
+  if (r13.code === DENY && /ownership-overlap/.test(r13.err)) pass += 1;
+  else failures.push(`item13: --worktree active and --worktree current must normalize onto the same workspace key (exit ${r13.code}, err ${r13.err.slice(0, 200)})`);
+  rmState(W13SID);
+
+  const Sub13SID = `${SID}-item13-sub`;
+  rmState(Sub13SID);
+  const subPost = { session_id: Sub13SID, hook_event_name: 'PostToolUse',
+    agent_id: 'ag_1', agent_type: 'general-purpose', tool_name: 'Bash',
+    tool_input: { command: 'orca orchestration worker-start --agent codex --task subws' },
+    tool_response: { stdout: '{"dispatchId":"ctx_item13_sub"}', stderr: '' } };
+  invoke(subPost, B13);
+  {
+    const st13sub = readState(Sub13SID);
+    if (!st13sub || !st13sub.workers || !st13sub.workers.ctx_item13_sub) pass += 1;
+    else failures.push('item13: a subagent Bash worker-start must never be registered at PostToolUse either');
+  }
+  rmState(Sub13SID);
+
+  const M13SID = `${SID}-item13-multi`;
+  rmState(M13SID);
+  expect('item13: multiple Owns: lines in one brief all count (not just the first)',
+    mainBash('orca orchestration worker-start --agent codex --spec "implement v.\nVerify: npm test\nOwns: src/item13/a.ts\nsome other line\nOwns: src/item13/b.ts"',
+      { sid: M13SID, cwd: FAKE_REPO }), ALLOW, B13);
+  {
+    const st = readState(M13SID);
+    const grp = st && Object.values(st.reservations)[0];
+    if (grp && grp.owns && grp.owns.includes('src/item13/a.ts') && grp.owns.includes('src/item13/b.ts')) pass += 1;
+    else failures.push(`item13: both Owns: lines must be recorded (${JSON.stringify(st && st.reservations)})`);
+  }
+  rmState(M13SID);
+}
+
 console.log(`${pass} passed, ${failures.length} failed`);
 for (const f of failures) console.log(`  FAIL ${f}`);
 

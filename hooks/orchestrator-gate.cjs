@@ -673,11 +673,24 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     const target = rc[2];
     let released = 0;
     if (target.toLowerCase() === 'all') {
-      released = Object.keys(s.agentClaims).length;
+      // Clears BOTH sources of a live ownership claim (item 12): in-session Agent claims
+      // AND Bash-dispatch reservations — a reservation is just as capable of holding a
+      // stuck Owns: claim (and a parallel-Codex cap slot) as an agentClaims entry is.
+      released = Object.keys(s.agentClaims).length + Object.keys(s.reservations).length;
       s.agentClaims = {};
+      s.reservations = {};
     } else if (s.agentClaims[target]) {
       delete s.agentClaims[target];
       released = 1;
+    } else if (s.reservations[target]) {
+      delete s.reservations[target];
+      released = 1;
+    } else {
+      // A reservation is keyed `<toolUseId>#<idx>`, not the bare id — releasing by the
+      // bare toolUseId should still reach every reservation it owns.
+      for (const key of Object.keys(s.reservations)) {
+        if (key === target || key.startsWith(`${target}#`)) { delete s.reservations[key]; released += 1; }
+      }
     }
     if (released) { save(s); process.stdout.write(`orchestrator-gate: released ${released} ownership claim(s).\n`); }
     else process.stdout.write(`orchestrator-gate: --release-claims ${target} matched no tracked claim.\n`);
@@ -955,6 +968,11 @@ function onPostToolUseLocked(p, s, cfg) {
       }
       if (s.agentClaims[failedToolUseId]) { delete s.agentClaims[failedToolUseId]; dirty = true; }
     }
+    // Nothing below this point should be trusted on a failed call: a Bash failure's
+    // stdout/stderr is not a real Orca reply and must never be scanned for ids (that would
+    // register a phantom "pending" worker for a dispatch that never actually happened).
+    if (dirty) save(s);
+    return;
   }
 
   // Foreground Agent/Task dispatches release their Owns: claim as soon as the dispatch

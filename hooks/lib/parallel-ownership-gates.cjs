@@ -194,7 +194,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   // same command (e.g. `task-create ... && worker-start --task "$ID"`) can resolve an
   // unexpanded `$ID` against the one task-create this command itself just created (item 8).
   const localReservations = {};
-  const taskCreatesInThisCommand = []; // { owns } per task-create invocation seen so far
+  const taskCreatesInThisCommand = []; // { owns, resKey } per task-create invocation seen so far
 
   // Only release the lock if THIS call actually acquired it — acquireLock() can return
   // false on timeout (degrade to allow, per the file-lock design), and unconditionally
@@ -225,6 +225,12 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
       let owns = null;       // resolved claim once known (empty array = explicit n/a)
       let ownsKnown = false; // an explicit Owns:/n/a was found, or inherited from a task
       let needsOwns = false; // this is code work, in a shared workspace
+      // Set only when this invocation inherited its claim from a task-create EARLIER IN
+      // THIS SAME command line (the `$ID` resolution below): that task-create's own
+      // reservation is a still-live claim over the identical files, but it is this
+      // worker-start's own predecessor, not a genuine second claimant — excluded from the
+      // overlap check the same way a --retry-of/--terminal replacement is (item 8).
+      let sourceTaskResKey = null;
 
       if (hasFlag(inv.args, '--spec')) {
         // Ownership is enforced where the workspace is actually known: worker-start. A
@@ -234,7 +240,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
         needsOwns = !isolated && !isTaskCreate && EXEC_INTENT.test(brief.text);
         const parsed = OWN.parseOwns(brief.text, { repoRoot: repoRootDir });
         if (parsed.present) { ownsKnown = true; owns = parsed.isNA ? [] : parsed.owns; }
-        if (isTaskCreate) taskCreatesInThisCommand.push({ owns: ownsKnown ? owns : null });
+        if (isTaskCreate) taskCreatesInThisCommand.push({ owns: ownsKnown ? owns : null, resKey: `${baseId}#${idx}` });
       } else if (!isTaskCreate) {
         const taskRef = flagValue(inv.args, '--task');
         if (taskRef) {
@@ -246,6 +252,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
               owns = taskCreatesInThisCommand[0].owns;
               ownsKnown = owns !== null;
               needsOwns = !isolated && owns === null;
+              sourceTaskResKey = taskCreatesInThisCommand[0].resKey;
             } else {
               process.stdout.write(
                 `orchestrator-gate advice: worker-start --task ${taskRef} looks unresolved (an unexpanded ` +
@@ -290,7 +297,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
         null;
 
       if (!isolated && owns && owns.length) {
-        const claims = OC.liveClaims(s, ttl, replacesGroup);
+        const claims = OC.liveClaims(s, ttl, replacesGroup).filter((c) => c.id !== sourceTaskResKey);
         const conflict = OC.findOverlap(claims, ws, owns);
         if (conflict) {
           if (gateDisabled(cfg, 'ownership-overlap')) {
