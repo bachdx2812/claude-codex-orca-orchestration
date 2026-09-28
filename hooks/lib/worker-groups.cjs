@@ -36,11 +36,27 @@ function idsFromOutput(out) {
   return ids;
 }
 
-/** True when a parsed reply is worker-list-shaped (carries a `workers[]` array) rather than
- * a single dispatch's own reply — excluded everywhere replies are collected. */
+/**
+ * True when a parsed value is a real orca reply envelope worth attributing to a dispatch
+ * invocation, rather than noise a lenient parser happened to accept: it must be a plain
+ * object (never an array or primitive — `[3]` from a stray `retry [3]` log line parses as
+ * valid JSON but is never a dispatch reply), it must not be worker-list-shaped (carries a
+ * `workers[]` array), and it must carry at least one field a real envelope always has — an
+ * explicit `ok`, an `error`, or one of the dispatch/task/terminal id fields, checked at the
+ * top level, one level under `.result` (the common `{"ok":true,"result":{...}}` shape), or
+ * nested further under `.result.mutation`/`.result.resource` (the fuller nested-envelope
+ * shape). A bare `{}` — a real but signal-less object a stray log line can produce just as
+ * easily as a genuine reply — carries none of these and is correctly rejected as noise.
+ */
 function isDispatchReply(obj) {
-  const r = (obj && obj.result) || obj;
-  return !(r && Array.isArray(r.workers));
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+  const r = (obj.result && typeof obj.result === 'object' && !Array.isArray(obj.result)) ? obj.result : obj;
+  if (Array.isArray(r.workers)) return false;
+  const hasSignal = (o) => !!o && typeof o === 'object' && !Array.isArray(o) && (
+    'ok' in o || 'error' in o ||
+    typeof o.dispatchId === 'string' || typeof o.taskId === 'string' || typeof o.handle === 'string'
+  );
+  return hasSignal(obj) || hasSignal(r) || hasSignal(r.mutation) || hasSignal(r.resource);
 }
 
 /**
@@ -50,6 +66,17 @@ function isDispatchReply(obj) {
  * between or inside them. A `{`/`}` inside a quoted string (e.g. a dispatch's own prompt
  * text) never affects the brace-depth count, so it can never mis-split a reply that merely
  * contains braces as content.
+ *
+ * At depth 0 (not currently inside an opened candidate chunk), a `{`/`[` only OPENS one when
+ * it is the first non-whitespace character of its own line — the discriminator between "this
+ * line is a real JSON reply" and "this is human-readable log/progress text that happens to
+ * contain a brace/bracket somewhere in the middle" (`retry [3]`, `progress [==` never open a
+ * chunk this way, and never derail bracket-depth tracking for the real replies that follow).
+ * Depth 0 also never enters string mode: a stray, unterminated `"` in ordinary log text
+ * (`Starting "phase`) before any chunk has been opened is inert noise, not the start of a
+ * JSON string — string/escape tracking only applies once already inside an opened chunk
+ * (depth > 0), where it is still needed to handle a reply whose own string content contains
+ * braces or brackets.
  */
 function splitConcatenatedJson(text) {
   const chunks = [];
@@ -57,8 +84,22 @@ function splitConcatenatedJson(text) {
   let start = -1;
   let inString = false;
   let escaped = false;
+  let atLineStart = true;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
+    if (depth === 0) {
+      if (c === '\n') { atLineStart = true; continue; }
+      if (c === ' ' || c === '\t' || c === '\r') continue; // whitespace never ends "start of line"
+      if ((c === '{' || c === '[') && atLineStart) {
+        start = i;
+        depth = 1;
+        atLineStart = false;
+        continue;
+      }
+      atLineStart = false; // any other non-whitespace character (including a stray quote) is inert noise
+      continue;
+    }
+    // depth > 0: inside an opened candidate chunk — normal string/escape-aware balanced scan.
     if (inString) {
       if (escaped) escaped = false;
       else if (c === '\\') escaped = true;
@@ -66,16 +107,10 @@ function splitConcatenatedJson(text) {
       continue;
     }
     if (c === '"') { inString = true; continue; }
-    if (c === '{' || c === '[') {
-      if (depth === 0) start = i;
-      depth += 1;
-      continue;
-    }
+    if (c === '{' || c === '[') { depth += 1; continue; }
     if (c === '}' || c === ']') {
-      if (depth > 0) {
-        depth -= 1;
-        if (depth === 0 && start !== -1) { chunks.push(text.slice(start, i + 1)); start = -1; }
-      }
+      depth -= 1;
+      if (depth === 0) { chunks.push(text.slice(start, i + 1)); start = -1; }
       continue;
     }
   }

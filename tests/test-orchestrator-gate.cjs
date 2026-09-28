@@ -792,6 +792,27 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   const onePretty = prettyEnvelope('ctx_solo', 'task_solo', 'term_solo');
   check('splitJsonReplies: a single pretty-printed reply is still exactly one object',
     WG.splitJsonReplies(onePretty).map((r) => r.result.dispatchId), ['ctx_solo']);
+
+  // Third review round, item 2: realistic mixed log+JSON stdout must not break the
+  // balanced-brace fallback (pass 3) — a log line containing `[3]`/`[==`/a stray `"` must
+  // never shift, corrupt, or swallow the real replies around it.
+  const r1 = JSON.stringify({ ok: true, result: { dispatchId: 'ctx_1', taskId: 'task_1' } });
+  const r2 = JSON.stringify({ ok: true, result: { dispatchId: 'ctx_2', taskId: 'task_2' } });
+  const dispatchIds = (text) => WG.splitJsonReplies(text).map((r) => r.result.dispatchId);
+  check('splitJsonReplies: a `retry [3]` log line before two replies does not shift or misattribute them',
+    dispatchIds(`retry [3]\n${r1}\n${r2}\n`), ['ctx_1', 'ctx_2']);
+  check('splitJsonReplies: a bare `{}` log artifact between real replies is rejected as signal-less noise',
+    dispatchIds(`${r1}\nnote\n${r2}\n`), ['ctx_1', 'ctx_2']);
+  check('splitJsonReplies: a bare `{}` line on its own is never counted as a dispatch reply',
+    WG.splitJsonReplies('{}\n').length, 0);
+  check('splitJsonReplies: a stray unterminated quote in a log line before any chunk opens is inert',
+    dispatchIds(`Starting "phase\n${r1}\n${r2}\n`), ['ctx_1', 'ctx_2']);
+  check('splitJsonReplies: an unbalanced `[` in a log line never derails bracket-depth for what follows',
+    dispatchIds(`progress [==\n${r1}\n${r2}\n`), ['ctx_1', 'ctx_2']);
+  check('splitJsonReplies: trailing log noise (with its own stray bracket/quote) after real replies is ignored',
+    dispatchIds(`${r1}\n${r2}\nwarn: [x "y\n`), ['ctx_1', 'ctx_2']);
+  check('splitJsonReplies: an array value (e.g. a stray `[3]`) is never accepted as a dispatch reply',
+    WG.splitJsonReplies('[3]\n').length, 0);
 }
 
 // --- ownership.cjs: ownsOverlap regression cases for the fix-round-1 false negatives (item 3) --
