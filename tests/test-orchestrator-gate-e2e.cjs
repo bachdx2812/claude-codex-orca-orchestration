@@ -1399,12 +1399,12 @@ rmState(`${SID}-hard-off`);
   invoke(mainBash('orca orchestration worker-start --agent codex --task round3item3old', { sid: G3iSID, tool_use_id: tuOld }), CAP3i);
   invoke(postBash('orca orchestration worker-start --agent codex --task round3item3old', '{"dispatchId":"ctx_round3_item3_old"}', { sid: G3iSID, tool_use_id: tuOld }), CAP3i);
   // Orca now reports that seeded worker as done but still holding its terminal — reconciling
-  // it marks it cap-exempt (frees the one slot) without settling it.
+  // it marks it cap-exempt (frees the one opening) without settling it.
   const reconcileEnv3i = { ...CAP3i, STUB_WORKERS_JSON: JSON.stringify([
     { dispatchId: 'ctx_round3_item3_old', terminalState: 'live', workerState: 'succeeded', dispatchStatus: 'completed' },
   ]) };
   // One command, two worker-starts claiming the IDENTICAL Owns in the same shared workspace:
-  // invocation 0 triggers the at-cap reconcile (freeing the slot via the done-but-held
+  // invocation 0 triggers the at-cap reconcile (freeing capacity via the done-but-held
   // worker above) and is admitted; invocation 1, in the very same command, then conflicts
   // with invocation 0's own just-made reservation and is refused for ownership-overlap — so
   // the overall command is denied even though the reconcile itself succeeded.
