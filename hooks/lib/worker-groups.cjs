@@ -68,15 +68,18 @@ function isDispatchReply(obj) {
  * contains braces as content.
  *
  * At depth 0 (not currently inside an opened candidate chunk), a `{`/`[` only OPENS one when
- * it is the first non-whitespace character of its own line — the discriminator between "this
- * line is a real JSON reply" and "this is human-readable log/progress text that happens to
- * contain a brace/bracket somewhere in the middle" (`retry [3]`, `progress [==` never open a
- * chunk this way, and never derail bracket-depth tracking for the real replies that follow).
- * Depth 0 also never enters string mode: a stray, unterminated `"` in ordinary log text
- * (`Starting "phase`) before any chunk has been opened is inert noise, not the start of a
- * JSON string — string/escape tracking only applies once already inside an opened chunk
- * (depth > 0), where it is still needed to handle a reply whose own string content contains
- * braces or brackets.
+ * it is the first non-whitespace character of its own line, OR the character immediately
+ * following a chunk that just closed — the discriminator between "this line is a real JSON
+ * reply" and "this is human-readable log/progress text that happens to contain a
+ * brace/bracket somewhere in the middle" (`retry [3]`, `progress [==` never open a chunk this
+ * way, and never derail bracket-depth tracking for the real replies that follow), while still
+ * letting two real replies printed back-to-back on the SAME line (`{...}{...}`, no separator
+ * at all) both open — the "start of line" flag is forced true the instant a real, successfully
+ * completed top-level value closes, never by arbitrary other characters. Depth 0 also never
+ * enters string mode: a stray, unterminated `"` in ordinary log text (`Starting "phase`)
+ * before any chunk has been opened is inert noise, not the start of a JSON string —
+ * string/escape tracking only applies once already inside an opened chunk (depth > 0), where
+ * it is still needed to handle a reply whose own string content contains braces or brackets.
  */
 function splitConcatenatedJson(text) {
   const chunks = [];
@@ -110,7 +113,15 @@ function splitConcatenatedJson(text) {
     if (c === '{' || c === '[') { depth += 1; continue; }
     if (c === '}' || c === ']') {
       depth -= 1;
-      if (depth === 0) { chunks.push(text.slice(start, i + 1)); start = -1; }
+      if (depth === 0) {
+        chunks.push(text.slice(start, i + 1));
+        start = -1;
+        // A real value just closed: the very next character may be a second reply printed
+        // immediately after it with no separator (`{...}{...}`) — treat that position as a
+        // fresh "start of line" so it can still open a chunk, without waiting for an actual
+        // newline.
+        atLineStart = true;
+      }
       continue;
     }
   }

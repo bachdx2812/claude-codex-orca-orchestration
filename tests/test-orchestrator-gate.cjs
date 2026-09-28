@@ -813,6 +813,12 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     dispatchIds(`${r1}\n${r2}\nwarn: [x "y\n`), ['ctx_1', 'ctx_2']);
   check('splitJsonReplies: an array value (e.g. a stray `[3]`) is never accepted as a dispatch reply',
     WG.splitJsonReplies('[3]\n').length, 0);
+
+  // Fourth Opus 5.5 review round, item 1: two real replies printed back-to-back on the SAME
+  // line, with no separator between them at all, must still both split (a chunk closing must
+  // itself re-open the "start of line" flag, not only an actual `\n`).
+  check('splitJsonReplies: two real replies with no separator on the same line (`{...}{...}`) both split',
+    dispatchIds(`${r1}${r2}`), ['ctx_1', 'ctx_2']);
 }
 
 // --- ownership.cjs: ownsOverlap regression cases for the fix-round-1 false negatives (item 3) --

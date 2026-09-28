@@ -982,8 +982,21 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
   const dispatchInvs = orcaInvocations(cmd).filter((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
   if (!dispatchInvs.length) return false;
   const toolUseId = p.tool_use_id || p.toolUseId || null;
-  const replies = dispatchInvs.length > 1 ? WG.splitJsonReplies(out) : null;
-  const replySlice = (idx) => (replies ? (replies[idx] !== undefined ? JSON.stringify(replies[idx]) : '') : out);
+  const rawReplies = dispatchInvs.length > 1 ? WG.splitJsonReplies(out) : null;
+  // A count mismatch (e.g. one invocation's reply got swallowed by a log-line prefix that
+  // defeated the line-start discriminator, or a stray object was miscounted as a reply) means
+  // positional zipping (`replies[idx]` <-> `dispatchInvs[idx]`) cannot be trusted AT ALL — it
+  // would silently credit one invocation's ids/owns/agent to a completely different
+  // invocation. Rather than guess which index is "really" which, every invocation in this
+  // command is treated as id-less: each falls through to its own "no ids found" handling
+  // (a pending placeholder on the success path, an untouched reservation on the failure path),
+  // which is always safe even when wrong, unlike a confident-but-incorrect attribution.
+  const mismatched = !!rawReplies && rawReplies.length !== dispatchInvs.length;
+  const replies = mismatched ? null : rawReplies;
+  const replySlice = (idx) => {
+    if (mismatched) return '';
+    return replies ? (replies[idx] !== undefined ? JSON.stringify(replies[idx]) : '') : out;
+  };
   let dirty = false;
 
   dispatchInvs.forEach((inv, idx) => {
@@ -1060,14 +1073,19 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
  * Runs under the same lock-reload-mutate-save discipline as every other state write (item
  * 1 of the prior round).
  *
- * A failed/interrupted Bash call that actually invoked a dispatch sub-command (e.g.
- * `orca orchestration worker-start ... --json && false`, or the same command Ctrl-C'd after
- * Orca already answered) may well have dispatched a real worker before the failure — the
- * non-zero exit or interrupt says nothing about whether the dispatch itself succeeded.
- * `p.error` carries the command's actual output on this event, so it is scanned exactly like
- * a successful reply would be via `registerDispatchReplies`. Only a Bash call with NO
- * dispatch sub-command at all, or an Agent/Task claim (which has no such ambiguity), gets its
- * reservation/claim dropped immediately.
+ * A Bash call that actually invoked a dispatch sub-command and then genuinely errored out
+ * (non-zero exit — e.g. `orca orchestration worker-start ... --json && false`) may well have
+ * dispatched a real worker before that failure; the exit code says nothing about whether the
+ * dispatch itself succeeded. `p.error` carries the command's actual output on this event, so
+ * it is scanned exactly like a successful reply would be via `registerDispatchReplies`. Only a
+ * Bash call with NO dispatch sub-command at all, one whose error text contains no `{`
+ * whatsoever (a real dispatch reply is always JSON, so there is no ambiguity left), or an
+ * Agent/Task claim (no such ambiguity to begin with), gets its reservation/claim dropped
+ * immediately.
+ *
+ * NOTE: cancelling/interrupting a still-running tool call does NOT fire this event at all
+ * (Claude Code's hook docs) — that case never reaches this handler and is invisible to it.
+ * It is handled correctly by the reservation's own TTL expiry instead, same as it always was.
  */
 function onPostToolUseFailure(p, s, cfg) {
   const lockDir = path.join(DIR, '.lock');
@@ -1079,9 +1097,24 @@ function onPostToolUseFailure(p, s, cfg) {
     if (p.tool_name === 'Bash') {
       const cmd = String((p.tool_input && p.tool_input.command) || '');
       const hasDispatch = orcaInvocations(cmd).some((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
-      if (hasDispatch) {
-        if (registerDispatchReplies(s, p, cmd, String(p.error || ''), { assumeDispatched: false })) dirty = true;
+      const errorText = String(p.error || '');
+      // Two different "no id was found" cases must NOT be treated the same:
+      //  - errorText is NON-EMPTY and contains no `{` at all (e.g. `--bad-flag`'s plain-text
+      //    CLI usage error) — a real orca `--json` dispatch reply is ALWAYS JSON, so this is
+      //    affirmative, positive evidence nothing was dispatched. No ambiguity: drop now.
+      //  - errorText is EMPTY (no output was captured at all, e.g. before Orca could reply) —
+      //    this is an absence of information, not evidence of anything; the outcome is
+      //    genuinely unknown, so the reservation must be kept for the TTL exactly as before.
+      const definitelyNoJson = errorText.length > 0 && !errorText.includes('{');
+      if (hasDispatch && !definitelyNoJson) {
+        // Either the error text carries at least one `{` (scan it for a real id exactly like a
+        // success would), or it's empty (registerDispatchReplies will find no ids either way
+        // and, with assumeDispatched:false, correctly leave the reservation untouched).
+        if (registerDispatchReplies(s, p, cmd, errorText, { assumeDispatched: false })) dirty = true;
       } else if (dropFailedToolState(s, toolUseId)) {
+        // Either this command had no dispatch sub-command at all, or its error text
+        // affirmatively contains no JSON whatsoever — drop the reservation now rather than
+        // waiting out its TTL.
         dirty = true;
       }
     } else if (dropFailedToolState(s, toolUseId)) {
