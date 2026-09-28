@@ -63,14 +63,16 @@ function liveCodexGroupIds(s) {
 }
 
 /**
- * Reconciles `s.workers` against Orca's own `worker-list --json`, dropping rows Orca
- * reports released or done, and dropping an id Orca never mentions at all once it is
- * older than 10 minutes (a very recent dispatch Orca simply hasn't listed yet is kept).
- * Called only when the local count is at or over the parallel-Codex cap, so a healthy
- * session under the cap never pays this round trip. Returns false when Orca could not be
- * asked at all (malformed reply or unreachable) — the caller then trusts local state.
+ * Pure fetch: exec `orca orchestration worker-list --json` and return its parsed worker
+ * rows, or null on any failure (unreachable, malformed reply). Does NO read or write of
+ * session state, so it is safe to call with the file lock NOT held — this is the (up to 5s)
+ * part of reconciliation that must never block every other concurrent hook process, and,
+ * just as important, must never let its own before/after state snapshot race a concurrent
+ * process's lock-protected write (see `handleOrcaDispatchGates`'s at-cap branch, which calls
+ * this unlocked and only ever applies the result after re-acquiring the lock and reloading
+ * fresh state — item 1 of the second review round).
  */
-function reconcileCodexGroupsWithOrca(s, orcaBin) {
+function fetchOrcaWorkerRows(orcaBin) {
   let out;
   try {
     out = require('child_process').execFileSync(
@@ -78,23 +80,39 @@ function reconcileCodexGroupsWithOrca(s, orcaBin) {
       { encoding: 'utf8', timeout: 5000, maxBuffer: 32 * 1024 * 1024 }
     );
   } catch {
-    return false;
+    return null;
   }
-  let workers;
   try {
     const parsed = JSON.parse(out);
     const r = parsed.result ?? parsed;
-    workers = Array.isArray(r) ? r : r.workers || [];
+    return Array.isArray(r) ? r : r.workers || [];
   } catch {
-    return false;
+    return null;
   }
-  const DONE = /^(succeeded|failed|stopped|cancelled|canceled|completed)$/i;
+}
+
+const DONE = /^(succeeded|failed|stopped|cancelled|canceled|completed)$/i;
+
+/**
+ * Pure apply: mutates `s.workers` in place against already-fetched Orca rows — dropping rows
+ * Orca reports released, marking a done-but-still-terminal-held row cap-exempt (see below),
+ * and dropping an id Orca never mentions at all once it is older than 10 minutes (a very
+ * recent dispatch Orca simply hasn't listed yet is kept). Must only be called while the lock
+ * IS held, and only against a state object freshly reloaded from disk — never a stale
+ * snapshot taken before the (unlocked) fetch — so this mutation can never silently overwrite
+ * a concurrent process's write made during the fetch's own round trip. Returns true when
+ * anything changed.
+ */
+function applyOrcaReconciliation(s, rows) {
   const liveIds = new Set();
   const releasedIds = new Set();
   const doneButHeldIds = new Set();
-  for (const w of workers) {
+  for (const w of rows || []) {
     const ids = [w.dispatchId, w.taskId, w.agentTerminalHandle].filter(Boolean);
-    const isDone = DONE.test(String(w.workerState || w.dispatchStatus || ''));
+    // Independent field checks (item 8): `workerState` being present but non-matching (e.g.
+    // "running") must never short-circuit away from also checking `dispatchStatus` — a
+    // worker can be reported done through either field alone.
+    const isDone = DONE.test(String(w.workerState || '')) || DONE.test(String(w.dispatchStatus || ''));
     if (w.terminalState === 'released') {
       // Fully released: free its capacity AND drop it from tracking (below).
       for (const id of ids) releasedIds.add(id);
@@ -110,12 +128,34 @@ function reconcileCodexGroupsWithOrca(s, orcaBin) {
     }
   }
   const tenMinAgo = Date.now() - 10 * 60 * 1000;
+  let changed = false;
   for (const [key, w] of Object.entries(s.workers)) {
     if (w.status !== 'live') continue;
-    if (releasedIds.has(key)) { w.status = 'settled'; continue; }
-    if (doneButHeldIds.has(key)) { w.capExempt = true; continue; }
-    if (!liveIds.has(key) && !doneButHeldIds.has(key) && (w.started || 0) < tenMinAgo) w.status = 'settled';
+    // A "pending-<ts>" key is a placeholder registered when a worker-start's own reply
+    // carried no id at all (see orchestrator-gate.cjs) — Orca was NEVER given this key as an
+    // id, so it can never appear in `rows` under any status. Its only correct resolution is
+    // a later worker-list/worker-read poll adopting a real id for it; the 10-minute
+    // "Orca never mentioned it" rule below must not apply to it; a still-genuinely-running
+    // worker would otherwise be settled out from under itself just because this particular
+    // reconcile pass, by construction, could never have found it.
+    if (key.startsWith('pending-')) continue;
+    if (releasedIds.has(key)) { w.status = 'settled'; changed = true; continue; }
+    if (doneButHeldIds.has(key)) { if (!w.capExempt) { w.capExempt = true; changed = true; } continue; }
+    if (!liveIds.has(key) && (w.started || 0) < tenMinAgo) { w.status = 'settled'; changed = true; }
   }
+  return changed;
+}
+
+/**
+ * Convenience wrapper composing fetch+apply against the SAME state object, for callers (and
+ * existing tests) that don't need the unlocked-fetch/locked-apply split `handleOrcaDispatchGates`
+ * performs itself. Returns false when Orca could not be asked at all — the caller then trusts
+ * local state, exactly as before.
+ */
+function reconcileCodexGroupsWithOrca(s, orcaBin) {
+  const rows = fetchOrcaWorkerRows(orcaBin);
+  if (rows === null) return false;
+  applyOrcaReconciliation(s, rows);
   return true;
 }
 
@@ -323,18 +363,22 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
         if (codexSlot && cap > 0 && !gateDisabled(cfg, 'max-parallel-codex-workers')) {
           let live = WG.countLiveGroups(s.workers, 'codex') + OC.countPendingCodexReservations(s);
           if (live >= cap) {
-            // Run the (up to 5s) Orca reconcile OUTSIDE the lock, so an at-cap check on one
-            // session never blocks every other concurrent hook process for that long (item
-            // 10). Reservations this same command already made (localReservations) are
-            // re-applied onto the freshly reloaded state so they are never lost by the
-            // reload, then the count is rechecked under the lock before proceeding.
+            // Run the (up to 5s) Orca reconcile's NETWORK CALL ONLY outside the lock, so an
+            // at-cap check on one session never blocks every other concurrent hook process
+            // for that long (item 10) — but never read-modify-write state while unlocked
+            // (second review round, item 1): a concurrent process's lock-protected write
+            // made during this round trip must never be clobbered by a stale save landing
+            // after it. `fetchOrcaWorkerRows` does no state I/O at all; the fetched rows are
+            // only ever applied to a FRESH post-reacquire `load()`, under the lock, so
+            // whatever changed during the unlocked window (including this same command's own
+            // earlier localReservations, re-applied here since the reload wiped them) is
+            // never lost.
             if (locked) { releaseLock(lockDir); locked = false; }
-            const reconciled = load(sessionId);
-            const changed = reconcileCodexGroupsWithOrca(reconciled, ORCA_BIN);
-            if (changed) save(reconciled);
+            const rows = fetchOrcaWorkerRows(ORCA_BIN);
             locked = acquireLock(lockDir, {});
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
+            if (rows !== null) applyOrcaReconciliation(s, rows);
             live = WG.countLiveGroups(s.workers, 'codex') + OC.countPendingCodexReservations(s);
           }
           if (live >= cap) {
@@ -364,5 +408,5 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
 module.exports = {
   OWNS_BRIEF_HELP, resolveWorkerStartAgent, liveCodexGroupIds, reconcileCodexGroupsWithOrca,
-  handleOrcaDispatchGates, resolveSpecText,
+  fetchOrcaWorkerRows, applyOrcaReconciliation, handleOrcaDispatchGates, resolveSpecText,
 };

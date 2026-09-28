@@ -621,7 +621,12 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   // to react to. TTL and --release-claims remain the safety nets when no id is found here.
   if (/<task-notification\b/i.test(raw)) {
     let releasedAny = false;
-    for (const m of raw.matchAll(/\b(toolu_[A-Za-z0-9_-]+|agent_[A-Za-z0-9_-]+)\b/g)) {
+    // Only an id that appears INSIDE the notification's own <tool-use-id> tag identifies the
+    // dispatch that just finished. Matching anywhere in the whole block (the pre-fix
+    // behavior) also matched ids mentioned in the notification's free-text <result> body —
+    // e.g. a finished task's own result text naming a still-running sibling task's id —
+    // which wrongly released that sibling's claim while its work was still in flight.
+    for (const m of raw.matchAll(/<tool-use-id>\s*(toolu_[A-Za-z0-9_-]+|agent_[A-Za-z0-9_-]+)\s*<\/tool-use-id>/gi)) {
       if (s.agentClaims[m[1]]) { delete s.agentClaims[m[1]]; releasedAny = true; }
     }
     if (releasedAny) save(s);
@@ -931,6 +936,42 @@ function onPreToolUse(p, s, cfg) {
   }
 }
 
+/**
+ * Drops `toolUseId`'s live reservation and/or in-session-Agent ownership claim. Shared by
+ * the defense-in-depth `toolFailed` check inside `onPostToolUseLocked` and by
+ * `onPostToolUseFailure` (the real, separate failure event) — a failed dispatch must never
+ * hold a parallel-Codex-worker opening or an Owns: claim until its TTL just because it errored.
+ * Returns true when anything was actually removed.
+ */
+function dropFailedToolState(s, toolUseId) {
+  if (!toolUseId) return false;
+  let dirty = false;
+  for (const key of Object.keys(s.reservations)) {
+    if (key === toolUseId || key.startsWith(`${toolUseId}#`)) { delete s.reservations[key]; dirty = true; }
+  }
+  if (s.agentClaims[toolUseId]) { delete s.agentClaims[toolUseId]; dirty = true; }
+  return dirty;
+}
+
+/**
+ * `PostToolUseFailure` — Claude Code's actual event for a tool call that errored out
+ * (code.claude.com/docs/en/hooks; claude-code issue #6371), distinct from `PostToolUse`.
+ * Runs under the same lock-reload-mutate-save discipline as every other state write (item
+ * 1 of the prior round): a failed Bash/Agent dispatch's reservation/claim is dropped
+ * immediately rather than waiting out the reservation TTL / ownershipClaimTtlMinutes.
+ */
+function onPostToolUseFailure(p, s, cfg) {
+  const lockDir = path.join(DIR, '.lock');
+  const locked = acquireLock(lockDir, {});
+  try {
+    s = load(p.session_id);
+    const toolUseId = p.tool_use_id || p.toolUseId;
+    if (dropFailedToolState(s, toolUseId)) save(s);
+  } finally {
+    if (locked) releaseLock(lockDir);
+  }
+}
+
 function onPostToolUse(p, s, cfg) {
   // CRITICAL: every mutation in this function runs against a copy of state reloaded fresh
   // AFTER the lock is held, never the stale snapshot main() loaded before any lock existed
@@ -957,17 +998,13 @@ function onPostToolUseLocked(p, s, cfg) {
   // Orca "ok":false JSON, no registered worker, no launched-then-finished Agent) — without
   // this, its PreToolUse reservation/claim would sit until the 10-minute reservation TTL
   // (or the much longer ownershipClaimTtlMinutes for an agentClaim), silently holding a
-  // parallel-Codex opening or an ownership claim for nothing. Recognise the common
-  // error-indicator shapes and drop this tool_use_id's reservation/claim outright.
+  // parallel-Codex opening or an ownership claim for nothing. Defense in depth only: on the
+  // real harness a failed call fires the SEPARATE `PostToolUseFailure` event (see
+  // onPostToolUseFailure below), not a `PostToolUse` with an error flag on `tool_response` —
+  // but if some environment ever does shape it this way, still clean up rather than leak.
   const toolFailed = !!(resp && (resp.is_error === true || resp.error || resp.isError === true));
   if (toolFailed) {
-    const failedToolUseId = p.tool_use_id || p.toolUseId;
-    if (failedToolUseId) {
-      for (const key of Object.keys(s.reservations)) {
-        if (key === failedToolUseId || key.startsWith(`${failedToolUseId}#`)) { delete s.reservations[key]; dirty = true; }
-      }
-      if (s.agentClaims[failedToolUseId]) { delete s.agentClaims[failedToolUseId]; dirty = true; }
-    }
+    if (dropFailedToolState(s, p.tool_use_id || p.toolUseId)) dirty = true;
     // Nothing below this point should be trusted on a failed call: a Bash failure's
     // stdout/stderr is not a real Orca reply and must never be scanned for ids (that would
     // register a phantom "pending" worker for a dispatch that never actually happened).
@@ -1298,6 +1335,7 @@ function main(p) {
     case 'UserPromptSubmit': return onUserPromptSubmit(p, s, cfg);
     case 'PreToolUse': return onPreToolUse(p, s, cfg);
     case 'PostToolUse': return onPostToolUse(p, s, cfg);
+    case 'PostToolUseFailure': return onPostToolUseFailure(p, s, cfg);
     case 'Stop': return onStop(p, s, cfg);
     default: return;
   }

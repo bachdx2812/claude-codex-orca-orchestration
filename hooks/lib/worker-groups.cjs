@@ -36,24 +36,97 @@ function idsFromOutput(out) {
   return ids;
 }
 
+/** True when a parsed reply is worker-list-shaped (carries a `workers[]` array) rather than
+ * a single dispatch's own reply — excluded everywhere replies are collected. */
+function isDispatchReply(obj) {
+  const r = (obj && obj.result) || obj;
+  return !(r && Array.isArray(r.workers));
+}
+
+/**
+ * Depth-limited, string/escape-aware scan that splits a blob of concatenated JSON text into
+ * its individual top-level `{...}`/`[...]` value chunks, whatever whitespace (including
+ * newlines — a pretty-printed `JSON.stringify(x, null, 2)` reply spans many lines) sits
+ * between or inside them. A `{`/`}` inside a quoted string (e.g. a dispatch's own prompt
+ * text) never affects the brace-depth count, so it can never mis-split a reply that merely
+ * contains braces as content.
+ */
+function splitConcatenatedJson(text) {
+  const chunks = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; continue; }
+    if (c === '{' || c === '[') {
+      if (depth === 0) start = i;
+      depth += 1;
+      continue;
+    }
+    if (c === '}' || c === ']') {
+      if (depth > 0) {
+        depth -= 1;
+        if (depth === 0 && start !== -1) { chunks.push(text.slice(start, i + 1)); start = -1; }
+      }
+      continue;
+    }
+  }
+  return chunks;
+}
+
 /**
  * Best-effort split of one Bash call's combined stdout+stderr into the individual JSON
- * reply objects each real orca invocation in that command printed, in command order — one
- * non-worker-list-shaped JSON object per line. Used only to disambiguate MULTIPLE dispatch
- * invocations chained in a single command line; a line that fails to parse as JSON, or that
- * carries a `workers` array (a worker-list-shaped reply, not a dispatch reply), is skipped
- * rather than misattributed to a dispatch.
+ * reply objects each real orca invocation in that command printed, in command order. Used
+ * only to disambiguate MULTIPLE dispatch invocations chained in a single command line.
+ *
+ * Three passes, each trusted only when it can fully explain the text (never a partial,
+ * silently-wrong parse):
+ *   1. the whole blob is exactly one JSON value (the common single-dispatch case).
+ *   2. one compact JSON value per non-empty line (NDJSON) — accepted only when EVERY
+ *      non-empty line parses; a real `orca --json` reply is often pretty-printed across many
+ *      lines, and a pretty-printed object's individual lines (`{`, `  "ok": true,`, ...)
+ *      would otherwise half-parse and misattribute ids to the wrong invocation.
+ *   3. fallback: a balanced-brace/bracket scan across the whole blob (handles concatenated,
+ *      possibly pretty-printed, multi-line replies with no separator between them at all).
+ * A worker-list-shaped reply (carries a `workers` array) is excluded at every stage rather
+ * than misattributed to a dispatch.
  */
 function splitJsonReplies(out) {
+  const text = String(out || '');
+  const trimmed = text.trim();
+
+  if (trimmed) {
+    try {
+      const obj = JSON.parse(trimmed);
+      return isDispatchReply(obj) ? [obj] : [];
+    } catch { /* not a single JSON value; fall through */ }
+  }
+
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length) {
+    const parsed = [];
+    let allParse = true;
+    for (const line of lines) {
+      if (line[0] !== '{' && line[0] !== '[') { allParse = false; break; }
+      try { parsed.push(JSON.parse(line)); } catch { allParse = false; break; }
+    }
+    if (allParse && parsed.length) return parsed.filter(isDispatchReply);
+  }
+
   const replies = [];
-  for (const line of String(out || '').split('\n')) {
-    const t = line.trim();
-    if (!t || (t[0] !== '{' && t[0] !== '[')) continue;
-    let obj;
-    try { obj = JSON.parse(t); } catch { continue; }
-    const r = (obj && obj.result) || obj;
-    if (r && Array.isArray(r.workers)) continue;
-    replies.push(obj);
+  for (const chunk of splitConcatenatedJson(text)) {
+    try {
+      const obj = JSON.parse(chunk);
+      if (isDispatchReply(obj)) replies.push(obj);
+    } catch { /* skip an unparsable chunk */ }
   }
   return replies;
 }
@@ -152,6 +225,7 @@ function releaseTarget(inv, flagValue) {
 }
 
 module.exports = {
-  idsFromOutput, splitJsonReplies, kindOf, canonicalGroup, groupOf, countLiveGroups,
-  liveGroupByTerminal, groupById, settleGroup, RELEASE_SUBS, releaseTarget,
+  idsFromOutput, splitJsonReplies, splitConcatenatedJson, isDispatchReply, kindOf,
+  canonicalGroup, groupOf, countLiveGroups, liveGroupByTerminal, groupById, settleGroup,
+  RELEASE_SUBS, releaseTarget,
 };

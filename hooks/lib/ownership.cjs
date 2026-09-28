@@ -48,9 +48,12 @@ function collapseWildcardRuns(item) {
   return item.replace(/\*{2,}/g, '**').replace(/(\*\*)(\/\*\*)+/g, '$1');
 }
 
-/** Normalize `.` and `./` (a bare "current directory" reference, with nothing after it)
- * to the repo root marker — treated the same as any other item that resolves to nothing
- * claimable on its own (refused, not silently coerced into a literal "." path segment). */
+/** Normalize `.` / `./` (a bare "current directory" reference, with nothing after it, or an
+ * absolute path equal to the repo root itself) to `'**'` — a deliberate WHOLE-REPO claim,
+ * since `ownsOverlap` already special-cases `'**'` to conflict with everything. Previously
+ * this normalized to the empty string and was then dropped entirely, so `Owns: .` silently
+ * claimed nothing while still satisfying the `code-brief-needs-owns` gate's "present"
+ * check — a real ownership-bypass: the brief looked compliant but conflicted with nothing. */
 function normalizeOwnsItem(raw, repoRootDir) {
   let item = stripQuotes(String(raw || '').trim());
   if (!item) return null;
@@ -58,14 +61,13 @@ function normalizeOwnsItem(raw, repoRootDir) {
   if (path.isAbsolute(item)) {
     if (!repoRootDir) return null;
     const rel = path.relative(repoRootDir, item).split(path.sep).join('/');
-    if (rel === '' || rel === '.') return null; // the repo root itself is not a file claim
+    if (rel === '' || rel === '.') return '**'; // the repo root itself IS a claim: everything
     if (rel.startsWith('..')) return null; // outside the repo root
     item = rel;
   }
   item = item.replace(/^\.\//, '');
   item = item.replace(/\/+$/, '');
-  if (item === '.') item = '';
-  if (!item) return null;
+  if (item === '.' || item === '') return '**';
   if (item.split('/').includes('..')) return null;
   if (item.length > MAX_ITEM_LENGTH) return null;
   const wildcardCount = (item.match(/[*?]/g) || []).length;
@@ -205,6 +207,124 @@ function globToRegExp(pattern) {
   return new RegExp(`^${re}$`);
 }
 
+// A brace-alternation group's combinations are expanded before matching (below); bounded so
+// a pattern with many/nested `{...}` groups can never blow up the expansion itself — beyond
+// this, the pattern is treated as matching everything (the same "err toward conflict"
+// philosophy the rest of this matcher already uses), never silently checking only a subset.
+const MAX_BRACE_EXPANSIONS = 64;
+
+/**
+ * Expands every `{a,b,c}` group in `pattern` into the list of concrete, brace-free patterns
+ * obtained by picking one alternative per group (cartesian product) — each concrete pattern
+ * then contains only literal characters, `*`/`**` and `?`. Returns null when the combination
+ * count would exceed `MAX_BRACE_EXPANSIONS` (caller treats that as "matches everything").
+ */
+function expandBraces(pattern) {
+  let results = [''];
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i];
+    if (c === '{') {
+      const close = pattern.indexOf('}', i);
+      if (close === -1) { results = results.map((r) => r + pattern.slice(i)); break; }
+      const alts = pattern.slice(i + 1, close).split(',');
+      const next = [];
+      for (const r of results) {
+        for (const a of alts) {
+          next.push(r + a);
+          if (next.length > MAX_BRACE_EXPANSIONS) return null;
+        }
+      }
+      results = next;
+      i = close + 1;
+      continue;
+    }
+    results = results.map((r) => r + c);
+    i += 1;
+  }
+  return results;
+}
+
+/** Tokenizes a brace-free glob into a flat token list: a literal character, `?` (exactly one
+ * non-`/` character), a `*`/`**` run (`crossSlash` tells the matcher below whether the run
+ * may include `/`), or `optSlash` — `**` immediately followed by `/`, matching the same
+ * "zero or more whole path segments" semantics `globToRegExp` gives it: it may match nothing
+ * at all (so a leading "star-star-slash" also matches the zero-directory `x.ts`), or any run of characters
+ * (including `/`) that ends in exactly one literal `/`. */
+function tokenizeGlob(pattern) {
+  const tokens = [];
+  let i = 0;
+  while (i < pattern.length) {
+    const c = pattern[i];
+    if (c === '*' && pattern[i + 1] === '*' && pattern[i + 2] === '/') { tokens.push({ type: 'optSlash' }); i += 3; continue; }
+    if (c === '*' && pattern[i + 1] === '*') { tokens.push({ type: 'anyN', crossSlash: true }); i += 2; continue; }
+    if (c === '*') { tokens.push({ type: 'anyN', crossSlash: false }); i += 1; continue; }
+    if (c === '?') { tokens.push({ type: 'any1' }); i += 1; continue; }
+    tokens.push({ type: 'lit', ch: c });
+    i += 1;
+  }
+  return tokens;
+}
+
+/**
+ * Linear-time (dynamic programming, O(tokens.length * text.length), no regex backtracking)
+ * match of a tokenized brace-free glob against a literal string.
+ *
+ * This replaces compiling `*`-heavy patterns into a single backtracking regex
+ * (`^[^/]*a[^/]*a[^/]*a...[^/]*b$`), which is the textbook catastrophic-backtracking shape:
+ * a claim like `*a*a*a*a*a*a*a*b` (8 wildcards — at, not over, the MAX_WILDCARDS cap, so it
+ * is never rejected outright) tested against a long near-miss string of the repeated
+ * character can force a regex engine's NFA to explore exponentially many paths before
+ * concluding "no match" — a real denial-of-service, since this match happens while the
+ * state-file lock may be held, hanging every other concurrent hook process with it. This
+ * bounded DP can never cost more than tokens.length * text.length regardless of input.
+ */
+function tokensMatch(tokens, text) {
+  const m = text.length;
+  let dp = new Array(m + 1).fill(false);
+  dp[0] = true;
+  for (const tok of tokens) {
+    const next = new Array(m + 1).fill(false);
+    if (tok.type === 'anyN') {
+      next[0] = dp[0];
+      for (let j = 1; j <= m; j++) {
+        const charOk = tok.crossSlash || text[j - 1] !== '/';
+        next[j] = dp[j] || (charOk && next[j - 1]);
+      }
+    } else if (tok.type === 'optSlash') {
+      // Matches empty, OR any run (any characters, any length) ending in exactly one '/'.
+      // `orSoFar` tracks OR(dp[0..j-1]) as j scans upward, so "some position before the
+      // trailing '/' was already a valid match start" is a running O(1) check per position
+      // rather than an O(m) rescan — keeps the whole token linear.
+      next[0] = dp[0];
+      let orSoFar = dp[0];
+      for (let j = 1; j <= m; j++) {
+        next[j] = dp[j] || (text[j - 1] === '/' && orSoFar);
+        orSoFar = orSoFar || dp[j];
+      }
+    } else if (tok.type === 'any1') {
+      for (let j = 1; j <= m; j++) next[j] = dp[j - 1] && text[j - 1] !== '/';
+    } else {
+      for (let j = 1; j <= m; j++) next[j] = dp[j - 1] && text[j - 1] === tok.ch;
+    }
+    dp = next;
+  }
+  return dp[m];
+}
+
+/** True when glob `pattern` matches literal string `literal` — the safe (linear-time)
+ * replacement for `globToRegExp(pattern).test(literal)` used by `ownsOverlap`. Brace
+ * alternation is resolved by trying every expansion; a pattern whose expansion count would
+ * exceed the cap is treated as matching everything. */
+function globMatchesLiteral(pattern, literal) {
+  const expansions = expandBraces(pattern);
+  if (expansions === null) return true;
+  for (const concrete of expansions) {
+    if (tokensMatch(tokenizeGlob(concrete), literal)) return true;
+  }
+  return false;
+}
+
 /** True when `a` and `b` are the same path, or one is a directory prefix of the other
  * (matched at a path-segment boundary — "src/api" overlaps "src/api/x.ts" but not
  * "src/api2"). Both inputs are treated as plain literal path text. */
@@ -241,8 +361,8 @@ function ownsOverlap(a, b) {
   // treated as matching everywhere for conflict purposes (same "err toward conflict"
   // philosophy as the rest of this matcher), rather than the empty string being compared
   // as if it were a literal directory name that nothing can ever be "inside" of.
-  if (aGlob && !bGlob) return globToRegExp(a).test(b) || literalPrefix(a) === '' || directoryPrefixRelated(literalPrefix(a), b);
-  if (!aGlob && bGlob) return globToRegExp(b).test(a) || literalPrefix(b) === '' || directoryPrefixRelated(literalPrefix(b), a);
+  if (aGlob && !bGlob) return globMatchesLiteral(a, b) || literalPrefix(a) === '' || directoryPrefixRelated(literalPrefix(a), b);
+  if (!aGlob && bGlob) return globMatchesLiteral(b, a) || literalPrefix(b) === '' || directoryPrefixRelated(literalPrefix(b), a);
   return literalPrefix(a) === '' || literalPrefix(b) === '' || directoryPrefixRelated(literalPrefix(a), literalPrefix(b));
 }
 
@@ -272,5 +392,6 @@ function workspaceKey({ repoRootDir, worktreeValue, isolated }) {
 
 module.exports = {
   parseOwns, normalizeOwnsItem, repoRoot, ownsOverlap, anyOverlap, workspaceKey,
-  globToRegExp, literalPrefix, directoryPrefixRelated, isGlobPattern,
+  globToRegExp, globMatchesLiteral, expandBraces, tokenizeGlob, tokensMatch,
+  literalPrefix, directoryPrefixRelated, isGlobPattern,
 };

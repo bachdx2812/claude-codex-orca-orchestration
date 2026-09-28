@@ -49,6 +49,10 @@ const EVENTS = {
   UserPromptSubmit: '*',
   PreToolUse: 'Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task',
   PostToolUse: '*',
+  // A failed tool call (Claude Code's own separate event, distinct from PostToolUse) drops
+  // whatever reservation/ownership claim its PreToolUse made, so a Bash/Agent call that
+  // errors out never leaks a parallel-Codex-worker opening or an Owns: claim until the TTL.
+  PostToolUseFailure: '*',
   Stop: '*',
 };
 const START_MARK = '<!-- orchestration:start -->';
