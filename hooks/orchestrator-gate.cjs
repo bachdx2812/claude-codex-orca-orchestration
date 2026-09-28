@@ -752,14 +752,15 @@ function onPreToolUse(p, s, cfg) {
         'Integration and repository mutations belong to a worker, not the orchestrator panel.\n' +
         'Moving or deleting files under .claude/, plans/, docs/ or a temp dir is still allowed.');
     }
-    // Code briefs handed to Codex through Orca must let it check itself. Judged on the
-    // real orca invocation's own args (quoted mentions in grep/echo never match), and
-    // only for code work: research / review / publish specs are not code briefs.
-    const orcaInv = orcaInvocations(cmd).find((inv) =>
+    // Code briefs handed to Codex through Orca must let it check itself. Judged on each
+    // real orca invocation's own args and its OWN --spec text (quoted mentions in
+    // grep/echo never match, and one invocation's brief never leaks into another's — item
+    // 6), and only for code work: research / review / publish specs are not code briefs.
+    const orcaSpecInvs = orcaInvocations(cmd).filter((inv) =>
       (inv.sub === 'orchestration task-create' || inv.sub === 'orchestration worker-start') &&
       hasFlag(inv.args, '--spec') && !hasFlag(inv.args, '--help'));
-    if (orcaInv) {
-      const brief = briefText(cmd, p.cwd);
+    for (const orcaInv of orcaSpecInvs) {
+      const brief = PARALLEL_OWNERSHIP.resolveSpecText(orcaInv, cmd, p.cwd, { flagValue, briefText });
       if (EXEC_INTENT.test(brief.text) && !VERIFY_COMMAND.test(brief.text)) {
         d('code-brief-needs-verify', CODE_BRIEF_HELP +
           (brief.unreadable.length ? `\nCould not read spec file(s): ${brief.unreadable.join(', ')}` : ''));

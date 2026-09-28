@@ -141,6 +141,18 @@ function reconcileCodexGroupsWithOrca(s, orcaBin) {
  * still degraded-but-checked rather than silently skipped.
  */
 function resolveSpecText(inv, cmd, cwd, deps) {
+  // A `--spec` argument containing a `$( )`/backtick command substitution has its
+  // substituted content silently dropped by the shell scanner (see
+  // shell-orca-invocations.cjs — it recurses into the substitution to find nested orca
+  // invocations, but never re-emits its text into the enclosing word), so `flagValue` alone
+  // would see only a truncated fragment and could miss content entirely (e.g. an unreadable
+  // file reference). Whenever the whole command contains ANY such substitution, degrade
+  // to the pre-fix, whole-command `briefText()` scoping rather than risk silently
+  // dropping part of a brief — this only costs precision for the (rarer) case of multiple
+  // invocations that ALSO use command substitution in their specs; a plain multi-invocation
+  // command with inline text or `@file` specs (the common case) still gets full per-
+  // invocation scoping via the fast path below.
+  if (/\$\(|`/.test(cmd)) return deps.briefText(cmd, cwd);
   const raw = deps.flagValue(inv.args, '--spec');
   if (raw && raw.length) {
     if (raw.startsWith('@')) {
@@ -343,5 +355,5 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
 module.exports = {
   OWNS_BRIEF_HELP, resolveWorkerStartAgent, liveCodexGroupIds, reconcileCodexGroupsWithOrca,
-  handleOrcaDispatchGates,
+  handleOrcaDispatchGates, resolveSpecText,
 };
