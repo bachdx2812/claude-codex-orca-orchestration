@@ -5,7 +5,12 @@ generated from the source of truth: the gate's code plus
 `~/.claude/orchestration.config.json`. Every noun below (model aliases, the Codex handoff
 threshold, the reply language) is a config value, not a literal baked into this file — if
 you change the config, re-read the SessionStart banner rather than this file for the
-exact current numbers.
+exact current numbers - it now names both the alias and the exact id, e.g.
+`model "opus" (claude-opus-5-5)`.
+
+**Shipped versions** (the example config; override in `~/.claude/orchestration.config.json`):
+review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fable 5.1**
+(`claude-fable-5-1`), Codex worker dispatches on **`gpt-5.6-sol`**.
 
 ## The contract
 
@@ -71,7 +76,7 @@ The operator (only) can pick who writes code for the rest of the session:
 --code-model haiku         # the configured lookup model, for code work specifically
 --code-model fable         # the configured escalation model, for code work specifically
 --code-model codex         # Codex in an Orca worker, no pinned model (same as --exec-codex)
---code-model codex:gpt-5.6-luna   # Codex in an Orca worker, pinned to this model
+--code-model codex:gpt-5-custom   # Codex in an Orca worker, pinned to this model
 --code-model auto          # back to automatic routing (same as --exec-auto)
 ```
 
@@ -89,9 +94,20 @@ either, regardless of what the operator's standing override says.
 ## No Orca / no Codex
 
 If `orca` is not on `PATH`, or Codex has never produced a readable `rate_limits` reading
-(see `codexRemaining()` in `hooks/lib/exec-route-by-quota.cjs`), automatic routing keeps
-preferring Codex by default — an unknown Codex quota is not evidence Codex is unusable.
-The honest way to route code in-session anyway is one of:
+(see `codexRemaining()` in `hooks/lib/exec-route-by-quota.cjs`), and
+`execFallbackWhenCodexUnavailable` is `"sonnet"` (the default), automatic routing falls
+back to the configured code model instead of defaulting to Codex — either condition alone
+is enough, because a missing `orca` binary means Codex can never actually be dispatched to
+regardless of how much quota it has left. Set `execFallbackWhenCodexUnavailable` to `null`
+to disable this and keep preferring Codex even when its quota is simply unknown (as
+opposed to known and merely under the handoff threshold, which always prefers Codex
+either way).
+
+The gate checks `orca` reachability itself (an absolute `ORCA_BIN` path is checked with a
+file-exists test; the bare default name via `which`/`where`) — no per-invocation cost
+beyond that one lookup, and never a live `worker-list` call just to decide routing.
+
+Independent of that automatic fallback, the operator can always route explicitly:
 
 - `--exec-sonnet` (or `--code-model <code alias>`): an explicit, session-scoped operator
   preference. It does not claim Orca is down.
@@ -101,8 +117,8 @@ The honest way to route code in-session anyway is one of:
   Codex-in-Orca rule forever after one transient failure.
 
 `node install.mjs --check` reports whether `orca` and `codex` are on `PATH`, whether Codex
-looks logged in, and warns when neither Orca nor a readable Codex quota is available —
-exactly the situation `execFallbackWhenCodexUnavailable` names in the config.
+looks logged in, and the effective config (including `execFallbackWhenCodexUnavailable`)
+as the installed hooks would actually read it.
 
 ## Config
 

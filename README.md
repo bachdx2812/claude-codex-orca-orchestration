@@ -28,6 +28,13 @@ which model escalates to, which model codes, the Codex-quota handoff threshold, 
 language, which gates are active. See `rules/orchestration-contract.md` for the full
 contract and `config/orchestration.config.example.json` for every knob.
 
+**Shipped model versions.** The example config pins exact versions, not just aliases:
+review/red-team/verify runs on **Opus 5.5** (`claude-opus-5-5`, alias `opus`), escalation
+on **Fable 5.1** (`claude-fable-5-1`, alias `fable`), and Codex worker dispatches default
+to **`gpt-5.6-sol`**. `install.mjs` pins both `ANTHROPIC_DEFAULT_OPUS_MODEL` and
+`ANTHROPIC_DEFAULT_FABLE_MODEL` to these by default (`--no-pin-models` skips both); edit
+`~/.claude/orchestration.config.json` to point at different versions or providers.
+
 ## Quickstart
 
 ```bash
@@ -76,13 +83,19 @@ Edit `~/.claude/orchestration.config.json` (created from
 `config/orchestration.config.example.json` on first install; re-read on every hook call,
 no restart needed):
 
-```jsonc
+The file is plain JSON — no comments — parsed as-is:
+
+```json
 {
-  "codexHandoffUsedPercent": 60,      // was 40: Codex keeps coding until 60% of quota used
-  "replyLanguage": "Vietnamese",      // or any language name; null = no language instruction
+  "codexHandoffUsedPercent": 60,
+  "replyLanguage": "Vietnamese",
   "disabledGates": ["code-brief-needs-verify"]
 }
 ```
+
+(`codexHandoffUsedPercent: 60` means Codex keeps coding until 60% of its quota is used,
+up from the default 40; `replyLanguage` accepts any language name, or `null` for no
+language instruction at all.)
 
 See `rules/orchestration-contract.md#config` for every field.
 
