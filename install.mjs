@@ -38,7 +38,12 @@ const CLAUDE_MD_FILE = path.join(CLAUDE_DIR, 'CLAUDE.md');
 const MANIFEST_FILE = path.join(HOOKS_DIR, 'install-manifest.json');
 
 const GATE_SCRIPT = 'orchestrator-gate.cjs';
-const HOOK_FILES = ['orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/shell-orca-invocations.cjs'];
+const HOOK_FILES = [
+  'orchestrator-gate.cjs', 'orca-heartbeat.cjs',
+  'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/shell-orca-invocations.cjs',
+  'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
+  'lib/parallel-ownership-gates.cjs',
+];
 const EVENTS = {
   SessionStart: '*',
   UserPromptSubmit: '*',

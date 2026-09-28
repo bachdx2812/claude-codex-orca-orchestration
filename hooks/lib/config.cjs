@@ -26,6 +26,9 @@ const GATE_NAMES = [
   'execution-model-mismatch',
   'workers-unwatched',
   'workers-unreconciled',
+  'max-parallel-codex-workers',
+  'code-brief-needs-owns',
+  'ownership-overlap',
 ];
 
 const DEFAULT_CONFIG = {
@@ -45,6 +48,8 @@ const DEFAULT_CONFIG = {
   codexHandoffUsedPercent: 40,
   execFallbackWhenCodexUnavailable: 'sonnet',
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
+  maxParallelCodexWorkers: 3, // 0 = unlimited
+  ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
 };
 
@@ -151,6 +156,22 @@ function loadConfig() {
     merged.execFallbackWhenCodexUnavailable = 'sonnet';
   }
 
+  const maxParallel = Number(merged.maxParallelCodexWorkers);
+  if (!Number.isInteger(maxParallel) || maxParallel < 0 || maxParallel > 32) {
+    warnings.push(`maxParallelCodexWorkers "${merged.maxParallelCodexWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelCodexWorkers}.`);
+    merged.maxParallelCodexWorkers = DEFAULT_CONFIG.maxParallelCodexWorkers;
+  } else {
+    merged.maxParallelCodexWorkers = maxParallel;
+  }
+
+  const claimTtl = Number(merged.ownershipClaimTtlMinutes);
+  if (!Number.isInteger(claimTtl) || claimTtl < 1 || claimTtl > 10080) {
+    warnings.push(`ownershipClaimTtlMinutes "${merged.ownershipClaimTtlMinutes}" is not an integer 1-10080; using ${DEFAULT_CONFIG.ownershipClaimTtlMinutes}.`);
+    merged.ownershipClaimTtlMinutes = DEFAULT_CONFIG.ownershipClaimTtlMinutes;
+  } else {
+    merged.ownershipClaimTtlMinutes = claimTtl;
+  }
+
   if (!Array.isArray(merged.agents.escalation)) merged.agents.escalation = DEFAULT_CONFIG.agents.escalation;
   if (!Array.isArray(merged.agents.lookup)) merged.agents.lookup = DEFAULT_CONFIG.agents.lookup;
 
@@ -182,4 +203,35 @@ function stateDir() {
   return process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
 }
 
-module.exports = { GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir };
+/**
+ * How many live Codex worker groups this session may hold at once (0 = unlimited).
+ * `ORCH_MAX_PARALLEL_CODEX_WORKERS` overrides the config value for one process (tests, or
+ * an operator who wants a one-off cap without editing the config file); an invalid override
+ * falls back to the config value, exactly like `handoffUsed`.
+ */
+function maxParallelCodexWorkers(cfg) {
+  const envOverride = process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS;
+  if (envOverride !== undefined) {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 32) return n;
+  }
+  return cfg.maxParallelCodexWorkers;
+}
+
+/**
+ * Minutes a background in-session Agent's `Owns:` claim survives without an explicit
+ * release before it auto-expires. `ORCH_CLAIM_TTL_MINUTES` overrides for one process.
+ */
+function ownershipClaimTtlMinutes(cfg) {
+  const envOverride = process.env.ORCH_CLAIM_TTL_MINUTES;
+  if (envOverride !== undefined) {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 1 && n <= 10080) return n;
+  }
+  return cfg.ownershipClaimTtlMinutes;
+}
+
+module.exports = {
+  GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
+  maxParallelCodexWorkers, ownershipClaimTtlMinutes,
+};

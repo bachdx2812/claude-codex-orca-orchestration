@@ -29,7 +29,14 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { loadConfig, gateDisabled, handoffUsed, stateDir } = require('./lib/config.cjs');
+const {
+  loadConfig, gateDisabled, handoffUsed, stateDir,
+  maxParallelCodexWorkers, ownershipClaimTtlMinutes,
+} = require('./lib/config.cjs');
+const WG = require('./lib/worker-groups.cjs');
+const OWN = require('./lib/ownership.cjs');
+const OC = require('./lib/ownership-claims.cjs');
+const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 
 const DIR = stateDir();
 const LOG = path.join(DIR, 'violations.log');
@@ -213,14 +220,29 @@ function blank(sid) {
     created: new Date().toISOString(),
     bypass: false,
     execAgent: null,        // null (auto by quota) | 'code' | 'codex' | 'codex:<model>' | 'claude:<alias>'
-    workers: {},            // label -> { role, started, status, last_seen, rate_limited_until }
+    workers: {},            // label -> { role, started, status, last_seen, rate_limited_until,
+                             //            group, kind, agent, owns, ws }
+    reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot } — the gap
+                             // between a Bash dispatch being admitted and its PostToolUse resolving it
+    agentClaims: {},        // toolUseId -> { owns, ws, ts } — in-session Agent/Task Owns: claims
+    tasks: {},              // taskId -> { owns, ws } — recorded when `task-create` resolves its id
     last_heartbeat: 0,      // epoch ms of the last worker-status poll
     rate_limit_hits: 0,
   };
 }
 
 function load(sid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(sid), 'utf8')); } catch { return blank(sid); }
+  try {
+    const s = JSON.parse(fs.readFileSync(stateFile(sid), 'utf8'));
+    // Back-fill fields a state file written before this gate's ownership/parallel-limit
+    // work existed would not have, so an in-progress session never crashes on upgrade.
+    if (!s.reservations) s.reservations = {};
+    if (!s.agentClaims) s.agentClaims = {};
+    if (!s.tasks) s.tasks = {};
+    return s;
+  } catch {
+    return blank(sid);
+  }
 }
 
 // Atomic write: a concurrent hook must never read a half-written file and fall back to blank().
@@ -507,6 +529,22 @@ function liveWorkers(s) {
   return Object.entries(s.workers).filter(([, w]) => w.status === 'live');
 }
 
+// Gate A (max-parallel-codex-workers) + Gate B (code-brief-needs-owns / ownership-overlap)
+// live in their own module (matches the existing hooks/lib/*.cjs boundary); this file
+// still owns `d()`/deny() and supplies the small helpers below it as `deps`, so there is no
+// import cycle back into this file.
+const PARALLEL_OWNERSHIP = require('./lib/parallel-ownership-gates.cjs');
+const OWNS_BRIEF_HELP = PARALLEL_OWNERSHIP.OWNS_BRIEF_HELP;
+const resolveWorkerStartAgent = (inv, s) => PARALLEL_OWNERSHIP.resolveWorkerStartAgent(inv, s, flagValue);
+const liveCodexGroupIds = PARALLEL_OWNERSHIP.liveCodexGroupIds;
+
+function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
+  return PARALLEL_OWNERSHIP.handleOrcaDispatchGates({
+    p, s, cfg, cmd, d,
+    deps: { hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, ownershipClaimTtlMinutes, save },
+  });
+}
+
 /** "Reply to the operator in <language>." — omitted entirely when replyLanguage is null. */
 function languageSentence(cfg, forBanner) {
   if (!cfg.replyLanguage) return forBanner ? '' : '';
@@ -561,6 +599,20 @@ const operatorFlag = (prompt, flag) => new RegExp(`(^|\\s)${flag}(?=\\s|$)`, 'i'
 
 function onUserPromptSubmit(p, s, cfg) {
   const raw = String(p.prompt || '');
+
+  // Background-Agent ownership claims: best-effort release when a <task-notification>
+  // names the id of the dispatch that just finished. This reads harness-injected content
+  // ON PURPOSE (the opposite of the operator-flag rule right below) — a task-notification
+  // is never the operator's own text, but it is exactly the signal this release path exists
+  // to react to. TTL and --release-claims remain the safety nets when no id is found here.
+  if (/<task-notification\b/i.test(raw)) {
+    let releasedAny = false;
+    for (const m of raw.matchAll(/\b(toolu_[A-Za-z0-9_-]+|agent_[A-Za-z0-9_-]+)\b/g)) {
+      if (s.agentClaims[m[1]]) { delete s.agentClaims[m[1]]; releasedAny = true; }
+    }
+    if (releasedAny) save(s);
+  }
+
   const prompt = NON_OPERATOR_TURN.test(raw) ? '' : raw;
   if (operatorFlag(prompt, '--no-orchestrate')) {
     s.bypass = true; save(s);
@@ -597,6 +649,24 @@ function onUserPromptSubmit(p, s, cfg) {
       : `orchestrator-gate: coding model set by the operator for this session: ${describeOverride(cfg, override)}. Revert with --code-model auto.\n`);
   } else if (override === 'invalid') {
     process.stdout.write(`orchestrator-gate: ignored --code-model ${cm[2]} (use ${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | auto).\n`);
+  }
+
+  // Operator-only manual release of a stuck ownership claim (foreground release is
+  // automatic at PostToolUse; background release is best-effort via <task-notification> or
+  // the ownershipClaimTtlMinutes safety net — this is the deliberate manual override).
+  const rc = prompt.match(/(^|\s)--release-claims(?:=|\s+)(\S+)/i);
+  if (rc) {
+    const target = rc[2];
+    let released = 0;
+    if (target.toLowerCase() === 'all') {
+      released = Object.keys(s.agentClaims).length;
+      s.agentClaims = {};
+    } else if (s.agentClaims[target]) {
+      delete s.agentClaims[target];
+      released = 1;
+    }
+    if (released) { save(s); process.stdout.write(`orchestrator-gate: released ${released} ownership claim(s).\n`); }
+    else process.stdout.write(`orchestrator-gate: --release-claims ${target} matched no tracked claim.\n`);
   }
 
   const live = liveWorkers(s);
@@ -690,6 +760,10 @@ function onPreToolUse(p, s, cfg) {
       }
     }
 
+    // Gate A (max-parallel-codex-workers) + Gate B (code-brief-needs-owns /
+    // ownership-overlap) for every real worker-start / task-create in this command line.
+    handleOrcaDispatchGates(p, s, cfg, cmd, d);
+
     // Advisory only: a Codex worker-start that omits --model gets no model pin, so a
     // fleet can silently drift onto whatever Codex defaults to. Skipped when --terminal
     // targets an existing terminal (its model is already fixed) or --model is already given.
@@ -768,6 +842,42 @@ function onPreToolUse(p, s, cfg) {
       if (!VERIFY_COMMAND.test(`${input.description || ''}\n${input.prompt || ''}`)) {
         d('code-brief-needs-verify', CODE_BRIEF_HELP);
       }
+
+      // Gate B for in-session code dispatches: isolated work (a fresh worktree, or a
+      // remote sandbox) needs no Owns:; anything sharing this workspace does. Runs under
+      // the same lock as the Bash-side check in handleOrcaDispatchGates, and — same
+      // reasoning as there — always releases it via `finally` before `d()` can exit.
+      if (!input.isolation) {
+        const lockDir = path.join(DIR, '.lock');
+        let violation = null;
+        // Same caution as handleOrcaDispatchGates: only release the lock if we acquired it.
+        const locked = acquireLock(lockDir, {});
+        try {
+          const repoRootDir = OWN.repoRoot(p.cwd);
+          const ws = OWN.workspaceKey({ repoRootDir, worktreeValue: null, isolated: false });
+          const brief = `${input.description || ''}\n${input.prompt || ''}`;
+          const parsed = OWN.parseOwns(brief, { repoRoot: repoRootDir });
+          if (!parsed.present) {
+            violation = { gate: 'code-brief-needs-owns', reason: OWNS_BRIEF_HELP };
+          } else if (!parsed.isNA && parsed.owns.length) {
+            const ttl = ownershipClaimTtlMinutes(cfg);
+            const claims = OC.liveClaims(s, ttl, null);
+            const conflict = OC.findOverlap(claims, ws, parsed.owns);
+            if (conflict) {
+              violation = { gate: 'ownership-overlap', reason:
+                `Owns ${conflict.hit.b} overlaps ${conflict.hit.a} held by ${conflict.id} (since ${OC.ageString(conflict.ts)}) ` +
+                `in workspace ${ws}.\nNarrow the claim, wait for or release that worker, or run it in its own worktree: ` +
+                'Agent isolation:"worktree".' };
+            } else {
+              const toolUseId = p.tool_use_id || p.toolUseId;
+              if (toolUseId) { s.agentClaims[toolUseId] = { owns: parsed.owns, ws, ts: Date.now() }; save(s); }
+            }
+          }
+        } finally {
+          if (locked) releaseLock(lockDir);
+        }
+        if (violation) d(violation.gate, violation.reason);
+      }
     }
 
     // Light lookups: advise the lookup model (never blocks).
@@ -787,9 +897,20 @@ function onPostToolUse(p, s, cfg) {
   const resp = p.tool_response || {};
   let dirty = false;
 
+  // Foreground Agent/Task dispatches release their Owns: claim as soon as the dispatch
+  // itself returns — this event IS that return, since it carries no agent_id/agent_type
+  // (a subagent's own tool calls do; see isMainPanel). Background dispatches are released
+  // by a <task-notification> (best effort, in onUserPromptSubmit), ownershipClaimTtlMinutes,
+  // or the operator's --release-claims.
+  if (tool === 'Agent' || tool === 'Task') {
+    const toolUseId = p.tool_use_id || p.toolUseId;
+    if (toolUseId && s.agentClaims[toolUseId]) { delete s.agentClaims[toolUseId]; dirty = true; }
+  }
+
   if (tool === 'Bash') {
     const cmd = String(input.command || '');
     const out = `${resp.stdout || ''}\n${resp.stderr || ''}`;
+    const toolUseId = p.tool_use_id || p.toolUseId || null;
 
     // Any orca worker/terminal inspection counts as a heartbeat poll.
     if (/\borca\b/.test(cmd) && /(worker-list|worker-read|worker-show|terminal (list|read|show)|worktree ps|task-list|inbox|check)\b/.test(cmd)) {
@@ -819,6 +940,26 @@ function onPostToolUse(p, s, cfg) {
       }
     }
 
+    // task-create resolves its own id only in the reply. Transfer THIS invocation's
+    // ownership reservation (recorded at PreToolUse — see handleOrcaDispatchGates) onto
+    // `s.tasks[id]` so a later `worker-start --task <id>` (no --spec of its own) inherits
+    // the claim, then drop the reservation — the claim now lives under the task id instead.
+    const dispatchInvs = orcaInvocations(cmd).filter((inv) =>
+      (inv.sub === 'orchestration worker-start' || inv.sub === 'orchestration task-create') &&
+      !hasFlag(inv.args, '--help'));
+    const taskCreateIdx = dispatchInvs.findIndex((inv) => inv.sub === 'orchestration task-create');
+    if (taskCreateIdx !== -1) {
+      const idMatch = out.match(/"taskId"\s*:\s*"([^"]+)"/) || out.match(/\b(task_[A-Za-z0-9_-]+)\b/);
+      const taskId = idMatch && idMatch[1];
+      if (taskId) {
+        const resId = toolUseId ? `${toolUseId}#${taskCreateIdx}` : null;
+        const reservation = resId ? s.reservations[resId] : null;
+        s.tasks[taskId] = { owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null };
+        if (resId) delete s.reservations[resId];
+        dirty = true;
+      }
+    }
+
     // Starting a worker registers it as live. The identifier is taken from
     // Orca's own reply rather than parsed out of the command line, because the
     // operator does not use a fixed invocation - whatever flags the panel chose,
@@ -826,47 +967,87 @@ function onPostToolUse(p, s, cfg) {
     // Only a real orca invocation counts: a grep/echo that merely mentions worker-start
     // (from the panel or a subagent) must not register a phantom worker. --help is judged
     // on that invocation's own args, not the whole command line.
-    const startsWorker = orcaInvocations(cmd).some((inv) =>
+    const startsWorkerInvs = orcaInvocations(cmd).filter((inv) =>
       (inv.sub === 'orchestration worker-start' || inv.sub === 'terminal create') &&
       !hasFlag(inv.args, '--help'));
-    if (startsWorker) {
-      const ids = new Set();
-      for (const m of out.matchAll(/"(?:dispatchId|taskId|handle)"\s*:\s*"([^"]+)"/g)) ids.add(m[1]);
-      for (const m of out.matchAll(/\b((?:ctx|task|term)_[A-Za-z0-9_-]+)\b/g)) ids.add(m[1]);
-      if (!ids.size) {
-        // No id in Orca's own reply: track it as an explicitly-marked placeholder rather
-        // than inventing a fake dispatch id or dropping it silently. `unverified: true`
-        // means the Stop gate still refuses to end the session over it (a real worker may
-        // well be running), and the next worker-list/worker-read poll resolves it - either
-        // adopting a real id this poll surfaces, or settling it once a poll comes back
-        // with nothing new to match it to.
-        const pendingId = `pending-${Date.now()}`;
-        s.workers[pendingId] = { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(), rate_limited_until: 0, unverified: true };
-        dirty = true;
-        process.stdout.write(
-          'orchestrator-gate: orca worker-start ran but no dispatch id was found in its output; ' +
-          `tracked as ${pendingId} until \`orca orchestration worker-list\` resolves it.\n`
-        );
+    if (startsWorkerInvs.length) {
+      // "ok": false in Orca's own reply means the dispatch never actually started: drop
+      // the reservation without registering any worker, even if error text happens to
+      // contain something that looks like an id.
+      const failed = /"ok"\s*:\s*false/i.test(out);
+      const wsIdx = dispatchInvs.findIndex((inv) => inv.sub === 'orchestration worker-start');
+      const resId = toolUseId && wsIdx !== -1 ? `${toolUseId}#${wsIdx}` : null;
+      const reservation = resId ? s.reservations[resId] : null;
+      // A pure `terminal create` (no matching worker-start invocation) is not tagged
+      // 'codex' by default - it must never inflate the parallel-Codex-worker count.
+      const agent = reservation ? reservation.agent
+        : (wsIdx !== -1 ? resolveWorkerStartAgent(dispatchInvs[wsIdx], s) : null);
+
+      if (failed) {
+        if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
+        process.stdout.write('orchestrator-gate: orca worker-start reported "ok": false; nothing was registered.\n');
       } else {
-        for (const id of ids) {
-          s.workers[id] = { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(), rate_limited_until: 0 };
-        }
-        dirty = true;
-        if (!heartbeatAlive(s.session_id)) {
+        // Section 0 fix #1 (triple worker records): every id this reply names for ONE
+        // worker-start (dispatch id, task id, terminal handle) shares one `group`, so a
+        // worker count only counts it once even though each id is still kept as its own
+        // `s.workers` key (Orca reconciliation and the Stop gate need every individual id).
+        const ids = WG.idsFromOutput(out);
+        if (!ids.size) {
+          // No id in Orca's own reply: track it as an explicitly-marked placeholder rather
+          // than inventing a fake dispatch id or dropping it silently. `unverified: true`
+          // means the Stop gate still refuses to end the session over it (a real worker may
+          // well be running), and the next worker-list/worker-read poll resolves it - either
+          // adopting a real id this poll surfaces, or settling it once a poll comes back
+          // with nothing new to match it to.
+          const pendingId = `pending-${Date.now()}`;
+          s.workers[pendingId] = {
+            role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+            rate_limited_until: 0, unverified: true, group: pendingId, kind: 'worker', agent,
+            owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+          };
+          dirty = true;
           process.stdout.write(
-            'orchestrator-gate: worker dispatched. Start the heartbeat now so it cannot sit IDLE unnoticed:\n' +
-            `  ${heartbeatStartCommand()}\n`
+            'orchestrator-gate: orca worker-start ran but no dispatch id was found in its output; ' +
+            `tracked as ${pendingId} until \`orca orchestration worker-list\` resolves it.\n`
           );
+        } else {
+          const group = WG.canonicalGroup(ids) || `start-${Date.now()}`;
+          for (const id of ids) {
+            s.workers[id] = {
+              role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+              rate_limited_until: 0, group, kind: WG.kindOf(id), agent,
+              owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+            };
+          }
+          dirty = true;
+          if (!heartbeatAlive(s.session_id)) {
+            process.stdout.write(
+              'orchestrator-gate: worker dispatched. Start the heartbeat now so it cannot sit IDLE unnoticed:\n' +
+              `  ${heartbeatStartCommand()}\n`
+            );
+          }
         }
+        if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
       }
     }
 
-    // Stopping, releasing or closing a worker settles it.
-    const stop = cmd.match(/(?:worker-stop|worker-release|worker-abandon|terminal close)[^\n]*?("[^"]+"|'[^']+'|[^\s]+)\s*$/);
-    if (stop) {
-      const label = stop[1].replace(/^["']|["']$/g, '');
-      if (s.workers[label]) { s.workers[label].status = 'settled'; dirty = true; }
-      else { for (const w of Object.values(s.workers)) { if (w.status === 'live') { w.status = 'settled'; dirty = true; } } }
+    // Stopping, releasing or closing a worker settles its whole group. Section 0 fix #2:
+    // the target id comes from the SPECIFIC orca invocation's own parsed args
+    // (`WG.releaseTarget`), never from "whatever the command line's last shell token
+    // happened to be" — the old regex took `--json` as the target of
+    // `worker-release --dispatch <id> --json`, matched nothing, and fell back to settling
+    // every live worker in the session. An unrecognised label now settles nothing and
+    // prints a hint instead of guessing.
+    for (const inv of orcaInvocations(cmd)) {
+      const target = WG.releaseTarget(inv, flagValue);
+      if (!target) continue;
+      if (s.workers[target]) {
+        if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
+      } else {
+        process.stdout.write(
+          `orchestrator-gate: ${inv.sub} named "${target}", which this session is not tracking as a live worker; ` +
+          'nothing was settled. Check `orca orchestration worker-list`.\n');
+      }
     }
 
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
@@ -1024,5 +1205,5 @@ process.stdin.on('end', () => {
 module.exports = {
   shellSyntaxOnly, redirectTargets, isExemptPath, movesOnlyExemptPaths, shellSegments,
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
-  hasFlag, flagValue,
+  hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds,
 };
