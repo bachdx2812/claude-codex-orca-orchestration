@@ -21,6 +21,7 @@ process.env.ORCH_CONFIG_PATH = path.join(STATE_DIR, 'no-such-config.json'); // -
 const gate = require('../hooks/orchestrator-gate.cjs');
 const heartbeat = require('../hooks/orca-heartbeat.cjs');
 const config = require('../hooks/lib/config.cjs');
+const { orcaInvocations } = require('../hooks/lib/shell-orca-invocations.cjs');
 
 let pass = 0;
 const failures = [];
@@ -113,6 +114,92 @@ check('compound line splits into commands',
 check('quoted text is dropped before segmenting',
   gate.shellSegments('echo "git commit is only mentioned here"'),
   ['echo']);
+
+// --- orcaInvocations ---------------------------------------------------------
+// Linear-time shell scanner, replacing an earlier regex-based detector. Each case
+// checks the list of `sub` names detected, since that is what the gate routes on.
+
+function subs(cmd) { return orcaInvocations(cmd).map((inv) => inv.sub); }
+
+// Detected: bare, absolute path, assignment, env, env -u, command, exec, nohup,
+// time, sudo, xargs, ( ), { ; }, if;then;fi, backticks, unquoted and
+// double-quoted $( ), nested quoted $( ) inside $( ).
+check('bare orca invocation is detected',
+  subs('orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('absolute path is detected',
+  subs('/opt/local/bin/orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('leading assignment is detected',
+  subs('ORCA_X=1 orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('env wrapper is detected',
+  subs('env A=1 orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('env -u wrapper is detected',
+  subs('env -u FOO orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('command wrapper is detected',
+  subs('command orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('exec wrapper is detected',
+  subs('exec orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('nohup wrapper is detected',
+  subs('nohup orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('time wrapper is detected',
+  subs('time orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('sudo wrapper is detected',
+  subs('sudo orca orchestration worker-start --task t'), ['orchestration worker-start']);
+check('xargs wrapper is detected',
+  subs('echo t | xargs -n1 orca orchestration worker-start --task'), ['orchestration worker-start']);
+check('bare (  ) grouping is detected',
+  subs('( orca orchestration worker-start --task t )'), ['orchestration worker-start']);
+check('{ ; } grouping is detected',
+  subs('{ orca orchestration worker-start --task t; }'), ['orchestration worker-start']);
+check('if ...; then ...; fi is detected',
+  subs('if true; then orca orchestration worker-start --task t; fi'), ['orchestration worker-start']);
+check('backtick substitution is detected',
+  subs('id=`orca orchestration worker-start --task t`'), ['orchestration worker-start']);
+check('unquoted $( ) substitution is detected',
+  subs('id=$(orca orchestration worker-start --task t)'), ['orchestration worker-start']);
+check('double-quoted $( ) substitution is detected',
+  subs('id="$(orca orchestration worker-start --task t)"'), ['orchestration worker-start']);
+check('nested quoted $( ) inside $( ) is detected',
+  subs('id="$(orca orchestration worker-start --task "$(cat f)")"'), ['orchestration worker-start']);
+
+// Not detected: single-quoted, heredoc body (incl. a markdown code span with
+// backticks), escaped \$(, echo/grep mentions, worker-started.
+check('single-quoted text is never scanned',
+  subs("echo '$(orca orchestration worker-start)'"), []);
+check('heredoc body is skipped, including a markdown code span with backticks',
+  subs('cat <<EOF\n```\norca orchestration worker-start\n```\nEOF'), []);
+check('escaped \\$( is literal, not a substitution',
+  subs(String.raw`echo "\$(orca orchestration worker-start)"`), []);
+check('an echo mention is text, not an invocation',
+  subs('echo "orca orchestration worker-start"'), []);
+check('a grep mention is text, not an invocation',
+  subs("grep -rn 'orca orchestration worker-start' /work/.claude"), []);
+check('a longer sub-command name is not worker-start',
+  subs('orca orchestration worker-started --x'), ['orchestration worker-started']);
+
+// --help / --spec are judged per invocation's own args, not the whole line.
+check('--help in a different orca invocation does not suppress this one\'s --spec',
+  orcaInvocations('orca orchestration task-create --spec s ; orca orchestration worker-start --help')
+    .map((inv) => [inv.sub, inv.args.includes('--spec'), inv.args.includes('--help')]),
+  [['orchestration task-create', true, false], ['orchestration worker-start', false, true]]);
+check('--spec in a different orca invocation does not count for this one',
+  orcaInvocations('orca orchestration task-create --help ; orca orchestration worker-start --spec s')
+    .map((inv) => [inv.sub, inv.args.includes('--spec'), inv.args.includes('--help')]),
+  [['orchestration task-create', false, true], ['orchestration worker-start', true, false]]);
+
+// Timing: none of these may pay a backtracking-regex-shaped cost.
+{
+  const timed = (cmd) => {
+    const t0 = process.hrtime.bigint();
+    orcaInvocations(cmd);
+    return Number(process.hrtime.bigint() - t0) / 1e6;
+  };
+  const t1 = timed('A=$(b) '.repeat(2000) + 'x');
+  if (t1 < 50) pass += 1; else failures.push(`'A=$(b) '.repeat(2000)+'x' took ${t1}ms, want <50ms`);
+  const t2 = timed('A=$(b ' + 'x'.repeat(60 * 1024));
+  if (t2 < 50) pass += 1; else failures.push(`60KB unclosed A=$(b took ${t2}ms, want <50ms`);
+  const t3 = timed('`'.repeat(60 * 1024));
+  if (t3 < 50) pass += 1; else failures.push(`60KB of backticks took ${t3}ms, want <50ms`);
+}
 
 // --- heartbeat classifyTerminal --------------------------------------------
 
@@ -211,14 +298,14 @@ check('a released worker holds nothing',
   check('parseCodeModel: the escalation alias maps to claude:<alias>', gate.parseCodeModel(cfg, 'fable'), 'claude:fable');
   check('parseCodeModel: the lookup alias maps to claude:<alias>', gate.parseCodeModel(cfg, 'haiku'), 'claude:haiku');
   check('parseCodeModel: bare codex', gate.parseCodeModel(cfg, 'codex'), 'codex');
-  check('parseCodeModel: codex:<model>', gate.parseCodeModel(cfg, 'codex:gpt-5.6-luna'), 'codex:gpt-5.6-luna');
+  check('parseCodeModel: codex:<model>', gate.parseCodeModel(cfg, 'codex:gpt-5-custom'), 'codex:gpt-5-custom');
   check('parseCodeModel: a gpt- id is treated as a codex model', gate.parseCodeModel(cfg, 'gpt-5.6-sol'), 'codex:gpt-5.6-sol');
   check('parseCodeModel: a gpt id is lower-cased', gate.parseCodeModel(cfg, 'GPT-5.6-Sol'), 'codex:gpt-5.6-sol');
   check('parseCodeModel: an unknown word is invalid', gate.parseCodeModel(cfg, 'banana'), 'invalid');
   check('parseCodeModel: a value with "/" is rejected, never truncated', gate.parseCodeModel(cfg, 'codex:openai/gpt-5'), 'invalid');
 
   check('describeOverride: codex', gate.describeOverride(cfg, 'codex'), 'Codex in an Orca worker');
-  check('describeOverride: codex:<model>', gate.describeOverride(cfg, 'codex:gpt-5.6-luna'), 'Codex (gpt-5.6-luna) in an Orca worker');
+  check('describeOverride: codex:<model>', gate.describeOverride(cfg, 'codex:gpt-5-custom'), 'Codex (gpt-5-custom) in an Orca worker');
   check('describeOverride: code alias', gate.describeOverride(cfg, 'code'), 'in-session Agent with model "sonnet"');
   check('describeOverride: claude:<alias>', gate.describeOverride(cfg, 'claude:opus'), 'in-session Agent with model "opus"');
 
@@ -227,7 +314,7 @@ check('a released worker holds nothing',
   check('currentExecRoute: operator override "codex"',
     gate.currentExecRoute(cfg, { execAgent: 'codex' }).route, 'codex');
   check('currentExecRoute: operator override "codex:<model>" carries the model',
-    gate.currentExecRoute(cfg, { execAgent: 'codex:gpt-5.6-luna' }).codexModel, 'gpt-5.6-luna');
+    gate.currentExecRoute(cfg, { execAgent: 'codex:gpt-5-custom' }).codexModel, 'gpt-5-custom');
   check('currentExecRoute: operator override "claude:opus" carries the alias',
     gate.currentExecRoute(cfg, { execAgent: 'claude:opus' }).alias, 'opus');
 
@@ -289,6 +376,8 @@ check('a released worker holds nothing',
   writeCodex('c.jsonl', [rl({ used_percent: 95, resets_at: now / 1000 - 60 }, null)], now);
   eq('codex: a window past resets_at counts as 0% used', q.codexRemaining(now), 100);
   eq('codex: old reading is not discarded by age', q.codexRemaining(now + 30 * 86400000), 100);
+  writeCodex('d.jsonl', [rl({ used_percent: 0.5, resets_at: future }, null)], now + 1);
+  eq('codex: used_percent in (0,1) is a genuine low reading, never treated as a fraction', q.codexRemaining(now), 99.5);
 
   const cache = path.join(root, 'claude.json');
   process.env.CK_USAGE_CACHE_PATH = cache;

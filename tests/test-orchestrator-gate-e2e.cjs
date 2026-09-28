@@ -22,6 +22,16 @@ const GATE = path.join(__dirname, '..', 'hooks', 'orchestrator-gate.cjs');
 const STUB = path.join(__dirname, 'fixtures', 'orca-stub.cjs');
 try { fs.chmodSync(STUB, 0o755); } catch {}
 
+// The process this suite runs in may itself be an orchestrated Claude Code session (it
+// is, when run under the operator's own setup) and so may carry ORCHESTRATOR_GATE,
+// ORCH_*, ORCA_TERMINAL_HANDLE, CODEX_HOME or CLAUDE_CODE_* from its real environment.
+// Every test env is built from this stripped base, never raw process.env, so the suite's
+// outcome depends only on what each test explicitly sets.
+const BASE_ENV = Object.fromEntries(
+  Object.entries(process.env).filter(([k]) =>
+    !/^(ORCHESTRATOR_GATE|ORCH_|ORCA_TERMINAL_HANDLE|CODEX_HOME|CLAUDE_CODE_)/.test(k))
+);
+
 const SID = `e2e-${process.pid}`;
 const SRC = '/work/proj/src/app.py'; // synthetic, not under any real tmp/home path
 
@@ -35,7 +45,7 @@ const FLAG = path.join(RUN_DIR, 'orca-unavailable');
 // activation forced to "always" so most of this suite exercises full gating regardless
 // of whether an ORCA_TERMINAL_HANDLE happens to be set - dedicated activation-mode tests
 // further down cover "orca-only" (the real default) and "off" explicitly. `agents.escalation`
-// and `agents.lookup` are configured explicitly (never hard-coded) so the ported "kongming"/
+// and `agents.lookup` are configured explicitly (never hard-coded) so the ported "escalation-agent"/
 // "Explore"/"scout" cases demonstrate the config-driven mechanism, not an operator-local default.
 const DEFAULT_CFG = {
   activation: 'always',
@@ -47,7 +57,7 @@ const DEFAULT_CFG = {
     lookup: { alias: 'haiku', id: null },
     codex: { alias: null, id: 'gpt-5.6-sol' },
   },
-  agents: { escalation: ['kongming'], lookup: ['Explore', 'scout'] },
+  agents: { escalation: ['escalation-agent'], lookup: ['Explore', 'scout'] },
   codexHandoffUsedPercent: 40,
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
   disabledGates: [],
@@ -69,7 +79,7 @@ function quotaEnv(name, claudeUsed, codexUsed, extraCfg) {
     fs.writeFileSync(configFile, JSON.stringify({ ...DEFAULT_CFG, ...extraCfg }));
   }
   return {
-    ...process.env,
+    ...BASE_ENV,
     CK_USAGE_CACHE_PATH: path.join(dir, 'claude.json'),
     CODEX_SESSIONS_DIR: path.join(dir, 'codex'),
     ORCA_DOWN_FLAG_PATH: FLAG,
@@ -167,18 +177,18 @@ expect('planning with inherited model is refused',
   dispatch({ subagent_type: 'planner', description: 'plan the refactor' }), DENY);
 expect('planning on fable without escalation reason is refused',
   dispatch({ subagent_type: 'planner', description: 'plan the refactor', model: 'fable' }), DENY);
-expect('a configured escalation agent (kongming) without escalation reason is refused',
-  dispatch({ subagent_type: 'kongming', description: 'review the diff' }), DENY);
+expect('a configured escalation agent (escalation-agent) without escalation reason is refused',
+  dispatch({ subagent_type: 'escalation-agent', description: 'review the diff' }), DENY);
 expect('planning on fable with escalation reason is allowed',
   dispatch({ subagent_type: 'planner', description: 'escalation: plan the refactor, opus failed twice at high effort', model: 'fable' }), ALLOW);
-expect('kongming with escalation reason in prompt is allowed',
-  dispatch({ subagent_type: 'kongming', description: 'review the diff', prompt: 'Opus could not resolve the race even with ultrathink; review the diff.' }), ALLOW);
+expect('escalation-agent with escalation reason in prompt is allowed',
+  dispatch({ subagent_type: 'escalation-agent', description: 'review the diff', prompt: 'Opus could not resolve the race even with ultrathink; review the diff.' }), ALLOW);
 expect('opus for non-review work is refused',
   dispatch({ subagent_type: 'Explore', description: 'find the config loader', model: 'opus' }), DENY);
 expect('opus for execution is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'opus' }), DENY);
 expect('an agent name not in the configured escalation list gets no special treatment',
-  dispatch({ subagent_type: 'not-kongming', description: 'review the diff' }), DENY);
+  dispatch({ subagent_type: 'not-configured-agent', description: 'review the diff' }), DENY);
 
 // Main panel vs Orca worker terminal, via the deterministic stub (never a live Orca).
 expect('attended main panel is still gated',
@@ -250,12 +260,14 @@ expect('a code spec read through $(< file) is judged by the file',
 expect('fable escalation naming opus (xhigh) is allowed',
   dispatch({ subagent_type: 'planner', description: 'escalation: opus (xhigh) failed twice to plan it', model: 'fable' }), ALLOW);
 
-// invokesOrca: absolute path, leading VAR= assignment, and $( ) forms all count as a
-// real invocation; a bare mention inside an echo/grep does not.
+// orcaInvocations (the linear-time scanner): absolute path, leading VAR= assignment,
+// wrapper commands, and $( )/backtick forms all count as a real invocation; a bare
+// mention inside an echo/grep does not. A real invocation whose reply carries no
+// dispatch id registers nothing (no "unlabelled-*" phantom worker) but prints a notice.
 {
   const RS = `${SID}-invoke`;
-  const post = (command) => ({ session_id: RS, hook_event_name: 'PostToolUse', effort: 'high', tool_name: 'Bash',
-    tool_input: { command }, tool_response: { stdout: '{"dispatchId":"ctx_rv_1"}', stderr: '' } });
+  const post = (command, stdout = '{"dispatchId":"ctx_rv_1"}') => ({ session_id: RS, hook_event_name: 'PostToolUse', effort: 'high',
+    tool_name: 'Bash', tool_input: { command }, tool_response: { stdout, stderr: '' } });
   const registered = (command) => {
     rmState(RS);
     invoke(post(command), CODEX_WINS);
@@ -263,11 +275,22 @@ expect('fable escalation naming opus (xhigh) is allowed',
   };
   for (const c of ['/opt/local/bin/orca orchestration worker-start --task t --agent codex',
                    'ORCA_X=1 orca orchestration worker-start --task t --agent codex',
-                   'id=$(orca orchestration worker-start --task t --agent codex)']) {
+                   'id=$(orca orchestration worker-start --task t --agent codex)',
+                   'id=`orca orchestration worker-start --task t --agent codex`',
+                   'sudo orca orchestration worker-start --task t --agent codex',
+                   'if true; then orca orchestration worker-start --task t --agent codex; fi']) {
     if (registered(c)) pass += 1; else failures.push(`real worker start not registered: ${c}`);
   }
   if (!registered('echo "orca orchestration worker-start" | cat')) pass += 1;
   else failures.push('an echo of worker-start registered a phantom worker');
+  {
+    rmState(RS);
+    const r = invoke(post('orca orchestration worker-start --task t --agent codex', '{"no_id_here":true}'), CODEX_WINS);
+    const st = readState(RS) || { workers: {} };
+    const gotPhantom = Object.keys(st.workers || {}).some((k) => k.startsWith('unlabelled-'));
+    if (!gotPhantom && r.out && /no dispatch id was found/.test(r.out)) pass += 1;
+    else failures.push(`a worker-start with no id in the reply must print a notice and register nothing (workers: ${JSON.stringify(st.workers)})`);
+  }
   rmState(RS);
 }
 
@@ -284,16 +307,16 @@ expect('fable escalation naming opus (xhigh) is allowed',
   expect('--code-model fable: code on fable needs no escalation reason', code('fable'), ALLOW, CODEX_WINS);
   expect('--code-model fable: fable for non-code work still needs escalation',
     d({ subagent_type: 'planner', description: 'plan it', model: 'fable' }), DENY, CODEX_WINS);
-  invoke(promptSubmit(OSID, '--code-model codex:gpt-5.6-luna'), SONNET_WINS);
+  invoke(promptSubmit(OSID, '--code-model codex:gpt-5-custom'), SONNET_WINS);
   expect('--code-model codex:<m>: in-session code refused even when quota favours the code model', code('sonnet'), DENY, SONNET_WINS);
   {
     const st = readState(OSID);
-    if (st && st.execAgent === 'codex:gpt-5.6-luna') pass += 1; else failures.push(`codex model override not stored (${st && st.execAgent})`);
+    if (st && st.execAgent === 'codex:gpt-5-custom') pass += 1; else failures.push(`codex model override not stored (${st && st.execAgent})`);
   }
   invoke(promptSubmit(OSID, '--code-model banana'), CODEX_WINS);
   {
     const st = readState(OSID);
-    if (st && st.execAgent === 'codex:gpt-5.6-luna') pass += 1; else failures.push('an invalid --code-model must not change the override');
+    if (st && st.execAgent === 'codex:gpt-5-custom') pass += 1; else failures.push('an invalid --code-model must not change the override');
   }
   invoke(promptSubmit(OSID, '--code-model auto'), CODEX_WINS);
   {
@@ -430,6 +453,47 @@ expect('auto: Codex at/over 40% used -> code on another model is refused',
 }
 expect('a neutral scouting dispatch is allowed',
   dispatch({ subagent_type: 'scout', description: 'search docs for the config key' }), ALLOW);
+
+// execFallbackWhenCodexUnavailable: when Codex's quota is genuinely unknown (no session
+// data at all) and `orca` cannot be found, auto-routing falls back to the code model
+// instead of defaulting to Codex; with a real orca binary present, it still defaults to
+// Codex despite the unknown quota (unknown is not evidence Codex is unusable).
+{
+  const dir = path.join(RUN_DIR, 'no-codex-data');
+  fs.mkdirSync(path.join(dir, 'empty-codex'), { recursive: true });
+  const noQuotaEnv = (orcaBin) => ({
+    ...BASE_ENV, CODEX_SESSIONS_DIR: path.join(dir, 'empty-codex'),
+    CK_USAGE_CACHE_PATH: path.join(dir, 'no-such-claude-cache.json'),
+    ORCA_DOWN_FLAG_PATH: FLAG, ORCH_STATE_DIR: STATE_DIR, ORCH_CONFIG_PATH: CONFIG_FILE, ORCA_BIN: orcaBin,
+  });
+  const FSID = `${SID}-fallback-nodata`;
+  const codeBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).' };
+  expect('unknown Codex quota + no orca binary falls back to the code model',
+    dispatch(codeBrief, FSID), ALLOW, noQuotaEnv(path.join(dir, 'no-such-orca-binary')));
+  rmState(FSID);
+  expect('unknown Codex quota + a reachable orca binary still falls back (quota alone is never known to favour Codex)',
+    dispatch(codeBrief, FSID), ALLOW, noQuotaEnv(STUB));
+  rmState(FSID);
+  // Codex quota IS known and under the handoff threshold (favours Codex) - a missing
+  // orca binary still forces the fallback, because Codex cannot be dispatched to at all
+  // without Orca, regardless of how much of its quota is left.
+  const knownQuotaNoOrca = { ...CODEX_WINS, ORCA_BIN: path.join(dir, 'no-such-orca-binary-2') };
+  expect('known quota favouring Codex + no orca binary still falls back to the code model',
+    dispatch(codeBrief, FSID), ALLOW, knownQuotaNoOrca);
+  rmState(FSID);
+  expect('known quota favouring Codex + a reachable orca binary stays on Codex',
+    dispatch(codeBrief, FSID), DENY, CODEX_WINS);
+  rmState(FSID);
+}
+
+// The per-turn banner names the exact configured model id alongside its alias.
+{
+  const RSID = `${SID}-modelid`;
+  const out = spawnSync(process.execPath, [GATE], { input: JSON.stringify(promptSubmit(RSID, 'status?')), encoding: 'utf8', env: CODEX_WINS }).stdout;
+  if (/model "opus" \(claude-opus-5-5\)/.test(out)) pass += 1;
+  else failures.push(`banner must show the review model's exact id: ${out.slice(0, 200)}`);
+  rmState(RSID);
+}
 
 // disabledGates: a named gate stops refusing, others are unaffected.
 {
