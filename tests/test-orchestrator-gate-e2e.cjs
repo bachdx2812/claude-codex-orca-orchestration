@@ -1151,7 +1151,7 @@ rmState(`${SID}-hard-off`);
 }
 
 // Item 7: a worker Orca reports done (dispatchStatus "completed") but still holding its
-// terminal is cap-exempt (frees a slot) WITHOUT being settled, so the Stop gate still
+// terminal is cap-exempt (frees capacity) WITHOUT being settled, so the Stop gate still
 // catches it as a leak.
 {
   const CAP7 = quotaEnv('item7-cap-exempt', 10, 30, { maxParallelCodexWorkers: 1 });
@@ -1163,7 +1163,7 @@ rmState(`${SID}-hard-off`);
   const doneHeldEnv = { ...CAP7, STUB_WORKERS_JSON: JSON.stringify([
     { dispatchId: 'ctx_item7_1', terminalState: 'live', workerState: 'succeeded', dispatchStatus: 'completed' },
   ]) };
-  expect('item7: a done-but-terminal-held worker is cap-exempt (frees a slot without being settled)',
+  expect('item7: a done-but-terminal-held worker is cap-exempt (frees capacity without being settled)',
     mainBash('orca orchestration worker-start --agent codex --task item7b', { sid: G7SID }), ALLOW, doneHeldEnv);
   {
     const st7 = readState(G7SID);

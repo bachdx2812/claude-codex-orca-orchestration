@@ -45,7 +45,7 @@ function resolveWorkerStartAgent(inv, s, flagValue) {
 
 /** Distinct live Codex group ids, for naming them in the parallel-limit refusal. A
  * cap-exempt group (done per Orca, still holding its terminal) is named with a suffix so
- * the operator knows RELEASING it — not waiting on it — is what frees a slot; it is never
+ * the operator knows RELEASING it — not waiting on it — is what frees capacity; it is never
  * counted toward the cap number itself (see countLiveGroups). */
 function liveCodexGroupIds(s) {
   const groups = new Map(); // group -> capExempt
@@ -94,7 +94,7 @@ function reconcileCodexGroupsWithOrca(s, orcaBin) {
     const ids = [w.dispatchId, w.taskId, w.agentTerminalHandle].filter(Boolean);
     const isDone = DONE.test(String(w.workerState || w.dispatchStatus || ''));
     if (w.terminalState === 'released') {
-      // Fully released: free its slot AND drop it from tracking (below).
+      // Fully released: free its capacity AND drop it from tracking (below).
       for (const id of ids) releasedIds.add(id);
     } else if (isDone) {
       // Done, but still holding its terminal: a resource leak the Stop gate
@@ -286,8 +286,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
       const replacesGroup =
         (WG.liveGroupByTerminal(s.workers, flagValue(inv.args, '--terminal')) || {}).group ||
         // `--retry-of` only replaces a group that is still LIVE (groupById matches any
-        // status); a group that has already settled freed its slot when it settled, so
-        // retrying it is a brand-new dispatch, not a same-slot replacement (item 8).
+        // status); a group that has already settled freed its capacity when it settled, so
+        // retrying it is a brand-new dispatch, not a same-opening replacement (item 8).
         (() => {
           const g = WG.groupById(s.workers, flagValue(inv.args, '--retry-of'));
           if (!g) return null;

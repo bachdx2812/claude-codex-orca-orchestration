@@ -115,7 +115,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 408 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 472 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -227,9 +227,23 @@ File ownership is *declared*, not observed: `Owns:` is trusted at face value, an
 checks that a worker's actual edits stayed within what it claimed. Workers started by a
 subagent (not the main panel) are not tracked and do not count toward
 `maxParallelCodexWorkers`, the same boundary every other gate here respects — these hooks
-gate the main panel's own dispatches. `orchestration dispatch --to <handle>` (a
-context-only send to an existing terminal, not a new worker) is out of scope for both the
-parallel-limit and ownership gates.
+gate the main panel's own dispatches, both at `worker-start` time and again when that
+dispatch's own result is registered, so a subagent's Codex worker is never counted twice
+or once by accident. `orchestration dispatch --to <handle>` (a context-only send to an
+existing terminal, not a new worker) is out of scope for both the parallel-limit and
+ownership gates.
+
+Only an `Owns:` line that starts the line (optionally after `-`/`*`) is read — a markdown-
+bold `**Owns:**` or an `Owns:` appearing mid-sentence is not recognized, and the refusal
+message says so rather than guessing at prose. `code-brief-needs-owns` is enforced at
+`worker-start`, where the workspace is actually known; a `task-create --spec` with no
+`Owns:` is not refused by itself, since it doesn't yet know whether its eventual
+`worker-start` will be isolated. When a Bash command chains more than one
+`worker-start`/`task-create` invocation, each is matched to its own JSON reply
+positionally (in command order) to keep them from being merged into one group — a command
+whose spec text uses `$(cat file)`/`` `cat file` `` command substitution degrades to
+judging the whole command's text instead of just that invocation's own spec, since the
+substituted content isn't visible to the per-invocation argument scanner.
 
 ## Development
 

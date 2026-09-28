@@ -675,7 +675,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (target.toLowerCase() === 'all') {
       // Clears BOTH sources of a live ownership claim (item 12): in-session Agent claims
       // AND Bash-dispatch reservations — a reservation is just as capable of holding a
-      // stuck Owns: claim (and a parallel-Codex cap slot) as an agentClaims entry is.
+      // stuck Owns: claim (and a parallel-Codex cap opening) as an agentClaims entry is.
       released = Object.keys(s.agentClaims).length + Object.keys(s.reservations).length;
       s.agentClaims = {};
       s.reservations = {};
@@ -957,7 +957,7 @@ function onPostToolUseLocked(p, s, cfg) {
   // Orca "ok":false JSON, no registered worker, no launched-then-finished Agent) — without
   // this, its PreToolUse reservation/claim would sit until the 10-minute reservation TTL
   // (or the much longer ownershipClaimTtlMinutes for an agentClaim), silently holding a
-  // parallel-Codex slot or an ownership claim for nothing. Recognise the common
+  // parallel-Codex opening or an ownership claim for nothing. Recognise the common
   // error-indicator shapes and drop this tool_use_id's reservation/claim outright.
   const toolFailed = !!(resp && (resp.is_error === true || resp.error || resp.isError === true));
   if (toolFailed) {

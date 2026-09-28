@@ -225,27 +225,57 @@ live worker in the session. The release matcher (`worker-stop`/`worker-release`/
 `worker-abandon`/`terminal close`) now reads the specific orca invocation's own parsed
 `--dispatch`/positional argument; an unrecognised label settles nothing and prints a hint.
 
+A related gap closed in the same round: a real Orca reply is a nested envelope
+(`{"id","ok","result":{...,"mutation":{...}}}`), and a Bash command can chain more than one
+`worker-start`/`task-create` in one call (`task-create ... && worker-start --task "$ID"`,
+or two `worker-start`s back to back). Each invocation's own reply is now matched
+positionally (one JSON reply line per dispatch invocation, in command order, skipping
+anything shaped like a `worker-list` reply) rather than scanning the whole command's
+concatenated stdout as a single blob — otherwise two chained dispatches would merge into
+one group, and releasing one would silently settle the other too.
+
 **`max-parallel-codex-workers`.** Every real `orchestration worker-start` invocation with
 agent Codex (explicit `--agent codex`, or `--terminal <h>` with no `--agent` when `<h>`
 does not belong to a tracked non-Codex group) counts against `maxParallelCodexWorkers`. The
 count is this session's own state, reconciled against `orca orchestration worker-list
 --json` (5s timeout) only once the local count is at or over the cap — a healthy session
-under the cap never pays that round trip. A race between two parallel `Bash` calls is
-closed by a short-lived file lock around "count, then reserve": the losing call sees the
-winner's reservation and is refused before either registers a real worker.
+under the cap never pays that round trip, and that round trip itself runs OUTSIDE the state
+lock (acquired again only to recheck and reserve afterward), so an at-cap session never
+blocks every other concurrent hook process for its full duration. A worker Orca reports
+done (`workerState`/`dispatchStatus` succeeded/failed/stopped/cancelled/completed) but
+still holding its terminal (`terminalState` not `released`) is cap-exempt — it frees capacity
+without being settled, since settling it here would make the still-unreleased terminal
+invisible to the `workers-unreconciled` Stop gate. A race between two parallel `Bash` calls
+is closed by a file lock around "reload the state fresh from disk under the lock, then
+count, then reserve, then save" — every process that races this section reads the
+PREVIOUS winner's just-saved reservation, not a stale pre-lock snapshot, so the losing
+call sees the winner's reservation and is refused before either registers a real worker,
+and one process's save can never silently overwrite another's.
 
 **`code-brief-needs-owns` / `ownership-overlap`.** The same code briefs that already need a
 verify command (an Orca `--spec`, or an in-session `Agent`/`Task` exec dispatch) — when
 running in a *shared* workspace, not an isolated worktree/Agent — must also declare
-`Owns: <repo-relative paths, globs ok>` or `Owns: n/a <reason>`, **on its own line**. A
-claim that overlaps another live claim in the same workspace (`repoRoot|--worktree value`,
-or `repoRoot|current` with no `--worktree`) is refused, naming the holder and its age. A
-`task-create --spec`'s `Owns:` is inherited by a later `worker-start --task <id>` that
-supplies no `--spec` of its own; an unresolvable `--task` value (an unexpanded shell
-variable) is allowed with an advisory note rather than refused. Isolated work
-(`--worktree new-child`/`new-top-level`, or Agent `isolation:"worktree"`) needs no `Owns:`
-at all and never conflicts with anything, since each isolated dispatch gets a unique
-workspace key.
+`Owns: <repo-relative paths, globs ok>` or `Owns: n/a <reason>`, **on its own line** (a
+markdown-bold `**Owns:**` or a mid-sentence `Owns:` is not recognized — the refusal names
+this explicitly rather than guessing at prose). A claim that overlaps another live claim in
+the same workspace (`repoRoot|--worktree value`, or `repoRoot|current` with no
+`--worktree`, and `--worktree active`/`current` normalize onto that same "current" key
+rather than becoming their own workspace) is refused, naming the holder and its age. The
+requirement is enforced at `worker-start`, where the workspace is actually known — a
+`task-create --spec` with no `Owns:` is never refused by itself, since it doesn't yet know
+whether its eventual `worker-start` will be isolated; `task-create`'s `Owns:` (or its
+absence) is recorded and inherited by a later `worker-start --task <id>` that supplies no
+`--spec` of its own, and THAT is where a missing claim is finally refused if the dispatch
+turns out non-isolated. An unresolvable `--task` value (an unexpanded shell variable) is
+allowed with an advisory note, UNLESS the same command line contains exactly one
+`task-create`, in which case its claim resolves the reference directly (the one-liner
+`ID=$(orca orchestration task-create ...) && orca orchestration worker-start --task "$ID"`
+pattern). Isolated work (`--worktree new-child`/`new-top-level`, or Agent
+`isolation:"worktree"`) needs no `Owns:` at all and never conflicts with anything, since
+each isolated dispatch gets a unique workspace key. A disabled `code-brief-needs-owns` or
+`ownership-overlap` only skips THAT check — the parallel-Codex cap check and the
+dispatch's own reservation still run for the same invocation, never silently skipped
+alongside it.
 
 A claim releases when its holder does: a settled worker group frees its claim; a
 foreground `Agent`/`Task` dispatch frees it at the matching `PostToolUse`; a background
@@ -282,11 +312,13 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
                              "status": "live|settled", "last_seen": 0,
                              "rate_limited_until": 0,
                              "group": "ctx_x", "kind": "worker|terminal", "agent": "codex",
-                             "owns": ["src/api/**"], "ws": "<repoRoot>|current" } },
+                             "owns": ["src/api/**"], "ws": "<repoRoot>|current",
+                             "capExempt": false } },
   "reservations": { "<toolUseId>#<idx>": { "ts": 0, "agent": "codex",
                                             "owns": ["src/api/**"], "ws": "<repoRoot>|current",
                                             "codexSlot": true } },
-  "agentClaims": { "<toolUseId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current", "ts": 0 } },
+  "agentClaims": { "<toolUseId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current", "ts": 0,
+                                     "background": false } },
   "tasks": { "<taskId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current" } },
   "last_heartbeat": 0, "rate_limit_hits": 0 }
 ```
@@ -297,9 +329,19 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
 `group`/`kind`/`agent`/`owns`/`ws` on a worker entry, `reservations`, `agentClaims` and
 `tasks` are the parallel-Codex-worker cap and file-ownership bookkeeping (see "Parallel
 Codex workers and file ownership" above). `reservations` and `agentClaims` are both
-transient — a reservation is consumed by the matching `PostToolUse` (or expires after 10
-minutes if nothing ever does), and an `agentClaims` entry is removed at release, whichever
-of the paths above fires first.
+transient — a reservation is consumed by the matching `PostToolUse` (dropped outright on a
+failed tool call or an Orca `"ok":false` reply, or expires after 10 minutes if nothing ever
+resolves it), and an `agentClaims` entry is removed at release, whichever of the paths
+above fires first. A worker Orca reports done but still holding its terminal is marked
+`capExempt: true` — it no longer counts toward `maxParallelCodexWorkers`, but stays `live`
+so the Stop gate still catches it as an unreleased resource. An `agentClaims` entry from a
+`run_in_background: true` dispatch is marked `background: true` and is deliberately NOT
+released at its own launch `PostToolUse` (that event fires as soon as the dispatch is
+sent, long before the background work finishes) — only a matching
+`<task-notification><tool-use-id>`, the TTL, or `--release-claims` frees it. Every state
+mutation above happens after the state file's `.lock` directory is held and the state is
+re-read fresh from disk, never against the snapshot loaded before the lock — two hook
+processes racing the same session id can otherwise silently drop each other's write.
 
 ## Escape hatches
 
@@ -313,7 +355,10 @@ of the paths above fires first.
   execution routing, honestly — narrower than a full bypass.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees one or every
   tracked `Owns:` claim — the deliberate manual override alongside the automatic release
-  paths (matching `PostToolUse`, a `<task-notification>`, `ownershipClaimTtlMinutes`).
+  paths (matching `PostToolUse`, a `<task-notification>`, `ownershipClaimTtlMinutes`). It
+  clears BOTH `agentClaims` and any matching Bash-dispatch `reservations` (by exact id or
+  by `<id>#<idx>` prefix), so a stuck reservation can be freed the same way a stuck
+  `agentClaims` entry can.
 - `maxParallelCodexWorkers: 0` (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env, one
   process) makes the parallel-Codex-worker cap unlimited.
 
