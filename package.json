@@ -1,0 +1,20 @@
+{
+  "name": "claude-codex-orca-orchestration",
+  "version": "1.0.0",
+  "description": "Installable Claude Code hooks that enforce a plan/review-on-one-model, code-on-another, Orca-worker-supervised orchestration contract.",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs"
+  },
+  "files": [
+    "hooks",
+    "rules",
+    "snippets",
+    "config",
+    "install.mjs"
+  ]
+}
