@@ -819,6 +819,23 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   // itself re-open the "start of line" flag, not only an actual `\n`).
   check('splitJsonReplies: two real replies with no separator on the same line (`{...}{...}`) both split',
     dispatchIds(`${r1}${r2}`), ['ctx_1', 'ctx_2']);
+
+  // Fifth Opus 5.5 review round, optional LOW item: a real reply closing must re-arm chunk
+  // detection for a following `{` on the same line (proven above), but must NOT also let a `[`
+  // reopen right there — a dispatch reply is always a JSON object, never a top-level array. This
+  // is not just a filtering nicety: an UNTERMINATED stray `[` mid-line (e.g. `{...}[unterminated`
+  // with no matching `]` before the next real reply) would, if opened as a chunk, consume every
+  // character up to end-of-text as "still inside that chunk" — silently swallowing the next real
+  // reply entirely. Before this fix a `[` right after a closing `}` (no newline) was still
+  // eligible to reopen, so exactly this happened. A `[` immediately after an actual newline is
+  // still a legitimate chunk opener (the existing "an array value is never accepted as a
+  // dispatch reply" case above already proves a well-formed, terminated `[3]\n` on its own line
+  // is rejected for lacking dispatch signal — a separate, later filtering step — not because it
+  // failed to open at all).
+  check('splitJsonReplies: an unterminated `[` right after a closing `}` on the same line does not swallow the next real reply',
+    dispatchIds(`${r1}[unterminated\n${r2}`), ['ctx_1', 'ctx_2']);
+  check('splitJsonReplies: a well-formed `[1,2,3]` right after a closing `}` on the same line is still not reopened',
+    dispatchIds(`${r1}[1,2,3]`), ['ctx_1']);
 }
 
 // --- ownership.cjs: ownsOverlap regression cases for the fix-round-1 false negatives (item 3) --

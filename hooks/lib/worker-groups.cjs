@@ -88,18 +88,26 @@ function splitConcatenatedJson(text) {
   let inString = false;
   let escaped = false;
   let atLineStart = true;
+  // Only set true right after a real newline; a chunk closing mid-line re-arms `atLineStart`
+  // but must NOT also permit `[` there — a dispatch reply is always a JSON object, never a
+  // top-level array, so allowing `[` to reopen immediately after `{...}` with no separator
+  // (e.g. `{...}[stray, log, array]`) risks swallowing unrelated log noise as a second "reply".
+  // A `[` is only ever a legitimate chunk opener right after an actual newline.
+  let realLineStart = true;
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (depth === 0) {
-      if (c === '\n') { atLineStart = true; continue; }
+      if (c === '\n') { atLineStart = true; realLineStart = true; continue; }
       if (c === ' ' || c === '\t' || c === '\r') continue; // whitespace never ends "start of line"
-      if ((c === '{' || c === '[') && atLineStart) {
+      if ((c === '{' || (c === '[' && realLineStart)) && atLineStart) {
         start = i;
         depth = 1;
         atLineStart = false;
+        realLineStart = false;
         continue;
       }
       atLineStart = false; // any other non-whitespace character (including a stray quote) is inert noise
+      realLineStart = false;
       continue;
     }
     // depth > 0: inside an opened candidate chunk — normal string/escape-aware balanced scan.

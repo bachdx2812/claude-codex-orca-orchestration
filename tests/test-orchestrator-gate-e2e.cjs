@@ -1608,6 +1608,32 @@ rmState(`${SID}-hard-off`);
   rmState(G4dSID);
 }
 
+// Round 5, item 1 (HIGH regression fix): a dispatch made WITHOUT --json can still print a
+// plain-text id line with no `{` anywhere (e.g. "Dispatched worker ctx_abc123 for task
+// task_xyz"). The prior round's `definitelyNoJson` check only looked for `{`, so this real,
+// successful dispatch was wrongly treated as "affirmative evidence nothing was dispatched" and
+// its reservation was dropped immediately — the worker then ran unmetered against the parallel-
+// Codex cap. The fix also checks WG.idsFromOutput for a bare ctx_/task_/term_ token before
+// concluding nothing was dispatched, and registers the plain-text id exactly like a JSON reply.
+{
+  const CAP5aEnv = quotaEnv('round5-item1-plaintext-id', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G5aSID = `${SID}-round5-item1`;
+  rmState(G5aSID);
+  const tu5a = 'toolu_round5_item1';
+  const cmd5a = 'orca orchestration worker-start --agent codex --spec @a.md && false';
+  invoke(mainBash(cmd5a, { sid: G5aSID, tool_use_id: tu5a, cwd: FAKE_REPO }), CAP5aEnv);
+  invoke({ session_id: G5aSID, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+    tool_input: { command: cmd5a }, tool_use_id: tu5a,
+    error: 'Exit code 1\nDispatched worker ctx_abc123 for task task_xyz' }, CAP5aEnv);
+  const after5a = readState(G5aSID);
+  if (after5a && after5a.workers && after5a.workers.ctx_abc123 && after5a.workers.ctx_abc123.status === 'live'
+      && !after5a.reservations[`${tu5a}#0`]) pass += 1;
+  else failures.push(`round5 item1: a plain-text dispatch id in a failed command's error text must register a real worker, not drop the reservation as if nothing happened (${JSON.stringify(after5a && { workers: after5a.workers, reservations: after5a.reservations })})`);
+  expect('round5 item1: the next worker-start at cap 1 is now correctly REFUSED (the plain-text-id dispatch is really running)',
+    mainBash('orca orchestration worker-start --agent codex --spec @b.md --json', { sid: G5aSID, cwd: FAKE_REPO }), DENY, CAP5aEnv);
+  rmState(G5aSID);
+}
+
 console.log(`${pass} passed, ${failures.length} failed`);
 for (const f of failures) console.log(`  FAIL ${f}`);
 

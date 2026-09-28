@@ -1078,8 +1078,9 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
  * dispatched a real worker before that failure; the exit code says nothing about whether the
  * dispatch itself succeeded. `p.error` carries the command's actual output on this event, so
  * it is scanned exactly like a successful reply would be via `registerDispatchReplies`. Only a
- * Bash call with NO dispatch sub-command at all, one whose error text contains no `{`
- * whatsoever (a real dispatch reply is always JSON, so there is no ambiguity left), or an
+ * Bash call with NO dispatch sub-command at all, one whose error text contains neither a `{`
+ * nor a bare ctx_/task_/term_ id token (a dispatch without `--json` can still print a plain-text
+ * id line, so both are checked — there is no ambiguity left only once neither is present), or an
  * Agent/Task claim (no such ambiguity to begin with), gets its reservation/claim dropped
  * immediately.
  *
@@ -1099,13 +1100,19 @@ function onPostToolUseFailure(p, s, cfg) {
       const hasDispatch = orcaInvocations(cmd).some((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
       const errorText = String(p.error || '');
       // Two different "no id was found" cases must NOT be treated the same:
-      //  - errorText is NON-EMPTY and contains no `{` at all (e.g. `--bad-flag`'s plain-text
-      //    CLI usage error) — a real orca `--json` dispatch reply is ALWAYS JSON, so this is
-      //    affirmative, positive evidence nothing was dispatched. No ambiguity: drop now.
+      //  - errorText is NON-EMPTY, contains no `{` at all, AND no bare ctx_/task_/term_ token
+      //    either (e.g. `--bad-flag`'s plain-text CLI usage error) — genuinely nothing to find.
+      //    No ambiguity: drop now. A dispatch WITHOUT `--json` prints a plain-text id line
+      //    (e.g. "Dispatched worker ctx_abc123 for task task_xyz") with no `{` anywhere, so the
+      //    bare-`{`-check alone would wrongly treat a real, successful dispatch as "definitely
+      //    nothing happened" and drop its reservation while the worker keeps running unmetered
+      //    against the parallel-Codex cap — `WG.idsFromOutput` (the same generic ctx_/task_/
+      //    term_ token scan the JSON path already relies on) is checked here too so a plain-text
+      //    id is never missed.
       //  - errorText is EMPTY (no output was captured at all, e.g. before Orca could reply) —
       //    this is an absence of information, not evidence of anything; the outcome is
       //    genuinely unknown, so the reservation must be kept for the TTL exactly as before.
-      const definitelyNoJson = errorText.length > 0 && !errorText.includes('{');
+      const definitelyNoJson = errorText.length > 0 && !errorText.includes('{') && WG.idsFromOutput(errorText).size === 0;
       if (hasDispatch && !definitelyNoJson) {
         // Either the error text carries at least one `{` (scan it for a real id exactly like a
         // success would), or it's empty (registerDispatchReplies will find no ids either way
