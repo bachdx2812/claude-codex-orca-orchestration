@@ -3,6 +3,32 @@
 Exact steps for an AI coding agent installing this repo on a teammate's machine.
 Read `rules/orchestration-contract.md` first for what gets enforced and why.
 
+## Who does what
+
+```
+Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
+[Sonnet once Codex has used >= 40%] -> Opus 5.5 reviews -> main panel reports
+```
+
+| Role | Model | Dispatched as | Config key |
+|---|---|---|---|
+| Main panel | session default; never writes code | — | `activation` |
+| Planner / red-team / reviewer / verifier | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
+| Coder (default) | Codex `gpt-5.6-sol` | Orca worker (`worker-start --agent codex --model gpt-5.6-sol`) | `models.codex` |
+| Coder (handoff) | Sonnet, once Codex used >= `codexHandoffUsedPercent` (40) or `orca`/`codex` missing | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `models.code` |
+| Lookups | Haiku (advised, not enforced) | `Agent` with `model: "haiku"` | `models.lookup` |
+| Escalation | Fable 5.1 (`claude-fable-5-1`), only after Opus 5.5 failed at high effort | `Agent` with `model: "fable"` | `models.escalation` |
+
+Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto`. Full
+detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
+
+**Subagents and parallel work.** In-session subagents (`Agent` tool) return their result
+directly and are never tracked by these hooks — no heartbeat needed. Orca workers
+(Codex) run in their own terminal/worktree and must be supervised by
+`orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
+terminal, an orphan, or a rate limit; `Stop` refuses to end the session with one live and
+unwatched, or finished and unreleased. Full detail: `README.md#subagents-and-parallel-work`.
+
 ## 1. Prerequisite checks
 
 ```bash

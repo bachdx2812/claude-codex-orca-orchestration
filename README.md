@@ -9,6 +9,64 @@ loop that will not let the session end with an Orca worker still live and unwatc
 
 Repo: <https://github.com/bachdx2812/claude-codex-orca-orchestration>
 
+## Who does what
+
+```
+Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
+[Sonnet once Codex has used >= 40%] -> Opus 5.5 reviews -> main panel reports
+```
+
+| Role | What it does | Model (exact version) | How it is dispatched | Config key |
+|---|---|---|---|---|
+| Main panel (orchestrator) | Takes the request, delegates, supervises workers, reports; never writes code | Session default model | — | `activation` |
+| Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
+| Reviewer / verifier | Code review, verification | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
+| Coder (default) | Implement / fix / refactor | Codex `gpt-5.6-sol` | Orca worker: `orca orchestration worker-start --agent codex --model gpt-5.6-sol` (brief must name a verify command) | `models.codex` |
+| Coder (handoff) | Same work once Codex has used >= `codexHandoffUsedPercent` (default 40) of its quota, or when `orca`/`codex` is not installed | Sonnet | `Agent` with `model: "sonnet"` (brief must name a verify command) | `codexHandoffUsedPercent`, `models.code`, `execFallbackWhenCodexUnavailable` |
+| Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
+| Escalation | Only after Opus 5.5 failed even at higher effort; the dispatch must say both | Fable 5.1 (`claude-fable-5-1`) | `Agent` with `model: "fable"` + "escalation: opus failed ... at high effort ..." | `models.escalation` |
+
+### Override from the main panel
+
+`--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto` (session-scoped, last flag
+wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The per-prompt "Model
+routing" line always shows the current coder and why.
+
+## Subagents and parallel work
+
+Two kinds of workers do the actual work; only Orca workers need supervision:
+
+| Kind | Examples | Where it runs | How the panel learns it finished |
+|---|---|---|---|
+| In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
+| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, an orphaned terminal, or a rate-limit signal. |
+
+**Parallel work.** These hooks gate the main panel's writes and model routing, not task
+scheduling, so running things in parallel is the operator's call, not something the gate
+checks: keep file ownership disjoint between anything running at once, and remember
+read-only work (review, red-team, lookups) is always safe to parallelize since nothing is
+written. The gate has no visibility into which files a worker touches or whether two
+workers collide on one.
+
+**Codex rate limits under parallel load.** On a rate-limit signal (`rate limit`, `429`,
+`quota exceeded`, `usage limit`, `too many requests`, `retry-after`, `overloaded_error` in
+a worker's output), `orca-heartbeat.cjs` marks every live worker as backing off for ~120s.
+The correct response is to wait, then retry the *same* dispatch — never re-dispatch
+immediately or start a replacement, both of which deepen the limit:
+
+```
+orca orchestration worker-start --retry-of <dispatchId> ...
+```
+
+— and reduce how many Codex workers run in parallel.
+
+**Enforced vs advisory.** Enforced: gates apply to the main panel only (subagents and
+Orca-worker sessions are never gated); `Stop` refuses to end the session while a worker is
+running and unwatched (`workers-unwatched` — no live heartbeat) or finished but still
+holding a terminal (`workers-unreconciled` — needs `worker-retain` or `worker-release`).
+Advisory only, never checked by the gate: how much to parallelize, and whether two
+workers' file ownership overlaps.
+
 ## What it is
 
 Claude Code hooks are just scripts your settings.json wires to lifecycle events
@@ -28,11 +86,9 @@ which model escalates to, which model codes, the Codex-quota handoff threshold, 
 language, which gates are active. See `rules/orchestration-contract.md` for the full
 contract and `config/orchestration.config.example.json` for every knob.
 
-**Shipped model versions.** The example config pins exact versions, not just aliases:
-review/red-team/verify runs on **Opus 5.5** (`claude-opus-5-5`, alias `opus`), escalation
-on **Fable 5.1** (`claude-fable-5-1`, alias `fable`), and Codex worker dispatches default
-to **`gpt-5.6-sol`**. `install.mjs` pins both `ANTHROPIC_DEFAULT_OPUS_MODEL` and
-`ANTHROPIC_DEFAULT_FABLE_MODEL` to these by default (`--no-pin-models` skips both); edit
+Exact model versions are listed once, in "Who does what" above. `install.mjs` pins both
+`ANTHROPIC_DEFAULT_OPUS_MODEL` and `ANTHROPIC_DEFAULT_FABLE_MODEL` to the review and
+escalation versions by default (`--no-pin-models` skips both); edit
 `~/.claude/orchestration.config.json` to point at different versions or providers.
 
 ## Quickstart
