@@ -1385,6 +1385,42 @@ rmState(`${SID}-hard-off`);
   rmState(G1cSID);
 }
 
+// Round 3, item 3: a mid-loop Orca reconcile's real effect (marking a done-but-held worker
+// cap-exempt) must survive even when THIS SAME command's own dispatch attempt ends up
+// refused for an unrelated reason later in the same command line — only this command's own
+// (rolled-back) reservations must vanish, never the reconcile's independent, Orca-confirmed
+// change to a different worker.
+{
+  const CAP3i = quotaEnv('round3-item3-reconcile-survives-violation', 10, 30, { maxParallelCodexWorkers: 1 });
+  const G3iSID = `${SID}-round3-item3`;
+  rmState(G3iSID);
+  const tuOld = 'toolu_round3_item3_old';
+  // Seed one live (not yet cap-exempt) codex worker so the cap (1) is already at capacity.
+  invoke(mainBash('orca orchestration worker-start --agent codex --task round3item3old', { sid: G3iSID, tool_use_id: tuOld }), CAP3i);
+  invoke(postBash('orca orchestration worker-start --agent codex --task round3item3old', '{"dispatchId":"ctx_round3_item3_old"}', { sid: G3iSID, tool_use_id: tuOld }), CAP3i);
+  // Orca now reports that seeded worker as done but still holding its terminal — reconciling
+  // it marks it cap-exempt (frees the one slot) without settling it.
+  const reconcileEnv3i = { ...CAP3i, STUB_WORKERS_JSON: JSON.stringify([
+    { dispatchId: 'ctx_round3_item3_old', terminalState: 'live', workerState: 'succeeded', dispatchStatus: 'completed' },
+  ]) };
+  // One command, two worker-starts claiming the IDENTICAL Owns in the same shared workspace:
+  // invocation 0 triggers the at-cap reconcile (freeing the slot via the done-but-held
+  // worker above) and is admitted; invocation 1, in the very same command, then conflicts
+  // with invocation 0's own just-made reservation and is refused for ownership-overlap — so
+  // the overall command is denied even though the reconcile itself succeeded.
+  const sameOwnsSpec = 'implement x.\nVerify: npm test\nOwns: src/round3item3/x.ts';
+  const cmd3i = `orca orchestration worker-start --agent codex --spec "${sameOwnsSpec}" --json && ` +
+    `orca orchestration worker-start --agent codex --spec "${sameOwnsSpec}" --json`;
+  expect('round3 item3: two same-Owns worker-starts in one command, the second self-conflicts and denies the whole command',
+    mainBash(cmd3i, { sid: G3iSID, cwd: FAKE_REPO }), DENY, reconcileEnv3i);
+  const after3i = readState(G3iSID);
+  if (after3i.workers.ctx_round3_item3_old && after3i.workers.ctx_round3_item3_old.status === 'live' && after3i.workers.ctx_round3_item3_old.capExempt) pass += 1;
+  else failures.push(`round3 item3: the reconcile's cap-exempt effect on the OTHER worker must survive this command's own refusal (${JSON.stringify(after3i && after3i.workers)})`);
+  if (Object.keys(after3i.reservations || {}).length === 0) pass += 1;
+  else failures.push(`round3 item3: this command's own (refused) reservations must be rolled back, none left (${JSON.stringify(after3i.reservations)})`);
+  rmState(G3iSID);
+}
+
 // Round 2, item 6: a "pending-<ts>" placeholder (a worker-start reply that carried no id at
 // all — Orca was never given this key as an id) must survive the at-cap reconcile's "not
 // mentioned by Orca and older than 10 minutes" rule. Only a later worker-list/worker-read

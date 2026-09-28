@@ -231,6 +231,13 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   const cap = maxParallelCodexWorkers(cfg);
   const ttl = ownershipClaimTtlMinutes(cfg);
   let violation = null;
+  // True once a mid-loop Orca reconcile (`applyOrcaReconciliation`) has actually changed
+  // something real — a worker Orca confirmed released, or marked cap-exempt. That change
+  // must be persisted even when THIS command's own dispatch attempt ends up refused (third
+  // review round, item 3): it reflects reality independently of this command's outcome, and
+  // discarding it just means the very next hook invocation pays for the same 5s reconcile
+  // all over again for no reason.
+  let reconcileChanged = false;
   // Reservations made by earlier invocations IN THIS SAME command line, kept locally so a
   // mid-loop reconcile reload (item 10) never loses them, and so a later invocation in the
   // same command (e.g. `task-create ... && worker-start --task "$ID"`) can resolve an
@@ -378,7 +385,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             locked = acquireLock(lockDir, {});
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
-            if (rows !== null) applyOrcaReconciliation(s, rows);
+            if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;
             live = WG.countLiveGroups(s.workers, 'codex') + OC.countPendingCodexReservations(s);
           }
           if (live >= cap) {
@@ -398,7 +405,18 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
       localReservations[`${baseId}#${idx}`] = reservation;
       s.reservations[`${baseId}#${idx}`] = reservation;
     }
-    if (!violation) save(s);
+    if (violation) {
+      // All-or-nothing for THIS command's own reservations: an earlier, non-violating
+      // invocation in the same multi-invocation command line must not keep its reservation
+      // once a later invocation in that same command is refused (unchanged from before this
+      // fix) — but a real, Orca-confirmed reconcile effect on OTHER, unrelated workers made
+      // during this same critical section must survive independently of this command's own
+      // outcome, since it reflects reality regardless of whether this dispatch was allowed.
+      for (const key of Object.keys(localReservations)) delete s.reservations[key];
+      if (reconcileChanged) save(s);
+    } else {
+      save(s);
+    }
   } finally {
     if (locked) releaseLock(lockDir);
   }
