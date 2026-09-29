@@ -242,6 +242,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   const baseId = toolUseId || `sid-${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const cap = maxParallelCodexWorkers(cfg);
   const ttl = ownershipClaimTtlMinutes(cfg);
+  const agentCapActive = !gateDisabled(cfg, 'max-parallel-agents') &&
+    Number.isFinite(deps.agentParallelLimit(cfg));
+  const codexCapActive = cap > 0 && !gateDisabled(cfg, 'max-parallel-codex-workers');
+  const hardCapActive = agentCapActive || codexCapActive;
   let violation = null;
   // True once a mid-loop Orca reconcile (`applyOrcaReconciliation`) has actually changed
   // something real — a worker Orca confirmed released, or marked cap-exempt. That change
@@ -260,7 +264,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   // Only release the lock if THIS call actually acquired it — acquireLock() can return
   // false on timeout (degrade to allow, per the file-lock design), and unconditionally
   // rmdir-ing the lock directory then would tear down another process's still-held lock.
-  let locked = acquireLock(lockDir, deps.capLockOpts);
+  // Ownership bookkeeping is best-effort under contention, so it keeps file-lock's short
+  // default. Only an enabled, finite resource cap needs the long timeout that can outlive a
+  // stale lock. This keeps an unlimited worker-start from waiting ~10.5s for no cap at all.
+  let locked = acquireLock(lockDir, hardCapActive ? deps.capLockOpts : {});
   try {
     // CRITICAL: reload state fresh from disk now that the lock is held. `s` as passed in
     // was loaded by main() *before* this lock was acquired, so under concurrent hook
@@ -271,6 +278,15 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     // an outright dropped write). Every read and mutation below must go through this
     // freshly-loaded copy, never the stale `s` parameter.
     s = load(sessionId);
+    // A finite cap cannot be evaluated safely after its one long acquisition attempt failed.
+    // Refuse now instead of entering the at-cap reconcile branch and paying the same long
+    // timeout a second time against the same live holder.
+    if (!locked && hardCapActive) {
+      violation = {
+        gate: agentCapActive ? 'max-parallel-agents' : 'max-parallel-codex-workers',
+        reason: deps.lockContentionMessage,
+      };
+    }
     for (let idx = 0; idx < invs.length && !violation; idx++) {
       const inv = invs[idx];
       const isTaskCreate = inv.sub === 'orchestration task-create';

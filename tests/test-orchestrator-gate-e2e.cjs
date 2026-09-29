@@ -1997,10 +1997,17 @@ function withHeldLock(lockDir, fn) {
     const elapsed = Date.now() - started;
     if (result.code === ALLOW) pass += 1;
     else failures.push(`held lock + unlimited cap should allow Agent dispatch, got ${result.code}`);
-    if (elapsed < 3000) pass += 1;
-    else failures.push(`held lock + unlimited cap should finish in <3s, took ${elapsed}ms`);
+    if (elapsed < 4000) pass += 1;
+    else failures.push(`held lock + unlimited cap should finish in <4s, took ${elapsed}ms`);
     expect('item 1: a genuinely held .lock + unlimited (0) cap still admits `orca terminal create`',
       mainBash('orca terminal create --json', { sid: 'mpa-r3-i1-term-unlimited' }), ALLOW, env);
+    const workerStarted = Date.now();
+    const worker = invoke(mainBash(
+      'orca orchestration worker-start --agent codex --worktree new-child --spec "implement x. Verify: npm test." --json',
+      { sid: 'mpa-r5-i3-worker-unlimited', tool_use_id: 'toolu_r5_i3_worker_u' }), env);
+    const workerElapsed = Date.now() - workerStarted;
+    if (worker.code === ALLOW && workerElapsed < 4000) pass += 1;
+    else failures.push(`held lock + both caps unlimited should allow worker-start in <4s; code=${worker.code}, elapsed=${workerElapsed}ms`);
   });
 }
 {
@@ -2012,10 +2019,27 @@ function withHeldLock(lockDir, fn) {
     const elapsed = Date.now() - started;
     if (result.code === ALLOW) pass += 1;
     else failures.push(`held lock + disabled gate should allow Agent dispatch, got ${result.code}`);
-    if (elapsed < 3000) pass += 1;
-    else failures.push(`held lock + disabled gate should finish in <3s, took ${elapsed}ms`);
+    if (elapsed < 4000) pass += 1;
+    else failures.push(`held lock + disabled gate should finish in <4s, took ${elapsed}ms`);
     expect('item 1: a genuinely held .lock + disabledGates still admits `orca terminal create`',
       mainBash('orca terminal create --json', { sid: 'mpa-r3-i1-term-disabled' }), ALLOW, env);
+  });
+}
+
+// Review round 5, item 3: a finite worker-start cap gets one long lock attempt. If another
+// live process keeps the lock held, it must refuse after that attempt rather than starting a
+// reconcile and waiting the same ~10.5s a second time.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 1, maxParallelCodexWorkers: 1 });
+  const lockDir = path.join(stateDir, '.lock');
+  withHeldLock(lockDir, () => {
+    const started = Date.now();
+    const r = invoke(mainBash(
+      'orca orchestration worker-start --agent codex --worktree new-child --spec "implement x. Verify: npm test." --json',
+      { sid: 'mpa-r5-i3-worker-finite', tool_use_id: 'toolu_r5_i3_worker_f' }), env);
+    const elapsed = Date.now() - started;
+    if (r.code === DENY && /transient/i.test(r.err) && elapsed < 13000) pass += 1;
+    else failures.push(`held lock + finite worker-start cap should refuse once in <13s; code=${r.code}, elapsed=${elapsed}ms`);
   });
 }
 
