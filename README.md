@@ -13,7 +13,8 @@ Repo: <https://github.com/bachdx2812/claude-codex-orca-orchestration>
 
 ```
 Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
-[Sonnet once Codex has used >= 40%] -> Opus 5.5 reviews -> main panel reports
+[Sonnet once Codex has used >= 95% of its quota, read live; configurable via
+ codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED] -> Opus 5.5 reviews -> main panel reports
 ```
 
 | Role | What it does | Model (exact version) | How it is dispatched | Config key |
@@ -22,7 +23,7 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) write
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Reviewer / verifier | Code review, verification | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Coder (default) | Implement / fix / refactor | Codex `gpt-5.6-sol` | Orca worker: `orca orchestration worker-start --agent codex --model gpt-5.6-sol` (brief must name a verify command) | `models.codex` |
-| Coder (handoff) | Same work once Codex has used >= `codexHandoffUsedPercent` (default 40) of its quota, or when `orca`/`codex` is not installed | Sonnet | `Agent` with `model: "sonnet"` (brief must name a verify command) | `codexHandoffUsedPercent`, `models.code`, `execFallbackWhenCodexUnavailable` |
+| Coder (handoff) | Same work once Codex has used >= `codexHandoffUsedPercent` (default 95) of its live-read quota, or when `orca`/`codex` is not installed; override with `ORCH_CODEX_HANDOFF_USED` | Sonnet | `Agent` with `model: "sonnet"` (brief must name a verify command) | `codexHandoffUsedPercent`, `models.code`, `execFallbackWhenCodexUnavailable` |
 | Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
 | Escalation | Only after Opus 5.5 failed even at higher effort; the dispatch must say both | Fable 5.1 (`claude-fable-5-1`) | `Agent` with `model: "fable"` + "escalation: opus failed ... at high effort ..." | `models.escalation` |
 
@@ -39,7 +40,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or a worktree whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows and the panel's own terminal are excluded. |
+| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -79,9 +80,11 @@ orchestration worker-release --dispatch <id>`. Once its PR is merged or closed a
 worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree
 too: `orca worktree rm --worktree path:<path>`. Never remove a worktree with an open PR or
 unsaved work; sweep periodically with `orca worktree ps --json`. `orca-heartbeat.cjs`
-backs this up: each tick it also checks `orca worktree ps --json` (`--limit 500`; a page
+backs this up: each tick it also checks `orca worktree ps --json` (`--limit 500`) but only
+evaluates paths owned by this session's run-scoped worker rows; another session's worktree
+can never produce its summary or wake event. A page
 Orca itself reports `truncated` is never acted on — a partial page can neither confirm nor
-rule out a transition) and reports a worktree that is not main, not archived; **accepted**
+rule out a transition — and reports a worktree that is not main, not archived; **accepted**
 (a linked GitHub PR or GitLab MR already merged/closed — an open one never counts, whatever
 git alone might say — or, only when NEITHER is linked at all, a real `git merge-base
 --is-ancestor HEAD <base>` confirms HEAD is already in the worktree's own upstream default
@@ -268,7 +271,7 @@ The file is plain JSON — no comments — parsed as-is:
 
 ```json
 {
-  "codexHandoffUsedPercent": 60,
+  "codexHandoffUsedPercent": 90,
   "codexQuotaCacheSeconds": 60,
   "replyLanguage": "Vietnamese",
   "maxParallelCodexWorkers": 5,
@@ -279,8 +282,8 @@ The file is plain JSON — no comments — parsed as-is:
 }
 ```
 
-(`codexHandoffUsedPercent: 60` means Codex keeps coding until 60% of its quota is used,
-up from the default 40; `codexQuotaCacheSeconds` controls the cross-process live-reading
+(`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95;
+`codexQuotaCacheSeconds` controls the cross-process live-reading
 cache TTL (`0` disables file-cache reuse but retains memoization inside one hook process);
 `replyLanguage` accepts any language name, or `null` for no
 language instruction at all; `maxParallelCodexWorkers` raises or lowers how many live

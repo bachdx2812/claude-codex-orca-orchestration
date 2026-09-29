@@ -678,7 +678,8 @@ function onSessionStart(p, s, cfg) {
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (Codex spec or in-session prompt) names the exact test / build command to run green.\n' +
-    `- Code: Codex first; "${code}" once Codex has used >= ${threshold}% of its quota (the per-prompt reminder names it):\n` +
+    `- Code: Codex first; "${code}" once Codex has used >= ${threshold}% of its live-read quota ` +
+    '(configure codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED):\n' +
     '    Codex  -> Orca worker: orca orchestration task-create ... && worker-start ...\n' +
     '             then worker-list | worker-read | worker-release\n' +
     `    ${code[0].toUpperCase()}${code.slice(1)} -> in-session Agent with model "${code}".\n` +

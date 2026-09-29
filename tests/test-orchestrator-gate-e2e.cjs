@@ -63,7 +63,7 @@ const DEFAULT_CFG = {
     codex: { alias: null, id: 'gpt-5.6-sol' },
   },
   agents: { escalation: ['escalation-agent'], lookup: ['Explore', 'scout'] },
-  codexHandoffUsedPercent: 40,
+  codexHandoffUsedPercent: 95,
   codexQuotaCacheSeconds: 60,
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
   // Unlimited by default so the many unrelated tests sharing SID/state below (most never
@@ -109,8 +109,8 @@ function quotaEnv(name, claudeUsed, codexUsed, extraCfg) {
     ORCA_BIN: STUB, CODEX_BIN: STUB,
   };
 }
-const CODEX_WINS = quotaEnv('codex-wins', 10, 30);   // Codex 30% used (< 40) -> Codex codes
-const SONNET_WINS = quotaEnv('sonnet-wins', 10, 75); // Codex 75% used -> the code model codes
+const CODEX_WINS = quotaEnv('codex-wins', 10, 30);   // Codex 30% used (< 95) -> Codex codes
+const SONNET_WINS = quotaEnv('sonnet-wins', 10, 97); // Codex 97% used -> the code model codes
 
 let pass = 0;
 const failures = [];
@@ -555,12 +555,12 @@ expect('--exec-auto prompt is accepted', promptSubmit(SID, 'ok --exec-auto'), AL
   if (st && st.execAgent == null) pass += 1;
   else failures.push(`--exec-auto did not clear execAgent (got ${JSON.stringify(st && st.execAgent)})`);
 }
-// Automatic routing: Codex first, the code model once Codex has used >= 40%.
-expect('auto: Codex under 40% used -> in-session sonnet code is refused',
+// Automatic routing: Codex first, the code model once Codex has used >= 95%.
+expect('auto: Codex under 95% used -> in-session sonnet code is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet' }), DENY, CODEX_WINS);
-expect('auto: Codex at/over 40% used -> in-session sonnet code is allowed',
+expect('auto: Codex at/over 95% used -> in-session sonnet code is allowed',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' }), ALLOW, SONNET_WINS);
-expect('auto: Codex at/over 40% used -> code on another model is refused',
+expect('auto: Codex at/over 95% used -> code on another model is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan' }), DENY, SONNET_WINS);
 
 // --no-orchestrate must still fully bypass everything, unaffected by the exec-agent
@@ -905,8 +905,8 @@ rmState(`${SID}-hard-off`);
   const OWNS_ENV = quotaEnv('owns', 10, 30, {});
   // In-session Agent exec dispatches also have to clear the execution-routing gates
   // (route-execution-to-codex / execution-model-mismatch) before Owns: is ever reached —
-  // this quota favours the code model (Codex >= 40% used), same shape as SONNET_WINS.
-  const OWNS_AGENT_ENV = quotaEnv('owns-agent', 10, 75, {});
+  // this quota favours the code model (Codex >= 95% used), same shape as SONNET_WINS.
+  const OWNS_AGENT_ENV = quotaEnv('owns-agent', 10, 97, {});
   const OSID = `${SID}-owns`;
 
   rmState(OSID);
@@ -1109,7 +1109,7 @@ rmState(`${SID}-hard-off`);
 
     expect('owns: disabledGates lets an in-session exec dispatch without Owns: through',
       dispatch(execBrief(null), ASID, { cwd: FAKE_REPO }), ALLOW,
-      quotaEnv('owns-agent-disabled', 10, 75, { disabledGates: ['code-brief-needs-owns'] }));
+      quotaEnv('owns-agent-disabled', 10, 97, { disabledGates: ['code-brief-needs-owns'] }));
 
     rmState(ASID);
   }
@@ -1205,7 +1205,7 @@ rmState(`${SID}-hard-off`);
 // Item 4: a background Agent dispatch's Owns: claim must survive its own launch
 // PostToolUse, and release only via a matching <task-notification><tool-use-id>.
 {
-  const B4 = quotaEnv('item4-bg', 10, 75, {});
+  const B4 = quotaEnv('item4-bg', 10, 97, {});
   const BG4SID = `${SID}-item4-bg`;
   rmState(BG4SID);
   const bgBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet',

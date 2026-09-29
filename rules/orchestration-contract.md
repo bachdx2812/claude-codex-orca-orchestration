@@ -25,7 +25,7 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    could not do, even at higher effort — a dispatch to it must say so.
 3. **Code goes to Codex in an Orca worker first**, and to the configured in-session code
    model (`models.code.alias`, default `sonnet`) once Codex has used
-   `codexHandoffUsedPercent` (default 40) of its tightest rate-limit window. The operator
+   `codexHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. The operator
    can pick the coding model directly with `--code-model <alias|codex|codex:<model>|auto>`,
    or use the `--exec-sonnet` / `--exec-codex` / `--exec-auto` shortcuts.
 4. **Light lookups** (find/locate code, read logs or test output, explore) are advised
@@ -168,7 +168,7 @@ backup precedes their removal. Help and unknown options never enter the install 
     "codex": { "alias": null, "id": "gpt-5.6-sol" }
   },
   "agents": { "escalation": [], "lookup": ["Explore"] },
-  "codexHandoffUsedPercent": 40,
+  "codexHandoffUsedPercent": 95,
   "codexQuotaCacheSeconds": 60,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
@@ -291,8 +291,10 @@ After a worker finishes: read its result, then `orca orchestration worker-releas
 periodically with `orca worktree ps --json` to find worktrees nobody closed.
 
 The heartbeat daemon backs this up automatically: each tick it also reads `orca worktree
-ps --json --limit 500` (a page Orca itself marks `truncated` is never acted on — a partial
-page can neither confirm nor rule out a transition) and flags a worktree that is not the
+ps --json --limit 500`, then filters that machine-wide page to paths owned by this
+session's run-scoped worker rows. Another session's worktree is never summarized or emitted
+as a wake event. A page Orca itself marks `truncated` is never acted on — a partial
+page can neither confirm nor rule out a transition — and flags a worktree that is not the
 main worktree, not already archived, and that is:
   - **idle** — no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt`
     (one timestamp per worktree, not per terminal) already past `heartbeat.idleSeconds`;

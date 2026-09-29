@@ -498,7 +498,10 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   const defaults = withConfig({}, () => config.loadConfig());
   check('default activation is orca-only', defaults.activation, 'orca-only');
   check('default review alias is opus', defaults.models.review.alias, 'opus');
-  check('default codexHandoffUsedPercent is 40', defaults.codexHandoffUsedPercent, 40);
+  check('default codexHandoffUsedPercent is 95', defaults.codexHandoffUsedPercent, 95);
+  const exampleConfig = JSON.parse(fs.readFileSync(
+    path.join(__dirname, '..', 'config', 'orchestration.config.example.json'), 'utf8'));
+  check('example config uses the 95% handoff default', exampleConfig.codexHandoffUsedPercent, 95);
   check('default codexQuotaCacheSeconds is 60', defaults.codexQuotaCacheSeconds, 60);
   check('default agents.lookup is [Explore]', defaults.agents.lookup, ['Explore']);
   check('default agents.escalation is empty', defaults.agents.escalation, []);
@@ -509,7 +512,7 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('invalid activation produces a warning', badActivation.warnings.length > 0, true);
 
   const badThreshold = withConfig({ codexHandoffUsedPercent: 150 }, () => config.loadConfig());
-  check('out-of-range threshold falls back to default', badThreshold.codexHandoffUsedPercent, 40);
+  check('out-of-range threshold falls back to default', badThreshold.codexHandoffUsedPercent, 95);
   check('out-of-range threshold produces a warning', badThreshold.warnings.length > 0, true);
 
   const goodThreshold = withConfig({ codexHandoffUsedPercent: 60 }, () => config.loadConfig());
@@ -890,14 +893,16 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
 // Exec routing by quota left: pure decision table.
 {
   const { pickExecRoute } = require('../hooks/lib/exec-route-by-quota.cjs');
+  check('pickExecRoute default keeps Codex below 95% used', pickExecRoute(90, 6), 'codex');
+  check('pickExecRoute default hands off at 95% used', pickExecRoute(90, 5), 'sonnet');
   const cases = [
-    // Codex first; the code model once Codex has used >= 40% (i.e. <= 60% left).
-    [[90, 90], 'codex'], [[90, 61], 'codex'], [[90, 60], 'sonnet'], [[10, 23], 'sonnet'],
-    [[null, 30], 'sonnet'], [[90, null], 'codex'], [[null, null], 'codex'], [[5, 80], 'codex'],
+    // Codex first; the code model once Codex has used >= 95% (i.e. <= 5% left).
+    [[90, 90], 'codex'], [[90, 6], 'codex'], [[90, 5], 'sonnet'], [[10, 1], 'sonnet'],
+    [[null, 3], 'sonnet'], [[90, null], 'codex'], [[null, null], 'codex'], [[5, 80], 'codex'],
   ];
   for (const [[c, x], want] of cases) {
-    const got = pickExecRoute(c, x, 40);
-    if (got === want) pass += 1; else failures.push(`pickExecRoute(${c}, ${x}, 40) = ${got}, want ${want}`);
+    const got = pickExecRoute(c, x, 95);
+    if (got === want) pass += 1; else failures.push(`pickExecRoute(${c}, ${x}, 95) = ${got}, want ${want}`);
   }
   check('pickExecRoute: a lower handoff threshold hands off sooner', pickExecRoute(90, 45, 50), 'sonnet');
   check('pickExecRoute: the same reading stays with Codex at a higher threshold', pickExecRoute(90, 45, 70), 'codex');
@@ -1010,13 +1015,13 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   let quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
   eq('codex live: app-server reading is used', [quota.usedPercent, quota.source], [25, 'live']);
   eq('codex reminder: a live reading names the live source',
-    q.execRoute(40, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live, 0s ago)'), true);
+    q.execRoute(95, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live, 0s ago)'), true);
 
   process.env.STUB_CODEX_PRIMARY_USED = '90';
   const cached = q.codexQuota(quota.fetchedAt + 30_000, { stateDir, cacheSeconds: 60 });
   eq('codex live cache: a fresh value wins before another probe', cached.usedPercent, 25);
   eq('codex reminder: a cached live reading includes its age',
-    q.execRoute(40, quota.fetchedAt + 30_000, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live, 30s ago)'), true);
+    q.execRoute(95, quota.fetchedAt + 30_000, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live, 30s ago)'), true);
   const refreshed = q.codexQuota(quota.fetchedAt + 60_000, { stateDir, cacheSeconds: 60 });
   eq('codex live cache: an expired value is refreshed', refreshed.usedPercent, 90);
 
@@ -1060,7 +1065,7 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
   eq('codex live: rateLimitReachedType is treated as fully used', [quota.usedPercent, quota.limitReached], [100, true]);
   eq('codex reminder: a reached limit is surfaced explicitly',
-    q.execRoute(40, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('limit reached'), true);
+    q.execRoute(95, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('limit reached'), true);
   delete process.env.STUB_CODEX_RATE_LIMIT_REACHED_TYPE;
 
   clearCache(); clearStub();
@@ -1082,7 +1087,7 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   quota = q.codexQuota(sessionNow, { stateDir, cacheSeconds: 60 });
   eq('codex live: a malformed reply falls back to the session log', [quota.usedPercent, quota.source], [65, 'session log']);
   eq('codex reminder: a session fallback names its source and age',
-    q.execRoute(40, sessionNow, { stateDir, cacheSeconds: 0 }).summary.includes('Codex 35% left (session log, 5m old)'), true);
+    q.execRoute(95, sessionNow, { stateDir, cacheSeconds: 0 }).summary.includes('Codex 35% left (session log, 5m old)'), true);
 
   clearCache(); clearStub();
   process.env.STUB_CODEX_MODE = 'timeout';
@@ -1092,7 +1097,7 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   clearCache();
   fs.rmSync(sessions, { recursive: true, force: true });
   process.env.STUB_CODEX_MODE = 'malformed';
-  const route = q.execRoute(40, sessionNow, { stateDir, cacheSeconds: 0 });
+  const route = q.execRoute(95, sessionNow, { stateDir, cacheSeconds: 0 });
   eq('codex live: malformed with no session is unknown and keeps Codex', [route.codexSource, route.route], ['unknown', 'codex']);
   eq('codex reminder: an unknown reading names the unknown source', route.summary.includes('Codex unknown (unknown)'), true);
 

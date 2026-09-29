@@ -3,7 +3,7 @@
  * configured in-session code model, by which provider has more quota left.
  *
  * Codex is the default coder; the in-session code model takes over once Codex has used
- * `handoffUsed(cfg)` percent or more of its tightest rate-limit window (default 40).
+ * `handoffUsed(cfg)` percent or more of its tightest rate-limit window (default 95).
  *
  * Sources (all local, no model call):
  *   - Claude: OPTIONAL. Read only if a usage-limits cache file exists and parses — either
@@ -385,13 +385,13 @@ function formatAge(ageMs) {
  * `handoffUsed` % or more. Codex unknown keeps the preferred side (Codex). claudeLeft is
  * reported, not decisive.
  */
-function pickExecRoute(claudeLeft, codexLeft, handoffUsedPct = 40) {
+function pickExecRoute(claudeLeft, codexLeft, handoffUsedPct = 95) {
   if (codexLeft === null) return 'codex';
   return 100 - codexLeft >= handoffUsedPct ? 'sonnet' : 'codex';
 }
 
 /** Current routing verdict with the numbers that produced it. */
-function execRoute(handoffUsedPct = 40, now = Date.now(), options = {}) {
+function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
   const claudeQuota = readClaudeQuota(now);
   const quota = codexQuota(now, options);
   const claudeLeft = claudeQuota ? claudeQuota.remaining : null;

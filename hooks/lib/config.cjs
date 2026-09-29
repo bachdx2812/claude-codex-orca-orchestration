@@ -46,7 +46,7 @@ const DEFAULT_CONFIG = {
     escalation: [], // agent names that always count as the escalation role, alias match only
     lookup: ['Explore'],
   },
-  codexHandoffUsedPercent: 40,
+  codexHandoffUsedPercent: 95,
   codexQuotaCacheSeconds: 60,
   execFallbackWhenCodexUnavailable: 'sonnet',
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },

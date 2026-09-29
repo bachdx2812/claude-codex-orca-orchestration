@@ -7,7 +7,8 @@ Read `rules/orchestration-contract.md` first for what gets enforced and why.
 
 ```
 Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
-[Sonnet once Codex has used >= 40%] -> Opus 5.5 reviews -> main panel reports
+[Sonnet once Codex has used >= 95% of its quota, read live; configurable via
+ codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED] -> Opus 5.5 reviews -> main panel reports
 ```
 
 | Role | Model | Dispatched as | Config key |
@@ -15,7 +16,7 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) write
 | Main panel | session default; never writes code | — | `activation` |
 | Planner / red-team / reviewer / verifier | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Coder (default) | Codex `gpt-5.6-sol` | Orca worker (`worker-start --agent codex --model gpt-5.6-sol`) | `models.codex` |
-| Coder (handoff) | Sonnet, once Codex used >= `codexHandoffUsedPercent` (40) or `orca`/`codex` missing | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `models.code` |
+| Coder (handoff) | Sonnet, once Codex used >= `codexHandoffUsedPercent` (default 95) of its live-read quota, or `orca`/`codex` is missing; override with `ORCH_CODEX_HANDOFF_USED` | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `models.code` |
 | Lookups | Haiku (advised, not enforced) | `Agent` with `model: "haiku"` | `models.lookup` |
 | Escalation | Fable 5.1 (`claude-fable-5-1`), only after Opus 5.5 failed at high effort | `Agent` with `model: "fable"` | `models.escalation` |
 
@@ -26,8 +27,8 @@ detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
 directly and are never tracked by these hooks for supervision purposes — no heartbeat
 needed. Orca workers (Codex) run in their own terminal/worktree and must be supervised by
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
-terminal, an orphan, a rate limit, or a worktree whose PR already merged/closed with no
-live terminal left on it; `Stop` refuses to end the session with one live and
+terminal, an orphan, a rate limit, or one of this session's worktrees whose PR already
+merged/closed with no live terminal left on it; `Stop` refuses to end the session with one live and
 unwatched, or finished and unreleased. No more than `maxParallelCodexWorkers` (default 3)
 live Codex workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget
 (default `max(1, floor(0.8 x cores))`, `0` = unlimited) caps every live Orca worker group
@@ -44,8 +45,10 @@ Full detail: `README.md#subagents-and-parallel-work`.
 orchestration worker-release --dispatch <id>`. Once its PR is merged/closed and the
 worktree is clean (no uncommitted or unpushed work), close it too: `orca worktree rm
 --worktree path:<path>`. Never remove a worktree with an open PR or unsaved work; sweep
-with `orca worktree ps --json`. `closeDoneWorktrees` (default `true`, or
-`ORCH_CLOSE_DONE_WORKTREES` set to `1`/`true`/`0`/`false`) controls whether
+with `orca worktree ps --json`. The heartbeat filters that machine-wide list to worktree
+paths owned by this session's run-scoped workers; it never reports another session's path.
+`closeDoneWorktrees` (default `true`, or `ORCH_CLOSE_DONE_WORKTREES` set to
+`1`/`true`/`0`/`false`) controls whether
 `orca-heartbeat.cjs` reminds about this automatically — it judges a worktree as
 done-but-open only once it is idle, **accepted** (a merged/closed linked GitHub PR or
 GitLab MR, or — with neither linked — a real `git merge-base --is-ancestor` confirming HEAD
@@ -178,14 +181,14 @@ The file is plain JSON — no comments — parsed as-is:
 
 ```json
 {
-  "codexHandoffUsedPercent": 60,
+  "codexHandoffUsedPercent": 90,
   "codexQuotaCacheSeconds": 60,
   "replyLanguage": "Vietnamese",
   "disabledGates": ["code-brief-needs-verify"]
 }
 ```
 
-(`codexHandoffUsedPercent: 60` is up from the default 40; `codexQuotaCacheSeconds`
+(`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95; `codexQuotaCacheSeconds`
 controls the live-reading cache TTL and accepts `0` to disable reuse; `replyLanguage`
 accepts any language name, or `null` for no language sentence at all.)
 
