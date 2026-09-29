@@ -31,6 +31,13 @@
  * time `worktree ps` is invoked — a test can poll this file to learn exactly when the
  * daemon made its Nth call, instead of guessing a `setTimeout` delay long enough to land
  * between two ticks (a source of flakiness under CI load).
+ *
+ * STUB_WORKTREES_OK_FALSE=1 answers `{ ok: false }` (Orca reached the call but reports it did
+ * not actually succeed) — item M4: must be treated exactly like an unreachable Orca, never
+ * like "zero worktrees".
+ *
+ * STUB_WORKTREES_NO_ARRAY=1 answers `{ ok: true, result: {} }` — a reply that never seeded a
+ * `worktrees` array at all — item M4: also must degrade to null, not to an empty list.
  */
 const fs = require('fs');
 const args = process.argv.slice(2);
@@ -71,6 +78,14 @@ if (args[0] === 'worktree' && args[1] === 'ps') {
   const garbageUntil = Number(process.env.STUB_WORKTREE_PS_GARBAGE_UNTIL || 0);
   if (garbageUntil && Date.now() < garbageUntil) {
     process.stdout.write('not actually json {{{');
+    process.exit(0);
+  }
+  if (process.env.STUB_WORKTREES_OK_FALSE === '1') {
+    process.stdout.write(JSON.stringify({ ok: false }));
+    process.exit(0);
+  }
+  if (process.env.STUB_WORKTREES_NO_ARRAY === '1') {
+    process.stdout.write(JSON.stringify({ ok: true, result: {} }));
     process.exit(0);
   }
   let worktrees = [];

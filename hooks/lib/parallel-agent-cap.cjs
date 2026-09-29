@@ -19,6 +19,7 @@ const path = require('path');
 const os = require('os');
 const WG = require('./worker-groups.cjs');
 const OC = require('./ownership-claims.cjs');
+const HBL = require('./heartbeat-liveness.cjs');
 
 const MAX_SESSION_AGE_MS = 6 * 60 * 60 * 1000;
 // A registered in-session Agent/Task dispatch (`s.agents[id]`) auto-expires after this long
@@ -98,13 +99,26 @@ function readSessionState(file) {
   }
 }
 
+// M1 (orchestrator decision): another session's units count toward the machine-wide budget
+// only while there is some recent signal that session is actually still alive — either its
+// heartbeat daemon (see `heartbeatAliveAt`), or its state file having changed within this
+// window. Without either signal a session is presumed abandoned, and its stale
+// reservations/registrations must not eat into a live dispatch's budget. The CALLER's own
+// session (`currentState`/`currentSessionId`) always counts regardless — see
+// `machineWideLiveUnits`. This is a real trade-off (documented in README known limits): a
+// session that is genuinely still working, but whose heartbeat daemon is not running and
+// which has not touched its state file in 30 minutes, will have its units silently dropped
+// from the count.
+const OTHER_SESSION_RECENT_MS = 30 * 60 * 1000;
+
 /**
  * The live units contributed by ONE already-parsed session state object, appended to
- * `entries` as `{ ts, label, kind: 'orca' | 'agent' }`. Factored out of
+ * `entries` as `{ ts, label, kind: 'orca' | 'agent', sid }`. Factored out of
  * `machineWideLiveUnits` so the CALLER's own session can be counted from its accurate,
  * already-in-memory state (which may hold reservations from earlier in the very same
  * multi-invocation command line that are not yet flushed to disk) while every OTHER
- * session is counted from its last-saved file on disk.
+ * session is counted from its last-saved file on disk. `sid` is stamped onto every entry
+ * (H2) so a refusal can label each unit `<sid8>:<id>` instead of a bare, ambiguous id.
  *   - a live Orca worker GROUP of any agent (codex, claude, ...) — never `capExempt` (a
  *     worker Orca itself reports done but still holding its terminal is not doing work
  *     anymore and must not block a new dispatch, same reasoning as the Codex-only cap);
@@ -115,7 +129,7 @@ function readSessionState(file) {
  *   - a live in-session Agent/Task subagent dispatch (`s.agents[id]`), not yet past
  *     `AGENT_REGISTRY_TTL_MS` since it was registered.
  */
-function collectLiveUnitsFromState(s, nowMs, entries) {
+function collectLiveUnitsFromState(s, sid, nowMs, entries) {
   if (!s) return;
   const groups = new Map(); // group id -> earliest known ts
   for (const [key, w] of Object.entries(s.workers || {})) {
@@ -128,11 +142,11 @@ function collectLiveUnitsFromState(s, nowMs, entries) {
     if (!r || !r.newSlot || OC.reservationExpired(r)) continue;
     if (!groups.has(id)) groups.set(id, r.ts);
   }
-  for (const [g, ts] of groups) entries.push({ ts, label: g, kind: 'orca' });
+  for (const [g, ts] of groups) entries.push({ ts, label: g, kind: 'orca', sid });
 
   for (const [id, a] of Object.entries(s.agents || {})) {
     if (!a || !Number.isFinite(a.ts) || nowMs - a.ts > AGENT_REGISTRY_TTL_MS) continue;
-    entries.push({ ts: a.ts, label: id, kind: 'agent' });
+    entries.push({ ts: a.ts, label: id, kind: 'agent', sid });
   }
 }
 
@@ -142,9 +156,12 @@ function collectLiveUnitsFromState(s, nowMs, entries) {
  * one caller-supplied in-memory state for its own session (`opts.currentState` +
  * `opts.currentSessionId`, to avoid double-counting that session's own on-disk file, which
  * may be stale relative to reservations added earlier in the same still-in-flight command).
- * Returns `{ total, orcaWorkers, subagents, ids }` — `ids` is every counted unit's label,
- * oldest first, capped at 8, for a refusal message that names what is actually holding
- * capacity rather than a bare count.
+ * Every OTHER session's file is additionally gated by the M1 liveness rule above before its
+ * units are ever collected; the caller's own session is exempt from that rule (it is,
+ * definitionally, live right now). Returns `{ total, orcaWorkers, subagents, ids }` — `ids`
+ * is every counted unit's label as `<sid8>:<id>` (H2), oldest first, capped at 8, for a
+ * refusal message that names what is actually holding capacity, and whose session, rather
+ * than a bare and potentially ambiguous id.
  */
 function machineWideLiveUnits(dir, nowMs = Date.now(), opts = {}) {
   const { currentState, currentSessionId } = opts;
@@ -152,33 +169,67 @@ function machineWideLiveUnits(dir, nowMs = Date.now(), opts = {}) {
     ? `${String(currentSessionId).replace(/[^A-Za-z0-9_-]/g, '_')}.json`
     : null;
   const files = recentSessionStateFiles(dir, nowMs);
-  const entries = []; // { ts, label, kind: 'orca' | 'agent' }
+  const entries = []; // { ts, label, kind: 'orca' | 'agent', sid }
 
   for (const file of files) {
-    if (currentFileName && path.basename(file) === currentFileName) continue; // counted below instead
-    collectLiveUnitsFromState(readSessionState(file), nowMs, entries);
+    const base = path.basename(file);
+    if (currentFileName && base === currentFileName) continue; // counted below instead
+    const sid = base.slice(0, -'.json'.length);
+    let mtimeMs;
+    try {
+      mtimeMs = fs.statSync(file).mtimeMs;
+    } catch {
+      continue; // removed between the listing and here — not a live session either way
+    }
+    const recentlyActive = nowMs - mtimeMs <= OTHER_SESSION_RECENT_MS;
+    if (!recentlyActive && !HBL.heartbeatAliveAt(dir, sid)) continue; // M1
+    collectLiveUnitsFromState(readSessionState(file), sid, nowMs, entries);
   }
-  if (currentState) collectLiveUnitsFromState(currentState, nowMs, entries);
+  if (currentState) collectLiveUnitsFromState(currentState, currentSessionId || currentState.session_id, nowMs, entries);
 
   entries.sort((a, b) => a.ts - b.ts);
   const orcaWorkers = entries.filter((e) => e.kind === 'orca').length;
   const subagents = entries.filter((e) => e.kind === 'agent').length;
-  const ids = entries.slice(0, 8).map((e) => e.label);
+  const ids = entries.slice(0, 8).map((e) => `${String(e.sid || '').slice(0, 8)}:${e.label}`);
   return { total: orcaWorkers + subagents, orcaWorkers, subagents, ids };
 }
 
-/** The refusal reason for `max-parallel-agents` (the caller's `deny()`/`d()` prepends the
- * `[orchestrator-gate:max-parallel-agents]` prefix, so this string never repeats it). */
+/**
+ * The refusal reason for `max-parallel-agents` (the caller's `deny()`/`d()` prepends the
+ * `[orchestrator-gate:max-parallel-agents]` prefix, so this string never repeats it). H2:
+ * every unit is labeled `<sid8>:<id>` (see `machineWideLiveUnits`) so a machine-wide refusal
+ * names not just WHAT is holding capacity but WHICH session owns it — a bare id is ambiguous
+ * once two sessions' ids can collide in the same list. Recovery is framed as the OPERATOR's
+ * call, never the model's: raising the machine-wide budget or clearing a stuck registration
+ * is a resource decision, so this never invites the model to just raise the limit itself.
+ */
 function formatParallelAgentsRefusal(usage, limit, coreCount, fraction) {
   const idsPart = usage.ids.length ? ` [${usage.ids.join(', ')}]` : '';
   const limitText = Number.isFinite(limit) ? limit : 'unlimited';
   return `${usage.total}/${limitText} parallel units live on this machine ` +
     `(${coreCount} cores x ${Math.round(fraction * 100)}%): ${usage.orcaWorkers} Orca workers, ` +
-    `${usage.subagents} subagents${idsPart}. Wait for one to finish and release it, or raise ` +
-    'maxParallelAgents / ORCH_MAX_PARALLEL_AGENTS.';
+    `${usage.subagents} subagents${idsPart}. Wait for one to finish and release it, or ask the operator to: ` +
+    'release a specific claim (--release-claims <id>|all, this session only), ' +
+    "delete a dead session's state file under ~/.claude/orchestrator-gate/, " +
+    'or disable this gate (disabledGates: ["max-parallel-agents"]).';
 }
 
+/**
+ * Refusal text for the one deliberate exception to this file's "lock timeout degrades to
+ * allow" convention (Low item, concurrency review): the max-parallel-agents check is a hard
+ * resource cap, not policy, so proceeding unlocked when the state-file lock is contended
+ * would let every process contending for that SAME lock — i.e. exactly the high-concurrency
+ * condition the cap exists to catch — fall through uncounted and all be admitted at once,
+ * silently defeating the cap under the load it exists for. This is intentionally distinct
+ * from the ordinary at-capacity refusal text: the right response is "retry the same
+ * dispatch shortly", never "wait for a slot to free".
+ */
+const LOCK_CONTENTION_MESSAGE =
+  'the orchestrator-gate state lock is contended right now (many concurrent dispatches) - ' +
+  'this is transient, not being at capacity. Retry the same dispatch.';
+
 module.exports = {
-  MAX_SESSION_AGE_MS, AGENT_REGISTRY_TTL_MS, cores, agentParallelLimit,
+  MAX_SESSION_AGE_MS, AGENT_REGISTRY_TTL_MS, OTHER_SESSION_RECENT_MS, cores, agentParallelLimit,
   recentSessionStateFiles, readSessionState, machineWideLiveUnits, formatParallelAgentsRefusal,
+  LOCK_CONTENTION_MESSAGE,
 };

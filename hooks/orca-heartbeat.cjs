@@ -63,6 +63,11 @@ const IDLE_SECONDS = arg('idle', cfg.heartbeat.idleSeconds);        // quiet ter
 const INTERVAL_SECONDS = arg('interval', cfg.heartbeat.intervalSeconds);
 const MAX_SECONDS = arg('max', cfg.heartbeat.maxSeconds);           // hard stop so a forgotten daemon dies
 const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
+// A fleet with many worktrees means many per-row git subprocess calls (idle/accepted/clean,
+// each independently bounded ~3s by runGit) inside one `processDoneWorktrees` pass — capped
+// so a single git-heavy tick can never run long enough to starve the liveness file (see
+// `beat()` calls inside that loop) into looking dead.
+const GIT_BUDGET_MS = 10000;
 
 // Session whose panel started this daemon (inherited from the Claude Code Bash tool).
 const SESSION = String(process.env.CLAUDE_CODE_SESSION_ID || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
@@ -169,13 +174,22 @@ function isHoldingResources(w) {
  * The worktree-ps round trip is bounded tighter (8s) than the worker/terminal listing
  * calls (20s default) — it is normally fast, and a short bound leaves more of the liveness
  * margin intact at a short `--interval` (item L1).
+ *
+ * Item M4: an explicit `ok: false`, or a `result` that never seeded a `worktrees` array at
+ * all, is NOT the same fact as "zero worktrees exist" — the former means Orca could not
+ * actually answer this call, and treating it as an empty list would let a real backlog go
+ * unreported for as long as that condition persists. Both degrade to null, exactly like an
+ * unreachable Orca, so the caller retries next tick instead of quietly believing nothing is
+ * done-but-open.
  */
 function worktrees() {
   try {
     const d = orca(['worktree', 'ps', '--json', '--limit', '500'], 8000);
-    if (!d) return null;
+    if (!d || d.ok === false) return null;
     const r = d.result ?? d;
-    const rawList = Array.isArray(r) ? r : (Array.isArray(r && r.worktrees) ? r.worktrees : []);
+    const seeded = Array.isArray(r) || Array.isArray(r && r.worktrees);
+    if (!seeded) return null;
+    const rawList = Array.isArray(r) ? r : r.worktrees;
     const rows = rawList
       .filter((w) => w && typeof w.path === 'string')
       .map((w) => ({
@@ -243,15 +257,61 @@ function isAncestorOf(cwd, git, base) {
 }
 
 /**
+ * H1: the worktree's own creation-time proxy — the mtime of its `.git` file. A linked
+ * worktree's `.git` is a small text file naming its real gitdir under the main repo's
+ * `.git/worktrees/<name>/`, written once by `git worktree add` and never touched again in
+ * ordinary use, so its mtime is a reliable "this worktree was created at roughly T" signal
+ * without needing Orca to report a creation timestamp at all. Returns null on any stat
+ * failure (unreadable path, `.git` missing entirely) — never a candidate for a "produced new
+ * work" verdict; uncertain is never a pass, same rule as every other leg here.
+ */
+function statMtimeMs(dirPath) {
+  try {
+    const st = fs.statSync(path.join(dirPath, '.git'));
+    return Number.isFinite(st.mtimeMs) ? st.mtimeMs : null;
+  } catch {
+    return null;
+  }
+}
+
+/** HEAD's own commit time (`%ct`, committer date, seconds since epoch), in ms. Null on any
+ * git failure — same uncertainty rule as everywhere else in this file. */
+function headCommitTimeMs(cwd, git) {
+  const r = git(['log', '-1', '--format=%ct', 'HEAD'], cwd);
+  if (!r || r.status !== 0 || !r.stdout) return null;
+  const sec = Number(String(r.stdout).trim());
+  return Number.isFinite(sec) ? sec * 1000 : null;
+}
+
+/**
+ * H1: a worktree freshly branched off its base and never given a new commit is trivially
+ * "HEAD is an ancestor of base" (HEAD literally IS a commit already on base) AND trivially
+ * "clean" — the no-linked-PR/MR acceptance path must not mistake that for done-but-open work.
+ * This holds only when HEAD's own commit postdates the worktree's creation (`statMtimeMs`): a
+ * commit that already existed on `base` before the worktree was created necessarily predates
+ * it, so requiring the reverse means the worktree's branch actually advanced past what it
+ * started from. Either signal being unreadable is never a pass.
+ */
+function hasProducedMergedWork(w, git, stat) {
+  const created = stat(w.path);
+  if (created == null) return false;
+  const headTime = headCommitTimeMs(w.path, git);
+  return headTime != null && headTime > created;
+}
+
+/**
  * The "accepted" leg of done-but-open: a merged/closed linked GitHub PR or GitLab MR, or —
  * only when NEITHER is linked at all — HEAD already contained in the worktree's own
- * upstream default branch. A still-open PR/MR is never accepted, whatever git alone might
- * say about the branch. Git is consulted ONLY in the no-linked-PR/MR case: the cheap,
+ * upstream default branch AND that worktree actually produced a new, now-merged commit
+ * (`hasProducedMergedWork`, item H1 — otherwise a freshly-created, never-touched worktree
+ * would qualify too). A still-open PR/MR is never accepted, whatever git alone might say
+ * about the branch. Git is consulted ONLY in the no-linked-PR/MR case: the cheap,
  * Orca-reported PR/MR state always decides first when one exists, so a real git call never
- * runs for the (common) linked-PR case's acceptance leg. Returns `{ accepted, reason }` so
- * a caller can name which path fired.
+ * runs for the (common) linked-PR case's acceptance leg — a PR/MR's own merged/closed state
+ * is already external evidence real work happened, so H1's extra check does not apply there.
+ * Returns `{ accepted, reason }` so a caller can name which path fired.
  */
-function resolveAcceptance(w, git) {
+function resolveAcceptance(w, git, stat) {
   if (w.prState != null) {
     return DONE_PR_STATES.has(w.prState)
       ? { accepted: true, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}` }
@@ -265,6 +325,7 @@ function resolveAcceptance(w, git) {
   }
   const base = resolveBaseRef(w.path, git);
   if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: null };
+  if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: null };
   return { accepted: true, reason: `no linked PR, HEAD already merged into ${base}` };
 }
 
@@ -289,7 +350,10 @@ function isWorktreeIdle(w, now, idleSeconds) {
  * confirmed clean", never "clean" — same uncertainty rule as everywhere else here.
  */
 function isWorktreeClean(w, git) {
-  const status = git(['status', '--porcelain'], w.path);
+  // `--no-optional-locks`: a plain status read must never contend with, or be blocked by,
+  // another concurrent git process's lock on this worktree's index — this daemon polls
+  // repeatedly and runs alongside the user's own git/IDE activity.
+  const status = git(['--no-optional-locks', 'status', '--porcelain'], w.path);
   if (!status || status.status !== 0 || status.stdout !== '') return false;
   const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], w.path);
   if (upstream && upstream.status === 0 && upstream.stdout) {
@@ -316,8 +380,9 @@ function evaluateDoneButOpen(w, ctx = {}) {
   const now = ctx.now != null ? ctx.now : Date.now();
   const idleSeconds = ctx.idleSeconds != null ? ctx.idleSeconds : IDLE_SECONDS;
   const git = ctx.git || runGit;
+  const stat = ctx.stat || statMtimeMs;
   if (!isWorktreeIdle(w, now, idleSeconds)) return { done: false, reason: null };
-  const { accepted, reason } = resolveAcceptance(w, git);
+  const { accepted, reason } = resolveAcceptance(w, git, stat);
   if (!accepted) return { done: false, reason: null };
   if (!isWorktreeClean(w, git)) return { done: false, reason: null };
   return { done: true, reason };
@@ -329,18 +394,39 @@ function isDoneButOpen(w, ctx) {
   return evaluateDoneButOpen(w, ctx).done;
 }
 
+/** Strips ASCII control characters (a literal newline or other control char in an
+ * Orca-reported displayName/path could corrupt this single-line message or mislead whoever
+ * reads it) from free-text Orca-reported fields before they go into a printed line. */
+function sanitizeText(str) {
+  // eslint-disable-next-line no-control-regex
+  return String(str).replace(/[\x00-\x1f\x7f]/g, '');
+}
+
+/** POSIX-safe single-quoting: wraps `str` (already control-char-stripped) in `'...'`,
+ * escaping any embedded `'` the standard `'\''` way, so a path containing a space, `"`, `$`
+ * or backtick is still exactly one shell argument if the suggested command is pasted
+ * verbatim (item L2/L7 — the old double-quoted form did not protect against any of those). */
+function shellSingleQuote(str) {
+  return `'${sanitizeText(str).replace(/'/g, `'\\''`)}'`;
+}
+
 /** The wake-event line for one worktree that just became done-but-open. The `rm` target's
- * `path:` value is quoted (item L3) since a worktree's path can contain spaces. */
+ * `path:` value is single-quoted (items L2/L3/L7). Names which idle leg actually fired
+ * (item L1) instead of always claiming "no live terminal" — a worktree can also go idle with
+ * a live-but-quiet terminal (see `isWorktreeIdle`), and the earlier wording was misleading
+ * whenever that was the real reason. */
 function formatDoneWorktreeEvent(w, reason) {
-  return `DONE worktree ${w.displayName} (${reason}, no live terminal) — verify it is clean, then close: ` +
-    `orca worktree rm --worktree "path:${w.path}"`;
+  const idleDetail = w.liveTerminalCount > 0 ? 'quiet terminal(s)' : 'no live terminal';
+  return `DONE worktree ${sanitizeText(w.displayName)} (${reason}, ${idleDetail}) — verify it is clean, then close: ` +
+    `orca worktree rm --worktree ${shellSingleQuote(`path:${w.path}`)}`;
 }
 
 /** The one-time, non-waking startup line listing backlog already done-but-open at baseline.
  * Includes each worktree's path, not just its display name (item L4), since two worktrees
- * can share a display name. */
+ * can share a display name. Both fields are control-char-stripped (item L7) before joining
+ * this multi-row line. */
 function formatDoneWorktreeStartupSummary(list) {
-  const names = list.map((w) => `${w.displayName} (${w.path})`).join(', ');
+  const names = list.map((w) => `${sanitizeText(w.displayName)} (${sanitizeText(w.path)})`).join(', ');
   return `orca-heartbeat: ${list.length} pre-existing done-but-open worktree(s) at startup: ${names} ` +
     '— verify each is clean, then close with `orca worktree rm --worktree "path:<path>"`.';
 }
@@ -384,14 +470,31 @@ function ensureDoneWtPersistedLoaded() {
  * After seeding, this same process continues in ordinary steady-state on every later call:
  * anything done-but-open this process has not itself already reported is a wake event.
  */
-function processDoneWorktrees(data, events) {
+function processDoneWorktrees(data, events, started) {
   if (!CLOSE_DONE_WORKTREES || !data || data.truncated) return;
   try {
     ensureDoneWtPersistedLoaded();
     const now = Date.now();
-    const evaluated = data.rows
-      .map((w) => ({ w, verdict: evaluateDoneButOpen(w, { now, idleSeconds: IDLE_SECONDS, git: runGit }) }))
-      .filter((e) => e.verdict.done);
+    // A path this process has already reported can never produce a NEW event again once
+    // seeding has happened at least once — skip its (potentially several) git subprocess
+    // calls entirely instead of re-running them on every future tick forever. Before the
+    // first seed, every row must still be evaluated once to establish the backlog / diff
+    // against a persisted restart, so nothing is skipped yet at that point.
+    const candidates = doneWtSeeded
+      ? data.rows.filter((w) => !(w && typeof w.path === 'string' && reportedDoneWorktrees.has(w.path)))
+      : data.rows;
+    // A git-heavy pass (many worktrees left to evaluate) must never run long enough to make
+    // the liveness file look stale: cap it to ~GIT_BUDGET_MS total and beat() between rows.
+    // Whatever does not fit in the budget is simply retried next tick — evaluateDoneButOpen
+    // is pure/idempotent per row, so a partial pass here is a delay, never a correctness bug.
+    const budgetDeadline = Date.now() + GIT_BUDGET_MS;
+    const allEvaluated = [];
+    for (const w of candidates) {
+      allEvaluated.push({ w, verdict: evaluateDoneButOpen(w, { now, idleSeconds: IDLE_SECONDS, git: runGit }) });
+      beat(started);
+      if (Date.now() >= budgetDeadline) break;
+    }
+    const evaluated = allEvaluated.filter((e) => e.verdict.done);
 
     let persistedChanged = false;
 
@@ -499,7 +602,7 @@ function main() {
   // tick() below keeps retrying until one comes back.
   if (CLOSE_DONE_WORKTREES) {
     const startupEvents = [];
-    processDoneWorktrees(worktrees(), startupEvents);
+    processDoneWorktrees(worktrees(), startupEvents, started);
     if (startupEvents.length) flushAndExit(startupEvents, Date.now());
   }
 
@@ -537,7 +640,7 @@ function main() {
     }
 
     if (CLOSE_DONE_WORKTREES) {
-      processDoneWorktrees(worktrees(), events);
+      processDoneWorktrees(worktrees(), events, started);
       beat(started); // item L1
     }
 
@@ -586,4 +689,5 @@ module.exports = {
   classifyTerminal, isHoldingResources, snapshotWorkers, RATE_LIMIT,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
+  statMtimeMs, headCommitTimeMs, hasProducedMergedWork,
 };

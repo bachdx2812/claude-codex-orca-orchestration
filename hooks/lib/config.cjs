@@ -189,9 +189,15 @@ function loadConfig() {
     merged.closeDoneWorktrees = DEFAULT_CONFIG.closeDoneWorktrees;
   }
 
-  const coreFraction = Number(merged.parallelCoreFraction);
+  // M2: only an actual JSON number is accepted here — `Number("")`/`Number(" ")` coerce to
+  // 0, which would otherwise let a stray `"parallelCoreFraction": ""` in the config file
+  // silently fail the range check below in a confusing way, or (for maxParallelAgents,
+  // where 0 is a valid, meaningful value) silently turn the cap unlimited instead of
+  // warning and defaulting. A non-number is never coerced; it is simply invalid.
+  const coreFractionRaw = merged.parallelCoreFraction;
+  const coreFraction = typeof coreFractionRaw === 'number' ? coreFractionRaw : NaN;
   if (!Number.isFinite(coreFraction) || coreFraction < 0.1 || coreFraction > 1) {
-    warnings.push(`parallelCoreFraction "${merged.parallelCoreFraction}" is not a number 0.1-1; using ${DEFAULT_CONFIG.parallelCoreFraction}.`);
+    warnings.push(`parallelCoreFraction "${coreFractionRaw}" is not a number 0.1-1; using ${DEFAULT_CONFIG.parallelCoreFraction}.`);
     merged.parallelCoreFraction = DEFAULT_CONFIG.parallelCoreFraction;
   } else {
     merged.parallelCoreFraction = coreFraction;
@@ -200,9 +206,10 @@ function loadConfig() {
   // null (derive from cores) is a valid, and the default, value here — unlike every other
   // integer field above, so it is checked before the numeric-range check runs at all.
   if (merged.maxParallelAgents !== null) {
-    const maxAgents = Number(merged.maxParallelAgents);
+    const maxAgentsRaw = merged.maxParallelAgents;
+    const maxAgents = typeof maxAgentsRaw === 'number' ? maxAgentsRaw : NaN;
     if (!Number.isInteger(maxAgents) || maxAgents < 0 || maxAgents > 256) {
-      warnings.push(`maxParallelAgents "${merged.maxParallelAgents}" is not null or an integer 0-256; using null (derive from cores).`);
+      warnings.push(`maxParallelAgents "${maxAgentsRaw}" is not null or an integer 0-256; using null (derive from cores).`);
       merged.maxParallelAgents = null;
     } else {
       merged.maxParallelAgents = maxAgents;
@@ -287,11 +294,14 @@ function closeDoneWorktreesEnabled(cfg) {
 /**
  * The fraction of this machine's cores the parallel-agents budget derives its limit from
  * (0.1-1). `ORCH_PARALLEL_CORE_FRACTION` overrides the config value for one process; an
- * invalid override falls back to the config value, exactly like `handoffUsed`.
+ * invalid override falls back to the config value, exactly like `handoffUsed`. M2: an
+ * empty-or-whitespace-only override is treated as unset (falls back to config), not as `0`
+ * — `Number("")`/`Number(" ")` both coerce to `0`, which would otherwise silently accept an
+ * accidentally-empty env var as a real (and, for this field, always out-of-range) value.
  */
 function parallelCoreFraction(cfg) {
   const envOverride = process.env.ORCH_PARALLEL_CORE_FRACTION;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isFinite(n) && n >= 0.1 && n <= 1) return n;
   }
@@ -301,11 +311,14 @@ function parallelCoreFraction(cfg) {
 /**
  * The explicit machine-wide parallel-agents cap, or null to derive it from
  * `parallelCoreFraction x cores` (0 = unlimited). `ORCH_MAX_PARALLEL_AGENTS` overrides the
- * config value for one process; an invalid override falls back to the config value.
+ * config value for one process; an invalid override falls back to the config value. M2: an
+ * empty-or-whitespace-only override is treated as unset, not as `0` — since `0` here means
+ * a real, meaningful "unlimited", `Number("")` coercing to `0` would otherwise let a stray
+ * empty env var silently disable the entire cap.
  */
 function maxParallelAgents(cfg) {
   const envOverride = process.env.ORCH_MAX_PARALLEL_AGENTS;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isInteger(n) && n >= 0 && n <= 256) return n;
   }

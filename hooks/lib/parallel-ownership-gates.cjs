@@ -393,7 +393,31 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
         if (newSlot && !gateDisabled(cfg, 'max-parallel-agents')) {
           const limit = deps.agentParallelLimit(cfg);
           if (Number.isFinite(limit)) {
-            const usage = deps.machineWideLiveUnits(DIR, Date.now(), { currentState: s, currentSessionId: sessionId });
+            // Concurrency review, Low item: this is a hard resource cap, not policy — an
+            // unheld lock (`!locked`, e.g. this whole critical section's own initial
+            // acquireLock already timed out) means `s` cannot be trusted against every other
+            // racing process, so it is never treated as "under limit" by default; it is
+            // forced into the same reconcile-or-refuse path an at-cap count would take,
+            // rather than silently letting a lock-contention race admit uncounted.
+            let usage = locked ? deps.machineWideLiveUnits(DIR, Date.now(), { currentState: s, currentSessionId: sessionId }) : null;
+            if (!locked || usage.total >= limit) {
+              // H3: reconcile THIS session's own Orca-tracked workers before refusing — the
+              // same out-of-lock-fetch + locked-reapply pattern the max-parallel-codex-
+              // workers cap below already uses. A worker this session's own bookkeeping
+              // still shows live, but that Orca has already confirmed released or done,
+              // would otherwise refuse a dispatch that could actually proceed right now.
+              if (locked) { releaseLock(lockDir); locked = false; }
+              const rows = fetchOrcaWorkerRows(ORCA_BIN);
+              locked = acquireLock(lockDir, {});
+              if (!locked) {
+                violation = { gate: 'max-parallel-agents', reason: deps.lockContentionMessage };
+                break;
+              }
+              s = load(sessionId);
+              Object.assign(s.reservations, localReservations);
+              if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;
+              usage = deps.machineWideLiveUnits(DIR, Date.now(), { currentState: s, currentSessionId: sessionId });
+            }
             if (usage.total >= limit) {
               violation = { gate: 'max-parallel-agents', reason:
                 deps.formatParallelAgentsRefusal(usage, limit, deps.cores(), deps.parallelCoreFraction(cfg)) };
@@ -448,7 +472,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
       // during this same critical section must survive independently of this command's own
       // outcome, since it reflects reality regardless of whether this dispatch was allowed.
       for (const key of Object.keys(localReservations)) delete s.reservations[key];
-      if (reconcileChanged) save(s);
+      // `locked` guard: a max-parallel-agents lock-contention refusal can leave `locked`
+      // false right here — an earlier reconcile's real effect must still never be saved
+      // without the lock actually held (concurrency review, Low item).
+      if (reconcileChanged && locked) save(s);
     } else {
       save(s);
     }

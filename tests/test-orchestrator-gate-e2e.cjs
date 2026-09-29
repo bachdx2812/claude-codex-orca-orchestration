@@ -1761,6 +1761,151 @@ const postAgent = (sid, toolUseId) => ({
   expect('agent #3 also admitted with the gate disabled, despite cap 1', mpaLookup(sid, 'toolu_mpa_d3'), ALLOW, env);
 }
 
+// 8. C1 regression: a dispatch refused by a LATER gate (here: route-review, wrong model)
+// must never have registered a max-parallel-agents slot. Before the fix, registration
+// happened at the TOP of the Agent/Task branch, before routing/ownership gates ran — so a
+// dispatch that failed one of those later gates still left `s.agents[toolUseId]` behind,
+// and since a refused dispatch never fires PostToolUse, that slot leaked for up to
+// AGENT_REGISTRY_TTL_MS (120 minutes). Reproduced here with 3 wrong-model "review" dispatches
+// against cap 2: if any of them registered, the 2 genuine lookup dispatches below would be
+// wrongly refused too.
+{
+  const { env } = mpaTestEnv({ maxParallelAgents: 2 });
+  const sid = 'mpa-c1-no-leak-on-later-refusal';
+  const wrongModelReview = (toolUseId) => dispatch(
+    { subagent_type: 'reviewer', description: 'review the implementation for correctness', model: 'sonnet' },
+    sid, { tool_use_id: toolUseId });
+  for (const id of ['toolu_mpa_c1_r1', 'toolu_mpa_c1_r2', 'toolu_mpa_c1_r3']) {
+    const r = invoke(wrongModelReview(id), env);
+    if (r.code === DENY && /route-review/.test(r.err)) pass += 1;
+    else failures.push(`C1 setup: wrong-model review dispatch ${id} should be refused by route-review (code ${r.code}, err ${r.err.slice(0, 200)})`);
+  }
+  expect('C1: after 3 route-review refusals, a genuine dispatch #1 is still admitted under cap 2',
+    mpaLookup(sid, 'toolu_mpa_c1_g1'), ALLOW, env);
+  expect('C1: after 3 route-review refusals, a genuine dispatch #2 is still admitted under cap 2',
+    mpaLookup(sid, 'toolu_mpa_c1_g2'), ALLOW, env);
+}
+
+// 9. H3: at the machine-wide cap, the gate reconciles the caller's OWN session against
+// Orca's live worker-list before refusing. This session's local state still shows a worker
+// live (filling cap 1), but Orca's own worker-list reports it `terminalState: 'released'` —
+// the reconcile must settle it locally and free the slot, admitting the dispatch instead of
+// refusing it on stale bookkeeping.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 1 });
+  const sid = 'mpa-h3-reconcile-frees-slot';
+  const staleState = {
+    session_id: sid, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { ctx_h3_stale: { status: 'live', started: Date.now(), group: 'ctx_h3_stale', agent: 'codex', owns: null, ws: null } },
+    reservations: {}, agentClaims: {}, agents: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  };
+  fs.writeFileSync(path.join(stateDir, `${sid}.json`), JSON.stringify(staleState));
+  const h3Env = {
+    ...env,
+    STUB_WORKERS_JSON: JSON.stringify([
+      { dispatchId: 'ctx_h3_stale', taskId: 'task_h3_stale', terminalState: 'released', workerState: 'succeeded', dispatchStatus: 'succeeded' },
+    ]),
+  };
+  expect('H3: a dispatch at a stale-but-full cap is admitted once reconcile frees the Orca-released worker',
+    mpaLookup(sid, 'toolu_mpa_h3_1'), ALLOW, h3Env);
+  const after = JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
+  checkBool('H3: the reconciled worker is persisted as settled, not left live',
+    after.workers.ctx_h3_stale.status === 'settled', true);
+}
+
+// 10. Concurrency review, Low item: a max-parallel-agents check that cannot acquire the
+// state-file lock at all (contended by another process) must refuse with a distinct,
+// transient-retry reason — never silently evaluate capacity unlocked (which, under exactly
+// the many-concurrent-dispatches condition that causes lock contention, would let every
+// contending process fall through uncounted and all be admitted at once). Simulated here by
+// pre-holding the lock directory for longer than the gate's own ~2s acquire timeout.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 5 }); // generous cap: contention, not capacity, must be the cause
+  const sid = 'mpa-lock-contention';
+  const lockDir = path.join(stateDir, '.lock');
+  fs.mkdirSync(lockDir, { recursive: true });
+  const r = invoke(mpaLookup(sid, 'toolu_mpa_lock_1'), env);
+  if (r.code === DENY && /max-parallel-agents/.test(r.err) && /transient/i.test(r.err) && /retry/i.test(r.err)) pass += 1;
+  else failures.push(`lock contention: expected a transient-retry max-parallel-agents refusal (code ${r.code}, err ${r.err.slice(0, 300)})`);
+  checkBool('lock contention: the ordinary at-capacity wording is NOT used for a lock-contention refusal',
+    /parallel units live on this machine/.test(r.err), false);
+  fs.rmSync(lockDir, { recursive: true, force: true });
+  expect('lock contention: once the lock is free again, a dispatch is admitted normally',
+    mpaLookup(sid, 'toolu_mpa_lock_2'), ALLOW, env);
+}
+
+// 11. Low item: `--release-claims <id>` must release EVERY kind of claim tracked under that
+// id, not just whichever the old if/else-if chain happened to check first. Seeds a single
+// toolUseId with an agentClaims entry, an agents (max-parallel-agents) entry, AND an indexed
+// reservation, then confirms all three are gone after one `--release-claims <id>`.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 1 });
+  const sid = 'mpa-release-claims-multi-kind';
+  const targetId = 'toolu_release_multi';
+  const seeded = {
+    session_id: sid, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: {},
+    reservations: { [`${targetId}#0`]: { ts: Date.now(), agent: 'codex', owns: null, ws: null, newSlot: true } },
+    agentClaims: { [targetId]: { owns: ['src/x.ts'], ws: `${FAKE_REPO}|current`, ts: Date.now() } },
+    agents: { [targetId]: { ts: Date.now(), background: false, type: '', model: '' } },
+    tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  };
+  fs.writeFileSync(path.join(stateDir, `${sid}.json`), JSON.stringify(seeded));
+  invoke(promptSubmit(sid, `--release-claims ${targetId}`), env);
+  const after = JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
+  checkBool('release-claims (single id): the agentClaims entry is released', !after.agentClaims[targetId], true);
+  checkBool('release-claims (single id): the agents (max-parallel-agents) entry is ALSO released', !after.agents[targetId], true);
+  checkBool('release-claims (single id): the indexed reservation is ALSO released', !after.reservations[`${targetId}#0`], true);
+}
+
+// 12. C1 backstop: a genuine operator UserPromptSubmit (never an injected notification/
+// reminder) sweeps out every FOREGROUND `s.agents` registration — the safety net for a slot
+// that somehow outlived its own PostToolUse (e.g. a session that crashed mid-turn). A
+// background registration is left alone: it relies on its own <task-notification>/TTL/
+// --release-claims release path instead.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 5 });
+  const sid = 'mpa-c1-backstop-userpromptsubmit';
+  const seeded = {
+    session_id: sid, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: {}, reservations: {}, agentClaims: {},
+    agents: {
+      toolu_leaked_fg: { ts: Date.now(), background: false, type: '', model: '' },
+      toolu_leaked_bg: { ts: Date.now(), background: true, type: '', model: '' },
+    },
+    tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  };
+  fs.writeFileSync(path.join(stateDir, `${sid}.json`), JSON.stringify(seeded));
+  invoke(promptSubmit(sid, 'hello, anything to report?'), env);
+  const after = JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
+  checkBool('C1 backstop (UserPromptSubmit): a leaked FOREGROUND registration is swept',
+    !after.agents.toolu_leaked_fg, true);
+  checkBool('C1 backstop (UserPromptSubmit): a BACKGROUND registration survives untouched',
+    !!after.agents.toolu_leaked_bg, true);
+}
+
+// 13. C1 backstop: same sweep, at Stop — regardless of whether any Orca worker is live.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 5 });
+  const sid = 'mpa-c1-backstop-stop';
+  const seeded = {
+    session_id: sid, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: {}, reservations: {}, agentClaims: {},
+    agents: {
+      toolu_leaked_fg2: { ts: Date.now(), background: false, type: '', model: '' },
+      toolu_leaked_bg2: { ts: Date.now(), background: true, type: '', model: '' },
+    },
+    tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  };
+  fs.writeFileSync(path.join(stateDir, `${sid}.json`), JSON.stringify(seeded));
+  invoke({ session_id: sid, hook_event_name: 'Stop', effort: 'high', stop_hook_active: false }, env);
+  const after = JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
+  checkBool('C1 backstop (Stop): a leaked FOREGROUND registration is swept, even with zero live workers',
+    !after.agents.toolu_leaked_fg2, true);
+  checkBool('C1 backstop (Stop): a BACKGROUND registration survives untouched',
+    !!after.agents.toolu_leaked_bg2, true);
+}
+
 // --- orca-heartbeat.cjs: done-but-open worktree reminder (real spawned daemon + stubs) --
 //
 // Unlike the gate above, the daemon is long-running, so these spawn it for real (via
@@ -1848,6 +1993,19 @@ function realWtDir(label) {
   return p;
 }
 
+/** Same as `realWtDir`, but also plants a `.git` marker file (the mtime H1's
+ * `hasProducedMergedWork` stats — see orca-heartbeat.cjs) with a caller-controlled mtime, for
+ * fixtures that exercise the no-linked-PR/MR acceptance path against the git-stub (which
+ * itself answers HEAD's commit time via `STUB_GIT_HEAD_COMMIT_TIME`, set alongside this). */
+function realWtDirWithGitMarker(label, mtimeMs) {
+  const p = realWtDir(label);
+  const marker = path.join(p, '.git');
+  fs.writeFileSync(marker, 'gitdir: /nonexistent\n');
+  const t = mtimeMs / 1000;
+  fs.utimesSync(marker, t, t);
+  return p;
+}
+
 async function heartbeatWorktreeTests() {
   // 1. A worktree already done-but-open at startup: only the one-time summary line, never
   //    the wake-event line, and the daemon runs to its --max instead of exiting early.
@@ -1883,7 +2041,7 @@ async function heartbeatWorktreeTests() {
     });
     checkBool('a worktree that becomes done-but-open mid-run fires the wake-event line',
       out.includes(`DONE worktree t1 (PR #2 merged, no live terminal) — verify it is clean, then close: ` +
-        `orca worktree rm --worktree "path:${p}"`), true);
+        `orca worktree rm --worktree 'path:${p}'`), true);
     checkBool('a genuine transition is not also reported as a startup summary',
       out.includes('pre-existing'), false);
     checkBool('the daemon exits on the transition instead of running to --max',
@@ -2101,13 +2259,16 @@ async function heartbeatWorktreeTests() {
 
   // 12. No linked PR or MR at all: acceptance falls back to a real git ancestor-of-base
   // check via the git stub — accepted when HEAD is confirmed merged, refused when it isn't.
+  // H1: acceptance also requires HEAD's own commit to postdate the worktree's `.git` marker
+  // (`hasProducedMergedWork`), so `pMerged`'s marker is forced well into the past and the
+  // stub's HEAD commit time well after it.
   {
-    const pMerged = realWtDir('np');
+    const pMerged = realWtDirWithGitMarker('np', Date.now() - 3_600_000);
     const outMerged = await runHeartbeat({
       name: 'no-pr-ancestor',
       worktrees: [{ path: pMerged, displayName: 'np', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 0 }],
-      gitEnv: { STUB_GIT_ANCESTOR: '1' },
+      gitEnv: { STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)) },
       args: ['--interval', '1', '--idle', '60', '--max', '1'],
     });
     checkBool('no linked PR/MR + git confirms HEAD is an ancestor of base + clean is done-but-open',
@@ -2137,13 +2298,130 @@ async function heartbeatWorktreeTests() {
     checkBool('a merged PR with an uncommitted-changes worktree is never done-but-open',
       out.includes('pre-existing'), false);
   }
+
+  // 14. Item M4: `worktree ps` answering `{ ok: false }` must be treated exactly like an
+  // unreachable Orca (no summary, daemon keeps polling), never like "zero worktrees" — even
+  // though a worktree that would obviously qualify is sitting right there in the stub's data.
+  {
+    const out = await runHeartbeat({
+      name: 'm4-ok-false',
+      worktrees: [{ path: realWtDir('m4a'), displayName: 'm4a', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 40 } }],
+      envOverrides: { STUB_WORKTREES_OK_FALSE: '1' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('an `ok:false` worktree-ps reply never produces a startup summary', out.includes('pre-existing'), false);
+    checkBool('an `ok:false` worktree-ps reply never crashes the daemon',
+      out.includes('orca-heartbeat: Orca is not answering'), false);
+  }
+
+  // 15. Item M4: a reply that never seeded a `worktrees` array at all (e.g. `result: {}`)
+  // must degrade the same way — never silently read as an empty, all-clear list.
+  {
+    const out = await runHeartbeat({
+      name: 'm4-no-array',
+      worktrees: [{ path: realWtDir('m4b'), displayName: 'm4b', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 41 } }],
+      envOverrides: { STUB_WORKTREES_NO_ARRAY: '1' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('a reply with no `worktrees` array never produces a startup summary', out.includes('pre-existing'), false);
+    checkBool('a reply with no `worktrees` array never crashes the daemon',
+      out.includes('orca-heartbeat: Orca is not answering'), false);
+  }
 }
 
-heartbeatWorktreeTests().then(() => {
-  console.log(`${pass} passed, ${failures.length} failed`);
-  for (const f of failures) console.log(`  FAIL ${f}`);
+// --- H1 (real git, no stub): a fresh worktree with zero new commits must never be reported
+// done-but-open, even though it is trivially "an ancestor of base" and "clean"; a worktree
+// with a REAL new commit that is genuinely merged into origin/main must be reported. Uses a
+// real bare "origin" repo + a real clone + real linked worktrees (per the reviewer's own
+// repro note: "probe with a REAL fresh worktree ... trivially ancestor+clean; stub-only tests
+// miss it") — `ORCH_GIT_BIN` is pointed at the real `git` binary for this suite only.
+function sh(cmd, args, cwd, env) {
+  const r = spawnSync(cmd, args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(`\`${cmd} ${args.join(' ')}\` failed in ${cwd}: ${r.stderr}`);
+  return r.stdout;
+}
 
-  rmState(SID);
-  try { fs.rmSync(RUN_DIR, { recursive: true, force: true }); } catch {}
-  process.exit(failures.length ? 1 : 0);
-});
+const REAL_GIT_ENV = {
+  GIT_AUTHOR_NAME: 'h1-test', GIT_AUTHOR_EMAIL: 'h1-test@example.invalid',
+  GIT_COMMITTER_NAME: 'h1-test', GIT_COMMITTER_EMAIL: 'h1-test@example.invalid',
+};
+
+/** A real bare "origin" repo (branch `main`, one seed commit) plus a real non-bare clone to
+ * branch linked worktrees off. */
+function setupRealGitOrigin(label) {
+  const root = path.join(RUN_DIR, `real-git-${label}`);
+  fs.mkdirSync(root, { recursive: true });
+  const originDir = path.join(root, 'origin.git');
+  const repoDir = path.join(root, 'repo');
+  sh('git', ['init', '--quiet', '--bare', '-b', 'main', originDir], root);
+  sh('git', ['clone', '--quiet', originDir, repoDir], root);
+  fs.writeFileSync(path.join(repoDir, 'README.md'), 'seed\n');
+  sh('git', ['add', 'README.md'], repoDir, REAL_GIT_ENV);
+  sh('git', ['commit', '--quiet', '-m', 'seed'], repoDir, REAL_GIT_ENV);
+  sh('git', ['push', '--quiet', 'origin', 'main'], repoDir, REAL_GIT_ENV);
+  return { root, originDir, repoDir };
+}
+
+/** A fresh linked worktree branched off `origin/main`, with its `.git` marker file's mtime
+ * force-set to `gitMtimeMs` — sidesteps real-clock jitter/resolution entirely: H1's own
+ * discriminator is exactly this timestamp vs. HEAD's real commit time. */
+function addRealWorktree({ repoDir }, branch, gitMtimeMs) {
+  const wtPath = path.join(path.dirname(repoDir), `wt-${branch}`);
+  sh('git', ['worktree', 'add', '--quiet', '-b', branch, wtPath, 'origin/main'], repoDir, REAL_GIT_ENV);
+  const marker = path.join(wtPath, '.git');
+  const t = gitMtimeMs / 1000;
+  fs.utimesSync(marker, t, t);
+  return wtPath;
+}
+
+async function heartbeatH1RealGitTests() {
+  const origin = setupRealGitOrigin('h1');
+  const now = Date.now();
+
+  // Negative: zero new commits. Forcing the `.git` marker's mtime an hour into the FUTURE
+  // relative to the (real, wall-clock) seed commit means this worktree is unambiguously
+  // "created after its own HEAD commit" regardless of how fast or slow this machine is —
+  // i.e. it never advanced past what it started from.
+  const freshPath = addRealWorktree(origin, 'fresh', now + 3_600_000);
+  const outFresh = await runHeartbeat({
+    name: 'h1-fresh-worktree',
+    dirName: 'hb-h1-fresh',
+    worktrees: [{ path: freshPath, displayName: 'fresh', isMainWorktree: false, isArchived: false, liveTerminalCount: 0 }],
+    envOverrides: { ORCH_GIT_BIN: 'git' },
+    args: ['--interval', '1', '--idle', '60', '--max', '1'],
+  });
+  checkBool('H1 (real git): a fresh worktree with zero new commits is never reported done-but-open',
+    outFresh.includes('pre-existing') || outFresh.includes('DONE worktree'), false);
+
+  // Positive: a REAL new commit, force-pushed onto the bare origin's `main` and fetched back,
+  // so `origin/main` genuinely contains it. The `.git` marker's mtime is forced an hour into
+  // the PAST relative to that (real, wall-clock) commit.
+  const mergedPath = addRealWorktree(origin, 'merged', now - 3_600_000);
+  fs.writeFileSync(path.join(mergedPath, 'feature.txt'), 'real work\n');
+  sh('git', ['add', 'feature.txt'], mergedPath, REAL_GIT_ENV);
+  sh('git', ['commit', '--quiet', '-m', 'real work'], mergedPath, REAL_GIT_ENV);
+  sh('git', ['push', '--quiet', 'origin', 'merged:main'], mergedPath, REAL_GIT_ENV);
+  sh('git', ['fetch', '--quiet', 'origin'], mergedPath, REAL_GIT_ENV);
+  const outMerged = await runHeartbeat({
+    name: 'h1-merged-worktree',
+    dirName: 'hb-h1-merged',
+    worktrees: [{ path: mergedPath, displayName: 'merged', isMainWorktree: false, isArchived: false, liveTerminalCount: 0 }],
+    envOverrides: { ORCH_GIT_BIN: 'git' },
+    args: ['--interval', '1', '--idle', '60', '--max', '1'],
+  });
+  checkBool('H1 (real git): a worktree with a real commit genuinely merged into origin/main is reported done-but-open',
+    outMerged.includes(`pre-existing done-but-open worktree(s) at startup: merged (${mergedPath})`), true);
+}
+
+heartbeatWorktreeTests()
+  .then(() => heartbeatH1RealGitTests())
+  .then(() => {
+    console.log(`${pass} passed, ${failures.length} failed`);
+    for (const f of failures) console.log(`  FAIL ${f}`);
+
+    rmState(SID);
+    try { fs.rmSync(RUN_DIR, { recursive: true, force: true }); } catch {}
+    process.exit(failures.length ? 1 : 0);
+  });

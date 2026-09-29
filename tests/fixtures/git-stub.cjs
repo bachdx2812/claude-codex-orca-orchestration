@@ -15,9 +15,16 @@
  *   STUB_GIT_CLEAN=1            `status --porcelain` prints nothing (a clean worktree)
  *   STUB_GIT_HAS_UPSTREAM=1     `rev-parse @{u}` succeeds (a real upstream exists)
  *   STUB_GIT_UNPUSHED=1         `rev-list @{u}..HEAD` prints a commit (unpushed work)
+ *   STUB_GIT_HEAD_COMMIT_TIME  `log -1 --format=%ct HEAD` prints this value (unix seconds);
+ *                              unset means "could not confirm" (exit 1, no output) — same
+ *                              conservative default as every other knob here, since H1's
+ *                              no-linked-PR/MR acceptance path needs a real answer here to
+ *                              ever accept a worktree.
  */
 const args = process.argv.slice(2);
-const sub = args[0];
+// A leading global flag (e.g. `--no-optional-locks`, see the real `status --porcelain` call
+// in orca-heartbeat.cjs) must not be mistaken for the subcommand itself.
+const sub = args.find((a) => !a.startsWith('--'));
 
 function done(stdout, code) {
   if (stdout) process.stdout.write(stdout);
@@ -49,6 +56,12 @@ if (sub === 'status') {
 
 if (sub === 'rev-list') {
   done(process.env.STUB_GIT_UNPUSHED === '1' ? 'deadbeef1234\n' : '', 0);
+}
+
+if (sub === 'log') {
+  const t = process.env.STUB_GIT_HEAD_COMMIT_TIME;
+  if (t === undefined) done('', 1);
+  done(`${t}\n`, 0);
 }
 
 process.stderr.write(`git-stub: unrecognised command ${sub}\n`);

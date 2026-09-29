@@ -252,12 +252,18 @@ check('a released worker holds nothing',
   const pick = (overrides, key, dflt) => (key in overrides ? overrides[key] : dflt);
   function fakeGit(overrides = {}) {
     return (args) => {
-      const sub = args[0];
+      // A leading global flag (e.g. `--no-optional-locks`, see the real `status --porcelain`
+      // call) must not be mistaken for the subcommand itself.
+      const sub = args.find((a) => !a.startsWith('--'));
       if (sub === 'symbolic-ref') return pick(overrides, 'symbolicRef', { status: 0, stdout: 'origin/main' });
       if (sub === 'merge-base') return pick(overrides, 'mergeBase', { status: 0, stdout: '' });
       if (sub === 'status') return pick(overrides, 'status', { status: 0, stdout: '' });
       if (sub === 'rev-parse' && args.includes('@{u}')) return pick(overrides, 'upstream', { status: 0, stdout: 'origin/feature' });
       if (sub === 'rev-list') return pick(overrides, 'revList', { status: 0, stdout: '' });
+      // H1: HEAD's own commit time (seconds), consulted only on the no-linked-PR/MR
+      // acceptance path. Default (700s -> 700_000ms) sits after the default `stat` fixture
+      // below (500_000ms), so the common backdrop is "this worktree really did advance".
+      if (sub === 'log') return pick(overrides, 'log', { status: 0, stdout: '700' });
       if (sub === 'rev-parse') {
         const ref = args[args.length - 1];
         if (ref === 'origin/main') return pick(overrides, 'revParseOriginMain', { status: 0, stdout: 'sha' });
@@ -268,7 +274,14 @@ check('a released worker holds nothing',
     };
   }
   const throwingGit = () => { throw new Error('git must not be called for this row'); };
-  const ctx = (overrides = {}) => ({ now: 1_000_000, idleSeconds: 60, ...overrides, git: fakeGit(overrides.git) });
+  // H1: the worktree's own `.git` mtime proxy, injectable per test; defaults to a time
+  // before the default HEAD commit time above, so "no linked PR/MR" cases default to
+  // accepted exactly as they did before H1 introduced this extra leg.
+  const defaultStat = () => 500_000;
+  const ctx = (overrides = {}) => ({
+    now: 1_000_000, idleSeconds: 60, ...overrides,
+    git: fakeGit(overrides.git), stat: overrides.stat || defaultStat,
+  });
 
   const mergedIdle = { path: '/wt/a', displayName: 'a', isMainWorktree: false, isArchived: false,
     liveTerminalCount: 0, lastOutputAt: 0, prState: 'merged', prNumber: 12 };
@@ -303,6 +316,22 @@ check('a released worker holds nothing',
       revParseMain: { status: 1, stdout: '' },
     } })), false);
 
+  // H1: a worktree trivially "an ancestor of base" and "clean" because it was JUST created
+  // off that base (zero new commits) must not be reported — HEAD's commit predates the
+  // worktree's own creation.
+  check('H1: no linked PR + ancestor + clean, but HEAD predates the worktree\'s own creation, is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ stat: () => 900_000 })), false);
+  check('H1: no linked PR + ancestor + clean, HEAD commit time exactly equal to creation, is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ stat: () => 700_000 })), false);
+  check('H1: an unreadable worktree creation time (.git unstattable) is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ stat: () => null })), false);
+  check('H1: an unreadable HEAD commit time (git log failure) is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ git: { log: null } })), false);
+  check('H1: hasProducedMergedWork is true when HEAD postdates the worktree\'s creation',
+    heartbeat.hasProducedMergedWork(noPrIdle, fakeGit(), () => 500_000), true);
+  check('H1: hasProducedMergedWork is false when HEAD predates the worktree\'s creation',
+    heartbeat.hasProducedMergedWork(noPrIdle, fakeGit(), () => 900_000), false);
+
   // No upstream: the clean check falls back to "HEAD is an ancestor of the resolved base".
   const noPrNoUpstream = ctx({ git: { upstream: { status: 128, stdout: '' } } });
   check('clean check falls back to base-ancestor when there is no upstream at all',
@@ -334,13 +363,29 @@ check('a released worker holds nothing',
   check('evaluateDoneButOpen names the no-linked-PR/git acceptance path in its reason',
     heartbeat.evaluateDoneButOpen(noPrIdle, ctx()).reason, 'no linked PR, HEAD already merged into origin/main');
 
-  check('formatDoneWorktreeEvent names the acceptance reason, quotes the rm target path',
+  check('formatDoneWorktreeEvent names the acceptance reason, single-quotes the rm target path',
     heartbeat.formatDoneWorktreeEvent(mergedIdle, 'PR #12 merged'),
-    'DONE worktree a (PR #12 merged, no live terminal) — verify it is clean, then close: orca worktree rm --worktree "path:/wt/a"');
+    "DONE worktree a (PR #12 merged, no live terminal) — verify it is clean, then close: orca worktree rm --worktree 'path:/wt/a'");
+
+  // Low item: a live-but-quiet terminal is a different idle leg than "no live terminal at
+  // all" — the wake line must say so accurately.
+  check('formatDoneWorktreeEvent names "quiet terminal(s)" when the worktree has a live terminal',
+    heartbeat.formatDoneWorktreeEvent(liveButQuiet, 'PR #12 merged').includes('quiet terminal(s)'), true);
+  check('formatDoneWorktreeEvent never says "no live terminal" when a terminal actually is live',
+    heartbeat.formatDoneWorktreeEvent(liveButQuiet, 'PR #12 merged').includes('no live terminal'), false);
+
+  // Low item: control characters and a literal `'` in an Orca-reported name/path must never
+  // corrupt the line or escape the single-quoted shell argument.
+  check('formatDoneWorktreeEvent strips control characters from displayName and single-quote-escapes the path',
+    heartbeat.formatDoneWorktreeEvent({ ...mergedIdle, displayName: 'a\nb', path: "/wt/it's-a" }, 'PR #12 merged'),
+    "DONE worktree ab (PR #12 merged, no live terminal) — verify it is clean, then close: orca worktree rm --worktree 'path:/wt/it'\\''s-a'");
 
   check('formatDoneWorktreeStartupSummary lists every pre-existing worktree by name AND path',
     heartbeat.formatDoneWorktreeStartupSummary([mergedIdle, { ...closedIdle, displayName: 'b', path: '/wt/b' }])
       .includes('2 pre-existing done-but-open worktree(s) at startup: a (/wt/a), b (/wt/b)'), true);
+  check('formatDoneWorktreeStartupSummary strips control characters from displayName/path',
+    heartbeat.formatDoneWorktreeStartupSummary([{ ...mergedIdle, displayName: 'a\nb' }])
+      .includes('ab (/wt/a)'), true);
 
   // --- resolveBaseRef / isAncestorOf / resolveAcceptance / isWorktreeIdle directly -------
   check('resolveBaseRef prefers the resolved origin/HEAD symbolic ref',
@@ -497,7 +542,36 @@ check('a released worker holds nothing',
   check('ORCH_MAX_PARALLEL_AGENTS=0 overrides to explicit unlimited', config.maxParallelAgents(defaults), 0);
   process.env.ORCH_MAX_PARALLEL_AGENTS = 'nope';
   check('an invalid ORCH_MAX_PARALLEL_AGENTS falls back to config', config.maxParallelAgents(defaults), defaults.maxParallelAgents);
+
+  // M2: an empty or whitespace-only override is unset, never coerced to 0 (Number("")===0).
+  process.env.ORCH_MAX_PARALLEL_AGENTS = '';
+  check('M2: ORCH_MAX_PARALLEL_AGENTS="" is treated as unset, not as 0', config.maxParallelAgents(defaults), defaults.maxParallelAgents);
+  process.env.ORCH_MAX_PARALLEL_AGENTS = '   ';
+  check('M2: ORCH_MAX_PARALLEL_AGENTS="   " is treated as unset, not as 0', config.maxParallelAgents(defaults), defaults.maxParallelAgents);
   if (beforeMaxAgentsEnv === undefined) delete process.env.ORCH_MAX_PARALLEL_AGENTS; else process.env.ORCH_MAX_PARALLEL_AGENTS = beforeMaxAgentsEnv;
+
+  const beforeFraction2 = process.env.ORCH_PARALLEL_CORE_FRACTION;
+  process.env.ORCH_PARALLEL_CORE_FRACTION = '';
+  check('M2: ORCH_PARALLEL_CORE_FRACTION="" is treated as unset, not as 0', config.parallelCoreFraction(defaults), defaults.parallelCoreFraction);
+  process.env.ORCH_PARALLEL_CORE_FRACTION = '  ';
+  check('M2: ORCH_PARALLEL_CORE_FRACTION="  " is treated as unset, not as 0', config.parallelCoreFraction(defaults), defaults.parallelCoreFraction);
+  if (beforeFraction2 === undefined) delete process.env.ORCH_PARALLEL_CORE_FRACTION; else process.env.ORCH_PARALLEL_CORE_FRACTION = beforeFraction2;
+
+  // M2: the config FILE also only accepts an actual JSON number, never a numeric-looking
+  // string or an empty string silently coerced by Number(...).
+  const emptyStringMaxAgents = withConfig({ maxParallelAgents: '' }, () => config.loadConfig());
+  check('M2: maxParallelAgents:"" in the config file falls back to null with a warning',
+    emptyStringMaxAgents.maxParallelAgents, null);
+  check('M2: maxParallelAgents:"" produces a warning', emptyStringMaxAgents.warnings.length > 0, true);
+
+  const stringMaxAgents = withConfig({ maxParallelAgents: '5' }, () => config.loadConfig());
+  check('M2: maxParallelAgents:"5" (a string, not a number) falls back to null with a warning',
+    stringMaxAgents.maxParallelAgents, null);
+
+  const emptyStringFraction = withConfig({ parallelCoreFraction: '' }, () => config.loadConfig());
+  check('M2: parallelCoreFraction:"" in the config file falls back to the default with a warning',
+    emptyStringFraction.parallelCoreFraction, 0.8);
+  check('M2: parallelCoreFraction:"" produces a warning', emptyStringFraction.warnings.length > 0, true);
 
   fs.rmSync(cfgDir, { recursive: true, force: true });
 }
@@ -599,7 +673,62 @@ check('a released worker holds nothing',
   const refusal = PAC.formatParallelAgentsRefusal(usage, 3, 18, 0.8);
   check('formatParallelAgentsRefusal names the totals, cores/fraction and ids',
     /3\/3 parallel units live on this machine \(18 cores x 80%\): 2 Orca workers, 1 subagents/.test(refusal), true);
-  check('formatParallelAgentsRefusal points at raising the limit', /maxParallelAgents \/ ORCH_MAX_PARALLEL_AGENTS/.test(refusal), true);
+  // H2: every unit is labeled <sid8>:<id>, not a bare id.
+  check('formatParallelAgentsRefusal labels sessA\'s worker group <sid8>:<id>', refusal.includes('sessA:ctx_a1'), true);
+  check('formatParallelAgentsRefusal labels sessB\'s reservation <sid8>:<id>', refusal.includes('sessB:toolu_b1#0'), true);
+  check('formatParallelAgentsRefusal labels sessA\'s subagent <sid8>:<id>', refusal.includes('sessA:toolu_a1'), true);
+  // H2: recovery is framed as the operator's call (release-claims / delete a dead session's
+  // state file / disable the gate), never as an invitation for the model to raise the limit.
+  check('formatParallelAgentsRefusal asks the operator, and offers --release-claims/disabledGates',
+    /ask the operator/i.test(refusal) && /--release-claims/.test(refusal) && /disabledGates/.test(refusal), true);
+  check('formatParallelAgentsRefusal never invites the model to just raise the limit itself',
+    /or raise maxParallelAgents/.test(refusal), false);
+
+  // M1: another session's units only count while it has a recent liveness signal (its own
+  // state file changed recently, OR its heartbeat daemon is alive) — a session with NEITHER
+  // signal is presumed abandoned and must not eat into the budget, even though its file is
+  // still within the (much longer) 6h staleness window.
+  const abandonedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-pac-m1-'));
+  const writeAt = (dirPath, name, obj, ageMs) => {
+    const file = path.join(dirPath, name);
+    fs.writeFileSync(file, JSON.stringify(obj));
+    if (ageMs != null) {
+      const t = (now - ageMs) / 1000;
+      fs.utimesSync(file, t, t);
+    }
+  };
+  writeAt(abandonedDir, 'sessAbandoned.json', {
+    workers: { ctx_abandoned: { status: 'live', started: now, group: 'ctx_abandoned' } },
+    reservations: {}, agents: {},
+  }, 40 * 60 * 1000); // mtime 40 minutes old: past the 30-minute recency window
+  const abandonedUsage = PAC.machineWideLiveUnits(abandonedDir, now);
+  check('M1: a session with no heartbeat and a >30min-stale state file is never counted',
+    abandonedUsage.total, 0);
+
+  writeAt(abandonedDir, 'sessRecent.json', {
+    workers: { ctx_recent: { status: 'live', started: now, group: 'ctx_recent' } },
+    reservations: {}, agents: {},
+  }); // fresh mtime (just written): within the 30-minute recency window
+  const recentUsage = PAC.machineWideLiveUnits(abandonedDir, now);
+  check('M1: a session whose state file changed within the last 30 minutes still counts',
+    recentUsage.total, 1);
+
+  fs.rmSync(abandonedDir, { recursive: true, force: true });
+
+  // The other M1 leg: a stale state file whose SESSION's heartbeat daemon is alive still
+  // counts. `process.pid` (this very test process) is guaranteed alive. Own fresh dir so
+  // the earlier `sessRecent`/`sessAbandoned` fixtures above cannot contaminate this count.
+  const hbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-pac-m1-hb-'));
+  writeAt(hbDir, 'sessHbAlive.json', {
+    workers: { ctx_hb: { status: 'live', started: now, group: 'ctx_hb' } },
+    reservations: {}, agents: {},
+  }, 40 * 60 * 1000);
+  fs.writeFileSync(path.join(hbDir, 'heartbeat-sessHbAlive.json'),
+    JSON.stringify({ pid: process.pid, last_tick: now, interval: 20 }));
+  const hbAliveUsage = PAC.machineWideLiveUnits(hbDir, now);
+  check('M1: a >30min-stale session whose heartbeat daemon IS alive still counts',
+    hbAliveUsage.total, 1);
+  fs.rmSync(hbDir, { recursive: true, force: true });
 
   fs.rmSync(dir, { recursive: true, force: true });
 }

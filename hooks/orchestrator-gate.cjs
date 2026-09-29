@@ -35,6 +35,7 @@ const {
 } = require('./lib/config.cjs');
 const WG = require('./lib/worker-groups.cjs');
 const PAC = require('./lib/parallel-agent-cap.cjs');
+const HBL = require('./lib/heartbeat-liveness.cjs');
 const OWN = require('./lib/ownership.cjs');
 const OC = require('./lib/ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
@@ -464,19 +465,13 @@ function isOrcaWorkerSession(s) {
 }
 
 /**
- * The heartbeat daemon this session started, if it is alive: its liveness file
- * exists, its pid answers, and it ticked within three intervals. null otherwise.
+ * The heartbeat daemon `sid` started, if it is alive: its liveness file exists, its pid
+ * answers, and it ticked within three intervals. null otherwise. Thin wrapper over the
+ * shared `heartbeatAliveAt` (also used cross-session by lib/parallel-agent-cap.cjs's M1
+ * rule) bound to this file's own `DIR`.
  */
 function heartbeatAlive(sid) {
-  try {
-    const f = path.join(DIR, `heartbeat-${String(sid || 'default').replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
-    const b = JSON.parse(fs.readFileSync(f, 'utf8'));
-    process.kill(b.pid, 0); // throws when the process is gone
-    const maxAge = (Number(b.interval) || 20) * 3000 + 30000;
-    return Date.now() - Number(b.last_tick || 0) <= maxAge ? b : null;
-  } catch {
-    return null;
-  }
+  return HBL.heartbeatAliveAt(DIR, sid);
 }
 
 /** The exact command to start the heartbeat daemon, built from this install's own paths. */
@@ -565,23 +560,48 @@ function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
   const toolUseId = p.tool_use_id || p.toolUseId || null;
   const baseId = toolUseId || `sid-${s.session_id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   let violation = null;
-  const locked = acquireLock(lockDir, {});
+  let locked = acquireLock(lockDir, {});
+  // Reservations THIS command's own earlier invocations already added, re-applied after a
+  // mid-loop reconcile reload wipes the in-memory `fresh` object (same reasoning as
+  // parallel-ownership-gates.cjs's identical localReservations pattern).
+  const localReservations = {};
   try {
-    const fresh = load(s.session_id);
-    for (let idx = 0; idx < invs.length; idx++) {
-      const limit = agentParallelLimit(cfg);
-      if (Number.isFinite(limit)) {
-        const usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
-        if (usage.total >= limit) {
-          violation = PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
-          break;
+    // Concurrency review, Low item: this whole function exists ONLY to protect the hard
+    // max-parallel-agents cap (unlike handleOrcaDispatchGates, it has no other, softer
+    // concern to fall back to) — a lock the caller could not acquire at all means nothing
+    // here can be evaluated or saved safely, so it refuses immediately with a transient-
+    // retry reason instead of silently registering unlocked.
+    if (!locked) { violation = PAC.LOCK_CONTENTION_MESSAGE; }
+    else {
+      let fresh = load(s.session_id);
+      for (let idx = 0; idx < invs.length && !violation; idx++) {
+        const limit = agentParallelLimit(cfg);
+        if (Number.isFinite(limit)) {
+          let usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
+          if (usage.total >= limit) {
+            // H3: reconcile THIS session's own Orca-tracked workers before refusing — the
+            // same out-of-lock-fetch + locked-reapply pattern the worker-start path uses.
+            releaseLock(lockDir); locked = false;
+            const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+            locked = acquireLock(lockDir, {});
+            if (!locked) { violation = PAC.LOCK_CONTENTION_MESSAGE; break; }
+            fresh = load(s.session_id);
+            Object.assign(fresh.reservations, localReservations);
+            if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
+            usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
+          }
+          if (usage.total >= limit) {
+            violation = PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
+            break;
+          }
         }
+        const key = `term:${baseId}#${idx}`;
+        const reservation = { ts: Date.now(), agent: 'terminal', owns: null, ws: null, codexSlot: false, newSlot: true };
+        localReservations[key] = reservation;
+        fresh.reservations[key] = reservation;
       }
-      fresh.reservations[`term:${baseId}#${idx}`] = {
-        ts: Date.now(), agent: 'terminal', owns: null, ws: null, codexSlot: false, newSlot: true,
-      };
+      if (!violation) save(fresh);
     }
-    if (!violation) save(fresh);
   } finally {
     if (locked) releaseLock(lockDir);
   }
@@ -595,6 +615,7 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
       hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled,
       agentParallelLimit, machineWideLiveUnits: PAC.machineWideLiveUnits,
       formatParallelAgentsRefusal: PAC.formatParallelAgentsRefusal, cores: PAC.cores, parallelCoreFraction,
+      lockContentionMessage: PAC.LOCK_CONTENTION_MESSAGE,
     },
   });
 }
@@ -699,6 +720,22 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (releasedAny) save(s);
   }
 
+  // C1 backstop: sweep out every FOREGROUND (`background: false`) `s.agents` registration on
+  // every genuine operator turn (never an injected notification/reminder — same test as the
+  // operator-flag rule right below). A foreground dispatch's slot is normally released at its
+  // own matching PostToolUse; this exists only for the rare case where that never happened
+  // (a dispatch refused by a later gate before this fix, or a session that crashed mid-turn),
+  // so a leaked slot cannot outlive the very next real prompt the operator sends. Background
+  // registrations are untouched here — they rely on their own <task-notification> release,
+  // TTL, or --release-claims instead, exactly like a background Owns: claim.
+  if (!NON_OPERATOR_TURN.test(raw)) {
+    let purgedAny = false;
+    for (const [id, a] of Object.entries(s.agents || {})) {
+      if (a && a.background === false) { delete s.agents[id]; purgedAny = true; }
+    }
+    if (purgedAny) save(s);
+  }
+
   const prompt = NON_OPERATOR_TURN.test(raw) ? '' : raw;
   if (operatorFlag(prompt, '--no-orchestrate')) {
     s.bypass = true; save(s);
@@ -754,18 +791,19 @@ function onUserPromptSubmitLocked(p, s, cfg) {
       s.agentClaims = {};
       s.reservations = {};
       s.agents = {};
-    } else if (s.agentClaims[target]) {
-      delete s.agentClaims[target];
-      released = 1;
-    } else if (s.agents && s.agents[target]) {
-      delete s.agents[target];
-      released = 1;
-    } else if (s.reservations[target]) {
-      delete s.reservations[target];
-      released = 1;
     } else {
+      // Low item: a single `target` id can legitimately hold MORE than one kind of claim at
+      // once — e.g. an in-session code dispatch's `agentClaims[toolUseId]` (its Owns: claim)
+      // AND `agents[toolUseId]` (its max-parallel-agents registration) under the very same
+      // toolUseId. The old if/else-if chain stopped at whichever matched first, silently
+      // leaving the others behind — a `--release-claims <id>` that looked like it worked
+      // could still leave a parallel-agents slot (or a reservation) stuck. Every kind is now
+      // checked and released independently.
+      if (s.agentClaims[target]) { delete s.agentClaims[target]; released += 1; }
+      if (s.agents && s.agents[target]) { delete s.agents[target]; released += 1; }
       // A reservation is keyed `<toolUseId>#<idx>`, not the bare id — releasing by the
-      // bare toolUseId should still reach every reservation it owns.
+      // bare toolUseId should still reach every reservation it owns (and an exact bare-key
+      // match too, for the rarer reservation shapes that are not multi-invocation-indexed).
       for (const key of Object.keys(s.reservations)) {
         if (key === target || key.startsWith(`${target}#`)) { delete s.reservations[key]; released += 1; }
       }
@@ -811,6 +849,56 @@ function activationApplies(cfg) {
   if (cfg.activation === 'off') return false;
   if (cfg.activation === 'orca-only') return !!process.env.ORCA_TERMINAL_HANDLE;
   return true; // 'always'
+}
+
+/**
+ * Read-only max-parallel-agents capacity check against an already-loaded, already-fresh
+ * `state` — returns a refusal string, or null when there is room (or the gate is disabled,
+ * or the derived/explicit limit is unlimited). Never mutates `state` and never registers
+ * anything: shared by the EARLY fast-fail pass in `onPreToolUse` and the FINAL re-check
+ * immediately before registering a slot (C1 — see both call sites), so the two can never
+ * drift apart on what counts as "at capacity".
+ */
+function checkParallelAgentCapacity(state, cfg) {
+  if (gateDisabled(cfg, 'max-parallel-agents')) return null;
+  const limit = agentParallelLimit(cfg);
+  if (!Number.isFinite(limit)) return null;
+  const usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: state, currentSessionId: state.session_id });
+  if (usage.total < limit) return null;
+  return PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
+}
+
+/**
+ * H3: when `checkParallelAgentCapacity` finds the caller's session at/over the machine-wide
+ * limit, reconcile THIS session's own Orca-tracked workers against Orca's live worker-list
+ * before accepting that as final — the same out-of-lock-fetch + locked-reapply pattern the
+ * max-parallel-codex-workers gate (and, since H3, the worker-start/terminal-create paths)
+ * already use. `fetchOrcaWorkerRows` does no state I/O, so it is safe to run with the lock
+ * released; only the reapply, against a freshly reloaded state, ever mutates anything. A
+ * worker this session's own bookkeeping still shows live, but that Orca has already
+ * confirmed released or done, would otherwise refuse an Agent/Task dispatch that could
+ * actually proceed right now.
+ *
+ * `sessionId`/`lockDir` identify what to reload/relock; `locked` is this call's current view
+ * of whether the lock is held. Returns `{ state, violation, locked }` — the caller must
+ * adopt the returned `locked` for its own eventual `finally`, and keep operating on the
+ * returned `state` (reconciled when a reconcile actually ran, unchanged otherwise).
+ */
+function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
+  // Concurrency review, Low item: a hard resource cap must never be evaluated unlocked — a
+  // lock the caller could not acquire (contention timeout) means this check cannot trust
+  // `state` against every other racing process, so it refuses with a transient-retry reason
+  // instead of silently "degrading to allow" the way policy gates elsewhere in this file do.
+  if (!locked) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked };
+  const violation = checkParallelAgentCapacity(state, cfg);
+  if (!violation) return { state, violation: null, locked };
+  releaseLock(lockDir);
+  const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+  const reacquired = acquireLock(lockDir, {});
+  if (!reacquired) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked: false };
+  const fresh = load(sessionId);
+  if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
+  return { state: fresh, violation: checkParallelAgentCapacity(fresh, cfg), locked: true };
 }
 
 function onPreToolUse(p, s, cfg) {
@@ -886,42 +974,27 @@ function onPreToolUse(p, s, cfg) {
     }
   }
 
-  // Gate: max-parallel-agents — a MACHINE-wide budget (this machine's cores, not any one
-  // session's own concurrency) on live Orca workers of any agent plus live in-session
-  // Agent/Task subagents, on top of (never instead of) the existing Codex-only cap. Runs
-  // for EVERY Agent/Task dispatch from the main panel, not only code briefs, which is why
-  // it lives here rather than folded into the routing gates below. Registration
-  // (`s.agents[toolUseId]`) happens even when the gate itself is disabled, so a disabled
-  // gate never silently drops the accounting a re-enabled gate would need later.
+  // Gate: max-parallel-agents — EARLY, READ-ONLY fast-fail. A MACHINE-wide budget (this
+  // machine's cores, not any one session's own concurrency) on live Orca workers of any
+  // agent plus live in-session Agent/Task subagents, on top of (never instead of) the
+  // existing Codex-only cap. This check alone never registers a slot (C1 fix): the actual
+  // registration happens at the very END of the routing/ownership gates below, after every
+  // gate that could still refuse this exact dispatch has passed. Registering here, before
+  // those later gates ran, used to leave a refused dispatch's slot claimed for up to
+  // AGENT_REGISTRY_TTL_MS (120 minutes), since a refused dispatch never reaches PostToolUse
+  // to release it. This early pass exists only so an already-over-budget dispatch gets the
+  // max-parallel-agents refusal instead of walking through routing/ownership first.
   if (tool === 'Agent' || tool === 'Task') {
     const lockDir = path.join(DIR, '.lock');
     let violation = null;
-    const locked = acquireLock(lockDir, {});
+    let locked = acquireLock(lockDir, {});
     try {
       // CRITICAL: reload fresh now the lock is held — same reasoning as every other
-      // lock-protected read-decide-reserve section in this file: `s` here is the snapshot
-      // main() loaded before this lock ever existed, so a concurrent dispatch's just-saved
-      // registration would otherwise be invisible to this check.
-      const fresh = load(s.session_id);
-      if (!gateDisabled(cfg, 'max-parallel-agents')) {
-        const limit = agentParallelLimit(cfg);
-        if (Number.isFinite(limit)) {
-          const usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
-          if (usage.total >= limit) {
-            violation = PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
-          }
-        }
-      }
-      if (!violation) {
-        const toolUseId = p.tool_use_id || p.toolUseId;
-        if (toolUseId) {
-          fresh.agents[toolUseId] = {
-            ts: Date.now(), background: !!input.run_in_background,
-            type: String(input.subagent_type || ''), model: String(input.model || ''),
-          };
-          save(fresh);
-        }
-      }
+      // lock-protected read-decide-reserve section in this file. H3: reconcile against
+      // Orca before accepting an at-cap verdict as final.
+      const result = reconcileParallelAgentsAtCap(load(s.session_id), s.session_id, cfg, lockDir, locked);
+      violation = result.violation;
+      locked = result.locked;
     } finally {
       if (locked) releaseLock(lockDir);
     }
@@ -1051,6 +1124,42 @@ function onPreToolUse(p, s, cfg) {
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
         additionalContext: `orchestrator-gate advice: this looks like a light lookup (find/locate/read logs/explore). ` +
           `Prefer model "${cfg.models.lookup.alias}" for such dispatches - cheaper and faster; keep the code model for heavier reading.` } }));
+    }
+
+    // max-parallel-agents: re-check + register the slot now, ONLY after every routing/
+    // ownership gate above has passed (C1 fix). Registering earlier let a dispatch that
+    // failed a LATER gate leak a slot for up to AGENT_REGISTRY_TTL_MS, because a refused
+    // dispatch never fires PostToolUse to release it. The re-check (not just a bare write)
+    // catches a slot that filled up while this dispatch's own routing/ownership checks were
+    // running. Registration happens even when the gate itself is disabled (`gateDisabled`
+    // check lives inside `checkParallelAgentCapacity`), so a disabled gate never silently
+    // drops the accounting a re-enabled gate would need later.
+    {
+      const lockDir = path.join(DIR, '.lock');
+      let violation = null;
+      let locked = acquireLock(lockDir, {});
+      try {
+        // CRITICAL: reload fresh now the lock is held — same reasoning as every other
+        // lock-protected read-decide-reserve section in this file. H3: reconcile against
+        // Orca before accepting an at-cap verdict as final.
+        const result = reconcileParallelAgentsAtCap(load(s.session_id), s.session_id, cfg, lockDir, locked);
+        let fresh = result.state;
+        violation = result.violation;
+        locked = result.locked;
+        if (!violation) {
+          const toolUseId = p.tool_use_id || p.toolUseId;
+          if (toolUseId) {
+            fresh.agents[toolUseId] = {
+              ts: Date.now(), background: !!input.run_in_background,
+              type: String(input.subagent_type || ''), model: String(input.model || ''),
+            };
+            save(fresh);
+          }
+        }
+      } finally {
+        if (locked) releaseLock(lockDir);
+      }
+      if (violation) d('max-parallel-agents', violation);
     }
   }
 }
@@ -1309,8 +1418,8 @@ function onPostToolUseLocked(p, s, cfg) {
     if (claim && !claim.background) { delete s.agentClaims[toolUseId]; dirty = true; }
     // Same foreground-only rule for the max-parallel-agents registration: a background
     // dispatch's registration survives this event and is released by a matching
-    // <task-notification>, its own TTL, or --release-claims instead (see onSessionStart's
-    // registration site for the full reasoning).
+    // <task-notification>, its own TTL, or --release-claims instead (see onPreToolUse's
+    // registration site, at the end of the Agent/Task routing gates, for the full reasoning).
     const reg = toolUseId && s.agents && s.agents[toolUseId];
     if (reg && !reg.background) { delete s.agents[toolUseId]; dirty = true; }
   }
@@ -1461,6 +1570,27 @@ function unsettledPerOrca(ids) {
 
 function onStop(p, s, cfg) {
   if (s.bypass || p.stop_hook_active) return;
+
+  // C1 backstop: sweep out every FOREGROUND (`background: false`) `s.agents` registration at
+  // every Stop, regardless of whether any Orca worker is live — a session with zero workers
+  // but a leaked max-parallel-agents slot (see the identical UserPromptSubmit backstop above
+  // `onPreToolUse` for why one can exist at all) must still get it cleaned up here. Reloads
+  // fresh under the lock, since `s` is main()'s pre-lock snapshot.
+  {
+    const lockDir = path.join(DIR, '.lock');
+    const locked = acquireLock(lockDir, {});
+    try {
+      const fresh = load(p.session_id);
+      let purgedAny = false;
+      for (const [id, a] of Object.entries(fresh.agents || {})) {
+        if (a && a.background === false) { delete fresh.agents[id]; purgedAny = true; }
+      }
+      if (purgedAny) { save(fresh); s = fresh; }
+    } finally {
+      if (locked) releaseLock(lockDir);
+    }
+  }
+
   const live = liveWorkers(s);
   if (!live.length) return;
   const d = (gate, reason) => { if (!gateDisabled(cfg, gate)) { logViolation(s, gate, reason); process.stderr.write(reason); process.exit(2); } };
