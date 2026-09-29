@@ -31,9 +31,10 @@ const path = require('path');
 const os = require('os');
 const {
   loadConfig, gateDisabled, handoffUsed, stateDir,
-  maxParallelCodexWorkers, ownershipClaimTtlMinutes,
+  maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
 } = require('./lib/config.cjs');
 const WG = require('./lib/worker-groups.cjs');
+const PAC = require('./lib/parallel-agent-cap.cjs');
 const OWN = require('./lib/ownership.cjs');
 const OC = require('./lib/ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
@@ -222,9 +223,12 @@ function blank(sid) {
     execAgent: null,        // null (auto by quota) | 'code' | 'codex' | 'codex:<model>' | 'claude:<alias>'
     workers: {},            // label -> { role, started, status, last_seen, rate_limited_until,
                              //            group, kind, agent, owns, ws }
-    reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot } — the gap
-                             // between a Bash dispatch being admitted and its PostToolUse resolving it
+    reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot, newSlot } —
+                             // the gap between a Bash dispatch being admitted and its PostToolUse resolving it
     agentClaims: {},        // toolUseId -> { owns, ws, ts } — in-session Agent/Task Owns: claims
+    agents: {},             // toolUseId -> { ts, background, type, model } — EVERY main-panel
+                             // Agent/Task dispatch (not only code briefs), for the machine-wide
+                             // max-parallel-agents budget; see lib/parallel-agent-cap.cjs
     tasks: {},              // taskId -> { owns, ws } — recorded when `task-create` resolves its id
     last_heartbeat: 0,      // epoch ms of the last worker-status poll
     rate_limit_hits: 0,
@@ -238,6 +242,7 @@ function load(sid) {
     // work existed would not have, so an in-progress session never crashes on upgrade.
     if (!s.reservations) s.reservations = {};
     if (!s.agentClaims) s.agentClaims = {};
+    if (!s.agents) s.agents = {};
     if (!s.tasks) s.tasks = {};
     return s;
   } catch {
@@ -538,10 +543,59 @@ const OWNS_BRIEF_HELP = PARALLEL_OWNERSHIP.OWNS_BRIEF_HELP;
 const resolveWorkerStartAgent = (inv, s) => PARALLEL_OWNERSHIP.resolveWorkerStartAgent(inv, s, flagValue);
 const liveCodexGroupIds = PARALLEL_OWNERSHIP.liveCodexGroupIds;
 
+/** The live machine-wide parallel-agents limit for this config (Infinity = unlimited). */
+function agentParallelLimit(cfg) {
+  return PAC.agentParallelLimit(cfg, { maxParallelAgents, parallelCoreFraction });
+}
+
+/**
+ * max-parallel-agents for a real `orca terminal create` invocation in this Bash command —
+ * the other trigger the gate spec names besides Agent/Task and `worker-start` (the latter
+ * is handled inside handleOrcaDispatchGates/parallel-ownership-gates.cjs, alongside the
+ * Codex-only cap and the ownership checks, since it already knows the resolved agent and
+ * workspace). A bare `terminal create` has neither of those concepts, so this stays a
+ * small, separately-keyed (`term:<toolUseId>#<idx>`) reservation that only needs to survive
+ * the PreToolUse -> PostToolUse gap — see the cleanup at both of those events.
+ */
+function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
+  const invs = orcaInvocations(cmd).filter((inv) => inv.sub === 'terminal create' && !hasFlag(inv.args, '--help'));
+  if (!invs.length || gateDisabled(cfg, 'max-parallel-agents')) return;
+
+  const lockDir = path.join(DIR, '.lock');
+  const toolUseId = p.tool_use_id || p.toolUseId || null;
+  const baseId = toolUseId || `sid-${s.session_id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  let violation = null;
+  const locked = acquireLock(lockDir, {});
+  try {
+    const fresh = load(s.session_id);
+    for (let idx = 0; idx < invs.length; idx++) {
+      const limit = agentParallelLimit(cfg);
+      if (Number.isFinite(limit)) {
+        const usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
+        if (usage.total >= limit) {
+          violation = PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
+          break;
+        }
+      }
+      fresh.reservations[`term:${baseId}#${idx}`] = {
+        ts: Date.now(), agent: 'terminal', owns: null, ws: null, codexSlot: false, newSlot: true,
+      };
+    }
+    if (!violation) save(fresh);
+  } finally {
+    if (locked) releaseLock(lockDir);
+  }
+  if (violation) d('max-parallel-agents', violation);
+}
+
 function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
   return PARALLEL_OWNERSHIP.handleOrcaDispatchGates({
     p, s, cfg, cmd, d,
-    deps: { hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled },
+    deps: {
+      hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled,
+      agentParallelLimit, machineWideLiveUnits: PAC.machineWideLiveUnits,
+      formatParallelAgentsRefusal: PAC.formatParallelAgentsRefusal, cores: PAC.cores, parallelCoreFraction,
+    },
   });
 }
 
@@ -554,6 +608,16 @@ function languageSentence(cfg, forBanner) {
 }
 
 // --- handlers ---------------------------------------------------------------
+
+/** `parallel budget: <n>/<N> (<cores> cores x <fraction>%)` — the machine-wide
+ * max-parallel-agents usage line shared by the SessionStart banner and the per-prompt
+ * reminder. `<N>` reads "unlimited" when the derived/explicit limit is Infinity/0. */
+function parallelBudgetLine(cfg, s) {
+  const limit = agentParallelLimit(cfg);
+  const usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: s, currentSessionId: s.session_id });
+  const limitText = Number.isFinite(limit) ? limit : 'unlimited';
+  return `parallel budget: ${usage.total}/${limitText} (${PAC.cores()} cores x ${Math.round(parallelCoreFraction(cfg) * 100)}%)`;
+}
 
 function onSessionStart(p, s, cfg) {
   if (!fs.existsSync(stateFile(s.session_id))) save(s);
@@ -585,7 +649,9 @@ function onSessionStart(p, s, cfg) {
     `- Poll every live worker at least every ${cfg.heartbeat.idleSeconds}s. Never let one sit IDLE unattended.\n` +
     '- Codex workers get rate limited when run in parallel: on a rate-limit signal, back off and retry\n' +
     `  after ~${RATE_LIMIT_BACKOFF_SECONDS}s instead of abandoning or re-dispatching immediately.\n` +
-    '- Release or close a worker as soon as it is done and not reusable.\n'
+    '- Release or close a worker as soon as it is done and not reusable.\n' +
+    `- ${parallelBudgetLine(cfg, s)}: machine-wide live Orca workers + subagents, summed across\n` +
+    '  every recent session on this machine. Raise it with maxParallelAgents / ORCH_MAX_PARALLEL_AGENTS.\n'
   );
 }
 
@@ -628,6 +694,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     // which wrongly released that sibling's claim while its work was still in flight.
     for (const m of raw.matchAll(/<tool-use-id>\s*(toolu_[A-Za-z0-9_-]+|agent_[A-Za-z0-9_-]+)\s*<\/tool-use-id>/gi)) {
       if (s.agentClaims[m[1]]) { delete s.agentClaims[m[1]]; releasedAny = true; }
+      if (s.agents && s.agents[m[1]]) { delete s.agents[m[1]]; releasedAny = true; }
     }
     if (releasedAny) save(s);
   }
@@ -678,14 +745,20 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     const target = rc[2];
     let released = 0;
     if (target.toLowerCase() === 'all') {
-      // Clears BOTH sources of a live ownership claim (item 12): in-session Agent claims
-      // AND Bash-dispatch reservations — a reservation is just as capable of holding a
-      // stuck Owns: claim (and a parallel-Codex cap opening) as an agentClaims entry is.
-      released = Object.keys(s.agentClaims).length + Object.keys(s.reservations).length;
+      // Clears every source of a live claim/registration (item 12, extended for
+      // max-parallel-agents): in-session Agent Owns: claims, Bash-dispatch reservations —
+      // just as capable of holding a stuck Owns: claim (and a parallel-Codex or
+      // max-parallel-agents opening) as an agentClaims entry — AND the max-parallel-agents
+      // Agent/Task registry itself.
+      released = Object.keys(s.agentClaims).length + Object.keys(s.reservations).length + Object.keys(s.agents || {}).length;
       s.agentClaims = {};
       s.reservations = {};
+      s.agents = {};
     } else if (s.agentClaims[target]) {
       delete s.agentClaims[target];
+      released = 1;
+    } else if (s.agents && s.agents[target]) {
+      delete s.agents[target];
       released = 1;
     } else if (s.reservations[target]) {
       delete s.reservations[target];
@@ -710,6 +783,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     ? `Codex in an Orca worker${codexModelShown ? ` (worker-start --agent codex --model ${codexModelShown})` : ''}`
     : `in-session subagent (Agent model ${modelLabel(ex.route === 'claude' ? roleByAlias(ex.alias) : cfg.models.code)})`;
   parts.push(`Model routing: plan/red-team/review -> model ${modelLabel(cfg.models.review)}; code -> ${codeRoute} [${ex.why}].`);
+  parts.push(`${parallelBudgetLine(cfg, s)}.`);
   if (live.length) {
     const baseline = s.last_heartbeat || Math.min(...live.map(([, w]) => w.started || Date.now()));
     const stale = Math.round((Date.now() - baseline) / 1000);
@@ -794,8 +868,11 @@ function onPreToolUse(p, s, cfg) {
     }
 
     // Gate A (max-parallel-codex-workers) + Gate B (code-brief-needs-owns /
-    // ownership-overlap) for every real worker-start / task-create in this command line.
+    // ownership-overlap) + max-parallel-agents (machine-wide, any agent) for every real
+    // worker-start / task-create in this command line.
     handleOrcaDispatchGates(p, s, cfg, cmd, d);
+    // max-parallel-agents for a bare `terminal create` (not handled above — see its own doc).
+    handleTerminalCreateAgentCap(p, s, cfg, cmd, d);
 
     // Advisory only: a Codex worker-start that omits --model gets no model pin, so a
     // fleet can silently drift onto whatever Codex defaults to. Skipped when --terminal
@@ -807,6 +884,48 @@ function onPreToolUse(p, s, cfg) {
         additionalContext: `orchestrator-gate advice: pin the Codex model explicitly - add --model ${cfg.models.codex.id} ` +
           'to this worker-start so the fleet cannot silently drift onto a different default.' } }));
     }
+  }
+
+  // Gate: max-parallel-agents — a MACHINE-wide budget (this machine's cores, not any one
+  // session's own concurrency) on live Orca workers of any agent plus live in-session
+  // Agent/Task subagents, on top of (never instead of) the existing Codex-only cap. Runs
+  // for EVERY Agent/Task dispatch from the main panel, not only code briefs, which is why
+  // it lives here rather than folded into the routing gates below. Registration
+  // (`s.agents[toolUseId]`) happens even when the gate itself is disabled, so a disabled
+  // gate never silently drops the accounting a re-enabled gate would need later.
+  if (tool === 'Agent' || tool === 'Task') {
+    const lockDir = path.join(DIR, '.lock');
+    let violation = null;
+    const locked = acquireLock(lockDir, {});
+    try {
+      // CRITICAL: reload fresh now the lock is held — same reasoning as every other
+      // lock-protected read-decide-reserve section in this file: `s` here is the snapshot
+      // main() loaded before this lock ever existed, so a concurrent dispatch's just-saved
+      // registration would otherwise be invisible to this check.
+      const fresh = load(s.session_id);
+      if (!gateDisabled(cfg, 'max-parallel-agents')) {
+        const limit = agentParallelLimit(cfg);
+        if (Number.isFinite(limit)) {
+          const usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
+          if (usage.total >= limit) {
+            violation = PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
+          }
+        }
+      }
+      if (!violation) {
+        const toolUseId = p.tool_use_id || p.toolUseId;
+        if (toolUseId) {
+          fresh.agents[toolUseId] = {
+            ts: Date.now(), background: !!input.run_in_background,
+            type: String(input.subagent_type || ''), model: String(input.model || ''),
+          };
+          save(fresh);
+        }
+      }
+    } finally {
+      if (locked) releaseLock(lockDir);
+    }
+    if (violation) d('max-parallel-agents', violation);
   }
 
   // Gates 3 and 4: role routing for dispatched work.
@@ -947,9 +1066,12 @@ function dropFailedToolState(s, toolUseId) {
   if (!toolUseId) return false;
   let dirty = false;
   for (const key of Object.keys(s.reservations)) {
-    if (key === toolUseId || key.startsWith(`${toolUseId}#`)) { delete s.reservations[key]; dirty = true; }
+    if (key === toolUseId || key.startsWith(`${toolUseId}#`) || key.startsWith(`term:${toolUseId}#`)) {
+      delete s.reservations[key]; dirty = true;
+    }
   }
   if (s.agentClaims[toolUseId]) { delete s.agentClaims[toolUseId]; dirty = true; }
+  if (s.agents && s.agents[toolUseId]) { delete s.agents[toolUseId]; dirty = true; }
   return dirty;
 }
 
@@ -1185,6 +1307,12 @@ function onPostToolUseLocked(p, s, cfg) {
     const toolUseId = p.tool_use_id || p.toolUseId;
     const claim = toolUseId && s.agentClaims[toolUseId];
     if (claim && !claim.background) { delete s.agentClaims[toolUseId]; dirty = true; }
+    // Same foreground-only rule for the max-parallel-agents registration: a background
+    // dispatch's registration survives this event and is released by a matching
+    // <task-notification>, its own TTL, or --release-claims instead (see onSessionStart's
+    // registration site for the full reasoning).
+    const reg = toolUseId && s.agents && s.agents[toolUseId];
+    if (reg && !reg.background) { delete s.agents[toolUseId]; dirty = true; }
   }
 
   if (tool === 'Bash') {
@@ -1229,6 +1357,20 @@ function onPostToolUseLocked(p, s, cfg) {
     // dispatch that actually succeeded despite the overall Bash call failing is still
     // recognised the same way there.
     if (registerDispatchReplies(s, p, cmd, out, { assumeDispatched: true })) dirty = true;
+
+    // `terminal create`'s own max-parallel-agents reservation (see
+    // handleTerminalCreateAgentCap) is a lightweight, separately-keyed placeholder that
+    // only needs to survive the PreToolUse -> PostToolUse gap: by the time this event
+    // fires, `registerDispatchReplies` above has already turned a successful create into a
+    // real `s.workers` entry (terminal-create is in DISPATCH_SUBS), so the reservation's
+    // job is done either way — clear it unconditionally rather than re-deriving success/
+    // failure a second time.
+    const toolUseIdForTerm = p.tool_use_id || p.toolUseId;
+    if (toolUseIdForTerm) {
+      for (const key of Object.keys(s.reservations)) {
+        if (key.startsWith(`term:${toolUseIdForTerm}#`)) { delete s.reservations[key]; dirty = true; }
+      }
+    }
 
     // Stopping, releasing or closing a worker settles its whole group. Section 0 fix #2:
     // the target id comes from the SPECIFIC orca invocation's own parsed args

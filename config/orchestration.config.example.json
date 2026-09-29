@@ -18,5 +18,7 @@
   "maxParallelCodexWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
-  "closeDoneWorktrees": true
+  "closeDoneWorktrees": true,
+  "parallelCoreFraction": 0.8,
+  "maxParallelAgents": null
 }

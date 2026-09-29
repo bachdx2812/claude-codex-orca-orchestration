@@ -29,6 +29,7 @@ const GATE_NAMES = [
   'max-parallel-codex-workers',
   'code-brief-needs-owns',
   'ownership-overlap',
+  'max-parallel-agents',
 ];
 
 const DEFAULT_CONFIG = {
@@ -52,6 +53,13 @@ const DEFAULT_CONFIG = {
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
   closeDoneWorktrees: true, // heartbeat: remind on a merged/closed-PR worktree with no live terminal
+  // Machine-wide budget cap on live Orca workers + in-session subagents, MACHINE-wide (summed
+  // across every session's state file, not just this one) — the resource being budgeted is
+  // this machine's cores, not any one session's own concurrency. `maxParallelAgents: null`
+  // (default) derives the limit as max(1, floor(parallelCoreFraction x cores)); an explicit
+  // integer overrides that derivation entirely, and `0` means unlimited.
+  parallelCoreFraction: 0.8,
+  maxParallelAgents: null,
 };
 
 const ACTIVATION_VALUES = new Set(['orca-only', 'always', 'off']);
@@ -181,6 +189,26 @@ function loadConfig() {
     merged.closeDoneWorktrees = DEFAULT_CONFIG.closeDoneWorktrees;
   }
 
+  const coreFraction = Number(merged.parallelCoreFraction);
+  if (!Number.isFinite(coreFraction) || coreFraction < 0.1 || coreFraction > 1) {
+    warnings.push(`parallelCoreFraction "${merged.parallelCoreFraction}" is not a number 0.1-1; using ${DEFAULT_CONFIG.parallelCoreFraction}.`);
+    merged.parallelCoreFraction = DEFAULT_CONFIG.parallelCoreFraction;
+  } else {
+    merged.parallelCoreFraction = coreFraction;
+  }
+
+  // null (derive from cores) is a valid, and the default, value here — unlike every other
+  // integer field above, so it is checked before the numeric-range check runs at all.
+  if (merged.maxParallelAgents !== null) {
+    const maxAgents = Number(merged.maxParallelAgents);
+    if (!Number.isInteger(maxAgents) || maxAgents < 0 || maxAgents > 256) {
+      warnings.push(`maxParallelAgents "${merged.maxParallelAgents}" is not null or an integer 0-256; using null (derive from cores).`);
+      merged.maxParallelAgents = null;
+    } else {
+      merged.maxParallelAgents = maxAgents;
+    }
+  }
+
   merged.warnings = warnings;
   return merged;
 }
@@ -256,7 +284,36 @@ function closeDoneWorktreesEnabled(cfg) {
   return !!cfg.closeDoneWorktrees;
 }
 
+/**
+ * The fraction of this machine's cores the parallel-agents budget derives its limit from
+ * (0.1-1). `ORCH_PARALLEL_CORE_FRACTION` overrides the config value for one process; an
+ * invalid override falls back to the config value, exactly like `handoffUsed`.
+ */
+function parallelCoreFraction(cfg) {
+  const envOverride = process.env.ORCH_PARALLEL_CORE_FRACTION;
+  if (envOverride !== undefined) {
+    const n = Number(envOverride);
+    if (Number.isFinite(n) && n >= 0.1 && n <= 1) return n;
+  }
+  return cfg.parallelCoreFraction;
+}
+
+/**
+ * The explicit machine-wide parallel-agents cap, or null to derive it from
+ * `parallelCoreFraction x cores` (0 = unlimited). `ORCH_MAX_PARALLEL_AGENTS` overrides the
+ * config value for one process; an invalid override falls back to the config value.
+ */
+function maxParallelAgents(cfg) {
+  const envOverride = process.env.ORCH_MAX_PARALLEL_AGENTS;
+  if (envOverride !== undefined) {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 256) return n;
+  }
+  return cfg.maxParallelAgents;
+}
+
 module.exports = {
   GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
   maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
+  parallelCoreFraction, maxParallelAgents,
 };

@@ -23,16 +23,22 @@ Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|aut
 detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
 
 **Subagents and parallel work.** In-session subagents (`Agent` tool) return their result
-directly and are never tracked by these hooks — no heartbeat needed. Orca workers
-(Codex) run in their own terminal/worktree and must be supervised by
+directly and are never tracked by these hooks for supervision purposes — no heartbeat
+needed. Orca workers (Codex) run in their own terminal/worktree and must be supervised by
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
 terminal, an orphan, a rate limit, or a worktree whose PR already merged/closed with no
 live terminal left on it; `Stop` refuses to end the session with one live and
 unwatched, or finished and unreleased. No more than `maxParallelCodexWorkers` (default 3)
-live Codex workers at once, and any shared-workspace code brief must declare
-`Owns: <files>` (or `Owns: n/a <reason>`) so overlapping claims are caught before either
-dispatch starts — isolate with `--worktree new-child` / Agent `isolation:"worktree"` to
-skip both. Full detail: `README.md#subagents-and-parallel-work`.
+live Codex workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget
+(default `max(1, floor(0.8 x cores))`, `0` = unlimited) caps every live Orca worker group
+(any agent) plus every live in-session Agent/Task dispatch, summed across every recent
+session on this machine — this one IS registered for every main-panel Agent/Task dispatch
+(`s.agents[toolUseId]`), even though it is never tracked for supervision. Any
+shared-workspace code brief must declare `Owns: <files>` (or `Owns: n/a <reason>`) so
+overlapping claims are caught before either dispatch starts — isolate with
+`--worktree new-child` / Agent `isolation:"worktree"` to skip both ownership checks (not
+the parallel-agents budget, which every dispatch counts against regardless of isolation).
+Full detail: `README.md#subagents-and-parallel-work`.
 
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged/closed and the
@@ -70,7 +76,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 592 tests, fully hermetic
+npm test                       # 653 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -173,18 +179,22 @@ The file is plain JSON — no comments — parsed as-is:
 (`codexHandoffUsedPercent: 60` is up from the default 40; `replyLanguage` accepts any
 language name, or `null` for no language sentence at all.)
 
-Two more keys gate parallel work: `maxParallelCodexWorkers` (integer 0-32, default 3, `0`
-= unlimited) caps how many live Codex `worker-start` dispatches this session may hold at
-once — a `--terminal`/`--retry-of` that replaces an existing worker does not count as new,
-and a non-Codex agent is never counted; `ownershipClaimTtlMinutes` (default 120) is how
-long a background in-session Agent's `Owns:` file claim survives without an explicit
-release before it auto-expires. Both are overridable for one process with
-`ORCH_MAX_PARALLEL_CODEX_WORKERS` / `ORCH_CLAIM_TTL_MINUTES`. A third, `closeDoneWorktrees`
-(default `true`), controls whether `orca-heartbeat.cjs` reminds about a worktree that is
-idle, accepted (PR/MR merged or closed, or a git-confirmed ancestor when neither is
-linked) and clean, with no live terminal on it; disable with `false` or
-`ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false` (`1`/`true` forces it on; anything else,
-including empty, defers to the config). Every code brief that already
+Several more keys gate parallel work: `maxParallelCodexWorkers` (integer 0-32, default 3,
+`0` = unlimited) caps how many live Codex `worker-start` dispatches this session may hold
+at once — a `--terminal`/`--retry-of` that replaces an existing worker does not count as
+new, and a non-Codex agent is never counted; `parallelCoreFraction` (number 0.1-1, default
+0.8) and `maxParallelAgents` (integer 0-256 or `null`, default `null`) together derive the
+MACHINE-wide `max-parallel-agents` budget — `null` means `max(1, floor(parallelCoreFraction
+x cores))`, an explicit integer overrides that derivation outright, `0` means unlimited;
+`ownershipClaimTtlMinutes` (default 120) is how long a background in-session Agent's
+`Owns:` file claim survives without an explicit release before it auto-expires. All four
+are overridable for one process with `ORCH_MAX_PARALLEL_CODEX_WORKERS` /
+`ORCH_PARALLEL_CORE_FRACTION` / `ORCH_MAX_PARALLEL_AGENTS` / `ORCH_CLAIM_TTL_MINUTES`. One
+more, `closeDoneWorktrees` (default `true`), controls whether `orca-heartbeat.cjs` reminds
+about a worktree that is idle, accepted (PR/MR merged or closed, or a git-confirmed
+ancestor when neither is linked) and clean, with no live terminal on it; disable with
+`false` or `ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false` (`1`/`true` forces it on;
+anything else, including empty, defers to the config). Every code brief that already
 needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` dispatch)
 running in a *shared* workspace must also declare `Owns: <repo-relative paths>` or
 `Owns: n/a <reason>` on its own line, unless it is isolated
@@ -257,8 +267,10 @@ Rollback without the uninstaller: every settings.json mutation is preceded by a
   `resource`) is never treated as a worker, so it stays gated like the main panel.
 - **File ownership (`Owns:`) is declared, not observed** — nothing checks that a worker's
   actual edits stayed within what it claimed. Workers started by a subagent, not the main
-  panel, are not tracked or capped by `maxParallelCodexWorkers`, the same boundary every
-  other gate here respects.
+  panel, are not tracked or capped by `maxParallelCodexWorkers` or `maxParallelAgents`, the
+  same boundary every other gate here respects; a subagent that itself spawns further
+  subagents is likewise invisible to `max-parallel-agents` — only the main panel's own
+  `Agent`/`Task` dispatches are ever registered.
 - **Main-panel gating requires an Orca terminal environment** under the default
   `activation: "orca-only"` config: the gate only governs a session that carries
   `ORCA_TERMINAL_HANDLE` at all (i.e., one launched inside Orca). A plain `claude` session

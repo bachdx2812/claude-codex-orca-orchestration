@@ -92,8 +92,13 @@ Orca-worker sessions are never gated); `Stop` refuses to end the session while a
 running and unwatched (`workers-unwatched` — no live heartbeat) or finished but still
 holding a terminal (`workers-unreconciled` — needs `worker-retain` or `worker-release`);
 **no more than `maxParallelCodexWorkers` (default 3) live Codex workers at once**
-(`max-parallel-codex-workers`); **every code brief in a shared workspace declares the
-files it will touch** (`code-brief-needs-owns` — `Owns: <paths>` or `Owns: n/a <reason>`,
+(`max-parallel-codex-workers`); **no more than a MACHINE-wide budget of live Orca workers
+(any agent) plus live in-session subagents, summed across every recent session on this
+machine** (`max-parallel-agents` — the resource is this machine's cores, not any one
+session's own concurrency: `max(1, floor(parallelCoreFraction x cores))` by default, an
+explicit `maxParallelAgents` overrides that derivation, `0` = unlimited); **every code
+brief in a shared workspace declares the files it will touch**
+(`code-brief-needs-owns` — `Owns: <paths>` or `Owns: n/a <reason>`,
 on its own line) **and a claim that overlaps another live one is refused**
 (`ownership-overlap`, naming the holder and its age).
 
@@ -105,8 +110,21 @@ claim in a *shared* workspace only avoids that specific conflict, not the next o
 | Gate | Refuses when | Escape |
 |---|---|---|
 | `max-parallel-codex-workers` | a new Codex `worker-start` would exceed `maxParallelCodexWorkers` | release/reuse/retry an existing worker; raise the cap; `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` |
+| `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it; raise `maxParallelAgents` / `ORCH_MAX_PARALLEL_AGENTS`; `=0` for unlimited |
 | `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
 | `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
+
+`max-parallel-agents` counts every live Orca worker group (any agent, not only Codex — the
+Codex-only cap above still applies on top, never instead) plus every live in-session
+Agent/Task dispatch this main panel has registered (`s.agents[toolUseId]`, at `PreToolUse`,
+for every dispatch — not only code briefs), summed across every session's state file
+modified in the last 6h. A dispatch registered as `run_in_background: true` survives its
+own launch-returning `PostToolUse` and is instead released by a matching
+`<task-notification><tool-use-id>`, a 120-minute TTL, or `--release-claims`, the same
+pattern `code-brief-needs-owns`'s `Owns:` claims already use. A `--terminal <h>` /
+`--retry-of <id>` replacement of an already-tracked live group is not a new slot. The
+`SessionStart` banner and every per-prompt reminder show `parallel budget: <n>/<N> (<cores>
+cores x <fraction>%)`.
 
 Advisory only, never blocked by the gate: whether the files a worker actually touched
 matched what it declared (ownership is *declared*, not observed).
@@ -144,7 +162,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 592 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 653 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -193,7 +211,9 @@ The file is plain JSON — no comments — parsed as-is:
   "replyLanguage": "Vietnamese",
   "maxParallelCodexWorkers": 5,
   "ownershipClaimTtlMinutes": 60,
-  "disabledGates": ["code-brief-needs-verify"]
+  "disabledGates": ["code-brief-needs-verify"],
+  "parallelCoreFraction": 0.8,
+  "maxParallelAgents": null
 }
 ```
 
@@ -201,7 +221,11 @@ The file is plain JSON — no comments — parsed as-is:
 up from the default 40; `replyLanguage` accepts any language name, or `null` for no
 language instruction at all; `maxParallelCodexWorkers` raises or lowers how many live
 Codex workers this session may hold at once (`0` = unlimited); `ownershipClaimTtlMinutes`
-changes how long a background Agent's `Owns:` claim survives before it auto-expires.)
+changes how long a background Agent's `Owns:` claim survives before it auto-expires;
+`parallelCoreFraction` (default `0.8`) is the share of this machine's cores the
+machine-wide `max-parallel-agents` budget derives its limit from; `maxParallelAgents`
+(default `null`, meaning derive it from `parallelCoreFraction x cores`) overrides that
+derivation outright, `0` meaning unlimited.)
 
 See `rules/orchestration-contract.md#config` for every field.
 
@@ -225,8 +249,10 @@ exact-match removal (never a blind restore, so edits you made after installing s
   `rules/orchestration-contract.md`) let the operator override coding-model routing
   without a full bypass.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees a stuck `Owns:`
-  claim; `maxParallelCodexWorkers: 0` (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0`
-  (env) makes the parallel-Codex-worker cap unlimited.
+  claim OR a stuck `max-parallel-agents` registration; `maxParallelCodexWorkers: 0`
+  (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env) makes the parallel-Codex-worker cap
+  unlimited; `maxParallelAgents: 0` (config) or `ORCH_MAX_PARALLEL_AGENTS=0` (env) makes
+  the machine-wide max-parallel-agents budget unlimited.
 
 ## Known limitations
 
@@ -255,12 +281,15 @@ handed to a shell interpreter, is future work.
 File ownership is *declared*, not observed: `Owns:` is trusted at face value, and nothing
 checks that a worker's actual edits stayed within what it claimed. Workers started by a
 subagent (not the main panel) are not tracked and do not count toward
-`maxParallelCodexWorkers`, the same boundary every other gate here respects — these hooks
-gate the main panel's own dispatches, both at `worker-start` time and again when that
-dispatch's own result is registered, so a subagent's Codex worker is never counted twice
-or once by accident. `orchestration dispatch --to <handle>` (a context-only send to an
-existing terminal, not a new worker) is out of scope for both the parallel-limit and
-ownership gates.
+`maxParallelCodexWorkers` or `maxParallelAgents`, the same boundary every other gate here
+respects — these hooks gate the main panel's own dispatches, both at `worker-start` time
+and again when that dispatch's own result is registered, so a subagent's Codex worker is
+never counted twice or once by accident. `orchestration dispatch --to <handle>` (a
+context-only send to an existing terminal, not a new worker) is out of scope for both the
+parallel-limit and ownership gates. Likewise, a **subagent that itself spawns further
+subagents** is invisible to `max-parallel-agents`: only the main panel's own `Agent`/`Task`
+dispatches are registered, so nested fan-out from inside a subagent is not charged against
+the machine-wide budget — the same boundary, stated once here rather than per gate.
 
 Only an `Owns:` line that starts the line (optionally after `-`/`*`) is read — a markdown-
 bold `**Owns:**` or an `Owns:` appearing mid-sentence is not recognized, and the refusal
@@ -277,12 +306,13 @@ substituted content isn't visible to the per-invocation argument scanner.
 ## Development
 
 ```bash
-npm test   # node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs
+npm test   # node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-concurrency.cjs
 ```
 
-Both suites are fully hermetic: state lives under a fresh temp `ORCH_STATE_DIR`, `orca` is
-a deterministic local stub selected via `ORCA_BIN`, and every path judged by the gate is
-synthetic — nothing depends on, or touches, your real `~/.claude/`.
+All three suites are fully hermetic: state lives under a fresh temp `ORCH_STATE_DIR`,
+`orca` (and, for the git-backed done-worktree checks, `git`) is a deterministic local stub
+selected via `ORCA_BIN` / `ORCH_GIT_BIN`, and every path judged by the gate is synthetic —
+nothing depends on, or touches, your real `~/.claude/`.
 
 ## License
 

@@ -225,6 +225,9 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN,
     maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled,
   } = deps;
+  // deps also carries (and this function reads directly, so not destructured above):
+  // agentParallelLimit, machineWideLiveUnits, formatParallelAgentsRefusal, cores,
+  // parallelCoreFraction — the max-parallel-agents machine-wide budget's own helpers.
 
   const invs = orcaInvocations(cmd).filter((inv) =>
     (inv.sub === 'orchestration worker-start' || inv.sub === 'orchestration task-create') &&
@@ -372,9 +375,33 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
       // --- parallel-Codex-worker cap: worker-start only, and only a genuinely new dispatch ---
       let codexSlot = false;
       let agent = null;
+      // `newSlot`: this worker-start invocation is neither a task-create (never launches a
+      // terminal by itself) nor a replacement of an already-tracked live group
+      // (`--terminal <h>` / `--retry-of <id>`) — i.e. it is really about to consume one more
+      // unit of the MACHINE-wide max-parallel-agents budget, whatever agent it targets.
+      // `codexSlot` (the older, Codex-only field) is exactly this same condition narrowed to
+      // `agent === 'codex'`.
+      const newSlot = !isTaskCreate && !replacesGroup;
       if (!isTaskCreate) {
         agent = resolveWorkerStartAgent(inv, s, flagValue);
-        codexSlot = agent === 'codex' && !replacesGroup;
+        codexSlot = newSlot && agent === 'codex';
+
+        // Machine-wide max-parallel-agents budget: checked for EVERY agent's worker-start,
+        // on top of (never instead of) the Codex-only cap below. Uses the in-memory `s` for
+        // this session (already includes any reservation an earlier invocation in this same
+        // command line just added) and the on-disk state of every other recent session.
+        if (newSlot && !gateDisabled(cfg, 'max-parallel-agents')) {
+          const limit = deps.agentParallelLimit(cfg);
+          if (Number.isFinite(limit)) {
+            const usage = deps.machineWideLiveUnits(DIR, Date.now(), { currentState: s, currentSessionId: sessionId });
+            if (usage.total >= limit) {
+              violation = { gate: 'max-parallel-agents', reason:
+                deps.formatParallelAgentsRefusal(usage, limit, deps.cores(), deps.parallelCoreFraction(cfg)) };
+              break;
+            }
+          }
+        }
+
         if (codexSlot && cap > 0 && !gateDisabled(cfg, 'max-parallel-codex-workers')) {
           let live = WG.countLiveGroups(s.workers, 'codex') + OC.countPendingCodexReservations(s);
           if (live >= cap) {
@@ -408,7 +435,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
       }
 
       const reservation = {
-        ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot,
+        ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, newSlot,
       };
       localReservations[`${baseId}#${idx}`] = reservation;
       s.reservations[`${baseId}#${idx}`] = reservation;

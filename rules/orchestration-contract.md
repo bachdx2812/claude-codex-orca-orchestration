@@ -49,6 +49,14 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    dispatch) — unless the work is isolated (`--worktree new-child`/`new-top-level`, or
    Agent `isolation:"worktree"`), which needs no `Owns:` at all. A claim that overlaps
    another live claim in the same workspace is refused.
+10. **No more than a MACHINE-wide budget of live Orca workers plus live in-session
+    subagents at once.** The resource being budgeted is this machine's cores, not any one
+    session's own concurrency: `max(1, floor(parallelCoreFraction x cores))` by default
+    (`parallelCoreFraction` default `0.8`), or an explicit `maxParallelAgents` (`0` =
+    unlimited). Summed across every recent session's state file on this machine — every
+    live Orca worker group of any agent (on top of, never instead of, the Codex-only cap
+    above) plus every live main-panel `Agent`/`Task` dispatch. A dispatch that would exceed
+    it is refused; wait for one to finish and release it, or raise the limit.
 
 ## Activation
 
@@ -154,7 +162,9 @@ as the installed hooks would actually read it.
   "maxParallelCodexWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
-  "closeDoneWorktrees": true
+  "closeDoneWorktrees": true,
+  "parallelCoreFraction": 0.8,
+  "maxParallelAgents": null
 }
 ```
 
@@ -190,6 +200,15 @@ as the installed hooks would actually read it.
   one process with `ORCH_CLOSE_DONE_WORKTREES` set to `1`/`true` (force on) or `0`/`false`
   (force off) — any other value, including an empty string or the variable being unset,
   defers to the config rather than being read as "set at all, so true".
+- `parallelCoreFraction`: number 0.1-1, default `0.8`. The share of this machine's cores
+  (`os.availableParallelism?.() || os.cpus().length`, read fresh at every check) the
+  machine-wide `max-parallel-agents` budget derives its limit from when `maxParallelAgents`
+  is `null`. Overridable for one process with `ORCH_PARALLEL_CORE_FRACTION`.
+- `maxParallelAgents`: `null` (default) or integer 0-256. `null` derives the limit as
+  `max(1, floor(parallelCoreFraction x cores))`; an explicit integer overrides that
+  derivation outright; `0` means unlimited. See "Parallel Codex workers and file
+  ownership" below for what counts against it. Overridable for one process with
+  `ORCH_MAX_PARALLEL_AGENTS`.
 
 Env overrides: `ORCH_CONFIG_PATH` (which file to read), `ORCH_STATE_DIR` (where session
 state, the violations log and heartbeat liveness files live — default
@@ -297,6 +316,43 @@ PREVIOUS winner's just-saved reservation, not a stale pre-lock snapshot, so the 
 call sees the winner's reservation and is refused before either registers a real worker,
 and one process's save can never silently overwrite another's.
 
+**`max-parallel-agents`.** A MACHINE-wide budget, on top of (never instead of) the
+Codex-only cap above: the resource is this machine's cores, not any one session's own
+concurrency, so the count sums every recent (modified within 6h) session's own state file
+under the shared `~/.claude/orchestrator-gate/` directory, not just the caller's own. Two
+kinds of live unit are counted:
+  - every live Orca worker GROUP of any agent (codex, claude, ...) — never a `capExempt`
+    one, same reasoning as the Codex-only cap — plus its still-unresolved worker-start
+    reservation (`newSlot: true`, set only for a genuinely new dispatch — never a
+    `task-create`, which launches nothing by itself, and never a `--terminal`/`--retry-of`
+    replacement of an already-tracked live group);
+  - every live in-session `Agent`/`Task` dispatch the main panel has made, registered as
+    `s.agents[toolUseId] = { ts, background, type, model }` at `PreToolUse` for EVERY such
+    dispatch (not only code briefs needing `Owns:`) — even one the gate would otherwise be
+    disabled for still gets registered, so a later re-enable never silently missed
+    accounting for it.
+Fires at `PreToolUse` of every `Agent`/`Task` dispatch, every real `orchestration
+worker-start`, and every real `terminal create` (a bare `terminal create` carries neither an
+ownership-relevant workspace nor a resolved agent, so it holds its own small, separately-
+keyed reservation — `term:<toolUseId>#<idx>` — that only needs to survive the PreToolUse ->
+PostToolUse gap, since a successful create is already registered as a real worker by the
+existing `terminal create` reply-scanning path). The check-and-reserve critical section runs
+under the SAME shared file lock every other reservation-taking gate here uses, and always
+reloads state fresh from disk once the lock is held, exactly like the Codex-only cap — the
+whole point being genuine cross-SESSION mutual exclusion, not merely cross-Bash-call. The
+refusal names the live total, the limit, the cores/fraction it was derived from, and up to 8
+of the oldest live unit ids: `<n>/<N> parallel units live on this machine (<cores> cores x
+<fraction>%): <k> Orca workers, <m> subagents [<ids>]`.
+
+A registered `Agent`/`Task` dispatch releases exactly like an ownership claim does: a
+foreground dispatch frees it at the matching `PostToolUse`; a background
+(`run_in_background: true`) dispatch survives that same-turn launch-return event and is
+instead released by a matching `<task-notification><tool-use-id>`, a fixed 120-minute TTL
+(distinct from the configurable `ownershipClaimTtlMinutes` — this is "is the dispatch still
+running at all," not a file-ownership lock), or the operator's `--release-claims <id>` /
+`--release-claims all` (which now also clears this registry, alongside `agentClaims` and
+`reservations`).
+
 **`code-brief-needs-owns` / `ownership-overlap`.** The same code briefs that already need a
 verify command (an Orca `--spec`, or an in-session `Agent`/`Task` exec dispatch) — when
 running in a *shared* workspace, not an isolated worktree/Agent — must also declare
@@ -330,7 +386,10 @@ dispatch is released best-effort by a `<task-notification>` naming its id, by
 
 **Known limits.** Ownership is *declared*, not observed — nothing checks that a worker
 actually only touched the files it claimed. Workers started by a subagent (not the main
-panel) are not tracked or capped, the same boundary every other gate here respects.
+panel) are not tracked or capped, the same boundary every other gate here respects — and,
+specific to `max-parallel-agents`, a subagent that itself spawns further subagents is
+invisible to the budget: only the main panel's own `Agent`/`Task` dispatches are ever
+registered, so nested fan-out from inside a subagent is not charged against it.
 
 ## Codex rate limits
 
@@ -399,13 +458,16 @@ processes racing the same session id can otherwise silently drop each other's wr
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` toggle only
   execution routing, honestly — narrower than a full bypass.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees one or every
-  tracked `Owns:` claim — the deliberate manual override alongside the automatic release
-  paths (matching `PostToolUse`, a `<task-notification>`, `ownershipClaimTtlMinutes`). It
-  clears BOTH `agentClaims` and any matching Bash-dispatch `reservations` (by exact id or
-  by `<id>#<idx>` prefix), so a stuck reservation can be freed the same way a stuck
-  `agentClaims` entry can.
+  tracked `Owns:` claim OR `max-parallel-agents` registration — the deliberate manual
+  override alongside the automatic release paths (matching `PostToolUse`, a
+  `<task-notification>`, `ownershipClaimTtlMinutes` / the fixed 120-minute agent-registry
+  TTL). It clears `agentClaims`, `agents`, and any matching Bash-dispatch `reservations`
+  (by exact id or by `<id>#<idx>` prefix), so a stuck reservation or registration can be
+  freed the same way a stuck `agentClaims` entry can.
 - `maxParallelCodexWorkers: 0` (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env, one
   process) makes the parallel-Codex-worker cap unlimited.
+- `maxParallelAgents: 0` (config) or `ORCH_MAX_PARALLEL_AGENTS=0` (env, one process) makes
+  the machine-wide `max-parallel-agents` budget unlimited.
 
 Only the operator invokes these from the main panel's own prompt.
 
@@ -419,9 +481,10 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # both suites
+npm test                                             # all three suites
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
+node tests/test-concurrency.cjs                      # genuine multi-process races (both caps)
 ```
 
 Every false positive found in real use became a permanent case in these suites: a `>`

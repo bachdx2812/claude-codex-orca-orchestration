@@ -25,6 +25,7 @@ const { orcaInvocations } = require('../hooks/lib/shell-orca-invocations.cjs');
 const WG = require('../hooks/lib/worker-groups.cjs');
 const OWN = require('../hooks/lib/ownership.cjs');
 const OC = require('../hooks/lib/ownership-claims.cjs');
+const PAC = require('../hooks/lib/parallel-agent-cap.cjs');
 const { acquireLock, releaseLock } = require('../hooks/lib/file-lock.cjs');
 
 let pass = 0;
@@ -452,7 +453,155 @@ check('a released worker holds nothing',
   check('a garbage override defers to config (false)', config.closeDoneWorktreesEnabled(wtOff), false);
   if (beforeWt === undefined) delete process.env.ORCH_CLOSE_DONE_WORKTREES; else process.env.ORCH_CLOSE_DONE_WORKTREES = beforeWt;
 
+  // --- max-parallel-agents config fields (parallelCoreFraction / maxParallelAgents) -----
+  check('default parallelCoreFraction is 0.8', defaults.parallelCoreFraction, 0.8);
+  check('default maxParallelAgents is null (derive from cores)', defaults.maxParallelAgents, null);
+  check('max-parallel-agents is a known gate name', config.GATE_NAMES.includes('max-parallel-agents'), true);
+
+  const badFraction = withConfig({ parallelCoreFraction: 1.5 }, () => config.loadConfig());
+  check('out-of-range parallelCoreFraction falls back to default', badFraction.parallelCoreFraction, 0.8);
+  check('out-of-range parallelCoreFraction produces a warning', badFraction.warnings.length > 0, true);
+
+  const tooLowFraction = withConfig({ parallelCoreFraction: 0.05 }, () => config.loadConfig());
+  check('below-range parallelCoreFraction falls back to default', tooLowFraction.parallelCoreFraction, 0.8);
+
+  const goodFraction = withConfig({ parallelCoreFraction: 0.5 }, () => config.loadConfig());
+  check('a valid parallelCoreFraction is kept as-is', goodFraction.parallelCoreFraction, 0.5);
+  check('parallelCoreFraction() reads the config value', config.parallelCoreFraction(goodFraction), 0.5);
+
+  const badMaxAgents = withConfig({ maxParallelAgents: 'lots' }, () => config.loadConfig());
+  check('a non-integer maxParallelAgents falls back to null', badMaxAgents.maxParallelAgents, null);
+  check('a non-integer maxParallelAgents produces a warning', badMaxAgents.warnings.length > 0, true);
+
+  const outOfRangeMaxAgents = withConfig({ maxParallelAgents: 500 }, () => config.loadConfig());
+  check('an out-of-range maxParallelAgents falls back to null', outOfRangeMaxAgents.maxParallelAgents, null);
+
+  const explicitMaxAgents = withConfig({ maxParallelAgents: 5 }, () => config.loadConfig());
+  check('an explicit integer maxParallelAgents is kept as-is', explicitMaxAgents.maxParallelAgents, 5);
+  check('maxParallelAgents() reads the config value', config.maxParallelAgents(explicitMaxAgents), 5);
+
+  const zeroMaxAgents = withConfig({ maxParallelAgents: 0 }, () => config.loadConfig());
+  check('maxParallelAgents: 0 is kept as 0 (unlimited), not treated as falsy-missing', zeroMaxAgents.maxParallelAgents, 0);
+
+  const beforeFraction = process.env.ORCH_PARALLEL_CORE_FRACTION;
+  process.env.ORCH_PARALLEL_CORE_FRACTION = '0.3';
+  check('ORCH_PARALLEL_CORE_FRACTION overrides the config value', config.parallelCoreFraction(defaults), 0.3);
+  process.env.ORCH_PARALLEL_CORE_FRACTION = 'nope';
+  check('an invalid ORCH_PARALLEL_CORE_FRACTION falls back to config', config.parallelCoreFraction(defaults), defaults.parallelCoreFraction);
+  if (beforeFraction === undefined) delete process.env.ORCH_PARALLEL_CORE_FRACTION; else process.env.ORCH_PARALLEL_CORE_FRACTION = beforeFraction;
+
+  const beforeMaxAgentsEnv = process.env.ORCH_MAX_PARALLEL_AGENTS;
+  process.env.ORCH_MAX_PARALLEL_AGENTS = '7';
+  check('ORCH_MAX_PARALLEL_AGENTS overrides the config value', config.maxParallelAgents(defaults), 7);
+  process.env.ORCH_MAX_PARALLEL_AGENTS = '0';
+  check('ORCH_MAX_PARALLEL_AGENTS=0 overrides to explicit unlimited', config.maxParallelAgents(defaults), 0);
+  process.env.ORCH_MAX_PARALLEL_AGENTS = 'nope';
+  check('an invalid ORCH_MAX_PARALLEL_AGENTS falls back to config', config.maxParallelAgents(defaults), defaults.maxParallelAgents);
+  if (beforeMaxAgentsEnv === undefined) delete process.env.ORCH_MAX_PARALLEL_AGENTS; else process.env.ORCH_MAX_PARALLEL_AGENTS = beforeMaxAgentsEnv;
+
   fs.rmSync(cfgDir, { recursive: true, force: true });
+}
+
+// --- lib/parallel-agent-cap.cjs: limit derivation + cross-session counting -----------
+
+{
+  const cfgHelpers = (maxAgents, fraction) => ({
+    maxParallelAgents: () => maxAgents,
+    parallelCoreFraction: () => fraction,
+  });
+
+  // `PAC.cores()` reads this real machine's own core count (not injectable — deliberately,
+  // since a container's CPU allotment can change between calls and must be read fresh), so
+  // the derivation FORMULA itself is verified against the documented 18 -> 14 example
+  // directly, and `agentParallelLimit`'s null-derivation path is cross-checked against
+  // this real machine's own `PAC.cores()` further below instead of a hard-coded core count.
+  check('floor(0.8 x 18) = 14 (the documented example)', Math.max(1, Math.floor(0.8 * 18)), 14);
+  check('floor(0.8 x 1) = 1, never below the floor of 1', Math.max(1, Math.floor(0.8 * 1)), 1);
+
+  check('an explicit maxParallelAgents overrides the derivation entirely',
+    PAC.agentParallelLimit({}, cfgHelpers(5, 0.8)), 5);
+  check('maxParallelAgents: 0 means unlimited (Infinity)',
+    PAC.agentParallelLimit({}, cfgHelpers(0, 0.8)), Infinity);
+  check('maxParallelAgents: null derives from cores x fraction',
+    PAC.agentParallelLimit({}, cfgHelpers(null, 0.8)), Math.max(1, Math.floor(0.8 * PAC.cores())));
+
+  // --- cross-session counting: live workers/reservations/agents summed across files, -----
+  // --- ignoring a stale (> 6h old) session file entirely -----------------------------
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-pac-'));
+  const now = Date.now();
+  const write = (name, obj, ageMs) => {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, JSON.stringify(obj));
+    if (ageMs != null) {
+      const t = (now - ageMs) / 1000;
+      fs.utimesSync(file, t, t);
+    }
+  };
+
+  write('sessA.json', {
+    workers: { ctx_a1: { status: 'live', started: now, group: 'ctx_a1' } },
+    reservations: {}, agents: { toolu_a1: { ts: now } },
+  });
+  write('sessB.json', {
+    workers: {}, reservations: { 'toolu_b1#0': { ts: now, newSlot: true } },
+    agents: {},
+  });
+  // A stale session (7h old) with live-looking entries must be ignored entirely.
+  write('sessStale.json', {
+    workers: { ctx_stale: { status: 'live', started: now, group: 'ctx_stale' } },
+    reservations: {}, agents: { toolu_stale: { ts: now } },
+  }, 7 * 60 * 60 * 1000);
+  // A capExempt worker (done per Orca, still holding its terminal) must not count.
+  write('sessC.json', {
+    workers: { ctx_c1: { status: 'live', started: now, group: 'ctx_c1', capExempt: true } },
+    reservations: {}, agents: {},
+  });
+  // An expired reservation (no newSlot, or past the 10-minute reservation TTL) must not count.
+  write('sessD.json', {
+    workers: {}, reservations: {
+      'toolu_d1#0': { ts: now - 11 * 60 * 1000, newSlot: true }, // expired (> 10 min)
+      'toolu_d2#0': { ts: now, newSlot: false },                 // not a new slot (e.g. task-create)
+    }, agents: {},
+  });
+  // An agent registration past its 120-minute TTL must not count.
+  write('sessE.json', {
+    workers: {}, reservations: {}, agents: { toolu_e1: { ts: now - 121 * 60 * 1000 } },
+  });
+  // Not a session state file at all — must be ignored by the directory scan.
+  write('sessA.role.json', { handle: 'x', role: 'worker' });
+  write('heartbeat-sessA.json', { pid: 1, last_tick: now });
+
+  const usage = PAC.machineWideLiveUnits(dir, now);
+  check('recentSessionStateFiles excludes .role.json and heartbeat-* files',
+    PAC.recentSessionStateFiles(dir, now).some((f) => /sessA\.role\.json|heartbeat-/.test(f)), false);
+  check('machineWideLiveUnits counts one live worker group from sessA', usage.orcaWorkers >= 1, true);
+  check('machineWideLiveUnits counts one live reservation-backed slot from sessB', usage.orcaWorkers >= 2, true);
+  check('machineWideLiveUnits counts one live subagent from sessA', usage.subagents >= 1, true);
+  check('machineWideLiveUnits ignores a stale (>6h) session file entirely',
+    usage.ids.includes('ctx_stale') || usage.ids.includes('toolu_stale'), false);
+  check('machineWideLiveUnits never counts a capExempt worker', usage.ids.includes('ctx_c1'), false);
+  check('machineWideLiveUnits never counts an expired reservation', usage.ids.includes('toolu_d1#0'), false);
+  check('machineWideLiveUnits never counts a reservation with newSlot:false', usage.ids.includes('toolu_d2#0'), false);
+  check('machineWideLiveUnits never counts an agent past its TTL', usage.ids.includes('toolu_e1'), false);
+  // Exactly the 3 genuinely-live units: sessA's worker, sessA's agent, sessB's reservation.
+  check('machineWideLiveUnits total is exactly the 3 genuinely-live units', usage.total, 3);
+
+  // `currentState`/`currentSessionId` avoid double-counting the caller's own on-disk file
+  // when an accurate in-memory copy (e.g. with a same-command-earlier reservation already
+  // applied) is supplied instead.
+  const withCurrent = PAC.machineWideLiveUnits(dir, now, {
+    currentSessionId: 'sessA',
+    currentState: { workers: {}, reservations: {}, agents: { toolu_a1: { ts: now }, toolu_a2: { ts: now } } },
+  });
+  check('currentState overrides that session\'s own on-disk file rather than adding to it',
+    withCurrent.subagents, 2);
+
+  const refusal = PAC.formatParallelAgentsRefusal(usage, 3, 18, 0.8);
+  check('formatParallelAgentsRefusal names the totals, cores/fraction and ids',
+    /3\/3 parallel units live on this machine \(18 cores x 80%\): 2 Orca workers, 1 subagents/.test(refusal), true);
+  check('formatParallelAgentsRefusal points at raising the limit', /maxParallelAgents \/ ORCH_MAX_PARALLEL_AGENTS/.test(refusal), true);
+
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 // --- gate.cjs: parseCodeModel / describeOverride / currentExecRoute / escapeRegex ----

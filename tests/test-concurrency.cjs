@@ -129,6 +129,88 @@ async function raceReconcileTest() {
   return { pass, failures };
 }
 
+/**
+ * Genuine multi-process concurrency test for the MACHINE-wide max-parallel-agents cap.
+ * Unlike the Codex-cap race above, each spawned process uses its OWN session id (the
+ * budget is explicitly machine-wide, summed across every session's state file under one
+ * shared stateDir) — this is the harder, more meaningful proof: admission must be
+ * serialized correctly across DIFFERENT sessions racing the same shared file lock, not
+ * merely within one session's own reservations. Each dispatch is an `Agent` call shaped to
+ * pass every other gate cleanly (a lookup-agent type on the lookup model) so a refusal can
+ * only ever be this cap.
+ */
+async function maxParallelAgentsRaceTest() {
+  let pass = 0;
+  const failures = [];
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-agents-race-'));
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const configFile = path.join(dir, 'orchestration.config.json');
+  fs.writeFileSync(configFile, JSON.stringify({
+    activation: 'always', maxParallelAgents: 3, maxParallelCodexWorkers: 0, disabledGates: [],
+  }));
+  const env = { ...BASE_ENV, ORCH_STATE_DIR: stateDir, ORCH_CONFIG_PATH: configFile, ORCA_BIN: STUB, CODEX_BIN: STUB };
+
+  const CAP2 = 3;
+  const N2 = CAP2 + 2;
+
+  function spawnAgent(i) {
+    return new Promise((resolve) => {
+      const payload = JSON.stringify({
+        session_id: `agents-race-${i}`, hook_event_name: 'PreToolUse', effort: 'high',
+        tool_name: 'Agent',
+        tool_input: { subagent_type: 'Explore', model: 'haiku', description: `lookup task ${i}` },
+        tool_use_id: `toolu_agents_race_${i}`,
+      });
+      const child = spawn(process.execPath, [GATE], { env });
+      let stderr = '';
+      child.stderr.on('data', (d) => { stderr += d; });
+      child.on('close', (code) => resolve({ i, code, stderr }));
+      child.stdin.write(payload);
+      child.stdin.end();
+    });
+  }
+
+  const results = await Promise.all(Array.from({ length: N2 }, (_, i) => spawnAgent(i)));
+  const admitted = results.filter((r) => r.code === 0);
+  const refused = results.filter((r) => r.code === 2);
+  const other = results.filter((r) => r.code !== 0 && r.code !== 2);
+
+  if (admitted.length === CAP2) pass += 1;
+  else failures.push(`max-parallel-agents: expected exactly ${CAP2} admitted under a real cross-session race, got ${admitted.length} (${JSON.stringify(results.map((r) => r.code))})`);
+
+  if (refused.length === N2 - CAP2) pass += 1;
+  else failures.push(`max-parallel-agents: expected exactly ${N2 - CAP2} refused, got ${refused.length}`);
+
+  if (other.length === 0) pass += 1;
+  else failures.push(`max-parallel-agents: unexpected exit codes: ${JSON.stringify(other)}`);
+
+  for (const r of refused) {
+    if (/max-parallel-agents/.test(r.stderr)) pass += 1;
+    else failures.push(`max-parallel-agents: refused process ${r.i} did not name the cap gate: ${r.stderr.slice(0, 200)}`);
+  }
+
+  // Exactly CAP2 registrations must exist across every session's state file on disk —
+  // proving the race was resolved by real mutual exclusion across sessions, not by
+  // coincidence in which processes happened to exit first.
+  try {
+    const files = fs.readdirSync(stateDir).filter((n) => n.endsWith('.json') && !n.endsWith('.role.json') && !n.startsWith('heartbeat-'));
+    let totalAgents = 0;
+    for (const f of files) {
+      const st = JSON.parse(fs.readFileSync(path.join(stateDir, f), 'utf8'));
+      totalAgents += Object.keys(st.agents || {}).length;
+    }
+    if (totalAgents === CAP2) pass += 1;
+    else failures.push(`max-parallel-agents: expected exactly ${CAP2} agent registrations across all session files, got ${totalAgents}`);
+  } catch (err) {
+    failures.push(`max-parallel-agents: could not read final state files: ${err.message}`);
+  }
+
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { pass, failures };
+}
+
 async function main() {
   let pass = 0;
   const failures = [];
@@ -174,6 +256,10 @@ async function main() {
   const phase2 = await raceReconcileTest();
   pass += phase2.pass;
   failures.push(...phase2.failures);
+
+  const phase3 = await maxParallelAgentsRaceTest();
+  pass += phase3.pass;
+  failures.push(...phase3.failures);
 
   console.log(`${pass} passed, ${failures.length} failed`);
   for (const f of failures) console.log(`  FAIL ${f}`);

@@ -70,6 +70,13 @@ const DEFAULT_CFG = {
   maxParallelCodexWorkers: 0,
   ownershipClaimTtlMinutes: 120,
   disabledGates: [],
+  // Unlimited by default for the same reason as maxParallelCodexWorkers above: this suite
+  // fires many Agent/Task dispatches across many session ids sharing one STATE_DIR, and the
+  // machine-wide max-parallel-agents cap sums across ALL of them — on a low-core CI runner,
+  // a derived (fraction x cores) limit could be as small as 1 and make unrelated tests fail
+  // spuriously. The dedicated max-parallel-agents tests further down set their own small,
+  // explicit maxParallelAgents via cfgOverrides/env.
+  maxParallelAgents: 0,
 };
 const CONFIG_FILE = path.join(RUN_DIR, 'orchestration.config.json');
 fs.writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CFG));
@@ -1635,6 +1642,123 @@ rmState(`${SID}-hard-off`);
   expect('round5 item1: the next worker-start at cap 1 is now correctly REFUSED (the plain-text-id dispatch is really running)',
     mainBash('orca orchestration worker-start --agent codex --spec @b.md --json', { sid: G5aSID, cwd: FAKE_REPO }), DENY, CAP5aEnv);
   rmState(G5aSID);
+}
+
+// --- max-parallel-agents: machine-wide budget on live Orca workers + subagents ---------
+//
+// Each case below gets its OWN fresh, isolated state dir (never the shared STATE_DIR every
+// other test in this file uses) — this gate counts MACHINE-WIDE, i.e. every session file
+// under its state dir, so sharing STATE_DIR with the rest of the suite would make these
+// tests depend on exactly what earlier, unrelated tests happened to leave behind.
+
+function mpaTestEnv(cfgOverrides) {
+  const dir = fs.mkdtempSync(path.join(RUN_DIR, 'mpa-'));
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const cfgFile = path.join(dir, 'orchestration.config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ ...DEFAULT_CFG, maxParallelAgents: 0, ...cfgOverrides }));
+  const env = { ...BASE_ENV, ORCH_STATE_DIR: stateDir, ORCH_CONFIG_PATH: cfgFile, ORCA_BIN: STUB, CODEX_BIN: STUB };
+  return { env, stateDir };
+}
+
+// A lookup-agent dispatch shaped to pass every OTHER gate cleanly (subagent_type "Explore"
+// matches agents.lookup, model "haiku" matches models.lookup — advisory only, never a
+// denial) — a refusal in these tests can only ever be max-parallel-agents.
+const mpaLookup = (sid, toolUseId, extraToolInput) => dispatch(
+  { subagent_type: 'Explore', model: 'haiku', description: 'lookup something', ...(extraToolInput || {}) },
+  sid, { tool_use_id: toolUseId }
+);
+const postAgent = (sid, toolUseId) => ({
+  session_id: sid, hook_event_name: 'PostToolUse', effort: 'high', tool_name: 'Agent',
+  tool_input: {}, tool_use_id: toolUseId, tool_response: { stdout: '' },
+});
+
+// 1. Agent dispatch refused once the cap is reached, allowed below it.
+{
+  const { env } = mpaTestEnv({ maxParallelAgents: 2 });
+  const sid = 'mpa-basic';
+  expect('agent #1 admitted under cap 2', mpaLookup(sid, 'toolu_mpa_1'), ALLOW, env);
+  expect('agent #2 admitted under cap 2', mpaLookup(sid, 'toolu_mpa_2'), ALLOW, env);
+  const r3 = invoke(mpaLookup(sid, 'toolu_mpa_3'), env);
+  if (r3.code === DENY && /max-parallel-agents/.test(r3.err)) pass += 1;
+  else failures.push(`agent #3 should be refused by max-parallel-agents at cap 2 (code ${r3.code}, err ${r3.err.slice(0, 200)})`);
+}
+
+// 2. A foreground dispatch's PostToolUse frees its slot for a later dispatch.
+{
+  const { env } = mpaTestEnv({ maxParallelAgents: 1 });
+  const sid = 'mpa-foreground';
+  expect('agent #1 admitted under cap 1', mpaLookup(sid, 'toolu_mpa_fg1'), ALLOW, env);
+  const blocked = invoke(mpaLookup(sid, 'toolu_mpa_fg2'), env);
+  if (blocked.code === DENY) pass += 1; else failures.push('a second foreground agent at cap 1 should be refused before release');
+  invoke(postAgent(sid, 'toolu_mpa_fg1'), env);
+  expect('after the foreground PostToolUse frees the slot, a new dispatch is admitted',
+    mpaLookup(sid, 'toolu_mpa_fg3'), ALLOW, env);
+}
+
+// 3. A background dispatch's own launch-return PostToolUse must NOT free its slot; only a
+// matching <task-notification><tool-use-id> does.
+{
+  const { env } = mpaTestEnv({ maxParallelAgents: 1 });
+  const sid = 'mpa-background';
+  expect('background agent #1 admitted under cap 1',
+    mpaLookup(sid, 'toolu_mpa_bg1', { run_in_background: true }), ALLOW, env);
+  invoke(postAgent(sid, 'toolu_mpa_bg1'), env); // the launch itself returning
+  const stillBlocked = invoke(mpaLookup(sid, 'toolu_mpa_bg2'), env);
+  if (stillBlocked.code === DENY) pass += 1;
+  else failures.push('a background dispatch\'s own launch-return PostToolUse must not free its max-parallel-agents slot');
+  invoke(promptSubmit(sid, '<task-notification><tool-use-id>toolu_mpa_bg1</tool-use-id>' +
+    '<status>completed</status><result>done</result></task-notification>'), env);
+  expect('after the matching <task-notification>, a new dispatch is admitted',
+    mpaLookup(sid, 'toolu_mpa_bg3'), ALLOW, env);
+}
+
+// 4. A Codex worker-start counts against max-parallel-agents too (not only Agent/Task).
+{
+  const { env } = mpaTestEnv({ maxParallelAgents: 1, maxParallelCodexWorkers: 5 });
+  const sid = 'mpa-worker-start';
+  expect('a worker-start is admitted under max-parallel-agents cap 1',
+    mainBash('orca orchestration worker-start --agent codex --json', { sid }), ALLOW, env);
+  const r2 = invoke(mainBash('orca orchestration worker-start --agent codex --json', { sid }), env);
+  if (r2.code === DENY && /max-parallel-agents/.test(r2.err)) pass += 1;
+  else failures.push(`a second worker-start at max-parallel-agents cap 1 should be refused (code ${r2.code}, err ${r2.err.slice(0, 200)})`);
+}
+
+// 5. `--retry-of` an existing LIVE group is a replacement, not a new slot — allowed even
+// while already "at cap".
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 1, maxParallelCodexWorkers: 5 });
+  const sid = 'mpa-retry';
+  const seeded = {
+    session_id: sid, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { ctx_mpa_retry: { status: 'live', started: Date.now(), group: 'ctx_mpa_retry',
+      kind: 'worker', agent: 'codex', owns: null, ws: null } },
+    reservations: {}, agentClaims: {}, agents: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  };
+  fs.writeFileSync(path.join(stateDir, `${sid}.json`), JSON.stringify(seeded));
+  expect('--retry-of an existing live group is allowed even though its slot is already "at cap"',
+    mainBash('orca orchestration worker-start --agent codex --retry-of ctx_mpa_retry --json', { sid }), ALLOW, env);
+}
+
+// 6. `ORCH_MAX_PARALLEL_AGENTS=0` overrides the config to unlimited for one process.
+{
+  const { env } = mpaTestEnv({ maxParallelAgents: 1 });
+  const unlimitedEnv = { ...env, ORCH_MAX_PARALLEL_AGENTS: '0' };
+  const sid = 'mpa-env-unlimited';
+  expect('agent #1 admitted with ORCH_MAX_PARALLEL_AGENTS=0', mpaLookup(sid, 'toolu_mpa_u1'), ALLOW, unlimitedEnv);
+  expect('agent #2 also admitted with ORCH_MAX_PARALLEL_AGENTS=0 (unlimited)', mpaLookup(sid, 'toolu_mpa_u2'), ALLOW, unlimitedEnv);
+  expect('agent #3 also admitted with ORCH_MAX_PARALLEL_AGENTS=0 (unlimited)', mpaLookup(sid, 'toolu_mpa_u3'), ALLOW, unlimitedEnv);
+}
+
+// 7. `disabledGates: ["max-parallel-agents"]` never refuses, even well past a tiny cap —
+// registration still happens (proven by the cap re-applying once the gate is re-enabled
+// would be a separate test; here we only assert the disabled gate never blocks).
+{
+  const { env } = mpaTestEnv({ maxParallelAgents: 1, disabledGates: ['max-parallel-agents'] });
+  const sid = 'mpa-disabled';
+  expect('agent #1 admitted with the gate disabled', mpaLookup(sid, 'toolu_mpa_d1'), ALLOW, env);
+  expect('agent #2 also admitted with the gate disabled, despite cap 1', mpaLookup(sid, 'toolu_mpa_d2'), ALLOW, env);
+  expect('agent #3 also admitted with the gate disabled, despite cap 1', mpaLookup(sid, 'toolu_mpa_d3'), ALLOW, env);
 }
 
 // --- orca-heartbeat.cjs: done-but-open worktree reminder (real spawned daemon + stubs) --
