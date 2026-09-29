@@ -11,7 +11,14 @@
  * the single-row STUB_WORKER_HANDLE form above — used by tests that need several rows at
  * once (e.g. the parallel-Codex-worker cap's at-cap reconciliation, which drops rows Orca
  * shows released or done).
+ *
+ * STUB_WORKTREES_JSON answers `orca worktree ps --json` with a JSON array of worktree rows.
+ * A value starting with "@" is a file path instead of literal JSON, read fresh on every
+ * invocation — since each call spawns a new stub process, this lets a test rewrite the file
+ * between an orca-heartbeat daemon's startup baseline and its next tick, simulating a real
+ * worktree transition (e.g. open -> merged) without needing a live Orca.
  */
+const fs = require('fs');
 const args = process.argv.slice(2);
 const handle = process.env.STUB_WORKER_HANDLE;
 
@@ -36,6 +43,18 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
 }
 if (args[0] === 'terminal' && args[1] === 'list') {
   process.stdout.write(JSON.stringify({ result: { terminals: [] } }));
+  process.exit(0);
+}
+if (args[0] === 'worktree' && args[1] === 'ps') {
+  let worktrees = [];
+  const raw = process.env.STUB_WORKTREES_JSON;
+  if (raw) {
+    try {
+      const source = raw.startsWith('@') ? fs.readFileSync(raw.slice(1), 'utf8') : raw;
+      worktrees = JSON.parse(source);
+    } catch { worktrees = []; }
+  }
+  process.stdout.write(JSON.stringify({ result: { worktrees } }));
   process.exit(0);
 }
 process.stderr.write('orca-stub: unrecognised command\n');

@@ -17,5 +17,6 @@
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
-  "disabledGates": []
+  "disabledGates": [],
+  "closeDoneWorktrees": true
 }

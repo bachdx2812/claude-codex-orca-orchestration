@@ -39,7 +39,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, an orphaned terminal, or a rate-limit signal. |
+| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, an orphaned terminal, a rate-limit signal, or a worktree whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -59,6 +59,19 @@ orca orchestration worker-start --retry-of <dispatchId> ...
 ```
 
 — and reduce how many Codex workers run in parallel.
+
+**Close finished worker panels.** After a worker finishes: read its result, then `orca
+orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
+worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree
+too: `orca worktree rm --worktree path:<path>`. Never remove a worktree with an open PR or
+unsaved work; sweep periodically with `orca worktree ps --json`. `orca-heartbeat.cjs`
+backs this up: each tick it also checks `orca worktree ps --json` and reports a worktree
+that is not main, not archived, whose linked PR already merged/closed, and that holds no
+live terminal — naming the exact `orca worktree rm` command, but never running it itself.
+Only a worktree that *becomes* done-but-open after the daemon started wakes the panel;
+backlog already done-but-open at startup is listed once in a summary line instead, so
+restarting the daemon never re-reports it. Disable with `closeDoneWorktrees: false` or
+`ORCH_CLOSE_DONE_WORKTREES=0`.
 
 **Enforced vs advisory.** Enforced: gates apply to the main panel only (subagents and
 Orca-worker sessions are never gated); `Stop` refuses to end the session while a worker is
@@ -96,8 +109,9 @@ two of them, both zero-dependency Node:
   status). Subagents and Orca-worker sessions are never gated — they do the actual work.
 - **`hooks/orca-heartbeat.cjs`** — a background supervision loop the panel starts after
   dispatching a worker. It polls Orca and exits the instant something needs a decision
-  (a worker finished, went idle, hit a rate limit, or was orphaned), which is itself the
-  wake-up signal for the panel — no polling loop the model has to remember to run.
+  (a worker finished, went idle, hit a rate limit, was orphaned, or a worktree's PR merged/
+  closed with no live terminal left on it), which is itself the wake-up signal for the
+  panel — no polling loop the model has to remember to run.
 
 Everything either enforces is **configured**, not hard-coded: which model plans/reviews,
 which model escalates to, which model codes, the Codex-quota handoff threshold, the reply
@@ -116,7 +130,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 516 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 546 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION

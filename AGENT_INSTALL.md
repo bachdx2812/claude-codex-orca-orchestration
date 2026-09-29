@@ -26,12 +26,21 @@ detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
 directly and are never tracked by these hooks — no heartbeat needed. Orca workers
 (Codex) run in their own terminal/worktree and must be supervised by
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
-terminal, an orphan, or a rate limit; `Stop` refuses to end the session with one live and
+terminal, an orphan, a rate limit, or a worktree whose PR already merged/closed with no
+live terminal left on it; `Stop` refuses to end the session with one live and
 unwatched, or finished and unreleased. No more than `maxParallelCodexWorkers` (default 3)
 live Codex workers at once, and any shared-workspace code brief must declare
 `Owns: <files>` (or `Owns: n/a <reason>`) so overlapping claims are caught before either
 dispatch starts — isolate with `--worktree new-child` / Agent `isolation:"worktree"` to
 skip both. Full detail: `README.md#subagents-and-parallel-work`.
+
+**Close finished worker panels.** After a worker finishes: read its result, then `orca
+orchestration worker-release --dispatch <id>`. Once its PR is merged/closed and the
+worktree is clean (no uncommitted or unpushed work), close it too: `orca worktree rm
+--worktree path:<path>`. Never remove a worktree with an open PR or unsaved work; sweep
+with `orca worktree ps --json`. `closeDoneWorktrees` (default `true`, or
+`ORCH_CLOSE_DONE_WORKTREES=0`) controls whether `orca-heartbeat.cjs` reminds about this
+automatically.
 
 ## 1. Prerequisite checks
 
@@ -53,7 +62,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 516 tests, fully hermetic
+npm test                       # 546 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -162,7 +171,10 @@ once — a `--terminal`/`--retry-of` that replaces an existing worker does not c
 and a non-Codex agent is never counted; `ownershipClaimTtlMinutes` (default 120) is how
 long a background in-session Agent's `Owns:` file claim survives without an explicit
 release before it auto-expires. Both are overridable for one process with
-`ORCH_MAX_PARALLEL_CODEX_WORKERS` / `ORCH_CLAIM_TTL_MINUTES`. Every code brief that already
+`ORCH_MAX_PARALLEL_CODEX_WORKERS` / `ORCH_CLAIM_TTL_MINUTES`. A third, `closeDoneWorktrees`
+(default `true`), controls whether `orca-heartbeat.cjs` reminds about a worktree whose PR
+already merged/closed with no live terminal on it; disable with `false` or
+`ORCH_CLOSE_DONE_WORKTREES=0`. Every code brief that already
 needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` dispatch)
 running in a *shared* workspace must also declare `Owns: <repo-relative paths>` or
 `Owns: n/a <reason>` on its own line, unless it is isolated

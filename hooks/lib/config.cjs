@@ -51,6 +51,7 @@ const DEFAULT_CONFIG = {
   maxParallelCodexWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
+  closeDoneWorktrees: true, // heartbeat: remind on a merged/closed-PR worktree with no live terminal
 };
 
 const ACTIVATION_VALUES = new Set(['orca-only', 'always', 'off']);
@@ -175,6 +176,11 @@ function loadConfig() {
   if (!Array.isArray(merged.agents.escalation)) merged.agents.escalation = DEFAULT_CONFIG.agents.escalation;
   if (!Array.isArray(merged.agents.lookup)) merged.agents.lookup = DEFAULT_CONFIG.agents.lookup;
 
+  if (typeof merged.closeDoneWorktrees !== 'boolean') {
+    warnings.push(`closeDoneWorktrees "${merged.closeDoneWorktrees}" is not a boolean; using ${DEFAULT_CONFIG.closeDoneWorktrees}.`);
+    merged.closeDoneWorktrees = DEFAULT_CONFIG.closeDoneWorktrees;
+  }
+
   merged.warnings = warnings;
   return merged;
 }
@@ -231,7 +237,21 @@ function ownershipClaimTtlMinutes(cfg) {
   return cfg.ownershipClaimTtlMinutes;
 }
 
+/**
+ * Whether the heartbeat should remind about done-but-open Orca worktrees (a linked PR
+ * already merged/closed with no live terminal on it). `ORCH_CLOSE_DONE_WORKTREES=0` (or
+ * `false`) disables it for one process without touching the config file; any other value,
+ * or its absence, defers to the config.
+ */
+function closeDoneWorktreesEnabled(cfg) {
+  const envOverride = process.env.ORCH_CLOSE_DONE_WORKTREES;
+  if (envOverride !== undefined) {
+    return envOverride !== '0' && envOverride.toLowerCase() !== 'false';
+  }
+  return !!cfg.closeDoneWorktrees;
+}
+
 module.exports = {
   GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
-  maxParallelCodexWorkers, ownershipClaimTtlMinutes,
+  maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
 };

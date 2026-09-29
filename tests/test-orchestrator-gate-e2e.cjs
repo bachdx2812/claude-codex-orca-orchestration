@@ -13,12 +13,13 @@
  * Run: node tests/test-orchestrator-gate-e2e.cjs (or `npm test`)
  */
 
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
 const GATE = path.join(__dirname, '..', 'hooks', 'orchestrator-gate.cjs');
+const HEARTBEAT = path.join(__dirname, '..', 'hooks', 'orca-heartbeat.cjs');
 const STUB = path.join(__dirname, 'fixtures', 'orca-stub.cjs');
 try { fs.chmodSync(STUB, 0o755); } catch {}
 
@@ -1634,9 +1635,152 @@ rmState(`${SID}-hard-off`);
   rmState(G5aSID);
 }
 
-console.log(`${pass} passed, ${failures.length} failed`);
-for (const f of failures) console.log(`  FAIL ${f}`);
+// --- orca-heartbeat.cjs: done-but-open worktree reminder (real spawned daemon + stub) --
+//
+// Unlike the gate above, the daemon is long-running, so these spawn it for real (via
+// `spawn`, not `spawnSync`) against a short --interval/--max and a `worktree ps` stub
+// backed by a file (`STUB_WORKTREES_JSON=@<path>`) this test can rewrite mid-run to
+// simulate a real Orca transition (e.g. a PR merging) without needing live Orca.
 
-rmState(SID);
-try { fs.rmSync(RUN_DIR, { recursive: true, force: true }); } catch {}
-process.exit(failures.length ? 1 : 0);
+/** Spawns the heartbeat daemon against its own state/config dir and a worktree-ps stub
+ * seeded from `worktrees`; optionally rewrites that file after `mutateAfterMs` to
+ * `mutateTo`, simulating a transition observed on a later tick. Resolves with combined
+ * stdout+stderr once the daemon exits (or is force-killed after 8s as a safety net). */
+function runHeartbeat({ name, worktrees, args, cfgOverrides, mutateAfterMs, mutateTo }) {
+  return new Promise((resolve) => {
+    const dir = path.join(RUN_DIR, `hb-${name}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const cfgFile = path.join(dir, 'orchestration.config.json');
+    fs.writeFileSync(cfgFile, JSON.stringify({ ...DEFAULT_CFG, ...cfgOverrides }));
+    const wtFile = path.join(dir, 'worktrees.json');
+    fs.writeFileSync(wtFile, JSON.stringify(worktrees || []));
+    const env = {
+      ...BASE_ENV, ORCA_BIN: STUB, ORCH_STATE_DIR: dir, ORCH_CONFIG_PATH: cfgFile,
+      CLAUDE_CODE_SESSION_ID: `hb-${name}-${process.pid}`, STUB_WORKTREES_JSON: `@${wtFile}`,
+    };
+    const child = spawn(process.execPath, [HEARTBEAT, ...(args || [])], { env });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { out += d; });
+    if (mutateAfterMs != null) {
+      setTimeout(() => { try { fs.writeFileSync(wtFile, JSON.stringify(mutateTo)); } catch {} }, mutateAfterMs);
+    }
+    const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 8000);
+    child.on('exit', () => { clearTimeout(killer); resolve(out); });
+  });
+}
+
+function checkBool(name, actual, expected) {
+  if (actual === expected) pass += 1;
+  else failures.push(`${name} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`);
+}
+
+async function heartbeatWorktreeTests() {
+  // 1. A worktree already done-but-open at startup: only the one-time summary line, never
+  //    the wake-event line, and the daemon runs to its --max instead of exiting early.
+  {
+    const out = await runHeartbeat({
+      name: 'preexisting',
+      worktrees: [{ path: '/wt/pre', displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('pre-existing done-but-open worktree appears in the startup summary',
+      out.includes('pre-existing done-but-open worktree(s) at startup: pre'), true);
+    checkBool('pre-existing done-but-open worktree never fires the wake-event line',
+      out.includes('DONE worktree pre'), false);
+    checkBool('the startup summary alone does not end the daemon early',
+      out.includes('quiet for'), true);
+  }
+
+  // 2. A worktree that transitions to done-but-open AFTER the baseline: a wake event, and
+  //    the daemon exits promptly (well before its generous --max) instead of idling on it.
+  {
+    const out = await runHeartbeat({
+      name: 'transition',
+      worktrees: [{ path: '/wt/t1', displayName: 't1', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 1, linkedPR: { state: 'open', number: 2 } }],
+      mutateAfterMs: 300,
+      mutateTo: [{ path: '/wt/t1', displayName: 't1', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 2 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '10'],
+    });
+    checkBool('a worktree that becomes done-but-open mid-run fires the wake-event line',
+      out.includes('DONE worktree t1 (PR #2 merged, no live terminal) — verify it is clean, then close: ' +
+        'orca worktree rm --worktree path:/wt/t1'), true);
+    checkBool('a genuine transition is not also reported as a startup summary',
+      out.includes('pre-existing'), false);
+    checkBool('the daemon exits on the transition instead of running to --max',
+      out.includes('quiet for'), false);
+  }
+
+  // 3. Open PR, a live terminal, the main worktree, and an already-archived worktree must
+  //    never be reported, whether at startup or on a later tick (here: never, since static).
+  {
+    const out = await runHeartbeat({
+      name: 'never-report',
+      worktrees: [
+        { path: '/wt/openpr', displayName: 'openpr', isMainWorktree: false, isArchived: false,
+          liveTerminalCount: 0, linkedPR: { state: 'open', number: 3 } },
+        { path: '/wt/liveterm', displayName: 'liveterm', isMainWorktree: false, isArchived: false,
+          liveTerminalCount: 2, linkedPR: { state: 'merged', number: 4 } },
+        { path: '/', displayName: 'main', isMainWorktree: true, isArchived: false,
+          liveTerminalCount: 0, linkedPR: { state: 'merged', number: 5 } },
+        { path: '/wt/archived', displayName: 'archived', isMainWorktree: false, isArchived: true,
+          liveTerminalCount: 0, linkedPR: { state: 'closed', number: 6 } },
+      ],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('open-PR/live-terminal/main/archived worktrees never fire the wake-event line',
+      out.includes('DONE worktree'), false);
+    checkBool('open-PR/live-terminal/main/archived worktrees never appear in the startup summary',
+      out.includes('pre-existing'), false);
+  }
+
+  // 4. Config (or its env override) can disable the reminder entirely, even when a
+  //    worktree is done-but-open right from the baseline.
+  {
+    const out = await runHeartbeat({
+      name: 'config-disabled',
+      worktrees: [{ path: '/wt/pre', displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      cfgOverrides: { closeDoneWorktrees: false },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('closeDoneWorktrees:false suppresses the startup summary', out.includes('pre-existing'), false);
+    checkBool('closeDoneWorktrees:false suppresses the wake-event line', out.includes('DONE worktree'), false);
+
+    // Same scenario again, this time disabled via the env override instead of config, on a
+    // worktree already done-but-open at the baseline.
+    const dir = path.join(RUN_DIR, 'hb-env-disabled-direct');
+    fs.mkdirSync(dir, { recursive: true });
+    const cfgFile = path.join(dir, 'orchestration.config.json');
+    fs.writeFileSync(cfgFile, JSON.stringify(DEFAULT_CFG));
+    const wtFile = path.join(dir, 'worktrees.json');
+    fs.writeFileSync(wtFile, JSON.stringify(
+      [{ path: '/wt/pre', displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }]));
+    const outEnvDisabled = await new Promise((resolve) => {
+      const env = { ...BASE_ENV, ORCA_BIN: STUB, ORCH_STATE_DIR: dir, ORCH_CONFIG_PATH: cfgFile,
+        CLAUDE_CODE_SESSION_ID: `hb-env-disabled-${process.pid}`, STUB_WORKTREES_JSON: `@${wtFile}`,
+        ORCH_CLOSE_DONE_WORKTREES: '0' };
+      const child = spawn(process.execPath, [HEARTBEAT, '--interval', '1', '--idle', '60', '--max', '1'], { env });
+      let o = '';
+      child.stdout.on('data', (d) => { o += d; });
+      child.stderr.on('data', (d) => { o += d; });
+      const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 8000);
+      child.on('exit', () => { clearTimeout(killer); resolve(o); });
+    });
+    checkBool('ORCH_CLOSE_DONE_WORKTREES=0 suppresses the startup summary', outEnvDisabled.includes('pre-existing'), false);
+    checkBool('ORCH_CLOSE_DONE_WORKTREES=0 suppresses the wake-event line', outEnvDisabled.includes('DONE worktree'), false);
+  }
+}
+
+heartbeatWorktreeTests().then(() => {
+  console.log(`${pass} passed, ${failures.length} failed`);
+  for (const f of failures) console.log(`  FAIL ${f}`);
+
+  rmState(SID);
+  try { fs.rmSync(RUN_DIR, { recursive: true, force: true }); } catch {}
+  process.exit(failures.length ? 1 : 0);
+});

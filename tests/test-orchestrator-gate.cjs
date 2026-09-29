@@ -239,6 +239,36 @@ check('a finished worker still holding a terminal is flagged',
 check('a released worker holds nothing',
   heartbeat.isHoldingResources({ terminalState: 'released' }), false);
 
+// --- heartbeat isDoneButOpen / worktree event formatting --------------------
+
+{
+  const mergedIdle = { path: '/wt/a', displayName: 'a', isMainWorktree: false, isArchived: false,
+    liveTerminalCount: 0, prState: 'merged', prNumber: 12 };
+  check('merged PR + no live terminal is done-but-open', heartbeat.isDoneButOpen(mergedIdle), true);
+
+  const closedIdle = { ...mergedIdle, prState: 'closed', prNumber: 13 };
+  check('closed PR + no live terminal is done-but-open', heartbeat.isDoneButOpen(closedIdle), true);
+
+  check('an open PR is never done-but-open',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open' }), false);
+  check('a merged PR with a live terminal is never done-but-open',
+    heartbeat.isDoneButOpen({ ...mergedIdle, liveTerminalCount: 1 }), false);
+  check('the main worktree is never done-but-open even when merged and idle',
+    heartbeat.isDoneButOpen({ ...mergedIdle, isMainWorktree: true }), false);
+  check('an archived worktree is never done-but-open',
+    heartbeat.isDoneButOpen({ ...mergedIdle, isArchived: true }), false);
+  check('a worktree with no linked PR at all is never done-but-open',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: null, prNumber: null }), false);
+
+  check('formatDoneWorktreeEvent names the PR, state and rm command',
+    heartbeat.formatDoneWorktreeEvent(mergedIdle),
+    'DONE worktree a (PR #12 merged, no live terminal) — verify it is clean, then close: orca worktree rm --worktree path:/wt/a');
+
+  check('formatDoneWorktreeStartupSummary lists every pre-existing worktree by name',
+    heartbeat.formatDoneWorktreeStartupSummary([mergedIdle, { ...closedIdle, displayName: 'b' }])
+      .includes('2 pre-existing done-but-open worktree(s) at startup: a, b'), true);
+}
+
 // --- config.cjs --------------------------------------------------------------
 
 {
@@ -286,6 +316,27 @@ check('a released worker holds nothing',
   process.env.ORCH_CODEX_HANDOFF_USED = 'not-a-number';
   check('an invalid override falls back to config', config.handoffUsed(defaults), defaults.codexHandoffUsedPercent);
   if (before === undefined) delete process.env.ORCH_CODEX_HANDOFF_USED; else process.env.ORCH_CODEX_HANDOFF_USED = before;
+
+  check('default closeDoneWorktrees is true', defaults.closeDoneWorktrees, true);
+  check('closeDoneWorktreesEnabled defaults to the config value', config.closeDoneWorktreesEnabled(defaults), true);
+
+  const wtOff = withConfig({ closeDoneWorktrees: false }, () => config.loadConfig());
+  check('closeDoneWorktrees:false is kept as-is with no warning', wtOff.closeDoneWorktrees, false);
+  check('closeDoneWorktreesEnabled respects a false config value', config.closeDoneWorktreesEnabled(wtOff), false);
+
+  const wtBad = withConfig({ closeDoneWorktrees: 'yes' }, () => config.loadConfig());
+  check('a non-boolean closeDoneWorktrees falls back to the default', wtBad.closeDoneWorktrees, true);
+  check('a non-boolean closeDoneWorktrees produces a warning', wtBad.warnings.length > 0, true);
+
+  const beforeWt = process.env.ORCH_CLOSE_DONE_WORKTREES;
+  process.env.ORCH_CLOSE_DONE_WORKTREES = '0';
+  check('ORCH_CLOSE_DONE_WORKTREES=0 disables it even when config says true',
+    config.closeDoneWorktreesEnabled(defaults), false);
+  process.env.ORCH_CLOSE_DONE_WORKTREES = 'false';
+  check('ORCH_CLOSE_DONE_WORKTREES=false also disables it', config.closeDoneWorktreesEnabled(defaults), false);
+  process.env.ORCH_CLOSE_DONE_WORKTREES = '1';
+  check('a non-0/false override leaves it enabled', config.closeDoneWorktreesEnabled(wtOff), true);
+  if (beforeWt === undefined) delete process.env.ORCH_CLOSE_DONE_WORKTREES; else process.env.ORCH_CLOSE_DONE_WORKTREES = beforeWt;
 
   fs.rmSync(cfgDir, { recursive: true, force: true });
 }

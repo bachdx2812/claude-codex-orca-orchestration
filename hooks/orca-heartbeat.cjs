@@ -22,6 +22,8 @@
  * what a worker "should" be doing:
  *   orca orchestration worker-list --json   -> dispatch/worker/terminal state
  *   orca terminal list --json               -> live terminals, lastOutputAt, orphaned
+ *   orca worktree ps --json                 -> done-but-open worktrees (merged/closed PR,
+ *                                               no live terminal) that nobody has closed yet
  *
  * It reports only **changes since the baseline snapshot** taken at startup, so
  * terminals that were already open when it started cannot drown the signal.
@@ -30,11 +32,12 @@
 const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, stateDir } = require('./lib/config.cjs');
+const { loadConfig, stateDir, closeDoneWorktreesEnabled } = require('./lib/config.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
 const RATE_LIMIT = /(rate.?limit|429\b|quota\s+exceeded|usage\s+limit|too\s+many\s+requests|retry[- ]after|overloaded_error)/i;
+const DONE_PR_STATES = new Set(['merged', 'closed']);
 
 function arg(name, dflt) {
   const i = process.argv.indexOf(`--${name}`);
@@ -45,6 +48,7 @@ const cfg = loadConfig();
 const IDLE_SECONDS = arg('idle', cfg.heartbeat.idleSeconds);        // quiet terminal => needs a decision
 const INTERVAL_SECONDS = arg('interval', cfg.heartbeat.intervalSeconds);
 const MAX_SECONDS = arg('max', cfg.heartbeat.maxSeconds);           // hard stop so a forgotten daemon dies
+const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
 
 // Session whose panel started this daemon (inherited from the Claude Code Bash tool).
 const SESSION = String(process.env.CLAUDE_CODE_SESSION_ID || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
@@ -115,6 +119,47 @@ function isHoldingResources(w) {
   return w.terminalState && w.terminalState !== 'released';
 }
 
+function worktrees() {
+  const d = orca(['worktree', 'ps', '--json']);
+  if (!d) return null;
+  const r = d.result ?? d;
+  const list = Array.isArray(r) ? r : r.worktrees || [];
+  return list.map((w) => ({
+    path: w.path,
+    displayName: w.displayName || w.path,
+    isMainWorktree: !!w.isMainWorktree,
+    isArchived: !!w.isArchived,
+    liveTerminalCount: Number(w.liveTerminalCount) || 0,
+    prState: w.linkedPR ? w.linkedPR.state : null,
+    prNumber: w.linkedPR ? w.linkedPR.number : null,
+  }));
+}
+
+/**
+ * A worktree that looks like finished, unreleased work: not the main worktree, not already
+ * archived, its linked PR already merged or closed, and nothing currently has a live
+ * terminal open on it. Pure so it is testable against synthetic rows without a live Orca.
+ * Removal itself is never automated here — a worktree can hold uncommitted or unpushed
+ * work its PR state says nothing about, and only the panel can check `git status` first.
+ */
+function isDoneButOpen(w) {
+  return !w.isMainWorktree && !w.isArchived && DONE_PR_STATES.has(w.prState) && w.liveTerminalCount === 0;
+}
+
+/** The wake-event line for one worktree that just became done-but-open. */
+function formatDoneWorktreeEvent(w) {
+  const pr = w.prNumber != null ? `PR #${w.prNumber} ${w.prState}` : `PR ${w.prState}`;
+  return `DONE worktree ${w.displayName} (${pr}, no live terminal) — verify it is clean, then close: ` +
+    `orca worktree rm --worktree path:${w.path}`;
+}
+
+/** The one-time, non-waking startup line listing backlog already done-but-open at baseline. */
+function formatDoneWorktreeStartupSummary(list) {
+  const names = list.map((w) => w.displayName).join(', ');
+  return `orca-heartbeat: ${list.length} pre-existing done-but-open worktree(s) at startup: ${names} ` +
+    '— verify each is clean, then close with `orca worktree rm --worktree path:<path>`.';
+}
+
 /**
  * Decide what one terminal means for supervision. Pure, so it can be tested
  * against synthetic input instead of a live Orca.
@@ -164,6 +209,18 @@ function main() {
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
 
+  // Worktree done-but-open reminder: seed with whatever is already done at startup so a
+  // daemon restart never re-reports backlog as a fresh wake event — only a summary line.
+  const reportedDoneWorktrees = new Set();
+  if (CLOSE_DONE_WORKTREES) {
+    const baseWorktrees = worktrees();
+    if (baseWorktrees) {
+      const preExisting = baseWorktrees.filter(isDoneButOpen);
+      for (const w of preExisting) reportedDoneWorktrees.add(w.path);
+      if (preExisting.length) console.log(formatDoneWorktreeStartupSummary(preExisting));
+    }
+  }
+
   const deadline = started + MAX_SECONDS * 1000;
 
   const tick = () => {
@@ -195,6 +252,18 @@ function main() {
           `${newDoneHolding.length} finished worker(s) still holding a terminal: ` +
           `${newDoneHolding.map((w) => w.dispatchId).join(', ')} — retain if reusable, else release.`
         );
+      }
+    }
+
+    if (CLOSE_DONE_WORKTREES) {
+      const wts = worktrees();
+      if (wts) {
+        for (const w of wts) {
+          if (isDoneButOpen(w) && !reportedDoneWorktrees.has(w.path)) {
+            reportedDoneWorktrees.add(w.path);
+            events.push(formatDoneWorktreeEvent(w));
+          }
+        }
       }
     }
 
@@ -248,4 +317,7 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { classifyTerminal, isHoldingResources, snapshotWorkers, RATE_LIMIT };
+module.exports = {
+  classifyTerminal, isHoldingResources, snapshotWorkers, RATE_LIMIT,
+  isDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
+};

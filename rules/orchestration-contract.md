@@ -153,7 +153,8 @@ as the installed hooks would actually read it.
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
-  "disabledGates": []
+  "disabledGates": [],
+  "closeDoneWorktrees": true
 }
 ```
 
@@ -183,11 +184,15 @@ as the installed hooks would actually read it.
 - `ownershipClaimTtlMinutes`: integer 1-10080, default 120. How long a background
   in-session Agent's `Owns:` claim survives without an explicit release before it
   auto-expires. Overridable for one process with `ORCH_CLAIM_TTL_MINUTES`.
+- `closeDoneWorktrees`: boolean, default `true`. Whether the heartbeat daemon reminds the
+  panel about a worktree whose linked PR already merged/closed and that holds no live
+  terminal (see "Close finished worker panels" above). Overridable for one process with
+  `ORCH_CLOSE_DONE_WORKTREES=0` (or `false`).
 
 Env overrides: `ORCH_CONFIG_PATH` (which file to read), `ORCH_STATE_DIR` (where session
 state, the violations log and heartbeat liveness files live — default
 `~/.claude/orchestrator-gate/`), `ORCA_BIN` (which `orca` executable to invoke — mainly
-for tests), `ORCH_CODEX_HANDOFF_USED`. An invalid or missing config value never crashes
+for tests), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CLOSE_DONE_WORKTREES`. An invalid or missing config value never crashes
 the gate; it falls back to the default for that field alone and reports the fallback as a
 warning in the SessionStart banner. Config is re-read on every hook invocation (each is
 its own Node process), so an edit takes effect on the very next tool call — no restart
@@ -210,6 +215,26 @@ seconds pass with a live worker and no poll of either kind, the gate says so on 
 
 When a worker is finished: retain it if it will be reused, otherwise release it. `Stop`
 refuses to end a session with workers still live and unwatched.
+
+**Close finished worker panels.** A released worker still leaves its Orca worktree behind.
+After a worker finishes: read its result, then `orca orchestration worker-release
+--dispatch <id>`; once its PR is merged or closed and the worktree is clean (`git status
+--porcelain` empty, nothing unpushed), close the worktree too: `orca worktree rm
+--worktree path:<path>`. Never remove a worktree with an open PR or unsaved work — sweep
+periodically with `orca worktree ps --json` to find worktrees nobody closed.
+
+The heartbeat daemon backs this up automatically: each tick it also reads `orca worktree
+ps --json` and flags a worktree that is not the main worktree, not already archived, whose
+linked PR is already `merged`/`closed`, and that holds no live terminal — a
+`DONE worktree <name> (PR #<n> <state>, no live terminal)` event naming the exact `orca
+worktree rm` command to run next, once the panel has itself verified the worktree is
+clean. It never removes anything itself — only the panel decides, after checking `git
+status` and unpushed commits, same as the manual sweep above. Only a worktree that
+*becomes* done-but-open after the daemon's baseline wakes the panel; whatever was already
+done-but-open when the daemon started is listed once in a startup summary instead, so
+restarting the daemon never re-reports the same backlog as a fresh event. Disable it with
+`closeDoneWorktrees: false` in the config, or `ORCH_CLOSE_DONE_WORKTREES=0` for one
+process.
 
 ## Parallel Codex workers and file ownership
 
