@@ -17,6 +17,20 @@
  * invocation — since each call spawns a new stub process, this lets a test rewrite the file
  * between an orca-heartbeat daemon's startup baseline and its next tick, simulating a real
  * worktree transition (e.g. open -> merged) without needing a live Orca.
+ *
+ * STUB_WORKTREES_TRUNCATED=1 marks the `worktree ps` reply `truncated: true`, simulating a
+ * page cap Orca hit — orca-heartbeat.cjs must never act on a truncated page.
+ *
+ * STUB_WORKTREE_PS_FAIL_UNTIL / STUB_WORKTREE_PS_GARBAGE_UNTIL (epoch ms, each independent):
+ * while `Date.now()` is before the given time, `worktree ps` fails outright (non-zero exit,
+ * no JSON) or exits 0 with non-JSON stdout, respectively — after that time it answers
+ * normally from STUB_WORKTREES_JSON. Lets a test exercise "the first few polls fail/return
+ * garbage, then recover" without any live Orca.
+ *
+ * STUB_WORKTREE_PS_CALLS_LOG, when set, gets one line appended (the current epoch ms) every
+ * time `worktree ps` is invoked — a test can poll this file to learn exactly when the
+ * daemon made its Nth call, instead of guessing a `setTimeout` delay long enough to land
+ * between two ticks (a source of flakiness under CI load).
  */
 const fs = require('fs');
 const args = process.argv.slice(2);
@@ -46,6 +60,19 @@ if (args[0] === 'terminal' && args[1] === 'list') {
   process.exit(0);
 }
 if (args[0] === 'worktree' && args[1] === 'ps') {
+  if (process.env.STUB_WORKTREE_PS_CALLS_LOG) {
+    try { fs.appendFileSync(process.env.STUB_WORKTREE_PS_CALLS_LOG, `${Date.now()}\n`); } catch {}
+  }
+  const failUntil = Number(process.env.STUB_WORKTREE_PS_FAIL_UNTIL || 0);
+  if (failUntil && Date.now() < failUntil) {
+    process.stderr.write('orca-stub: worktree ps temporarily unavailable\n');
+    process.exit(1);
+  }
+  const garbageUntil = Number(process.env.STUB_WORKTREE_PS_GARBAGE_UNTIL || 0);
+  if (garbageUntil && Date.now() < garbageUntil) {
+    process.stdout.write('not actually json {{{');
+    process.exit(0);
+  }
   let worktrees = [];
   const raw = process.env.STUB_WORKTREES_JSON;
   if (raw) {
@@ -54,7 +81,8 @@ if (args[0] === 'worktree' && args[1] === 'ps') {
       worktrees = JSON.parse(source);
     } catch { worktrees = []; }
   }
-  process.stdout.write(JSON.stringify({ result: { worktrees } }));
+  const truncated = process.env.STUB_WORKTREES_TRUNCATED === '1';
+  process.stdout.write(JSON.stringify({ result: { worktrees, truncated } }));
   process.exit(0);
 }
 process.stderr.write('orca-stub: unrecognised command\n');

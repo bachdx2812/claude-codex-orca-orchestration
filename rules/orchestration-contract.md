@@ -185,9 +185,11 @@ as the installed hooks would actually read it.
   in-session Agent's `Owns:` claim survives without an explicit release before it
   auto-expires. Overridable for one process with `ORCH_CLAIM_TTL_MINUTES`.
 - `closeDoneWorktrees`: boolean, default `true`. Whether the heartbeat daemon reminds the
-  panel about a worktree whose linked PR already merged/closed and that holds no live
-  terminal (see "Close finished worker panels" above). Overridable for one process with
-  `ORCH_CLOSE_DONE_WORKTREES=0` (or `false`).
+  panel about a worktree that is idle, accepted, and clean (see "Close finished worker
+  panels" above for the full definition), and that holds no live terminal. Overridable for
+  one process with `ORCH_CLOSE_DONE_WORKTREES` set to `1`/`true` (force on) or `0`/`false`
+  (force off) — any other value, including an empty string or the variable being unset,
+  defers to the config rather than being read as "set at all, so true".
 
 Env overrides: `ORCH_CONFIG_PATH` (which file to read), `ORCH_STATE_DIR` (where session
 state, the violations log and heartbeat liveness files live — default
@@ -224,17 +226,35 @@ After a worker finishes: read its result, then `orca orchestration worker-releas
 periodically with `orca worktree ps --json` to find worktrees nobody closed.
 
 The heartbeat daemon backs this up automatically: each tick it also reads `orca worktree
-ps --json` and flags a worktree that is not the main worktree, not already archived, whose
-linked PR is already `merged`/`closed`, and that holds no live terminal — a
-`DONE worktree <name> (PR #<n> <state>, no live terminal)` event naming the exact `orca
-worktree rm` command to run next, once the panel has itself verified the worktree is
-clean. It never removes anything itself — only the panel decides, after checking `git
-status` and unpushed commits, same as the manual sweep above. Only a worktree that
-*becomes* done-but-open after the daemon's baseline wakes the panel; whatever was already
-done-but-open when the daemon started is listed once in a startup summary instead, so
-restarting the daemon never re-reports the same backlog as a fresh event. Disable it with
-`closeDoneWorktrees: false` in the config, or `ORCH_CLOSE_DONE_WORKTREES=0` for one
-process.
+ps --json --limit 500` (a page Orca itself marks `truncated` is never acted on — a partial
+page can neither confirm nor rule out a transition) and flags a worktree that is not the
+main worktree, not already archived, and that is:
+  - **idle** — no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt`
+    (one timestamp per worktree, not per terminal) already past `heartbeat.idleSeconds`;
+  - **accepted** — a linked GitHub PR or GitLab MR already `merged`/`closed` (an open one
+    never counts, whatever git alone might say), or — only when NEITHER is linked at all —
+    a real `git merge-base --is-ancestor HEAD <base>` confirms HEAD is already contained in
+    the worktree's own upstream default branch, resolved from `refs/remotes/origin/HEAD`
+    (falling back to `origin/main` then `main`; `git fetch` is never run);
+  - **clean** — `git status --porcelain` empty and no commits the branch holds that its
+    upstream does not (`git rev-list @{u}..HEAD` empty), or, lacking an upstream entirely,
+    HEAD contained in that same resolved base branch.
+
+Every git call here runs only for a worktree that already passed the idle check, each
+bounded to ~3s, and any git failure or uncertainty (unreadable repo, a timeout, no
+resolvable base) means "not a candidate" — never a guess. The event line,
+`DONE worktree <name> (<reason>, no live terminal) — ... orca worktree rm --worktree
+"path:<path>"`, names which of the above fired. It never removes anything itself — only
+the panel decides, after checking `git status` and unpushed commits, same as the manual
+sweep above. Only a worktree that *becomes* done-but-open after the daemon's own
+session-scoped record of what it has already reported wakes the panel; backlog already
+done-but-open at a session's first-ever daemon start is listed once in a startup summary
+instead. A LATER restart within the same session is judged against that same persisted
+record: anything newly done-but-open — it became so while no daemon in this session was
+watching — is reported as a real wake event, not silently re-absorbed as if it had always
+been backlog. Disable it with `closeDoneWorktrees: false` in the config, or
+`ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false` for one process (`1`/`true` forces it on;
+any other value defers to the config).
 
 ## Parallel Codex workers and file ownership
 

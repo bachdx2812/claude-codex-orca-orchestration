@@ -239,14 +239,19 @@ function ownershipClaimTtlMinutes(cfg) {
 
 /**
  * Whether the heartbeat should remind about done-but-open Orca worktrees (a linked PR
- * already merged/closed with no live terminal on it). `ORCH_CLOSE_DONE_WORKTREES=0` (or
- * `false`) disables it for one process without touching the config file; any other value,
- * or its absence, defers to the config.
+ * already merged/closed with no live terminal on it). `ORCH_CLOSE_DONE_WORKTREES` only
+ * ever forces an explicit answer: `1`/`true` enables it, `0`/`false` disables it (both
+ * case-insensitively). Any other value — including an empty string, or the variable being
+ * unset entirely — defers to the config rather than silently forcing it on, which is what
+ * a bare "anything set at all counts as true" reading would otherwise do to a typo or an
+ * accidentally-empty override.
  */
 function closeDoneWorktreesEnabled(cfg) {
   const envOverride = process.env.ORCH_CLOSE_DONE_WORKTREES;
   if (envOverride !== undefined) {
-    return envOverride !== '0' && envOverride.toLowerCase() !== 'false';
+    const v = envOverride.trim().toLowerCase();
+    if (v === '1' || v === 'true') return true;
+    if (v === '0' || v === 'false') return false;
   }
   return !!cfg.closeDoneWorktrees;
 }

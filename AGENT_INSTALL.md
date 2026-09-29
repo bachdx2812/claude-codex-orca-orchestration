@@ -39,8 +39,16 @@ orchestration worker-release --dispatch <id>`. Once its PR is merged/closed and 
 worktree is clean (no uncommitted or unpushed work), close it too: `orca worktree rm
 --worktree path:<path>`. Never remove a worktree with an open PR or unsaved work; sweep
 with `orca worktree ps --json`. `closeDoneWorktrees` (default `true`, or
-`ORCH_CLOSE_DONE_WORKTREES=0`) controls whether `orca-heartbeat.cjs` reminds about this
-automatically.
+`ORCH_CLOSE_DONE_WORKTREES` set to `1`/`true`/`0`/`false`) controls whether
+`orca-heartbeat.cjs` reminds about this automatically — it judges a worktree as
+done-but-open only once it is idle, **accepted** (a merged/closed linked GitHub PR or
+GitLab MR, or — with neither linked — a real `git merge-base --is-ancestor` confirming HEAD
+is already in the worktree's own upstream default branch), and **clean** (`git status
+--porcelain` empty, nothing unpushed, or, lacking an upstream, HEAD contained in that same
+base). A page Orca itself reports truncated is never acted on, and a daemon restart within
+the same session reports a worktree that became done-but-open while it was not running as
+a real reminder rather than silently folding it into pre-existing backlog. See
+`README.md#subagents-and-parallel-work` for the full acceptance/idle/clean breakdown.
 
 ## 1. Prerequisite checks
 
@@ -62,7 +70,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 546 tests, fully hermetic
+npm test                       # 592 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -172,9 +180,11 @@ and a non-Codex agent is never counted; `ownershipClaimTtlMinutes` (default 120)
 long a background in-session Agent's `Owns:` file claim survives without an explicit
 release before it auto-expires. Both are overridable for one process with
 `ORCH_MAX_PARALLEL_CODEX_WORKERS` / `ORCH_CLAIM_TTL_MINUTES`. A third, `closeDoneWorktrees`
-(default `true`), controls whether `orca-heartbeat.cjs` reminds about a worktree whose PR
-already merged/closed with no live terminal on it; disable with `false` or
-`ORCH_CLOSE_DONE_WORKTREES=0`. Every code brief that already
+(default `true`), controls whether `orca-heartbeat.cjs` reminds about a worktree that is
+idle, accepted (PR/MR merged or closed, or a git-confirmed ancestor when neither is
+linked) and clean, with no live terminal on it; disable with `false` or
+`ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false` (`1`/`true` forces it on; anything else,
+including empty, defers to the config). Every code brief that already
 needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` dispatch)
 running in a *shared* workspace must also declare `Owns: <repo-relative paths>` or
 `Owns: n/a <reason>` on its own line, unless it is isolated

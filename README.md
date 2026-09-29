@@ -65,13 +65,27 @@ orchestration worker-release --dispatch <id>`. Once its PR is merged or closed a
 worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree
 too: `orca worktree rm --worktree path:<path>`. Never remove a worktree with an open PR or
 unsaved work; sweep periodically with `orca worktree ps --json`. `orca-heartbeat.cjs`
-backs this up: each tick it also checks `orca worktree ps --json` and reports a worktree
-that is not main, not archived, whose linked PR already merged/closed, and that holds no
-live terminal — naming the exact `orca worktree rm` command, but never running it itself.
-Only a worktree that *becomes* done-but-open after the daemon started wakes the panel;
-backlog already done-but-open at startup is listed once in a summary line instead, so
-restarting the daemon never re-reports it. Disable with `closeDoneWorktrees: false` or
-`ORCH_CLOSE_DONE_WORKTREES=0`.
+backs this up: each tick it also checks `orca worktree ps --json` (`--limit 500`; a page
+Orca itself reports `truncated` is never acted on — a partial page can neither confirm nor
+rule out a transition) and reports a worktree that is not main, not archived; **accepted**
+(a linked GitHub PR or GitLab MR already merged/closed — an open one never counts, whatever
+git alone might say — or, only when NEITHER is linked at all, a real `git merge-base
+--is-ancestor HEAD <base>` confirms HEAD is already in the worktree's own upstream default
+branch, resolved from `refs/remotes/origin/HEAD` with no `git fetch` ever run); **idle**
+(no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt` already past the
+heartbeat's idle threshold); and **clean** (`git status --porcelain` empty and no unpushed
+commits — or, lacking an upstream entirely, HEAD contained in that same resolved base) —
+naming which of these fired in its message, and the exact, quoted `orca worktree rm`
+command, but never running it itself. Every git call only ever runs for a worktree that
+already passed the idle check, each bounded to ~3s, and any git failure or uncertainty
+(unreadable repo, timeout, no resolvable base) means "not a candidate", never a guess.
+Only a worktree that *becomes* done-but-open after the daemon's own session-scoped record
+of what it already reported wakes the panel; genuine backlog at a session's first-ever
+daemon start is listed once in a summary line instead — a LATER restart within the same
+session that finds something newly done-but-open (it became so while no daemon was
+watching) reports it as a real wake event, not silently-reabsorbed backlog. Disable with
+`closeDoneWorktrees: false` or `ORCH_CLOSE_DONE_WORKTREES` set to `1`/`true` (enable) or
+`0`/`false` (disable) — any other value, including empty, defers to the config.
 
 **Enforced vs advisory.** Enforced: gates apply to the main panel only (subagents and
 Orca-worker sessions are never gated); `Stop` refuses to end the session while a worker is
@@ -130,7 +144,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 546 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 592 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION

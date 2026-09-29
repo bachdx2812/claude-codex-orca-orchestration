@@ -22,6 +22,8 @@ const GATE = path.join(__dirname, '..', 'hooks', 'orchestrator-gate.cjs');
 const HEARTBEAT = path.join(__dirname, '..', 'hooks', 'orca-heartbeat.cjs');
 const STUB = path.join(__dirname, 'fixtures', 'orca-stub.cjs');
 try { fs.chmodSync(STUB, 0o755); } catch {}
+const GIT_STUB = path.join(__dirname, 'fixtures', 'git-stub.cjs');
+try { fs.chmodSync(GIT_STUB, 0o755); } catch {}
 
 // The process this suite runs in may itself be an orchestrated Claude Code session (it
 // is, when run under the operator's own setup) and so may carry ORCHESTRATOR_GATE,
@@ -1635,38 +1637,73 @@ rmState(`${SID}-hard-off`);
   rmState(G5aSID);
 }
 
-// --- orca-heartbeat.cjs: done-but-open worktree reminder (real spawned daemon + stub) --
+// --- orca-heartbeat.cjs: done-but-open worktree reminder (real spawned daemon + stubs) --
 //
 // Unlike the gate above, the daemon is long-running, so these spawn it for real (via
-// `spawn`, not `spawnSync`) against a short --interval/--max and a `worktree ps` stub
-// backed by a file (`STUB_WORKTREES_JSON=@<path>`) this test can rewrite mid-run to
-// simulate a real Orca transition (e.g. a PR merging) without needing live Orca.
+// `spawn`, not `spawnSync`) against a short --interval/--max, a `worktree ps` stub backed
+// by a file (`STUB_WORKTREES_JSON=@<path>`) this test can rewrite mid-run to simulate a
+// real Orca transition (e.g. a PR merging), and a `git` stub (ORCH_GIT_BIN=git-stub.cjs)
+// so the "clean"/"accepted-by-ancestor" legs never depend on a real repo existing at a
+// synthetic path. `STUB_GIT_CLEAN=1` + `STUB_GIT_HAS_UPSTREAM=1` (a clean worktree with a
+// real, fully-pushed upstream) is the default for every call below (most of these cases
+// are about the PR/idle/truncation legs, not the git legs themselves) — a test overrides
+// one via `gitEnv` only when the git legs are what it is exercising.
 
-/** Spawns the heartbeat daemon against its own state/config dir and a worktree-ps stub
- * seeded from `worktrees`; optionally rewrites that file after `mutateAfterMs` to
- * `mutateTo`, simulating a transition observed on a later tick. Resolves with combined
- * stdout+stderr once the daemon exits (or is force-killed after 8s as a safety net). */
-function runHeartbeat({ name, worktrees, args, cfgOverrides, mutateAfterMs, mutateTo }) {
+/** Spawns the heartbeat daemon against its own state/config/git-stub env, seeded from
+ * `worktrees`. `mutateAfterCalls` (paired with `mutateTo`) rewrites the worktree file the
+ * moment the Nth `worktree ps` call has actually been observed (via `STUB_WORKTREE_PS_CALLS_LOG`,
+ * polled by `waitForCalls`) rather than after a guessed delay (item M2) — deterministic
+ * regardless of how fast or slow the test machine is. `envOverrides` layers one-off knobs
+ * (e.g. `ORCH_CLOSE_DONE_WORKTREES`) on top; `dirName`/`sessionName` let a test reuse the
+ * same state dir and session id across two separate calls, to exercise a daemon restart
+ * within one session (item M3). Resolves with combined stdout+stderr once the daemon exits
+ * (or is force-killed after 8s as a safety net). */
+function runHeartbeat({
+  name, worktrees, args, cfgOverrides, envOverrides, gitEnv, mutateAfterCalls, mutateTo,
+  dirName, sessionName,
+}) {
   return new Promise((resolve) => {
-    const dir = path.join(RUN_DIR, `hb-${name}`);
+    const dir = path.join(RUN_DIR, dirName || `hb-${name}`);
     fs.mkdirSync(dir, { recursive: true });
     const cfgFile = path.join(dir, 'orchestration.config.json');
     fs.writeFileSync(cfgFile, JSON.stringify({ ...DEFAULT_CFG, ...cfgOverrides }));
     const wtFile = path.join(dir, 'worktrees.json');
     fs.writeFileSync(wtFile, JSON.stringify(worktrees || []));
+    const callsLogFile = path.join(dir, 'wt-calls.log');
     const env = {
-      ...BASE_ENV, ORCA_BIN: STUB, ORCH_STATE_DIR: dir, ORCH_CONFIG_PATH: cfgFile,
-      CLAUDE_CODE_SESSION_ID: `hb-${name}-${process.pid}`, STUB_WORKTREES_JSON: `@${wtFile}`,
+      ...BASE_ENV, ORCA_BIN: STUB, ORCH_GIT_BIN: GIT_STUB, ORCH_STATE_DIR: dir, ORCH_CONFIG_PATH: cfgFile,
+      CLAUDE_CODE_SESSION_ID: `hb-${sessionName || name}-${process.pid}`, STUB_WORKTREES_JSON: `@${wtFile}`,
+      STUB_WORKTREE_PS_CALLS_LOG: callsLogFile, STUB_GIT_CLEAN: '1', STUB_GIT_HAS_UPSTREAM: '1',
+      ...(gitEnv || {}), ...(envOverrides || {}),
     };
     const child = spawn(process.execPath, [HEARTBEAT, ...(args || [])], { env });
     let out = '';
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { out += d; });
-    if (mutateAfterMs != null) {
-      setTimeout(() => { try { fs.writeFileSync(wtFile, JSON.stringify(mutateTo)); } catch {} }, mutateAfterMs);
+    if (mutateAfterCalls != null) {
+      waitForCalls(callsLogFile, mutateAfterCalls).then(() => {
+        try { fs.writeFileSync(wtFile, JSON.stringify(mutateTo)); } catch {}
+      });
     }
     const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 8000);
     child.on('exit', () => { clearTimeout(killer); resolve(out); });
+  });
+}
+
+/** Polls `file` (one epoch-ms line appended per `worktree ps` call) until it has at least
+ * `n` lines, or `timeoutMs` elapses. Item M2: lets a test act exactly when the daemon has
+ * made its Nth call, instead of a fixed delay that can land on the wrong side of a tick
+ * under a loaded CI machine. */
+function waitForCalls(file, n, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const poll = () => {
+      let lines = 0;
+      try { lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).length; } catch {}
+      if (lines >= n || Date.now() - start > timeoutMs) resolve(lines);
+      else setTimeout(poll, 20);
+    };
+    poll();
   });
 }
 
@@ -1675,39 +1712,54 @@ function checkBool(name, actual, expected) {
   else failures.push(`${name} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`);
 }
 
+// The git-backed legs (accepted-by-ancestor, clean) really `spawnSync(git, ..., { cwd })`,
+// and Node refuses to spawn at all against a `cwd` that does not exist on disk — so every
+// worktree fixture below needs a REAL directory, not a synthetic `/wt/...` string, even
+// though the git binary itself is stubbed. `realWtDir` creates one on demand under this
+// suite's own temp RUN_DIR.
+let wtDirCounter = 0;
+function realWtDir(label) {
+  const p = path.join(RUN_DIR, 'real-wt', `${label}-${wtDirCounter++}`);
+  fs.mkdirSync(p, { recursive: true });
+  return p;
+}
+
 async function heartbeatWorktreeTests() {
   // 1. A worktree already done-but-open at startup: only the one-time summary line, never
   //    the wake-event line, and the daemon runs to its --max instead of exiting early.
   {
+    const p = realWtDir('pre');
     const out = await runHeartbeat({
       name: 'preexisting',
-      worktrees: [{ path: '/wt/pre', displayName: 'pre', isMainWorktree: false, isArchived: false,
+      worktrees: [{ path: p, displayName: 'pre', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
       args: ['--interval', '1', '--idle', '60', '--max', '1'],
     });
-    checkBool('pre-existing done-but-open worktree appears in the startup summary',
-      out.includes('pre-existing done-but-open worktree(s) at startup: pre'), true);
+    checkBool('pre-existing done-but-open worktree appears in the startup summary (with its path)',
+      out.includes(`pre-existing done-but-open worktree(s) at startup: pre (${p})`), true);
     checkBool('pre-existing done-but-open worktree never fires the wake-event line',
       out.includes('DONE worktree pre'), false);
     checkBool('the startup summary alone does not end the daemon early',
       out.includes('quiet for'), true);
   }
 
-  // 2. A worktree that transitions to done-but-open AFTER the baseline: a wake event, and
-  //    the daemon exits promptly (well before its generous --max) instead of idling on it.
+  // 2. A worktree that transitions to done-but-open AFTER the baseline: a wake event
+  //    (naming the acceptance reason, quoted rm path), and the daemon exits promptly
+  //    (well before its generous --max) instead of idling on it.
   {
+    const p = realWtDir('t1');
     const out = await runHeartbeat({
       name: 'transition',
-      worktrees: [{ path: '/wt/t1', displayName: 't1', isMainWorktree: false, isArchived: false,
+      worktrees: [{ path: p, displayName: 't1', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 1, linkedPR: { state: 'open', number: 2 } }],
-      mutateAfterMs: 300,
-      mutateTo: [{ path: '/wt/t1', displayName: 't1', isMainWorktree: false, isArchived: false,
+      mutateAfterCalls: 1,
+      mutateTo: [{ path: p, displayName: 't1', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 0, linkedPR: { state: 'merged', number: 2 } }],
       args: ['--interval', '1', '--idle', '60', '--max', '10'],
     });
     checkBool('a worktree that becomes done-but-open mid-run fires the wake-event line',
-      out.includes('DONE worktree t1 (PR #2 merged, no live terminal) — verify it is clean, then close: ' +
-        'orca worktree rm --worktree path:/wt/t1'), true);
+      out.includes(`DONE worktree t1 (PR #2 merged, no live terminal) — verify it is clean, then close: ` +
+        `orca worktree rm --worktree "path:${p}"`), true);
     checkBool('a genuine transition is not also reported as a startup summary',
       out.includes('pre-existing'), false);
     checkBool('the daemon exits on the transition instead of running to --max',
@@ -1720,13 +1772,13 @@ async function heartbeatWorktreeTests() {
     const out = await runHeartbeat({
       name: 'never-report',
       worktrees: [
-        { path: '/wt/openpr', displayName: 'openpr', isMainWorktree: false, isArchived: false,
+        { path: realWtDir('openpr'), displayName: 'openpr', isMainWorktree: false, isArchived: false,
           liveTerminalCount: 0, linkedPR: { state: 'open', number: 3 } },
-        { path: '/wt/liveterm', displayName: 'liveterm', isMainWorktree: false, isArchived: false,
+        { path: realWtDir('liveterm'), displayName: 'liveterm', isMainWorktree: false, isArchived: false,
           liveTerminalCount: 2, linkedPR: { state: 'merged', number: 4 } },
-        { path: '/', displayName: 'main', isMainWorktree: true, isArchived: false,
+        { path: realWtDir('main'), displayName: 'main', isMainWorktree: true, isArchived: false,
           liveTerminalCount: 0, linkedPR: { state: 'merged', number: 5 } },
-        { path: '/wt/archived', displayName: 'archived', isMainWorktree: false, isArchived: true,
+        { path: realWtDir('archived'), displayName: 'archived', isMainWorktree: false, isArchived: true,
           liveTerminalCount: 0, linkedPR: { state: 'closed', number: 6 } },
       ],
       args: ['--interval', '1', '--idle', '60', '--max', '1'],
@@ -1738,11 +1790,13 @@ async function heartbeatWorktreeTests() {
   }
 
   // 4. Config (or its env override) can disable the reminder entirely, even when a
-  //    worktree is done-but-open right from the baseline.
+  //    worktree is done-but-open right from the baseline. Item L6: both branches now go
+  //    through the same `runHeartbeat` helper via `envOverrides`, instead of one of them
+  //    hand-duplicating the whole spawn/env/listener boilerplate.
   {
     const out = await runHeartbeat({
       name: 'config-disabled',
-      worktrees: [{ path: '/wt/pre', displayName: 'pre', isMainWorktree: false, isArchived: false,
+      worktrees: [{ path: realWtDir('pre'), displayName: 'pre', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
       cfgOverrides: { closeDoneWorktrees: false },
       args: ['--interval', '1', '--idle', '60', '--max', '1'],
@@ -1750,29 +1804,214 @@ async function heartbeatWorktreeTests() {
     checkBool('closeDoneWorktrees:false suppresses the startup summary', out.includes('pre-existing'), false);
     checkBool('closeDoneWorktrees:false suppresses the wake-event line', out.includes('DONE worktree'), false);
 
-    // Same scenario again, this time disabled via the env override instead of config, on a
-    // worktree already done-but-open at the baseline.
-    const dir = path.join(RUN_DIR, 'hb-env-disabled-direct');
-    fs.mkdirSync(dir, { recursive: true });
-    const cfgFile = path.join(dir, 'orchestration.config.json');
-    fs.writeFileSync(cfgFile, JSON.stringify(DEFAULT_CFG));
-    const wtFile = path.join(dir, 'worktrees.json');
-    fs.writeFileSync(wtFile, JSON.stringify(
-      [{ path: '/wt/pre', displayName: 'pre', isMainWorktree: false, isArchived: false,
-        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }]));
-    const outEnvDisabled = await new Promise((resolve) => {
-      const env = { ...BASE_ENV, ORCA_BIN: STUB, ORCH_STATE_DIR: dir, ORCH_CONFIG_PATH: cfgFile,
-        CLAUDE_CODE_SESSION_ID: `hb-env-disabled-${process.pid}`, STUB_WORKTREES_JSON: `@${wtFile}`,
-        ORCH_CLOSE_DONE_WORKTREES: '0' };
-      const child = spawn(process.execPath, [HEARTBEAT, '--interval', '1', '--idle', '60', '--max', '1'], { env });
-      let o = '';
-      child.stdout.on('data', (d) => { o += d; });
-      child.stderr.on('data', (d) => { o += d; });
-      const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 8000);
-      child.on('exit', () => { clearTimeout(killer); resolve(o); });
+    const outEnvDisabled = await runHeartbeat({
+      name: 'env-disabled-direct',
+      worktrees: [{ path: realWtDir('pre'), displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      envOverrides: { ORCH_CLOSE_DONE_WORKTREES: '0' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
     });
     checkBool('ORCH_CLOSE_DONE_WORKTREES=0 suppresses the startup summary', outEnvDisabled.includes('pre-existing'), false);
     checkBool('ORCH_CLOSE_DONE_WORKTREES=0 suppresses the wake-event line', outEnvDisabled.includes('DONE worktree'), false);
+  }
+
+  // 5. Item M1: a malformed worktree row (a bare `null` entry, mixed in with a real one)
+  //    must never crash the daemon — it degrades this poll and the real entry still gets
+  //    its startup summary.
+  {
+    const p = realWtDir('pre');
+    const out = await runHeartbeat({
+      name: 'malformed-row',
+      worktrees: [null, { path: p, displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('a null row among the worktrees never crashes the daemon',
+      out.includes('orca-heartbeat: Orca is not answering'), false);
+    checkBool('the real row alongside a null one still gets its startup summary',
+      out.includes(`pre-existing done-but-open worktree(s) at startup: pre (${p})`), true);
+  }
+
+  // 6. Item M5: a page Orca itself marks `truncated: true` must never be acted on, even
+  //    when it contains a row that would otherwise be a clean, obvious done-but-open case
+  //    — a partial page can neither confirm nor rule out a transition.
+  {
+    const out = await runHeartbeat({
+      name: 'truncated',
+      worktrees: [{ path: realWtDir('pre'), displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      envOverrides: { STUB_WORKTREES_TRUNCATED: '1' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('a truncated page never produces a startup summary', out.includes('pre-existing'), false);
+    checkBool('a truncated page never fires a wake-event line', out.includes('DONE worktree'), false);
+  }
+
+  // 7. Item M4: the daemon's very first `worktree ps` call fails outright (non-zero exit,
+  //    no JSON at all) — the eventual FIRST SUCCESSFUL read must still seed as a one-time
+  //    backlog summary, never as an immediate flood of "new" wake events for what was
+  //    actually pre-existing all along.
+  {
+    const p = realWtDir('pre');
+    const out = await runHeartbeat({
+      name: 'failed-first-read',
+      worktrees: [{ path: p, displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      envOverrides: { STUB_WORKTREE_PS_FAIL_UNTIL: String(Date.now() + 1200) },
+      args: ['--interval', '1', '--idle', '60', '--max', '5'],
+    });
+    checkBool('a worktree already done-but-open when the first read finally succeeds is backlog, not a wake event',
+      out.includes('DONE worktree pre'), false);
+    checkBool('it still appears in the (delayed) one-time startup summary',
+      out.includes(`pre-existing done-but-open worktree(s) at startup: pre (${p})`), true);
+  }
+
+  // 7b. The same guarantee for a first read that comes back non-JSON rather than a
+  // non-zero exit — a different failure shape, same required outcome.
+  {
+    const p = realWtDir('pre');
+    const out = await runHeartbeat({
+      name: 'garbage-first-read',
+      worktrees: [{ path: p, displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      envOverrides: { STUB_WORKTREE_PS_GARBAGE_UNTIL: String(Date.now() + 1200) },
+      args: ['--interval', '1', '--idle', '60', '--max', '5'],
+    });
+    checkBool('a worktree already done-but-open when the first NON-JSON read finally succeeds is backlog, not a wake event',
+      out.includes('DONE worktree pre'), false);
+    checkBool('it still appears in the (delayed) one-time startup summary',
+      out.includes(`pre-existing done-but-open worktree(s) at startup: pre (${p})`), true);
+  }
+
+  // 8. A worktree already done-but-open at the baseline must be reported exactly ONCE
+  //    across several ticks of the SAME daemon run, never re-announced tick after tick.
+  {
+    const out = await runHeartbeat({
+      name: 'reported-once',
+      worktrees: [{ path: realWtDir('pre'), displayName: 'pre', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    const summaryCount = (out.match(/pre-existing done-but-open worktree\(s\) at startup/g) || []).length;
+    checkBool('the startup summary appears exactly once across multiple ticks of one run', summaryCount, 1);
+  }
+
+  // 9. Item M3: a worktree that becomes done-but-open while NO DAEMON IS RUNNING (between
+  //    two daemon lifetimes in the SAME session) must surface as a real wake event on the
+  //    restart, not be silently re-absorbed as if it had always been backlog.
+  {
+    const p = realWtDir('restart-a');
+    // First lifetime: nothing done-but-open yet, runs to its own short --max and exits.
+    await runHeartbeat({
+      name: 'restart',
+      sessionName: 'restart-shared',
+      dirName: 'hb-restart-shared',
+      worktrees: [{ path: p, displayName: 'a', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'open', number: 9 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    // Second lifetime, same session/state dir: the PR is now merged — this worktree became
+    // done-but-open while the daemon was not running at all.
+    const out2 = await runHeartbeat({
+      name: 'restart',
+      sessionName: 'restart-shared',
+      dirName: 'hb-restart-shared',
+      worktrees: [{ path: p, displayName: 'a', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 9 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '5'],
+    });
+    checkBool('a worktree that became done-but-open between two daemon runs fires a real wake event on restart',
+      out2.includes('DONE worktree a (PR #9 merged, no live terminal)'), true);
+    checkBool('it is not mistaken for pre-existing backlog on the restart',
+      out2.includes('pre-existing'), false);
+  }
+
+  // 10. Same restart shape, but nothing changed between the two lifetimes: a worktree
+  // already reported once (in run 1's startup summary) must never be re-announced — as
+  // either a summary line or a wake event — on a later restart within the same session.
+  {
+    const p = realWtDir('restart-b');
+    await runHeartbeat({
+      name: 'restart-quiet',
+      sessionName: 'restart-quiet-shared',
+      dirName: 'hb-restart-quiet-shared',
+      worktrees: [{ path: p, displayName: 'b', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 10 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    const out2 = await runHeartbeat({
+      name: 'restart-quiet',
+      sessionName: 'restart-quiet-shared',
+      dirName: 'hb-restart-quiet-shared',
+      worktrees: [{ path: p, displayName: 'b', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 10 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('a worktree already reported in a prior daemon run is never re-announced as a wake event on restart',
+      out2.includes('DONE worktree b'), false);
+    checkBool('nor re-announced as a fresh startup summary on restart',
+      out2.includes('pre-existing'), false);
+  }
+
+  // 11. Item L5: a merged GitLab MR (no GitHub PR linked at all) is accepted the same way a
+  // merged PR is; a still-"opened" MR is not.
+  {
+    const pMerged = realWtDir('mr');
+    const out = await runHeartbeat({
+      name: 'gitlab-mr-merged',
+      worktrees: [{ path: pMerged, displayName: 'mr', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedGitLabMR: { state: 'merged', number: 20 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('a merged GitLab MR (no PR linked) is done-but-open',
+      out.includes(`pre-existing done-but-open worktree(s) at startup: mr (${pMerged})`), true);
+
+    const outOpen = await runHeartbeat({
+      name: 'gitlab-mr-open',
+      worktrees: [{ path: realWtDir('mr2'), displayName: 'mr2', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedGitLabMR: { state: 'opened', number: 21 } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('a still-open GitLab MR is never done-but-open', outOpen.includes('pre-existing'), false);
+  }
+
+  // 12. No linked PR or MR at all: acceptance falls back to a real git ancestor-of-base
+  // check via the git stub — accepted when HEAD is confirmed merged, refused when it isn't.
+  {
+    const pMerged = realWtDir('np');
+    const outMerged = await runHeartbeat({
+      name: 'no-pr-ancestor',
+      worktrees: [{ path: pMerged, displayName: 'np', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0 }],
+      gitEnv: { STUB_GIT_ANCESTOR: '1' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('no linked PR/MR + git confirms HEAD is an ancestor of base + clean is done-but-open',
+      outMerged.includes(`pre-existing done-but-open worktree(s) at startup: np (${pMerged})`), true);
+
+    const outNotMerged = await runHeartbeat({
+      name: 'no-pr-not-ancestor',
+      worktrees: [{ path: realWtDir('np2'), displayName: 'np2', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0 }],
+      gitEnv: { STUB_GIT_ANCESTOR: '0' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('no linked PR/MR + git confirms HEAD is NOT an ancestor is never done-but-open',
+      outNotMerged.includes('pre-existing'), false);
+  }
+
+  // 13. A merged PR whose worktree git reports DIRTY (uncommitted changes) is never
+  // done-but-open — the clean leg is a real, independent gate, not implied by PR state.
+  {
+    const out = await runHeartbeat({
+      name: 'dirty',
+      worktrees: [{ path: realWtDir('dirty'), displayName: 'dirty', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 30 } }],
+      gitEnv: { STUB_GIT_CLEAN: '0' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('a merged PR with an uncommitted-changes worktree is never done-but-open',
+      out.includes('pre-existing'), false);
   }
 }
 

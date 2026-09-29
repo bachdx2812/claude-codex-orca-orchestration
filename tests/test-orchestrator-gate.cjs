@@ -242,31 +242,134 @@ check('a released worker holds nothing',
 // --- heartbeat isDoneButOpen / worktree event formatting --------------------
 
 {
+  // A git stand-in whose every answer is overridable per test, defaulting to "clean,
+  // origin/main resolves, HEAD is an ancestor of it, a real upstream with nothing unpushed"
+  // — the common accepted-and-clean backdrop most cases build on.
+  // `pick` distinguishes "no override supplied" (use the default) from an override that is
+  // explicitly `null` (simulate runGit()'s own "spawn-level failure" answer) — a plain `??`
+  // cannot tell those apart, since it treats an explicit null exactly like "absent".
+  const pick = (overrides, key, dflt) => (key in overrides ? overrides[key] : dflt);
+  function fakeGit(overrides = {}) {
+    return (args) => {
+      const sub = args[0];
+      if (sub === 'symbolic-ref') return pick(overrides, 'symbolicRef', { status: 0, stdout: 'origin/main' });
+      if (sub === 'merge-base') return pick(overrides, 'mergeBase', { status: 0, stdout: '' });
+      if (sub === 'status') return pick(overrides, 'status', { status: 0, stdout: '' });
+      if (sub === 'rev-parse' && args.includes('@{u}')) return pick(overrides, 'upstream', { status: 0, stdout: 'origin/feature' });
+      if (sub === 'rev-list') return pick(overrides, 'revList', { status: 0, stdout: '' });
+      if (sub === 'rev-parse') {
+        const ref = args[args.length - 1];
+        if (ref === 'origin/main') return pick(overrides, 'revParseOriginMain', { status: 0, stdout: 'sha' });
+        if (ref === 'main') return pick(overrides, 'revParseMain', { status: 0, stdout: 'sha' });
+        return { status: 1, stdout: '' };
+      }
+      return { status: 1, stdout: '' };
+    };
+  }
+  const throwingGit = () => { throw new Error('git must not be called for this row'); };
+  const ctx = (overrides = {}) => ({ now: 1_000_000, idleSeconds: 60, ...overrides, git: fakeGit(overrides.git) });
+
   const mergedIdle = { path: '/wt/a', displayName: 'a', isMainWorktree: false, isArchived: false,
-    liveTerminalCount: 0, prState: 'merged', prNumber: 12 };
-  check('merged PR + no live terminal is done-but-open', heartbeat.isDoneButOpen(mergedIdle), true);
+    liveTerminalCount: 0, lastOutputAt: 0, prState: 'merged', prNumber: 12 };
+  check('merged PR + no live terminal + clean is done-but-open', heartbeat.isDoneButOpen(mergedIdle, ctx()), true);
 
   const closedIdle = { ...mergedIdle, prState: 'closed', prNumber: 13 };
-  check('closed PR + no live terminal is done-but-open', heartbeat.isDoneButOpen(closedIdle), true);
+  check('closed PR + no live terminal + clean is done-but-open', heartbeat.isDoneButOpen(closedIdle, ctx()), true);
 
-  check('an open PR is never done-but-open',
-    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open' }), false);
-  check('a merged PR with a live terminal is never done-but-open',
-    heartbeat.isDoneButOpen({ ...mergedIdle, liveTerminalCount: 1 }), false);
+  check('an open PR is never done-but-open (git is never consulted)',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open' }, { ...ctx(), git: throwingGit }), false);
+  check('a merged PR with a live terminal and no lastOutputAt is never done-but-open (uncertain idle)',
+    heartbeat.isDoneButOpen({ ...mergedIdle, liveTerminalCount: 1 }, { ...ctx(), git: throwingGit }), false);
   check('the main worktree is never done-but-open even when merged and idle',
-    heartbeat.isDoneButOpen({ ...mergedIdle, isMainWorktree: true }), false);
+    heartbeat.isDoneButOpen({ ...mergedIdle, isMainWorktree: true }, { ...ctx(), git: throwingGit }), false);
   check('an archived worktree is never done-but-open',
-    heartbeat.isDoneButOpen({ ...mergedIdle, isArchived: true }), false);
-  check('a worktree with no linked PR at all is never done-but-open',
-    heartbeat.isDoneButOpen({ ...mergedIdle, prState: null, prNumber: null }), false);
+    heartbeat.isDoneButOpen({ ...mergedIdle, isArchived: true }, { ...ctx(), git: throwingGit }), false);
+  check('a merged PR that is NOT clean (dirty working tree) is never done-but-open',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { status: { status: 0, stdout: ' M x\n' } } })), false);
+  check('a git status failure means "not confirmed clean", never done-but-open',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { status: null } })), false);
 
-  check('formatDoneWorktreeEvent names the PR, state and rm command',
-    heartbeat.formatDoneWorktreeEvent(mergedIdle),
-    'DONE worktree a (PR #12 merged, no live terminal) — verify it is clean, then close: orca worktree rm --worktree path:/wt/a');
+  // No linked PR at all: acceptance falls back to a real git ancestor-of-base check.
+  const noPrIdle = { ...mergedIdle, prState: null, prNumber: null };
+  check('no linked PR + HEAD is an ancestor of the resolved base + clean is done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx()), true);
+  check('no linked PR + HEAD is NOT an ancestor of the base is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ git: { mergeBase: { status: 1, stdout: '' } } })), false);
+  check('no linked PR + no resolvable base at all is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ git: {
+      symbolicRef: { status: 128, stdout: '' },
+      revParseOriginMain: { status: 1, stdout: '' },
+      revParseMain: { status: 1, stdout: '' },
+    } })), false);
 
-  check('formatDoneWorktreeStartupSummary lists every pre-existing worktree by name',
-    heartbeat.formatDoneWorktreeStartupSummary([mergedIdle, { ...closedIdle, displayName: 'b' }])
-      .includes('2 pre-existing done-but-open worktree(s) at startup: a, b'), true);
+  // No upstream: the clean check falls back to "HEAD is an ancestor of the resolved base".
+  const noPrNoUpstream = ctx({ git: { upstream: { status: 128, stdout: '' } } });
+  check('clean check falls back to base-ancestor when there is no upstream at all',
+    heartbeat.isDoneButOpen(mergedIdle, noPrNoUpstream), true);
+  check('no upstream + not an ancestor of base is never clean',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { upstream: { status: 128, stdout: '' }, mergeBase: { status: 1, stdout: '' } } })), false);
+  check('an upstream with unpushed commits is never clean',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { revList: { status: 0, stdout: 'deadbeef\n' } } })), false);
+
+  // Idle via the worktree-level lastOutputAt aggregate (no per-terminal data is exposed).
+  const liveButQuiet = { ...mergedIdle, liveTerminalCount: 1, lastOutputAt: 1_000_000 - 120_000 };
+  check('a live terminal whose aggregate lastOutputAt is past the idle threshold is idle',
+    heartbeat.isDoneButOpen(liveButQuiet, ctx()), true);
+  const liveAndRecent = { ...mergedIdle, liveTerminalCount: 1, lastOutputAt: 1_000_000 - 5_000 };
+  check('a live terminal whose aggregate lastOutputAt is within the idle threshold is not idle',
+    heartbeat.isDoneButOpen(liveAndRecent, { ...ctx(), git: throwingGit }), false);
+
+  // GitLab MR support (item L5): judged the same way a GitHub PR is, only when no PR at all
+  // is linked (a GitLab worktree never carries both fields at once in practice).
+  const mrMerged = { ...noPrIdle, mrState: 'merged', mrNumber: 7 };
+  check('a merged GitLab MR (no PR linked) is done-but-open',
+    heartbeat.isDoneButOpen(mrMerged, ctx({ git: { symbolicRef: { status: 128, stdout: '' } } })), true);
+  const mrOpen = { ...noPrIdle, mrState: 'opened', mrNumber: 8 };
+  check('a still-open ("opened") GitLab MR is never done-but-open, even if HEAD is an ancestor',
+    heartbeat.isDoneButOpen(mrOpen, { ...ctx(), git: throwingGit }), false);
+
+  check('evaluateDoneButOpen names the PR acceptance path in its reason',
+    heartbeat.evaluateDoneButOpen(mergedIdle, ctx()).reason, 'PR #12 merged');
+  check('evaluateDoneButOpen names the no-linked-PR/git acceptance path in its reason',
+    heartbeat.evaluateDoneButOpen(noPrIdle, ctx()).reason, 'no linked PR, HEAD already merged into origin/main');
+
+  check('formatDoneWorktreeEvent names the acceptance reason, quotes the rm target path',
+    heartbeat.formatDoneWorktreeEvent(mergedIdle, 'PR #12 merged'),
+    'DONE worktree a (PR #12 merged, no live terminal) — verify it is clean, then close: orca worktree rm --worktree "path:/wt/a"');
+
+  check('formatDoneWorktreeStartupSummary lists every pre-existing worktree by name AND path',
+    heartbeat.formatDoneWorktreeStartupSummary([mergedIdle, { ...closedIdle, displayName: 'b', path: '/wt/b' }])
+      .includes('2 pre-existing done-but-open worktree(s) at startup: a (/wt/a), b (/wt/b)'), true);
+
+  // --- resolveBaseRef / isAncestorOf / resolveAcceptance / isWorktreeIdle directly -------
+  check('resolveBaseRef prefers the resolved origin/HEAD symbolic ref',
+    heartbeat.resolveBaseRef('/wt/a', fakeGit()), 'origin/main');
+  check('resolveBaseRef falls back to origin/main when no symbolic ref resolves',
+    heartbeat.resolveBaseRef('/wt/a', fakeGit({ symbolicRef: { status: 128, stdout: '' } })), 'origin/main');
+  check('resolveBaseRef falls back to local main when origin/main does not exist either',
+    heartbeat.resolveBaseRef('/wt/a', fakeGit({
+      symbolicRef: { status: 128, stdout: '' }, revParseOriginMain: { status: 1, stdout: '' },
+    })), 'main');
+  check('resolveBaseRef returns null when nothing resolves at all',
+    heartbeat.resolveBaseRef('/wt/a', fakeGit({
+      symbolicRef: { status: 128, stdout: '' },
+      revParseOriginMain: { status: 1, stdout: '' },
+      revParseMain: { status: 1, stdout: '' },
+    })), null);
+  check('resolveBaseRef returns null when git cannot answer at all',
+    heartbeat.resolveBaseRef('/wt/a', () => null), null);
+
+  check('isAncestorOf is true only on a confirmed git exit 0',
+    heartbeat.isAncestorOf('/wt/a', fakeGit(), 'origin/main'), true);
+  check('isAncestorOf is false on a confirmed "not an ancestor" (exit 1)',
+    heartbeat.isAncestorOf('/wt/a', fakeGit({ mergeBase: { status: 1, stdout: '' } }), 'origin/main'), false);
+  check('isAncestorOf is false on a spawn-level git failure',
+    heartbeat.isAncestorOf('/wt/a', () => null, 'origin/main'), false);
+
+  check('isWorktreeIdle is true immediately when there is no live terminal at all',
+    heartbeat.isWorktreeIdle({ liveTerminalCount: 0, lastOutputAt: 0 }, 1_000_000, 60), true);
+  check('isWorktreeIdle is false when lastOutputAt is missing but a terminal is live',
+    heartbeat.isWorktreeIdle({ liveTerminalCount: 1, lastOutputAt: 0 }, 1_000_000, 60), false);
 }
 
 // --- config.cjs --------------------------------------------------------------
@@ -335,7 +438,18 @@ check('a released worker holds nothing',
   process.env.ORCH_CLOSE_DONE_WORKTREES = 'false';
   check('ORCH_CLOSE_DONE_WORKTREES=false also disables it', config.closeDoneWorktreesEnabled(defaults), false);
   process.env.ORCH_CLOSE_DONE_WORKTREES = '1';
-  check('a non-0/false override leaves it enabled', config.closeDoneWorktreesEnabled(wtOff), true);
+  check('an explicit "1" override enables it even when config says false', config.closeDoneWorktreesEnabled(wtOff), true);
+  process.env.ORCH_CLOSE_DONE_WORKTREES = 'TRUE';
+  check('an explicit "TRUE" override (case-insensitive) enables it even when config says false',
+    config.closeDoneWorktreesEnabled(wtOff), true);
+  // Item L2: anything other than an explicit 1/true/0/false — including an empty string —
+  // defers to the config value rather than being read as "set at all, so true".
+  process.env.ORCH_CLOSE_DONE_WORKTREES = '';
+  check('an empty override defers to config (true default)', config.closeDoneWorktreesEnabled(defaults), true);
+  check('an empty override defers to config (false)', config.closeDoneWorktreesEnabled(wtOff), false);
+  process.env.ORCH_CLOSE_DONE_WORKTREES = 'garbage';
+  check('a garbage override defers to config (true default)', config.closeDoneWorktreesEnabled(defaults), true);
+  check('a garbage override defers to config (false)', config.closeDoneWorktreesEnabled(wtOff), false);
   if (beforeWt === undefined) delete process.env.ORCH_CLOSE_DONE_WORKTREES; else process.env.ORCH_CLOSE_DONE_WORKTREES = beforeWt;
 
   fs.rmSync(cfgDir, { recursive: true, force: true });

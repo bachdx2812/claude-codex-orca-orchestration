@@ -22,22 +22,36 @@
  * what a worker "should" be doing:
  *   orca orchestration worker-list --json   -> dispatch/worker/terminal state
  *   orca terminal list --json               -> live terminals, lastOutputAt, orphaned
- *   orca worktree ps --json                 -> done-but-open worktrees (merged/closed PR,
- *                                               no live terminal) that nobody has closed yet
+ *   orca worktree ps --json                 -> done-but-open worktrees (merged/closed PR
+ *                                               or GitLab MR, or — with no PR/MR linked at
+ *                                               all — HEAD already merged into the
+ *                                               worktree's own upstream default branch;
+ *                                               idle and clean; see the done-but-open
+ *                                               section below) that nobody has closed yet.
+ *                                               Live envelope shape:
+ *                                               {id, ok, result:{worktrees[], hostScope,
+ *                                               totalCount, truncated}, _meta}.
  *
  * It reports only **changes since the baseline snapshot** taken at startup, so
  * terminals that were already open when it started cannot drown the signal.
  */
 
-const { execFileSync } = require('child_process');
+const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { loadConfig, stateDir, closeDoneWorktreesEnabled } = require('./lib/config.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
+// Overridable the same way ORCA_BIN is (tests point this at a deterministic stub); a bare
+// "git" resolves against PATH exactly like the bare "orca" default does.
+const GIT_BIN = process.env.ORCH_GIT_BIN || 'git';
 const RATE_LIMIT = /(rate.?limit|429\b|quota\s+exceeded|usage\s+limit|too\s+many\s+requests|retry[- ]after|overloaded_error)/i;
 const DONE_PR_STATES = new Set(['merged', 'closed']);
+// GitLab's MR state vocabulary uses "opened"/"merged"/"closed"/"locked" where GitHub's PR
+// vocabulary uses "open"/"merged"/"closed" — normalize the "still open" spelling so a linked
+// GitLab MR is judged by the same accepted/still-open distinction as a linked GitHub PR.
+const OPEN_MR_STATES = new Set(['open', 'opened', 'locked']);
 
 function arg(name, dflt) {
   const i = process.argv.indexOf(`--${name}`);
@@ -53,6 +67,10 @@ const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
 // Session whose panel started this daemon (inherited from the Claude Code Bash tool).
 const SESSION = String(process.env.CLAUDE_CODE_SESSION_ID || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
 const BEAT_FILE = path.join(DIR, `heartbeat-${SESSION}.json`);
+// Persists which done-but-open worktree paths this SESSION has already reported (via the
+// one-time startup summary or a wake event), surviving a daemon restart within the session —
+// see processDoneWorktrees()'s doc comment for why this file exists.
+const DONE_WT_FILE = path.join(DIR, `heartbeat-${SESSION}-done-wt.json`);
 
 /** Refresh the liveness file the gate checks (atomic write). */
 function beat(started) {
@@ -74,10 +92,31 @@ function unbeat() {
   } catch {}
 }
 
-/** Run an orca command and return parsed JSON, or null when orca cannot answer. */
-function orca(args) {
+/** The persisted "already reported this session" path set, or null when the file does not
+ * exist yet — which is how the session's very first daemon run is told apart from a later
+ * restart within the same session (see processDoneWorktrees()). */
+function loadPersistedDoneWorktrees() {
   try {
-    const out = execFileSync(ORCA_BIN, args, { encoding: 'utf8', timeout: 20000, maxBuffer: 32 * 1024 * 1024 });
+    const arr = JSON.parse(fs.readFileSync(DONE_WT_FILE, 'utf8'));
+    return Array.isArray(arr) ? new Set(arr) : new Set();
+  } catch {
+    return null;
+  }
+}
+
+function savePersistedDoneWorktrees(set) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${DONE_WT_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...set]));
+    fs.renameSync(tmp, DONE_WT_FILE);
+  } catch {}
+}
+
+/** Run an orca command and return parsed JSON, or null when orca cannot answer. */
+function orca(args, timeoutMs = 20000) {
+  try {
+    const out = execFileSync(ORCA_BIN, args, { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024 });
     return JSON.parse(out);
   } catch {
     return null;
@@ -119,45 +158,275 @@ function isHoldingResources(w) {
   return w.terminalState && w.terminalState !== 'released';
 }
 
+/**
+ * `orca worktree ps --json`, defensively parsed (Opus review, item M1): a malformed or
+ * unexpected reply (a non-array `worktrees`, a `null` entry in it, a field of the wrong
+ * type) must never crash this long-running daemon — the whole function degrades to null,
+ * exactly like an unreachable Orca, and the caller simply tries again next tick. `--limit`
+ * is passed explicitly (item M5) so a normal-sized fleet never gets silently truncated;
+ * when the page comes back truncated anyway, `truncated: true` is surfaced so the caller
+ * can refuse to trust it for this reminder rather than risk a false or missed transition.
+ * The worktree-ps round trip is bounded tighter (8s) than the worker/terminal listing
+ * calls (20s default) — it is normally fast, and a short bound leaves more of the liveness
+ * margin intact at a short `--interval` (item L1).
+ */
 function worktrees() {
-  const d = orca(['worktree', 'ps', '--json']);
-  if (!d) return null;
-  const r = d.result ?? d;
-  const list = Array.isArray(r) ? r : r.worktrees || [];
-  return list.map((w) => ({
-    path: w.path,
-    displayName: w.displayName || w.path,
-    isMainWorktree: !!w.isMainWorktree,
-    isArchived: !!w.isArchived,
-    liveTerminalCount: Number(w.liveTerminalCount) || 0,
-    prState: w.linkedPR ? w.linkedPR.state : null,
-    prNumber: w.linkedPR ? w.linkedPR.number : null,
-  }));
+  try {
+    const d = orca(['worktree', 'ps', '--json', '--limit', '500'], 8000);
+    if (!d) return null;
+    const r = d.result ?? d;
+    const rawList = Array.isArray(r) ? r : (Array.isArray(r && r.worktrees) ? r.worktrees : []);
+    const rows = rawList
+      .filter((w) => w && typeof w.path === 'string')
+      .map((w) => ({
+        path: w.path,
+        displayName: w.displayName || w.path,
+        isMainWorktree: !!w.isMainWorktree,
+        isArchived: !!w.isArchived,
+        liveTerminalCount: Number(w.liveTerminalCount) || 0,
+        // One aggregate timestamp per worktree (not per terminal) — see isWorktreeIdle().
+        lastOutputAt: Number(w.lastOutputAt) || 0,
+        prState: w.linkedPR ? w.linkedPR.state : null,
+        prNumber: w.linkedPR ? w.linkedPR.number : null,
+        mrState: w.linkedGitLabMR ? w.linkedGitLabMR.state : null,
+        mrNumber: w.linkedGitLabMR ? w.linkedGitLabMR.number : null,
+      }));
+    return { truncated: !!(r && r.truncated), rows };
+  } catch {
+    return null;
+  }
 }
 
 /**
- * A worktree that looks like finished, unreleased work: not the main worktree, not already
- * archived, its linked PR already merged or closed, and nothing currently has a live
- * terminal open on it. Pure so it is testable against synthetic rows without a live Orca.
- * Removal itself is never automated here — a worktree can hold uncommitted or unpushed
- * work its PR state says nothing about, and only the panel can check `git status` first.
+ * Run `git <args>` in `cwd`, bounded to a short timeout, never throwing. Returns
+ * `{ status, stdout }` — `status` is git's real exit code (0 success; `merge-base
+ * --is-ancestor` uses 1 for a clean, confirmed "no", which callers must not confuse with
+ * failure) — or null on a spawn-level problem (missing binary, timeout, signal). Every
+ * caller treats null exactly like an unreadable answer: never a candidate for a git-backed
+ * check, per the "never remind on uncertainty" rule.
  */
-function isDoneButOpen(w) {
-  return !w.isMainWorktree && !w.isArchived && DONE_PR_STATES.has(w.prState) && w.liveTerminalCount === 0;
+function runGit(args, cwd) {
+  try {
+    const r = spawnSync(GIT_BIN, args, { cwd, encoding: 'utf8', timeout: 3000 });
+    if (r.error || r.status === null || r.status === undefined) return null;
+    return { status: r.status, stdout: (r.stdout || '').trim() };
+  } catch {
+    return null;
+  }
 }
 
-/** The wake-event line for one worktree that just became done-but-open. */
-function formatDoneWorktreeEvent(w) {
-  const pr = w.prNumber != null ? `PR #${w.prNumber} ${w.prState}` : `PR ${w.prState}`;
-  return `DONE worktree ${w.displayName} (${pr}, no live terminal) — verify it is clean, then close: ` +
-    `orca worktree rm --worktree path:${w.path}`;
+/**
+ * The worktree's upstream default branch (e.g. "origin/main"), resolved from
+ * `refs/remotes/origin/HEAD`, falling back to `origin/main` then `main`. Never runs
+ * `git fetch` — a stale remote-tracking ref is the operator's problem to keep current, not
+ * this reminder's to fix. Returns null when nothing resolves.
+ */
+function resolveBaseRef(cwd, git) {
+  const sym = git(['symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD'], cwd);
+  if (sym && sym.status === 0 && sym.stdout) return sym.stdout;
+  const originMain = git(['rev-parse', '--verify', '-q', 'origin/main'], cwd);
+  if (originMain && originMain.status === 0) return 'origin/main';
+  const main = git(['rev-parse', '--verify', '-q', 'main'], cwd);
+  if (main && main.status === 0) return 'main';
+  return null;
 }
 
-/** The one-time, non-waking startup line listing backlog already done-but-open at baseline. */
+/**
+ * True only when git affirmatively confirms HEAD is already an ancestor of `base` (exit
+ * 0). Exit 1 (a real, clean "not yet merged") and any spawn-level failure both return
+ * false here — this function never distinguishes "confirmed not merged" from "could not
+ * tell", since neither is ever a done-but-open candidate.
+ */
+function isAncestorOf(cwd, git, base) {
+  const r = git(['merge-base', '--is-ancestor', 'HEAD', base], cwd);
+  return !!r && r.status === 0;
+}
+
+/**
+ * The "accepted" leg of done-but-open: a merged/closed linked GitHub PR or GitLab MR, or —
+ * only when NEITHER is linked at all — HEAD already contained in the worktree's own
+ * upstream default branch. A still-open PR/MR is never accepted, whatever git alone might
+ * say about the branch. Git is consulted ONLY in the no-linked-PR/MR case: the cheap,
+ * Orca-reported PR/MR state always decides first when one exists, so a real git call never
+ * runs for the (common) linked-PR case's acceptance leg. Returns `{ accepted, reason }` so
+ * a caller can name which path fired.
+ */
+function resolveAcceptance(w, git) {
+  if (w.prState != null) {
+    return DONE_PR_STATES.has(w.prState)
+      ? { accepted: true, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}` }
+      : { accepted: false, reason: null };
+  }
+  if (w.mrState != null) {
+    if (OPEN_MR_STATES.has(w.mrState)) return { accepted: false, reason: null };
+    return DONE_PR_STATES.has(w.mrState)
+      ? { accepted: true, reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}` }
+      : { accepted: false, reason: null };
+  }
+  const base = resolveBaseRef(w.path, git);
+  if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: null };
+  return { accepted: true, reason: `no linked PR, HEAD already merged into ${base}` };
+}
+
+/**
+ * The "idle" leg: no live terminal at all, or — `orca worktree ps` exposes one aggregate
+ * `lastOutputAt` per worktree, not per terminal, so this is necessarily best-effort — that
+ * aggregate (the MOST RECENT output across every terminal on it) is already older than the
+ * idle threshold, which can only be true once every terminal on the worktree is quiet.
+ * A worktree with live terminals but no usable timestamp is never treated as idle: absence
+ * of the field is uncertainty, not evidence.
+ */
+function isWorktreeIdle(w, now, idleSeconds) {
+  if (w.liveTerminalCount === 0) return true;
+  if (!w.lastOutputAt) return false;
+  return Math.round((now - w.lastOutputAt) / 1000) >= idleSeconds;
+}
+
+/**
+ * The "clean" leg: no uncommitted changes, and no commits this worktree's branch holds
+ * that its upstream does not (or, lacking an upstream entirely, that the resolved base
+ * branch does not). Any git failure along the way (unreadable repo, a timeout) means "not
+ * confirmed clean", never "clean" — same uncertainty rule as everywhere else here.
+ */
+function isWorktreeClean(w, git) {
+  const status = git(['status', '--porcelain'], w.path);
+  if (!status || status.status !== 0 || status.stdout !== '') return false;
+  const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], w.path);
+  if (upstream && upstream.status === 0 && upstream.stdout) {
+    const unpushed = git(['rev-list', '@{u}..HEAD'], w.path);
+    return !!unpushed && unpushed.status === 0 && unpushed.stdout === '';
+  }
+  const base = resolveBaseRef(w.path, git);
+  return !!base && isAncestorOf(w.path, git, base);
+}
+
+/**
+ * The full done-but-open verdict for one worktree, pure so it is directly testable against
+ * synthetic rows and an injectable `git` runner without a live Orca or a real repo. Never
+ * the main worktree or an already-archived one. Checked cheapest-first: idle (Orca data
+ * only) before accepted/clean (which may shell out to git) — git only ever runs for a row
+ * that already passed the idle gate, and each call is independently bounded (~3s, see
+ * runGit) so one unreachable or slow worktree can never stall a whole tick.
+ * `ctx = { now, idleSeconds, git }`, all optional (defaulting to the daemon's own
+ * settings and the real `git` binary). Returns `{ done, reason }` — `reason` names which
+ * acceptance path fired, for the wake-event message.
+ */
+function evaluateDoneButOpen(w, ctx = {}) {
+  if (w.isMainWorktree || w.isArchived) return { done: false, reason: null };
+  const now = ctx.now != null ? ctx.now : Date.now();
+  const idleSeconds = ctx.idleSeconds != null ? ctx.idleSeconds : IDLE_SECONDS;
+  const git = ctx.git || runGit;
+  if (!isWorktreeIdle(w, now, idleSeconds)) return { done: false, reason: null };
+  const { accepted, reason } = resolveAcceptance(w, git);
+  if (!accepted) return { done: false, reason: null };
+  if (!isWorktreeClean(w, git)) return { done: false, reason: null };
+  return { done: true, reason };
+}
+
+/** Boolean convenience wrapper over evaluateDoneButOpen(), for callers that only need the
+ * yes/no verdict (most unit tests, and any future direct filter use). */
+function isDoneButOpen(w, ctx) {
+  return evaluateDoneButOpen(w, ctx).done;
+}
+
+/** The wake-event line for one worktree that just became done-but-open. The `rm` target's
+ * `path:` value is quoted (item L3) since a worktree's path can contain spaces. */
+function formatDoneWorktreeEvent(w, reason) {
+  return `DONE worktree ${w.displayName} (${reason}, no live terminal) — verify it is clean, then close: ` +
+    `orca worktree rm --worktree "path:${w.path}"`;
+}
+
+/** The one-time, non-waking startup line listing backlog already done-but-open at baseline.
+ * Includes each worktree's path, not just its display name (item L4), since two worktrees
+ * can share a display name. */
 function formatDoneWorktreeStartupSummary(list) {
-  const names = list.map((w) => w.displayName).join(', ');
+  const names = list.map((w) => `${w.displayName} (${w.path})`).join(', ');
   return `orca-heartbeat: ${list.length} pre-existing done-but-open worktree(s) at startup: ${names} ` +
-    '— verify each is clean, then close with `orca worktree rm --worktree path:<path>`.';
+    '— verify each is clean, then close with `orca worktree rm --worktree "path:<path>"`.';
+}
+
+// --- done-but-open worktree reminder: cross-restart, first-successful-read state ---------
+//
+// `doneWtSeeded` / `doneWtPersisted` / `doneWtFirstSessionRun` are this PROCESS's view of
+// the reminder's cross-restart bookkeeping; `reportedDoneWorktrees` is this process's own
+// in-memory de-dupe of what IT has already reported (via the seed pass or a later tick).
+let doneWtSeeded = false;
+let doneWtPersisted = null;
+let doneWtFirstSessionRun = false;
+const reportedDoneWorktrees = new Set();
+
+function ensureDoneWtPersistedLoaded() {
+  if (doneWtPersisted) return;
+  const loaded = loadPersistedDoneWorktrees();
+  doneWtFirstSessionRun = loaded === null;
+  doneWtPersisted = loaded || new Set();
+}
+
+/**
+ * Processes one successful `worktrees()` read for the done-but-open reminder, appending any
+ * wake events to `events`. Does nothing at all when the reminder is disabled, the read
+ * itself failed (`data` is null), or the page came back truncated (item M5 — a partial
+ * worktree list can neither confirm nor rule out a transition, and acting on it risks a
+ * false or a missed wake, either worse than waiting for a later, complete page).
+ *
+ * The FIRST successful read this process ever sees — whichever tick that turns out to be;
+ * a failed `worktree ps` at true startup no longer poisons this (item M4) — seeds rather
+ * than reports:
+ *   - the session's very first daemon run ever (no persisted file yet, item M3) treats
+ *     every currently done-but-open worktree as pre-existing backlog: a one-time, non-
+ *     waking summary line, same as before this fix;
+ *   - a LATER daemon run within the SAME session (the persisted file already exists) is a
+ *     restart, not a fresh session — anything done-but-open that is NOT already in the
+ *     persisted set became so while no daemon was watching, and is reported as a genuine
+ *     wake event right away, not silently re-absorbed as backlog (item M3's actual bug:
+ *     every restart used to re-seed quietly, which could hide a real transition from the
+ *     panel indefinitely).
+ * After seeding, this same process continues in ordinary steady-state on every later call:
+ * anything done-but-open this process has not itself already reported is a wake event.
+ */
+function processDoneWorktrees(data, events) {
+  if (!CLOSE_DONE_WORKTREES || !data || data.truncated) return;
+  try {
+    ensureDoneWtPersistedLoaded();
+    const now = Date.now();
+    const evaluated = data.rows
+      .map((w) => ({ w, verdict: evaluateDoneButOpen(w, { now, idleSeconds: IDLE_SECONDS, git: runGit }) }))
+      .filter((e) => e.verdict.done);
+
+    let persistedChanged = false;
+
+    if (!doneWtSeeded) {
+      doneWtSeeded = true;
+      for (const { w } of evaluated) reportedDoneWorktrees.add(w.path);
+      // The persisted file is written on this branch even when `evaluated` is empty: its
+      // mere EXISTENCE is what tells a later restart within this same session "seeding
+      // already happened once" (loadPersistedDoneWorktrees() returning null vs. an empty
+      // Set) — an empty first run must not look, to a later restart, like a session that
+      // never got as far as its first successful `worktree ps` read at all.
+      persistedChanged = true;
+      if (doneWtFirstSessionRun) {
+        const backlog = evaluated.map((e) => e.w);
+        if (backlog.length) console.log(formatDoneWorktreeStartupSummary(backlog));
+        for (const { w } of evaluated) doneWtPersisted.add(w.path);
+      } else {
+        const newSincePersisted = evaluated.filter((e) => !doneWtPersisted.has(e.w.path));
+        for (const { w } of evaluated) doneWtPersisted.add(w.path);
+        for (const { w, verdict } of newSincePersisted) events.push(formatDoneWorktreeEvent(w, verdict.reason));
+      }
+    } else {
+      for (const { w, verdict } of evaluated) {
+        if (reportedDoneWorktrees.has(w.path)) continue;
+        reportedDoneWorktrees.add(w.path);
+        doneWtPersisted.add(w.path);
+        persistedChanged = true;
+        events.push(formatDoneWorktreeEvent(w, verdict.reason));
+      }
+    }
+    if (persistedChanged) savePersistedDoneWorktrees(doneWtPersisted);
+  } catch {
+    // Item M1: a malformed/unexpected worktree row must never crash the daemon — skip
+    // this poll entirely and let the next one try again.
+  }
 }
 
 /**
@@ -209,19 +478,30 @@ function main() {
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
 
-  // Worktree done-but-open reminder: seed with whatever is already done at startup so a
-  // daemon restart never re-reports backlog as a fresh wake event — only a summary line.
-  const reportedDoneWorktrees = new Set();
-  if (CLOSE_DONE_WORKTREES) {
-    const baseWorktrees = worktrees();
-    if (baseWorktrees) {
-      const preExisting = baseWorktrees.filter(isDoneButOpen);
-      for (const w of preExisting) reportedDoneWorktrees.add(w.path);
-      if (preExisting.length) console.log(formatDoneWorktreeStartupSummary(preExisting));
-    }
-  }
-
   const deadline = started + MAX_SECONDS * 1000;
+
+  /** Shared exit path for both the startup done-worktree pass and every later tick. */
+  const flushAndExit = (events, now) => {
+    console.log(`orca-heartbeat: ${events.length} event(s) after ${Math.round((now - started) / 1000)}s.`);
+    for (const e of events) console.log(`  - ${e}`);
+    console.log('Act on these now — a worker waiting on a decision is wasted wall-clock.');
+    try {
+      fs.mkdirSync(DIR, { recursive: true });
+      fs.appendFileSync(path.join(DIR, 'heartbeat.log'), `${new Date().toISOString()}\t${events.join(' | ')}\n`);
+    } catch {}
+    process.exit(0); // exiting is the wake-up signal for the panel
+  };
+
+  // Done-but-open worktree reminder: try to seed immediately at startup, so the one-time
+  // passive summary (or, on a same-session restart, a real wake event per item M3) shows up
+  // right away instead of waiting a full --interval. A failed first attempt is not fatal
+  // (item M4): processDoneWorktrees() only marks itself seeded on a SUCCESSFUL read, so
+  // tick() below keeps retrying until one comes back.
+  if (CLOSE_DONE_WORKTREES) {
+    const startupEvents = [];
+    processDoneWorktrees(worktrees(), startupEvents);
+    if (startupEvents.length) flushAndExit(startupEvents, Date.now());
+  }
 
   const tick = () => {
     beat(started);
@@ -229,6 +509,7 @@ function main() {
     const now = Date.now();
 
     const ws = workers();
+    beat(started); // item L1: refresh liveness between round trips at a short --interval
     if (ws) {
       const cur = snapshotWorkers(ws);
       for (const [id, state] of cur) {
@@ -256,15 +537,8 @@ function main() {
     }
 
     if (CLOSE_DONE_WORKTREES) {
-      const wts = worktrees();
-      if (wts) {
-        for (const w of wts) {
-          if (isDoneButOpen(w) && !reportedDoneWorktrees.has(w.path)) {
-            reportedDoneWorktrees.add(w.path);
-            events.push(formatDoneWorktreeEvent(w));
-          }
-        }
-      }
+      processDoneWorktrees(worktrees(), events);
+      beat(started); // item L1
     }
 
     const ts = terminals();
@@ -294,16 +568,7 @@ function main() {
       }
     }
 
-    if (events.length) {
-      console.log(`orca-heartbeat: ${events.length} event(s) after ${Math.round((now - started) / 1000)}s.`);
-      for (const e of events) console.log(`  - ${e}`);
-      console.log('Act on these now — a worker waiting on a decision is wasted wall-clock.');
-      try {
-        fs.mkdirSync(DIR, { recursive: true });
-        fs.appendFileSync(path.join(DIR, 'heartbeat.log'), `${new Date().toISOString()}\t${events.join(' | ')}\n`);
-      } catch {}
-      process.exit(0); // exiting is the wake-up signal for the panel
-    }
+    if (events.length) { flushAndExit(events, now); return; }
 
     if (Date.now() >= deadline) {
       console.log(`orca-heartbeat: quiet for ${MAX_SECONDS}s, no worker state changed. Stopping.`);
@@ -319,5 +584,6 @@ if (require.main === module) main();
 
 module.exports = {
   classifyTerminal, isHoldingResources, snapshotWorkers, RATE_LIMIT,
-  isDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
+  isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
+  resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
 };
