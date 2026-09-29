@@ -321,7 +321,7 @@ function codexQuota(now = Date.now(), options = {}) {
     staleMs: LIVE_TIMEOUT_MS + 1000,
   });
   if (probeLock === false) {
-    const afterWait = readFreshCache(stateDir, cacheSeconds, now);
+    const afterWait = readFreshCache(stateDir, cacheSeconds, Math.max(now, Date.now()));
     if (afterWait && !afterWait.failed) return afterWait;
     if (afterWait && afterWait.failed) return readSessionQuota(now);
     const stale = readStaleCache(stateDir, now);
@@ -329,7 +329,7 @@ function codexQuota(now = Date.now(), options = {}) {
   }
   try {
     // Another process may have refreshed the cache while this process waited for the lease.
-    const afterAcquire = readFreshCache(stateDir, cacheSeconds, now);
+    const afterAcquire = readFreshCache(stateDir, cacheSeconds, Math.max(now, Date.now()));
     if (afterAcquire && !afterAcquire.failed) return afterAcquire;
     if (afterAcquire && afterAcquire.failed) return readSessionQuota(now);
     const live = liveQuota(now);
