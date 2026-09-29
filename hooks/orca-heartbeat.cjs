@@ -612,7 +612,10 @@ function classifyTerminal(t, ctx) {
 
 function snapshotWorkers(list) {
   const m = new Map();
-  for (const w of list) m.set(w.dispatchId, `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`);
+  for (const w of list) {
+    if (!w || w.workerState === 'unsupervised') continue;
+    m.set(w.dispatchId, `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`);
+  }
   return m;
 }
 
@@ -688,6 +691,7 @@ function main() {
       // watch; the backlog from earlier sessions is not this run's event.
       const newDoneHolding = ws.filter(
         (w) =>
+          w.workerState !== 'unsupervised' &&
           ['succeeded', 'failed', 'stopped'].includes(w.workerState) &&
           isHoldingResources(w) &&
           baseWorkerState.get(w.dispatchId) !== `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`

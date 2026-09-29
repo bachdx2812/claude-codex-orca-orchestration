@@ -261,6 +261,12 @@ check('a finished worker still holding a terminal is flagged',
   heartbeat.isHoldingResources({ terminalState: 'retained' }), true);
 check('a released worker holds nothing',
   heartbeat.isHoldingResources({ terminalState: 'released' }), false);
+check('heartbeat event snapshots exclude unsupervised context-only rows',
+  [...heartbeat.snapshotWorkers([
+    { dispatchId: 'ctx_context_only', workerState: 'unsupervised', dispatchStatus: 'created', terminalState: null },
+    { dispatchId: 'ctx_worker', workerState: 'running', dispatchStatus: 'started', terminalState: 'attached' },
+  ])],
+  [['ctx_worker', 'running|started|attached']]);
 
 // --- heartbeat isDoneButOpen / worktree event formatting --------------------
 
