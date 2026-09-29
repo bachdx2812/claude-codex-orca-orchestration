@@ -2203,7 +2203,7 @@ for (const event of ['UserPromptSubmit', 'Stop']) {
  * (or is force-killed after 8s as a safety net). */
 function runHeartbeat({
   name, worktrees, args, cfgOverrides, envOverrides, gitEnv, mutateAfterCalls, mutateTo,
-  dirName, sessionName,
+  dirName, sessionName, workerRows,
 }) {
   return new Promise((resolve) => {
     const dir = path.join(RUN_DIR, dirName || `hb-${name}`);
@@ -2213,10 +2213,21 @@ function runHeartbeat({
     const wtFile = path.join(dir, 'worktrees.json');
     fs.writeFileSync(wtFile, JSON.stringify(worktrees || []));
     const callsLogFile = path.join(dir, 'wt-calls.log');
+    const scopedWorkerRows = workerRows === undefined
+      ? (worktrees || []).filter((w) => w && typeof w.path === 'string').map((w, i) => ({
+        dispatchId: `ctx_hb_${i}`,
+        workerState: 'running',
+        dispatchStatus: 'running',
+        terminalState: 'active',
+        worktreePath: w.path,
+        resource: { path: w.path },
+      }))
+      : workerRows;
     const env = {
       ...BASE_ENV, ORCA_BIN: STUB, ORCH_GIT_BIN: GIT_STUB, ORCH_STATE_DIR: dir, ORCH_CONFIG_PATH: cfgFile,
       CLAUDE_CODE_SESSION_ID: `hb-${sessionName || name}-${process.pid}`, STUB_WORKTREES_JSON: `@${wtFile}`,
-      STUB_WORKTREE_PS_CALLS_LOG: callsLogFile, STUB_GIT_CLEAN: '1', STUB_GIT_HAS_UPSTREAM: '1',
+      STUB_WORKTREE_PS_CALLS_LOG: callsLogFile, STUB_WORKERS_JSON: JSON.stringify(scopedWorkerRows),
+      STUB_GIT_CLEAN: '1', STUB_GIT_HAS_UPSTREAM: '1',
       ...(gitEnv || {}), ...(envOverrides || {}),
     };
     const child = spawn(process.execPath, [HEARTBEAT, ...(args || [])], { env });
@@ -2281,6 +2292,36 @@ function realWtDirWithGitMarker(label, mtimeMs) {
 }
 
 async function heartbeatWorktreeTests() {
+  // A machine-wide worktree list may include another session's completed worktree. Only
+  // paths carried by this session's run-scoped worker rows may enter the reminder.
+  {
+    const owned = realWtDir('session-owned');
+    const foreign = realWtDir('foreign-session');
+    const out = await runHeartbeat({
+      name: 'session-owned-only',
+      worktrees: [
+        { path: owned, displayName: 'session-owned', isMainWorktree: false, isArchived: false,
+          liveTerminalCount: 1, linkedPR: { state: 'open', number: 501 } },
+        { path: foreign, displayName: 'foreign-session', isMainWorktree: false, isArchived: false,
+          liveTerminalCount: 1, linkedPR: { state: 'open', number: 502 } },
+      ],
+      workerRows: [{ dispatchId: 'ctx_session_owned', workerState: 'running', dispatchStatus: 'running',
+        terminalState: 'active', worktreePath: owned, resource: { path: owned } }],
+      mutateAfterCalls: 1,
+      mutateTo: [
+        { path: owned, displayName: 'session-owned', isMainWorktree: false, isArchived: false,
+          liveTerminalCount: 0, linkedPR: { state: 'merged', number: 501 } },
+        { path: foreign, displayName: 'foreign-session', isMainWorktree: false, isArchived: false,
+          liveTerminalCount: 0, linkedPR: { state: 'merged', number: 502 } },
+      ],
+      args: ['--interval', '1', '--idle', '60', '--max', '10'],
+    });
+    checkBool('done-worktree reminder reports a worktree owned by this session',
+      out.includes('DONE worktree session-owned'), true);
+    checkBool('done-worktree reminder never reports another session\'s worktree',
+      out.includes('foreign-session'), false);
+  }
+
   // 1. A worktree already done-but-open at startup: only the one-time summary line, never
   //    the wake-event line, and the daemon runs to its --max instead of exiting early.
   {

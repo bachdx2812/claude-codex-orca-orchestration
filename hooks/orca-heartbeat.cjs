@@ -158,7 +158,23 @@ function workers() {
     dispatchStatus: w.dispatchStatus,
     terminalState: w.terminalState,
     agentTerminalHandle: w.agentTerminalHandle || '',
+    worktreePaths: [
+      w.worktreePath,
+      w.resourcePath,
+      w.resource && w.resource.path,
+      w.resource && w.resource.worktreePath,
+      w.worktree && w.worktree.path,
+    ].filter((candidate) => typeof candidate === 'string' && candidate.length > 0),
   }));
+}
+
+/** Worktree paths owned by this run-scoped worker list. */
+function workerWorktreePaths(workerRows) {
+  const owned = new Set();
+  for (const worker of workerRows || []) {
+    for (const candidate of worker?.worktreePaths || []) owned.add(candidate);
+  }
+  return owned;
 }
 
 /** Terminal handles this session owns: worker-list is run-scoped, while the gate's own
@@ -519,7 +535,7 @@ function ensureDoneWtPersistedLoaded() {
  * After seeding, this same process continues in ordinary steady-state on every later call:
  * anything done-but-open this process has not itself already reported is a wake event.
  */
-function processDoneWorktrees(data, events, started) {
+function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
   if (!CLOSE_DONE_WORKTREES || !data || data.truncated) return;
   try {
     ensureDoneWtPersistedLoaded();
@@ -530,9 +546,10 @@ function processDoneWorktrees(data, events, started) {
     // first seed, every row must still be evaluated once to establish the backlog / diff
     // against a persisted restart, so nothing is skipped yet at that point.
     const isSeedingPass = !doneWtSeeded;
+    const sessionRows = data.rows.filter((w) => w && ownedWorktreePaths.has(w.path));
     const candidates = isSeedingPass
-      ? data.rows
-      : data.rows.filter((w) => !(w && typeof w.path === 'string' && reportedDoneWorktrees.has(w.path)));
+      ? sessionRows
+      : sessionRows.filter((w) => !reportedDoneWorktrees.has(w.path));
     // A git-heavy pass (many worktrees left to evaluate) must never run long enough to make
     // the liveness file look stale: cap it to ~GIT_BUDGET_MS total and beat() between rows.
     // Whatever does not fit in the budget is simply retried next tick — evaluateDoneButOpen
@@ -637,6 +654,7 @@ function main() {
   // Baseline: only deviations from this state are worth waking the panel for.
   const baseTermHandles = new Set((baseTerms || []).map((t) => t.handle));
   const baseWorkerState = snapshotWorkers(baseWorkers || []);
+  const ownedWorktreePaths = workerWorktreePaths(baseWorkers || []);
   const ownTerminalHandles = sessionTerminalHandles(baseWorkers || []);
   let prevWorkers = new Map(baseWorkerState);
   const reportedIdle = new Set();
@@ -665,7 +683,7 @@ function main() {
   // tick() below keeps retrying until one comes back.
   if (CLOSE_DONE_WORKTREES) {
     const startupEvents = [];
-    processDoneWorktrees(worktrees(), startupEvents, started);
+    processDoneWorktrees(worktrees(), startupEvents, started, ownedWorktreePaths);
     if (startupEvents.length) flushAndExit(startupEvents, Date.now());
   }
 
@@ -677,6 +695,7 @@ function main() {
     const ws = workers();
     beat(started); // item L1: refresh liveness between round trips at a short --interval
     if (ws) {
+      for (const worktreePath of workerWorktreePaths(ws)) ownedWorktreePaths.add(worktreePath);
       for (const handle of sessionTerminalHandles(ws)) ownTerminalHandles.add(handle);
       const cur = snapshotWorkers(ws);
       for (const [id, state] of cur) {
@@ -705,7 +724,7 @@ function main() {
     }
 
     if (CLOSE_DONE_WORKTREES) {
-      processDoneWorktrees(worktrees(), events, started);
+      processDoneWorktrees(worktrees(), events, started, ownedWorktreePaths);
       beat(started); // item L1
     }
 
@@ -758,6 +777,7 @@ if (require.main === module) main();
 
 module.exports = {
   classifyTerminal, isHoldingResources, snapshotWorkers, sessionTerminalHandles, RATE_LIMIT,
+  workerWorktreePaths,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
