@@ -10,7 +10,9 @@ function terminalLines(text) {
 
 function isSourceExcerpt(line) {
   return /^\s*(?:```|~~~|@@|diff\s+--git\b|index\s+[0-9a-f]+\.\.|[+-](?!\s*(?:ERROR\b|error:|■))|\d+\s*[|:│]|[|│┃]\s*)/i.test(line) ||
-    /^\s*(?:const|let|var|function|class|if|for|while|return|check|expect|assert|\/\/|#)\b/.test(line);
+    /^\s*(?:const|let|var|function|class|if|for|while|return|check|expect|assert)\b/.test(line) ||
+    /^\s*(?:\/\/|#)(?:\s|$)/.test(line) ||
+    /^\s*[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\s*(?:\(|=)/.test(line);
 }
 
 /** True only for a terminal line shaped like a runtime error, never standing tips or code/diff excerpts. */
@@ -38,4 +40,4 @@ function hasCodexDisconnect(text) {
   return false;
 }
 
-module.exports = { hasRateLimitError, hasCodexDisconnect, RATE_LIMIT_MARKER };
+module.exports = { hasRateLimitError, hasCodexDisconnect };

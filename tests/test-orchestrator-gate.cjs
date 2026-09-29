@@ -217,6 +217,10 @@ check('a diff excerpt mentioning a rate limit is not an error',
   hasRateLimitError('+const message = "Error: 429 rate limit";'), false);
 check('a fenced code excerpt mentioning a rate limit is not an error',
   hasRateLimitError('```text\nError: 429 rate limit\n```'), false);
+check('a displayed function call containing an HTTP 429 string is not an error',
+  hasRateLimitError('console.error("HTTP 429 Too Many Requests")'), false);
+check('a displayed test assertion containing an API error code is not an error',
+  hasRateLimitError("expect(message).toContain('rate_limit_exceeded');"), false);
 check('a Codex error bullet is a rate-limit error',
   hasRateLimitError("■ You've hit your usage limit. Try again later."), true);
 check('an HTTP 429 response line is a rate-limit error',
