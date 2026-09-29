@@ -76,7 +76,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 751 tests, fully hermetic
+npm test                       # 756 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -195,7 +195,7 @@ are overridable for one process with `ORCH_MAX_PARALLEL_CODEX_WORKERS` /
 more, `closeDoneWorktrees` (default `true`), controls whether `orca-heartbeat.cjs` reminds
 about a worktree that is idle, accepted (PR/MR merged or closed, or — when neither is linked
 — a git-confirmed ancestor whose own HEAD commit postdates the worktree's creation AND whose
-own branch reflog actually records a commit, so a freshly-branched worktree with zero new
+per-worktree HEAD reflog actually records a commit, so a freshly-branched worktree with zero new
 commits, or one merely rebased/fast-forwarded onto a base that itself advanced after the
 worktree was created, is never mistaken for done-but-open work) and clean, with no live
 terminal on it; disable with `false` or `ORCH_CLOSE_DONE_WORKTREES`

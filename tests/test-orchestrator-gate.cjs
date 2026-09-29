@@ -1640,6 +1640,42 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
 
 // --- report -----------------------------------------------------------------
 
+// A clean installer copy must contain the complete runtime dependency closure. Running
+// the copied gate with orchestration disabled still loads every top-level helper, so a
+// missing HOOK_FILES entry fails here with MODULE_NOT_FOUND instead of after installation.
+{
+  const installer = fs.readFileSync(path.join(__dirname, '..', 'install.mjs'), 'utf8');
+  const block = installer.match(/const HOOK_FILES = \[([\s\S]*?)\n\];/);
+  const files = block ? [...block[1].matchAll(/'([^']+)'/g)].map((m) => m[1]) : [];
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-installed-smoke-'));
+  for (const rel of files) {
+    const target = path.join(root, rel);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(path.join(__dirname, '..', 'hooks', rel), target);
+  }
+  const result = spawnSync(process.execPath, [path.join(root, 'orchestrator-gate.cjs')], {
+    input: JSON.stringify({ session_id: 'installed-smoke', hook_event_name: 'SessionStart' }),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ORCHESTRATOR_GATE: 'off',
+      ORCH_STATE_DIR: path.join(root, 'state'),
+      ORCH_CONFIG_PATH: path.join(root, 'no-config.json'),
+    },
+  });
+  check('installer hook file list has a loadable runtime dependency closure', result.status, 0);
+  const codexStub = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
+  try { fs.chmodSync(codexStub, 0o755); } catch {}
+  const liveResult = spawnSync(process.execPath, ['-e',
+    'const q=require(process.argv[1]);process.exit(q.liveQuota() ? 0 : 1)',
+    path.join(root, 'lib', 'exec-route-by-quota.cjs')], {
+    encoding: 'utf8',
+    env: { ...process.env, ORCH_CODEX_BIN: codexStub, STUB_CODEX_PRIMARY_USED: '20' },
+  });
+  check('installer hook file list includes the dynamically spawned live quota probe', liveResult.status, 0);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 fs.rmSync(STATE_DIR, { recursive: true, force: true });
 
 console.log(`${pass} passed, ${failures.length} failed`);

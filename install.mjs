@@ -40,9 +40,9 @@ const MANIFEST_FILE = path.join(HOOKS_DIR, 'install-manifest.json');
 const GATE_SCRIPT = 'orchestrator-gate.cjs';
 const HOOK_FILES = [
   'orchestrator-gate.cjs', 'orca-heartbeat.cjs',
-  'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/shell-orca-invocations.cjs',
+  'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/codex-quota-probe.cjs', 'lib/shell-orca-invocations.cjs',
   'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
-  'lib/parallel-ownership-gates.cjs',
+  'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
 ];
 const EVENTS = {
   SessionStart: '*',
@@ -55,6 +55,8 @@ const EVENTS = {
   PostToolUseFailure: '*',
   Stop: '*',
 };
+// Claude Code PreToolUse command hooks currently default to 600s. That is safely above
+// this gate's roughly 50s worst case, so its per-hook timeout is intentionally left unset.
 const START_MARK = '<!-- orchestration:start -->';
 const END_MARK = '<!-- orchestration:end -->';
 

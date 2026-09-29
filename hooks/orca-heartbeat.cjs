@@ -302,22 +302,21 @@ function hasProducedMergedWork(w, git, stat) {
 }
 
 /**
- * Review round 3, item 3 (H1 leftover false positive): whether this worktree's OWN checked-out
- * branch ever actually gained a commit, straight from its reflog — `git reflog show
- * --format=%gs HEAD` (HEAD, not a hardcoded branch name: a linked worktree's HEAD already
- * points at whatever branch it has checked out, and a branch's reflog is shared across every
- * worktree that has it checked out) lists one line per ref-log entry; any subject starting with
- * "commit" (`commit: ...`, `commit (initial): ...`, `commit (amend): ...`, `commit (merge):
- * ...`) is a real commit action taken ON THIS branch.
+ * Whether this worktree itself ever recorded a commit action, straight from its reflog —
+ * `git reflog show
+ * --format=%gs HEAD` (HEAD, not a hardcoded branch name: from `w.path`, Git resolves the
+ * per-worktree HEAD reflog for that linked worktree) lists one line per ref-log entry; any
+ * subject starting with "commit" (`commit: ...`, `commit (initial): ...`, `commit (amend): ...`, `commit (merge):
+ * ...`) is a real commit action taken in this worktree.
  *
  * `hasProducedMergedWork` above (the `.git`-marker-mtime vs HEAD-commit-time heuristic) has a
  * false positive: a worktree with zero commits of its own, rebased or fast-forwarded onto a
  * base that itself advanced AFTER the worktree was created, ends up with a HEAD commit time
  * that postdates the worktree's own creation — exactly the signal `hasProducedMergedWork`
- * reads as "this worktree produced work" — even though the worktree's own branch never
- * recorded a single commit. This reflog check answers the actual question directly instead of
+ * reads as "this worktree produced work" — even though that worktree never recorded a
+ * commit action. This reflog check answers the actual question directly instead of
  * inferring it from timestamps, so it is required IN ADDITION TO (not instead of)
- * `hasProducedMergedWork` below: a real commit made on the branch satisfies both signals, a
+ * `hasProducedMergedWork` below: a real commit made in the worktree satisfies both signals, a
  * rebase/fast-forward with no own commits satisfies only the (now insufficient) old one. Same
  * uncertainty rule as everywhere else in this file: a git failure, or an empty reflog, is
  * never a pass.

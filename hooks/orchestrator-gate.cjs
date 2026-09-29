@@ -632,7 +632,7 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
       hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled,
       agentParallelLimit, maxParallelAgents, machineWideLiveUnits: PAC.machineWideLiveUnits,
       formatParallelAgentsRefusal: PAC.formatParallelAgentsRefusal, cores: PAC.cores, parallelCoreFraction,
-      lockContentionMessage: PAC.LOCK_CONTENTION_MESSAGE,
+      lockContentionMessage: PAC.LOCK_CONTENTION_MESSAGE, capLockOpts: CAP_LOCK_OPTS,
     },
   });
 }
@@ -1162,7 +1162,11 @@ function onPreToolUse(p, s, cfg) {
     {
       const lockDir = path.join(DIR, '.lock');
       let violation = null;
-      let locked = acquireLock(lockDir, CAP_LOCK_OPTS);
+      // A finite, enabled hard cap must outlive file-lock's stale threshold. When the cap
+      // is disabled or unlimited this block only keeps best-effort bookkeeping, so retain
+      // file-lock's short default instead of making an allowed dispatch wait 10.5 seconds.
+      const hardCapActive = !gateDisabled(cfg, 'max-parallel-agents') && Number.isFinite(agentParallelLimit(cfg));
+      let locked = acquireLock(lockDir, hardCapActive ? CAP_LOCK_OPTS : {});
       try {
         // CRITICAL: reload fresh now the lock is held — same reasoning as every other
         // lock-protected read-decide-reserve section in this file. H3: reconcile against

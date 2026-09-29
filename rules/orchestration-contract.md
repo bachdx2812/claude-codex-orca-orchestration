@@ -272,10 +272,10 @@ main worktree, not already archived, and that is:
     path only) HEAD's own commit postdates the worktree's creation (the mtime of its `.git`
     file — a worktree freshly branched off that base with zero new commits is trivially an
     "ancestor" of it too, and must not be mistaken for done-but-open work) AND the
-    worktree's own branch reflog (`git reflog show --format=%gs HEAD`) actually records a
-    `commit` entry — a worktree merely rebased or fast-forwarded onto a base that itself
+    worktree's per-worktree HEAD reflog (`git reflog show --format=%gs HEAD`) actually
+    records a `commit` entry — a worktree merely rebased or fast-forwarded onto a base that itself
     advanced after the worktree was created can satisfy the commit-time check alone without
-    the worktree's own branch ever gaining a commit, so both signals are required together;
+    the worktree ever recording a commit action, so both signals are required together;
   - **clean** — `git status --porcelain` empty and no commits the branch holds that its
     upstream does not (`git rev-list @{u}..HEAD` empty), or, lacking an upstream entirely,
     HEAD contained in that same resolved base branch.

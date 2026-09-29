@@ -177,7 +177,8 @@ function reconcileCodexGroupsWithOrca(s, orcaBin) {
  * refuses the whole tool call; nothing past that point gets reserved.
  *
  * `deps`: `{ hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN,
- *            maxParallelCodexWorkers, ownershipClaimTtlMinutes, save }` — all lifted
+ *            maxParallelCodexWorkers, ownershipClaimTtlMinutes, capLockOpts, save }` —
+ * all lifted
  * straight from orchestrator-gate.cjs, which still owns `d()` (the actual refusal/exit).
  */
 /**
@@ -259,7 +260,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   // Only release the lock if THIS call actually acquired it — acquireLock() can return
   // false on timeout (degrade to allow, per the file-lock design), and unconditionally
   // rmdir-ing the lock directory then would tear down another process's still-held lock.
-  let locked = acquireLock(lockDir, {});
+  let locked = acquireLock(lockDir, deps.capLockOpts);
   try {
     // CRITICAL: reload state fresh from disk now that the lock is held. `s` as passed in
     // was loaded by main() *before* this lock was acquired, so under concurrent hook
@@ -408,7 +409,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
               // would otherwise refuse a dispatch that could actually proceed right now.
               if (locked) { releaseLock(lockDir); locked = false; }
               const rows = fetchOrcaWorkerRows(ORCA_BIN);
-              locked = acquireLock(lockDir, {});
+              locked = acquireLock(lockDir, deps.capLockOpts);
               if (!locked) {
                 violation = { gate: 'max-parallel-agents', reason: deps.lockContentionMessage };
                 break;
@@ -442,7 +443,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             // never lost.
             if (locked) { releaseLock(lockDir); locked = false; }
             const rows = fetchOrcaWorkerRows(ORCA_BIN);
-            locked = acquireLock(lockDir, {});
+            locked = acquireLock(lockDir, deps.capLockOpts);
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
             if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;

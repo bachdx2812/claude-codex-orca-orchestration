@@ -1960,8 +1960,13 @@ function withHeldLock(lockDir, fn) {
   const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 0 }); // 0 = unlimited
   const lockDir = path.join(stateDir, '.lock');
   withHeldLock(lockDir, () => {
-    expect('item 1: a genuinely held .lock + unlimited (0) cap still admits an Agent dispatch',
-      mpaLookup('mpa-r3-i1-agent-unlimited', 'toolu_r3i1_agent_u'), ALLOW, env);
+    const started = Date.now();
+    const result = invoke(mpaLookup('mpa-r3-i1-agent-unlimited', 'toolu_r3i1_agent_u'), env);
+    const elapsed = Date.now() - started;
+    if (result.code === ALLOW) pass += 1;
+    else failures.push(`held lock + unlimited cap should allow Agent dispatch, got ${result.code}`);
+    if (elapsed < 3000) pass += 1;
+    else failures.push(`held lock + unlimited cap should finish in <3s, took ${elapsed}ms`);
     expect('item 1: a genuinely held .lock + unlimited (0) cap still admits `orca terminal create`',
       mainBash('orca terminal create --json', { sid: 'mpa-r3-i1-term-unlimited' }), ALLOW, env);
   });
@@ -1970,8 +1975,13 @@ function withHeldLock(lockDir, fn) {
   const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 1, disabledGates: ['max-parallel-agents'] });
   const lockDir = path.join(stateDir, '.lock');
   withHeldLock(lockDir, () => {
-    expect('item 1: a genuinely held .lock + disabledGates still admits an Agent dispatch',
-      mpaLookup('mpa-r3-i1-agent-disabled', 'toolu_r3i1_agent_d'), ALLOW, env);
+    const started = Date.now();
+    const result = invoke(mpaLookup('mpa-r3-i1-agent-disabled', 'toolu_r3i1_agent_d'), env);
+    const elapsed = Date.now() - started;
+    if (result.code === ALLOW) pass += 1;
+    else failures.push(`held lock + disabled gate should allow Agent dispatch, got ${result.code}`);
+    if (elapsed < 3000) pass += 1;
+    else failures.push(`held lock + disabled gate should finish in <3s, took ${elapsed}ms`);
     expect('item 1: a genuinely held .lock + disabledGates still admits `orca terminal create`',
       mainBash('orca terminal create --json', { sid: 'mpa-r3-i1-term-disabled' }), ALLOW, env);
   });
@@ -1995,6 +2005,13 @@ function withHeldLock(lockDir, fn) {
   fs.utimesSync(lockDir, backdated, backdated);
   expect('item 2: a not-yet-stale-but-soon-to-be lock is outlasted, not refused as contended (Agent)',
     mpaLookup('mpa-r3-i2-agent', 'toolu_r3i2_agent'), ALLOW, env);
+
+  fs.mkdirSync(lockDir, { recursive: true });
+  const workerBackdated = Date.now() / 1000 - 7;
+  fs.utimesSync(lockDir, workerBackdated, workerBackdated);
+  expect('worker-start outlasts a soon-stale lock under a finite cap',
+    mainBash('orca orchestration worker-start --agent codex --worktree new-child --spec "implement x. Verify: npm test." --json',
+      { sid: 'mpa-r3-i2-worker-start', tool_use_id: 'toolu_r3i2_worker_start' }), ALLOW, env);
 }
 
 // --- orca-heartbeat.cjs: done-but-open worktree reminder (real spawned daemon + stubs) --

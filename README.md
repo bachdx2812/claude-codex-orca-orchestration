@@ -74,10 +74,10 @@ git alone might say — or, only when NEITHER is linked at all, a real `git merg
 branch, resolved from `refs/remotes/origin/HEAD` with no `git fetch` ever run, AND HEAD's own
 commit postdates the worktree's creation (a worktree freshly branched off that base with
 zero new commits is trivially an "ancestor" too, and must not be mistaken for done-but-open
-work) AND the worktree's own branch reflog (`git reflog show --format=%gs HEAD`) actually
-records a `commit` entry — a worktree that only ever got rebased or fast-forwarded onto a
+work) AND the worktree's per-worktree HEAD reflog (`git reflog show --format=%gs HEAD`)
+actually records a `commit` entry — a worktree that only ever got rebased or fast-forwarded onto a
 base that itself advanced after the worktree was created can satisfy the commit-time check
-above without ever gaining a commit of its own, so both signals are required); **idle**
+above without ever recording a commit action, so both signals are required); **idle**
 (no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt` already past the
 heartbeat's idle threshold); and **clean** (`git status --porcelain` empty and no unpushed
 commits — or, lacking an upstream entirely, HEAD contained in that same resolved base) —
@@ -192,7 +192,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 751 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 756 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
