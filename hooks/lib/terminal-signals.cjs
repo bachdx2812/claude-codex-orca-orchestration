@@ -36,7 +36,7 @@ function hasCodexDisconnect(text) {
     if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
     if (inFence || isSourceExcerpt(line)) continue;
     if (/^\s*■\s*(?:Connection lost\..*reconnect|Automatic reconnect could not restore this session\.)/i.test(line) ||
-        /^\s*Reconnect failed\b/i.test(line)) return true;
+        /^\s*(?:■|└)?\s*Reconnect failed\b/i.test(line)) return true;
   }
   return false;
 }

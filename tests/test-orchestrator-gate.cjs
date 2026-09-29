@@ -239,6 +239,10 @@ check('Codex automatic reconnect failure is a disconnect',
   hasCodexDisconnect('■ Automatic reconnect could not restore this session.'), true);
 check('Codex endpoint reconnect failure is a disconnect',
   hasCodexDisconnect('Reconnect failed — check the endpoint, then relaunch'), true);
+check('a bullet-prefixed reconnect failure is a disconnect',
+  hasCodexDisconnect('■ Reconnect failed — check the endpoint, then relaunch'), true);
+check('a branch-prefixed reconnect failure is a disconnect',
+  hasCodexDisconnect('└ Reconnect failed — check the endpoint, then relaunch'), true);
 check('a diff excerpt containing a reconnect failure is not a disconnect',
   hasCodexDisconnect('+Reconnect failed — check the endpoint, then relaunch'), false);
 
