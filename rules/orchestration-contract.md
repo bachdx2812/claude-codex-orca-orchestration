@@ -58,6 +58,12 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
     above) plus every live main-panel `Agent`/`Task` dispatch. A dispatch that would exceed
     it is refused; wait for one to finish and release it, or raise the limit.
 
+Agent/Task intent classification gives a recognized first verb in the description priority
+over later nouns: `Review ...`/`Plan ...` are review work and `Implement ...` is code work.
+The operational first verbs `commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`,
+`deploy`, `update`, and `write` are neutral, so a later `review`, `plan`, or `design` token
+does not reroute the dispatch.
+
 ## Activation
 
 `config.activation` decides which sessions this gate governs at all:
@@ -273,7 +279,9 @@ orca orchestration worker-retain --dispatch <dispatchId>
 
 An explicitly retained row is supervised work, not a finished-terminal leak. The heartbeat
 continues watching its terminal for IDLE even when it was already quiet before daemon
-startup, and `Stop` is allowed only while that heartbeat is alive; without a live daemon the
+startup. Reported quiet stretches are persisted per session as `handle` + `lastOutputAt`, so
+an unchanged terminal is not re-reported after every daemon restart; new output re-arms it.
+`Stop` is allowed only while that heartbeat is alive; without a live daemon the
 retained worker is refused as `workers-unwatched`. Orca's automatic
 `terminalState: retained` on a readiness failure does not get this exemption unless this
 session recorded an explicit `worker-retain`. Release the worker when it is no longer needed.
@@ -385,7 +393,9 @@ call sees the winner's reservation and is refused before either registers a real
 and one process's save can never silently overwrite another's. A byte-identical command is
 only treated as a retry that may replace its unresolved same-hash reservation once that
 reservation is at least two seconds old; a fresh one can be a second call in the same
-parallel batch and must still see the first reservation.
+parallel batch and must still see the first reservation. A same-command reservation with no
+numeric timestamp is treated as old and replaced. When a fresh identical retry conflicts
+with its own reservation, the refusal explicitly says to retry in a few seconds.
 
 **`max-parallel-agents`.** A MACHINE-wide budget, on top of (never instead of) the
 Codex-only cap above: the resource is this machine's cores, not any one session's own
@@ -611,7 +621,7 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # all four suites (791 checks)
+npm test                                             # all four suites (836 checks)
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
 node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)

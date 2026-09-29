@@ -74,6 +74,10 @@ const GIT_BUDGET_MS = Number(process.env.ORCH_GIT_BUDGET_MS) > 0 ? Number(proces
 // Session whose panel started this daemon (inherited from the Claude Code Bash tool).
 const SESSION = String(process.env.CLAUDE_CODE_SESSION_ID || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
 const BEAT_FILE = path.join(DIR, `heartbeat-${SESSION}.json`);
+// Persists the last quiet stretch reported for each terminal in this session. The daemon
+// exits to wake the panel, so process-local de-duplication alone would re-report the same
+// retained terminal after every restart. A changed lastOutputAt value starts a new stretch.
+const IDLE_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-idle-reported.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -117,6 +121,26 @@ function savePersistedDoneWorktrees(set) {
     const tmp = `${DONE_WT_FILE}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify([...set]));
     fs.renameSync(tmp, DONE_WT_FILE);
+  } catch {}
+}
+
+function loadPersistedIdleReports() {
+  try {
+    const pairs = JSON.parse(fs.readFileSync(IDLE_REPORTED_FILE, 'utf8'));
+    if (!Array.isArray(pairs)) return new Map();
+    return new Map(pairs.filter((pair) => Array.isArray(pair) && pair.length === 2 &&
+      typeof pair[0] === 'string' && Number.isFinite(pair[1])));
+  } catch {
+    return new Map();
+  }
+}
+
+function savePersistedIdleReports(map) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${IDLE_REPORTED_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...map]));
+    fs.renameSync(tmp, IDLE_REPORTED_FILE);
   } catch {}
 }
 
@@ -721,7 +745,7 @@ function main() {
   const explicitRetainedHandles = retainedTerminalHandles(baseWorkers || [], sessionState);
   const ownedWorktreePaths = sessionWorktreeKeys(baseWorkers || [], baseTerms || [], ownTerminalHandles, sessionState);
   let prevWorkers = new Map(baseWorkerState);
-  const reportedIdle = new Set();
+  const reportedIdle = loadPersistedIdleReports();
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
@@ -820,8 +844,9 @@ function main() {
           if (baseOrphans.has(t.handle) || reportedOrphans.has(t.handle)) continue;
           reportedOrphans.add(t.handle);
           events.push(`ORPHANED terminal ${label} — close it.`);
-        } else if (verdict.kind === 'idle' && !reportedIdle.has(t.handle)) {
-          reportedIdle.add(t.handle);
+        } else if (verdict.kind === 'idle' && reportedIdle.get(t.handle) !== t.lastOutputAt) {
+          reportedIdle.set(t.handle, t.lastOutputAt);
+          savePersistedIdleReports(reportedIdle);
           events.push(`IDLE ${verdict.quiet}s: ${label} — read it and decide: re-prompt, retry, or release.`);
         }
       }

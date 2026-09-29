@@ -303,6 +303,12 @@ expect('opus for execution is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'opus' }), DENY);
 expect('an agent name not in the configured escalation list gets no special treatment',
   dispatch({ subagent_type: 'not-configured-agent', description: 'review the diff' }), DENY);
+expect('a neutral Commit verb is not misclassified by review-fix later in the description',
+  dispatch({ subagent_type: 'git-manager', description: 'Commit review-fix round in worktree', model: 'sonnet' }), ALLOW);
+expect('a neutral Commit verb is not misclassified by a later plan noun',
+  dispatch({ subagent_type: 'git-manager', description: 'Commit the plan file', model: 'sonnet' }), ALLOW);
+expect('a neutral Update verb is not misclassified by a later design noun',
+  dispatch({ subagent_type: 'docs-manager', description: 'Update design tokens doc', model: 'sonnet' }), ALLOW);
 
 // Main panel vs Orca worker terminal, via the deterministic stub (never a live Orca).
 expect('attended main panel is still gated',
@@ -2065,6 +2071,41 @@ function withHeldLock(lockDir, fn) {
 // which means no PostToolUse event ever arrives. An exact retry in the same session must
 // replace that pending reservation, while a different overlapping command remains refused.
 {
+  const env = quotaEnv('pending-retry-guidance', 10, 30, { maxParallelCodexWorkers: 1 });
+  const sid = 'pending-retry-guidance';
+  const command = 'orca orchestration worker-start --agent codex --spec "implement retry.\nVerify: npm test\nOwns: src/retry-guidance.ts"';
+  rmState(sid);
+  expect('pending retry guidance: the original worker-start reserves its claim and slot',
+    mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_guidance_original' }), ALLOW, env);
+  const immediate = invoke(mainBash(command,
+    { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_guidance_retry' }), env);
+  checkBool('pending retry guidance: a fresh identical retry says to retry in a few seconds',
+    immediate.code === DENY && /retry in a few seconds/i.test(immediate.err), true);
+  rmState(sid);
+}
+
+{
+  const env = quotaEnv('pending-retry-missing-ts', 10, 30, { maxParallelCodexWorkers: 1 });
+  const sid = 'pending-retry-missing-ts';
+  const command = 'orca orchestration worker-start --agent codex --spec "implement retry.\nVerify: npm test\nOwns: src/retry-missing-ts.ts"';
+  rmState(sid);
+  expect('pending retry missing ts: the original worker-start reserves its claim and slot',
+    mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_missing_ts_original' }), ALLOW, env);
+  const withoutTs = readState(sid);
+  delete withoutTs.reservations['toolu_missing_ts_original#0'].ts;
+  fs.writeFileSync(path.join(STATE_DIR, `${sid}.json`), JSON.stringify(withoutTs));
+  expect('pending retry missing ts: the exact same command replaces a timestamp-less reservation',
+    mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_missing_ts_retry' }), ALLOW, env);
+  const afterMissingTsRetry = readState(sid);
+  checkBool('pending retry missing ts: the stale timestamp-less reservation is removed',
+    !afterMissingTsRetry.reservations['toolu_missing_ts_original#0'] &&
+      !!afterMissingTsRetry.reservations['toolu_missing_ts_retry#0'] &&
+      Object.keys(afterMissingTsRetry.reservations).length === 1,
+    true);
+  rmState(sid);
+}
+
+{
   const env = quotaEnv('pending-retry-replacement', 10, 30, { maxParallelCodexWorkers: 1 });
   const sid = 'pending-retry-replacement';
   const command = 'orca orchestration worker-start --agent codex --spec "implement retry.\nVerify: npm test\nOwns: src/retry.ts"';
@@ -2439,6 +2480,31 @@ async function heartbeatWorktreeTests() {
     });
     checkBool('explicit retained terminal silent before daemon startup is reported IDLE',
       out.includes('IDLE') && out.includes('term_explicit_retained'), true);
+  }
+
+  // A retained terminal's quiet stretch is reported once per session, not once per daemon
+  // lifetime. A changed lastOutputAt value starts a new quiet stretch and re-arms reporting.
+  {
+    const old = Date.now() - 60_000;
+    const shared = {
+      name: 'retained-idle-restart', dirName: 'hb-retained-idle-restart',
+      sessionName: 'retained-idle-restart-shared', worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_retained_restart', workerState: 'failed', dispatchStatus: 'failed',
+        terminalState: 'retained', agentTerminalHandle: 'term_retained_restart' }],
+      args: ['--interval', '1', '--idle', '2', '--max', '1'],
+    };
+    const seedState = { workers: { ctx_retained_restart: { status: 'live', retained: true,
+      group: 'ctx_retained_restart', started: old } } };
+    const out1 = await runHeartbeat({ ...shared, seedState,
+      terminalRows: [{ handle: 'term_retained_restart', title: 'retained restart', lastOutputAt: old }] });
+    const out2 = await runHeartbeat({ ...shared,
+      terminalRows: [{ handle: 'term_retained_restart', title: 'retained restart', lastOutputAt: old }] });
+    const firstStretchCount = ((out1 + out2).match(/IDLE \d+s: term_retained_restart/g) || []).length;
+    checkBool('retained terminal quiet stretch is reported once across a daemon restart', firstStretchCount, 1);
+    const out3 = await runHeartbeat({ ...shared,
+      terminalRows: [{ handle: 'term_retained_restart', title: 'retained restart', lastOutputAt: old + 1_000 }] });
+    checkBool('new retained-terminal output re-arms the next quiet-stretch report',
+      out3.includes('IDLE') && out3.includes('term_retained_restart'), true);
   }
 
   // 1. A worktree already done-but-open at startup: only the one-time summary line, never

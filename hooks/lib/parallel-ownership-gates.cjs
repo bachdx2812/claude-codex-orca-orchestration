@@ -290,10 +290,13 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     // Code then emits no PostToolUse event for this gate, leaving its reservation pending.
     // A later exact retry in the same session is the same attempted dispatch, not a
     // competing owner: replace its unresolved reservation before overlap/cap accounting.
+    const freshSameCommandReservations = new Set();
     for (const [key, reservation] of Object.entries(s.reservations || {})) {
-      if (reservation && reservation.commandHash === commandHash &&
-          Number.isFinite(reservation.ts) && Date.now() - reservation.ts >= SAME_COMMAND_RETRY_AGE_MS) {
+      if (!reservation || reservation.commandHash !== commandHash) continue;
+      if (!Number.isFinite(reservation.ts) || Date.now() - reservation.ts >= SAME_COMMAND_RETRY_AGE_MS) {
         delete s.reservations[key];
+      } else {
+        freshSameCommandReservations.add(key);
       }
     }
     // A finite cap cannot be evaluated safely after its one long acquisition attempt failed.
@@ -398,10 +401,13 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
           if (gateDisabled(cfg, 'ownership-overlap')) {
             // fall through: disabled, still reserve and still run the cap check below
           } else {
+            const retryGuidance = freshSameCommandReservations.has(conflict.id)
+              ? ' This is the same command as a fresh unresolved reservation; retry in a few seconds.'
+              : '';
             violation = { gate: 'ownership-overlap', reason:
               `Owns ${conflict.hit.b} overlaps ${conflict.hit.a} held by ${conflict.id} (since ${OC.ageString(conflict.ts)}) ` +
               `in workspace ${ws}.\nNarrow the claim, wait for or release that worker, or run it in its own worktree: ` +
-              'worker-start --worktree new-child.' };
+              `worker-start --worktree new-child.${retryGuidance}` };
             break;
           }
         }

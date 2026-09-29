@@ -33,6 +33,11 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) write
 wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The per-prompt "Model
 routing" line always shows the current coder and why.
 
+For Agent/Task descriptions, a recognized first verb governs intent before later nouns do:
+`Review ...` and `Plan ...` route to review, while `Implement ...` routes to code. Operational
+verbs (`commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`, `deploy`, `update`,
+`write`) are neutral, so `Commit review-fix round` is not mistaken for review work.
+
 ## Subagents and parallel work
 
 Two kinds of workers do the actual work; only Orca workers need supervision:
@@ -73,8 +78,10 @@ orca orchestration worker-retain --dispatch <dispatchId>
 
 An explicitly retained row remains supervised even when its terminal was already quiet
 before the daemon started: keep `orca-heartbeat.cjs` alive while waiting so it can wake the
-panel when the terminal becomes IDLE. `Stop` refuses an explicitly retained worker when no
-live heartbeat is watching it. A readiness-failure row Orca labels `retained` is not treated
+panel when the terminal becomes IDLE. Each `handle` + `lastOutputAt` quiet stretch is persisted
+for the session, so restarting the daemon does not wake the panel repeatedly for unchanged
+output; new output re-arms the next quiet-stretch report. `Stop` refuses an explicitly retained
+worker when no live heartbeat is watching it. A readiness-failure row Orca labels `retained` is not treated
 as this operator decision unless this session actually ran `worker-retain`. Release it
 normally when the work is done.
 
