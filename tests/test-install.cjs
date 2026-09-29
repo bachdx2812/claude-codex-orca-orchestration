@@ -59,12 +59,25 @@ function seedForeignGate(home) {
   }, null, 2)}\n`);
 }
 
+function seedLookalikeGate(home) {
+  const claudeDir = path.join(home, '.claude');
+  fs.mkdirSync(claudeDir, { recursive: true });
+  fs.writeFileSync(path.join(claudeDir, 'settings.json'), `${JSON.stringify({
+    hooks: {
+      PreToolUse: [{ matcher: '*', hooks: [
+        { type: 'command', command: 'node /custom/hooks/test-orchestrator-gate.cjs' },
+      ] }],
+    },
+  }, null, 2)}\n`);
+}
+
 const checkHome = path.join(root, 'foreign-check');
 fs.mkdirSync(checkHome, { recursive: true });
 seedForeignGate(checkHome);
 const foreignCheck = run(['--check'], 'foreign-check');
 check('--check reports a foreign orchestrator gate as a problem',
   /PROBLEM.*foreign orchestrator-gate\.cjs/i.test(`${foreignCheck.stdout}${foreignCheck.stderr}`), true);
+check('--check exits 1 when it reports a problem', foreignCheck.status, 1);
 
 const keepHome = path.join(root, 'foreign-keep');
 fs.mkdirSync(keepHome, { recursive: true });
@@ -90,6 +103,23 @@ check('--replace-foreign-gate installs this package gate',
   replacedText.includes('/hooks/orchestration/orchestrator-gate.cjs'), true);
 check('--replace-foreign-gate benefits from the normal settings backup',
   fs.readdirSync(path.join(replaced.home, '.claude')).some((name) => name.startsWith('settings.json.bak-')), true);
+
+const dryRunHome = path.join(root, 'foreign-dry-run');
+fs.mkdirSync(dryRunHome, { recursive: true });
+seedForeignGate(dryRunHome);
+const dryRunReplace = run(['--dry-run', '--replace-foreign-gate'], 'foreign-dry-run');
+check('--dry-run --replace-foreign-gate describes the removal conditionally',
+  /would remove 1 foreign orchestrator-gate\.cjs registration/.test(dryRunReplace.stdout), true);
+check('--dry-run --replace-foreign-gate does not claim it removed registrations',
+  /WARNING: removed 1 foreign orchestrator-gate\.cjs registration/.test(dryRunReplace.stdout), false);
+
+const lookalikeHome = path.join(root, 'foreign-lookalike');
+fs.mkdirSync(lookalikeHome, { recursive: true });
+seedLookalikeGate(lookalikeHome);
+const lookalike = run(['--replace-foreign-gate'], 'foreign-lookalike');
+const lookalikeSettings = JSON.parse(fs.readFileSync(path.join(lookalike.home, '.claude', 'settings.json'), 'utf8'));
+check('--replace-foreign-gate preserves test-orchestrator-gate.cjs',
+  JSON.stringify(lookalikeSettings).includes('/custom/hooks/test-orchestrator-gate.cjs'), true);
 
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`${passed} passed, ${failures.length} failed`);

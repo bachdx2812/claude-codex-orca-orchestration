@@ -282,7 +282,7 @@ function foreignGateCommands(settings, ownedCommands = []) {
       if (!Array.isArray(entry?.hooks)) continue;
       for (const hook of entry.hooks) {
         const command = hook?.type === 'command' ? hook.command : null;
-        if (typeof command === 'string' && /orchestrator-gate\.cjs(?:["']|\s|$)/.test(command) && !owned.has(command)) {
+        if (typeof command === 'string' && /(?:^|[\/\\"'\s])orchestrator-gate\.cjs(?:["']|\s|$)/.test(command) && !owned.has(command)) {
           found.push({ event, matcher: entry.matcher, command });
         }
       }
@@ -359,7 +359,7 @@ function installSettings(opts, prevManifest) {
   const foreign = foreignGateCommands(obj);
   if (foreign.length && REPLACE_FOREIGN_GATE) {
     removeForeignGateCommands(obj, foreign);
-    warn(`removed ${foreign.length} foreign orchestrator-gate.cjs registration(s) because --replace-foreign-gate was supplied.`);
+    warn(`${DRY_RUN ? 'would remove' : 'removed'} ${foreign.length} foreign orchestrator-gate.cjs registration(s) because --replace-foreign-gate was supplied.`);
   } else if (foreign.length) {
     warn(`FOREIGN orchestrator-gate.cjs registration(s) detected (${foreign.map((item) => item.command).join(', ')}). ` +
       'They remain active alongside this package and may enforce conflicting rules. Re-run with --replace-foreign-gate to remove them.');
@@ -713,6 +713,7 @@ function check() {
   if (foreign.length) {
     log(`  PROBLEM: ${foreign.length} foreign orchestrator-gate.cjs registration(s) found in ${SETTINGS_FILE}:`);
     for (const item of foreign) log(`    ${item.event} matcher "${item.matcher}": ${item.command}`);
+    process.exitCode = 1;
   } else {
     log('  OK   no foreign orchestrator-gate.cjs registrations');
   }
