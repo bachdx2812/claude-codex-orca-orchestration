@@ -76,7 +76,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 653 tests, fully hermetic
+npm test                       # 702 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -191,10 +191,14 @@ x cores))`, an explicit integer overrides that derivation outright, `0` means un
 are overridable for one process with `ORCH_MAX_PARALLEL_CODEX_WORKERS` /
 `ORCH_PARALLEL_CORE_FRACTION` / `ORCH_MAX_PARALLEL_AGENTS` / `ORCH_CLAIM_TTL_MINUTES`. One
 more, `closeDoneWorktrees` (default `true`), controls whether `orca-heartbeat.cjs` reminds
-about a worktree that is idle, accepted (PR/MR merged or closed, or a git-confirmed
-ancestor when neither is linked) and clean, with no live terminal on it; disable with
-`false` or `ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false` (`1`/`true` forces it on;
-anything else, including empty, defers to the config). Every code brief that already
+about a worktree that is idle, accepted (PR/MR merged or closed, or — when neither is linked
+— a git-confirmed ancestor whose own HEAD commit postdates the worktree's creation, so a
+freshly-branched worktree with zero new commits is never mistaken for done-but-open work)
+and clean, with no live terminal on it; disable with `false` or `ORCH_CLOSE_DONE_WORKTREES`
+set to `0`/`false` (`1`/`true` forces it on; anything else, including empty, defers to the
+config). `parallelCoreFraction`/`maxParallelAgents`'s env overrides treat an empty or
+whitespace-only value as unset (never coerced to `0`), and their config-file values accept
+only an actual JSON number (or `null` for `maxParallelAgents`) — never a numeric string. Every code brief that already
 needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` dispatch)
 running in a *shared* workspace must also declare `Owns: <repo-relative paths>` or
 `Owns: n/a <reason>` on its own line, unless it is isolated

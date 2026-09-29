@@ -71,7 +71,10 @@ rule out a transition) and reports a worktree that is not main, not archived; **
 (a linked GitHub PR or GitLab MR already merged/closed — an open one never counts, whatever
 git alone might say — or, only when NEITHER is linked at all, a real `git merge-base
 --is-ancestor HEAD <base>` confirms HEAD is already in the worktree's own upstream default
-branch, resolved from `refs/remotes/origin/HEAD` with no `git fetch` ever run); **idle**
+branch, resolved from `refs/remotes/origin/HEAD` with no `git fetch` ever run, AND HEAD's own
+commit postdates the worktree's creation — a worktree freshly branched off that base with
+zero new commits is trivially an "ancestor" too, and must not be mistaken for done-but-open
+work); **idle**
 (no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt` already past the
 heartbeat's idle threshold); and **clean** (`git status --porcelain` empty and no unpushed
 commits — or, lacking an upstream entirely, HEAD contained in that same resolved base) —
@@ -110,21 +113,30 @@ claim in a *shared* workspace only avoids that specific conflict, not the next o
 | Gate | Refuses when | Escape |
 |---|---|---|
 | `max-parallel-codex-workers` | a new Codex `worker-start` would exceed `maxParallelCodexWorkers` | release/reuse/retry an existing worker; raise the cap; `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` |
-| `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it; raise `maxParallelAgents` / `ORCH_MAX_PARALLEL_AGENTS`; `=0` for unlimited |
+| `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it, or ask the operator to release a claim, delete a dead session's state file, or raise/disable the cap — never the model's own call |
 | `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
 | `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
 
 `max-parallel-agents` counts every live Orca worker group (any agent, not only Codex — the
 Codex-only cap above still applies on top, never instead) plus every live in-session
-Agent/Task dispatch this main panel has registered (`s.agents[toolUseId]`, at `PreToolUse`,
-for every dispatch — not only code briefs), summed across every session's state file
-modified in the last 6h. A dispatch registered as `run_in_background: true` survives its
-own launch-returning `PostToolUse` and is instead released by a matching
-`<task-notification><tool-use-id>`, a 120-minute TTL, or `--release-claims`, the same
-pattern `code-brief-needs-owns`'s `Owns:` claims already use. A `--terminal <h>` /
-`--retry-of <id>` replacement of an already-tracked live group is not a new slot. The
-`SessionStart` banner and every per-prompt reminder show `parallel budget: <n>/<N> (<cores>
-cores x <fraction>%)`.
+Agent/Task dispatch this main panel has registered (`s.agents[toolUseId]`, for every
+dispatch — not only code briefs), summed across every session's state file modified in the
+last 6h — and, for every OTHER session (the caller's own always counts), only while it also
+has a recent liveness signal: its heartbeat daemon alive, or its state file touched in the
+last 30 minutes. For an Agent/Task dispatch, registration happens only at the very END of
+routing/ownership gate checks, after every gate that could still refuse it has passed — an
+early, read-only capacity check runs first so an already-over-budget dispatch still gets
+this refusal promptly. At capacity, the gate first reconciles the caller's own session
+against a live Orca worker-list before refusing (a stale local "still live" entry Orca has
+already confirmed released frees its slot); if the state lock itself is contended, it
+refuses with a transient "retry" reason rather than risk over-admitting under load. A
+dispatch registered as `run_in_background: true` survives its own launch-returning
+`PostToolUse` and is instead released by a matching `<task-notification><tool-use-id>`, a
+120-minute TTL, or `--release-claims`, the same pattern `code-brief-needs-owns`'s `Owns:`
+claims already use. A `--terminal <h>` / `--retry-of <id>` replacement of an already-tracked
+live group is not a new slot. The refusal labels each unit `<sid8>:<id>` (its owning
+session's id, truncated to 8 characters). The `SessionStart` banner and every per-prompt
+reminder show `parallel budget: <n>/<N> (<cores> cores x <fraction>%)`.
 
 Advisory only, never blocked by the gate: whether the files a worker actually touched
 matched what it declared (ownership is *declared*, not observed).
@@ -162,7 +174,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 653 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 702 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -291,6 +303,12 @@ subagents** is invisible to `max-parallel-agents`: only the main panel's own `Ag
 dispatches are registered, so nested fan-out from inside a subagent is not charged against
 the machine-wide budget — the same boundary, stated once here rather than per gate.
 
+Cross-session `max-parallel-agents` counting has its own trade-off (operator decision): a
+session with neither a live heartbeat daemon nor a state-file write in the last 30 minutes is
+presumed abandoned and its units are dropped from the shared count, even if it is technically
+still working — the alternative (a genuinely dead session eating into the budget forever)
+was judged worse. The caller's own session is never subject to this filter.
+
 Only an `Owns:` line that starts the line (optionally after `-`/`*`) is read — a markdown-
 bold `**Owns:**` or an `Owns:` appearing mid-sentence is not recognized, and the refusal
 message says so rather than guessing at prose. `code-brief-needs-owns` is enforced at
@@ -309,10 +327,13 @@ substituted content isn't visible to the per-invocation argument scanner.
 npm test   # node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-concurrency.cjs
 ```
 
-All three suites are fully hermetic: state lives under a fresh temp `ORCH_STATE_DIR`,
-`orca` (and, for the git-backed done-worktree checks, `git`) is a deterministic local stub
-selected via `ORCA_BIN` / `ORCH_GIT_BIN`, and every path judged by the gate is synthetic —
-nothing depends on, or touches, your real `~/.claude/`.
+All three suites are fully hermetic: state lives under a fresh temp `ORCH_STATE_DIR`, `orca`
+is always a deterministic local stub selected via `ORCA_BIN`, and every path judged by the
+gate is synthetic — nothing depends on, or touches, your real `~/.claude/`. Most git-backed
+done-worktree checks use an equally deterministic `git` stub (`ORCH_GIT_BIN`); a handful
+specifically exercising the ancestor-plus-real-new-commit check instead drive a real,
+throwaway git repo and worktrees under the test's own temp directory, since that check's
+whole point is real git semantics a stub cannot faithfully stand in for.
 
 ## License
 
