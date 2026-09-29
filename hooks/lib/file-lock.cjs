@@ -16,10 +16,11 @@ const fs = require('fs');
 
 /**
  * Acquire the lock, retrying for up to `timeoutMs`. Returns true when acquired (the
- * caller must release it), false on timeout — the caller then proceeds WITHOUT exclusion,
- * same "degrade to allow rather than hang the session" philosophy as every other gate
- * failure mode here. A lock directory older than `staleMs` is presumed abandoned by a
- * process that crashed mid-critical-section and is cleared rather than waited out.
+ * caller must release it), false only on contention timeout, and null on an unexpected
+ * filesystem error. Callers may transiently refuse on false when protecting a hard cap,
+ * but must degrade to allow on null like every other gate infrastructure failure. A lock
+ * directory older than `staleMs` is presumed abandoned by a process that crashed
+ * mid-critical-section and is cleared rather than waited out.
  */
 function acquireLock(lockDir, { timeoutMs = 2000, retryMs = 25, staleMs = 10000 } = {}) {
   const deadline = Date.now() + timeoutMs;
@@ -28,7 +29,7 @@ function acquireLock(lockDir, { timeoutMs = 2000, retryMs = 25, staleMs = 10000 
       fs.mkdirSync(lockDir);
       return true;
     } catch (err) {
-      if (!err || err.code !== 'EEXIST') return false; // unexpected fs failure: don't hang on it
+      if (!err || err.code !== 'EEXIST') return null; // infrastructure failure, distinct from contention
       try {
         const st = fs.statSync(lockDir);
         if (Date.now() - st.mtimeMs > staleMs) { fs.rmdirSync(lockDir); continue; }

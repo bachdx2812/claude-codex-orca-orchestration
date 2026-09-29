@@ -268,6 +268,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   // default. Only an enabled, finite resource cap needs the long timeout that can outlive a
   // stale lock. This keeps an unlimited worker-start from waiting ~10.5s for no cap at all.
   let locked = acquireLock(lockDir, hardCapActive ? deps.capLockOpts : {});
+  if (locked === null) return;
   try {
     // CRITICAL: reload state fresh from disk now that the lock is held. `s` as passed in
     // was loaded by main() *before* this lock was acquired, so under concurrent hook
@@ -281,7 +282,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     // A finite cap cannot be evaluated safely after its one long acquisition attempt failed.
     // Refuse now instead of entering the at-cap reconcile branch and paying the same long
     // timeout a second time against the same live holder.
-    if (!locked && hardCapActive) {
+    if (locked === false && hardCapActive) {
       violation = {
         gate: agentCapActive ? 'max-parallel-agents' : 'max-parallel-codex-workers',
         reason: deps.lockContentionMessage,
@@ -426,7 +427,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
               if (locked) { releaseLock(lockDir); locked = false; }
               const rows = fetchOrcaWorkerRows(ORCA_BIN);
               locked = acquireLock(lockDir, deps.capLockOpts);
-              if (!locked) {
+              if (locked === null) return;
+              if (locked === false) {
                 violation = { gate: 'max-parallel-agents', reason: deps.lockContentionMessage };
                 break;
               }
@@ -460,6 +462,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             if (locked) { releaseLock(lockDir); locked = false; }
             const rows = fetchOrcaWorkerRows(ORCA_BIN);
             locked = acquireLock(lockDir, deps.capLockOpts);
+            if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
             if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;

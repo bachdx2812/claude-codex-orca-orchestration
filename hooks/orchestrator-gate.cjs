@@ -580,6 +580,7 @@ function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
   const baseId = toolUseId || `sid-${s.session_id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   let violation = null;
   let locked = acquireLock(lockDir, CAP_LOCK_OPTS);
+  if (locked === null) return;
   // Reservations THIS command's own earlier invocations already added, re-applied after a
   // mid-loop reconcile reload wipes the in-memory `fresh` object (same reasoning as
   // parallel-ownership-gates.cjs's identical localReservations pattern).
@@ -590,7 +591,7 @@ function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
     // concern to fall back to) — a lock the caller could not acquire at all means nothing
     // here can be evaluated or saved safely, so it refuses immediately with a transient-
     // retry reason instead of silently registering unlocked.
-    if (!locked) { violation = PAC.LOCK_CONTENTION_MESSAGE; }
+    if (locked === false) { violation = PAC.LOCK_CONTENTION_MESSAGE; }
     else {
       let fresh = load(s.session_id);
       for (let idx = 0; idx < invs.length && !violation; idx++) {
@@ -601,7 +602,8 @@ function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
           releaseLock(lockDir); locked = false;
           const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
           locked = acquireLock(lockDir, CAP_LOCK_OPTS);
-          if (!locked) { violation = PAC.LOCK_CONTENTION_MESSAGE; break; }
+          if (locked === null) return;
+          if (locked === false) { violation = PAC.LOCK_CONTENTION_MESSAGE; break; }
           fresh = load(s.session_id);
           Object.assign(fresh.reservations, localReservations);
           if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
@@ -913,13 +915,15 @@ function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
   // lock the caller could not acquire (contention timeout) means this check cannot trust
   // `state` against every other racing process, so it refuses with a transient-retry reason
   // instead of silently "degrading to allow" the way policy gates elsewhere in this file do.
-  if (!locked) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked };
+  if (locked === null) return { state, violation: null, locked };
+  if (locked === false) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked };
   const violation = checkParallelAgentCapacity(state, cfg);
   if (!violation) return { state, violation: null, locked };
   releaseLock(lockDir);
   const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
   const reacquired = acquireLock(lockDir, CAP_LOCK_OPTS);
-  if (!reacquired) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked: false };
+  if (reacquired === null) return { state, violation: null, locked: null };
+  if (reacquired === false) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked: false };
   const fresh = load(sessionId);
   if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
   return { state: fresh, violation: checkParallelAgentCapacity(fresh, cfg), locked: true };

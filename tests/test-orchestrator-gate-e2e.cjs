@@ -245,6 +245,36 @@ expect('running the unit suite is allowed',
   else failures.push(`one Agent PreToolUse should pay at most one failed quota probe; exit=${r.status}, probes=${calls}`);
 }
 
+// A state-lock filesystem error is not lock contention. Both a missing parent and a path
+// beneath a regular file make mkdir(.lock) fail immediately; the hard Agent cap must degrade
+// to allow instead of reporting the worker budget as contended.
+{
+  const dir = path.join(RUN_DIR, 'lock-fs-errors');
+  fs.mkdirSync(dir, { recursive: true });
+  const cfg = path.join(dir, 'orchestration.config.json');
+  fs.writeFileSync(cfg, JSON.stringify({ ...DEFAULT_CFG, maxParallelAgents: 1 }));
+  const payload = dispatch({ subagent_type: 'Explore', description: 'find the relevant files', model: 'haiku' },
+    'lock-fs-errors', { tool_use_id: 'toolu_lock_fs' });
+  const base = { ...BASE_ENV, ORCA_BIN: STUB, ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB, ORCH_CONFIG_PATH: cfg };
+
+  const missingState = path.join(dir, 'missing-parent', 'state');
+  const missing = spawnSync(process.execPath, [GATE], {
+    input: JSON.stringify(payload), encoding: 'utf8', env: { ...base, ORCH_STATE_DIR: missingState },
+  });
+  if (missing.status === ALLOW) pass += 1;
+  else failures.push(`Agent dispatch with a missing state parent must degrade to allow; exit=${missing.status}, stderr=${missing.stderr}`);
+
+  const nonDirectoryParent = path.join(dir, 'not-a-directory');
+  fs.writeFileSync(nonDirectoryParent, 'x');
+  const unwritable = spawnSync(process.execPath, [GATE], {
+    input: JSON.stringify({ ...payload, session_id: 'lock-fs-errors-2', tool_use_id: 'toolu_lock_fs_2' }),
+    encoding: 'utf8', env: { ...base, ORCH_STATE_DIR: path.join(nonDirectoryParent, 'state') },
+  });
+  if (unwritable.status === ALLOW) pass += 1;
+  else failures.push(`Agent dispatch with an unusable state path must degrade to allow; exit=${unwritable.status}, stderr=${unwritable.stderr}`);
+}
+
 // Still refused
 expect('real commit is refused', mainBash('git commit -m x'), DENY);
 expect('real push is refused', mainBash('git push origin main'), DENY);

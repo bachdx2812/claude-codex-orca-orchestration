@@ -243,6 +243,20 @@ check('a foreign terminal that produced output after startup is ignored',
   heartbeat.classifyTerminal({ handle: 'foreign', preview: '', lastOutputAt: NOW - 200000 }, ctx).kind,
   'ignored');
 
+{
+  const previousPanelHandle = process.env.ORCA_TERMINAL_HANDLE;
+  process.env.ORCA_TERMINAL_HANDLE = 'term_panel';
+  check('heartbeat session handles exclude the panel terminal and unsupervised context-only rows',
+    [...heartbeat.sessionTerminalHandles([
+      { workerState: 'unsupervised', agentTerminalHandle: 'term_context_only' },
+      { workerState: 'running', agentTerminalHandle: 'term_panel' },
+      { workerState: 'running', agentTerminalHandle: 'term_worker' },
+    ])],
+    ['term_worker']);
+  if (previousPanelHandle === undefined) delete process.env.ORCA_TERMINAL_HANDLE;
+  else process.env.ORCA_TERMINAL_HANDLE = previousPanelHandle;
+}
+
 check('a finished worker still holding a terminal is flagged',
   heartbeat.isHoldingResources({ terminalState: 'retained' }), true);
 check('a released worker holds nothing',

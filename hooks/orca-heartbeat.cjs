@@ -164,11 +164,16 @@ function workers() {
 /** Terminal handles this session owns: worker-list is run-scoped, while the gate's own
  * session state also records bare `terminal create` replies that have no worker row. */
 function sessionTerminalHandles(workerRows) {
-  const handles = new Set((workerRows || []).map((w) => w.agentTerminalHandle).filter(Boolean));
+  const panelHandle = process.env.ORCA_TERMINAL_HANDLE || '';
+  const handles = new Set((workerRows || [])
+    .filter((w) => w && w.workerState !== 'unsupervised')
+    .map((w) => w.agentTerminalHandle)
+    .filter((handle) => handle && handle !== panelHandle));
   try {
     const state = JSON.parse(fs.readFileSync(path.join(DIR, `${SESSION}.json`), 'utf8'));
     for (const [id, worker] of Object.entries(state.workers || {})) {
-      if (worker && worker.status === 'live' && (worker.kind === 'terminal' || /^term_/.test(id))) handles.add(id);
+      if (worker && worker.status === 'live' && id !== panelHandle &&
+          (worker.kind === 'terminal' || /^term_/.test(id))) handles.add(id);
     }
   } catch {}
   return handles;
