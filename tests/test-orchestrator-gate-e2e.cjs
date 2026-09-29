@@ -213,6 +213,30 @@ expect('a mutating verb quoted as prose is allowed',
 expect('running the unit suite is allowed',
   mainBash('node tests/test-orchestrator-gate.cjs && echo done'), ALLOW);
 
+// Terminal previews can contain Codex's standing usage tip or source/diff text mentioning
+// rate limits. Only an error-shaped line is a backoff signal, in both the gate's immediate
+// worker-read path and the background heartbeat path covered below.
+{
+  const sid = `${SID}-rate-limit-lines`;
+  const toolUseId = 'toolu_rate_limit_lines';
+  const start = 'orca orchestration worker-start --agent codex --task rate-limit-lines --json';
+  rmState(sid);
+  invoke(mainBash(start, { sid, tool_use_id: toolUseId }), CODEX_WINS);
+  invoke(postBash(start, '{"dispatchId":"ctx_rate_limit_lines"}', { sid, tool_use_id: toolUseId }), CODEX_WINS);
+
+  const tip = 'Tip: When signed in with ChatGPT, use /usage to check your account usage and access available usage\n' +
+    'limit resets.';
+  invoke(postBash('orca orchestration worker-read --dispatch ctx_rate_limit_lines', tip, { sid }), CODEX_WINS);
+  checkBool('Codex standing usage tip does not mark workers rate-limited',
+    readState(sid)?.rate_limit_hits, 0);
+
+  invoke(postBash('orca orchestration worker-read --dispatch ctx_rate_limit_lines',
+    "■ You've hit your usage limit. Try again after the limit resets.", { sid }), CODEX_WINS);
+  checkBool('a real-looking Codex usage-limit error marks workers rate-limited',
+    readState(sid)?.rate_limit_hits, 1);
+  rmState(sid);
+}
+
 // A single Agent PreToolUse evaluates routing twice along the execution path. A failed
 // live lookup is process-local memoized, so this one hook process may spawn at most one
 // quota probe. The real Codex CLI is never touched: ORCH_CODEX_BIN points at the stub.
@@ -2447,6 +2471,29 @@ function realWtDirWithGitMarker(label, mtimeMs) {
 }
 
 async function heartbeatWorktreeTests() {
+  {
+    const tip = 'Tip: When signed in with ChatGPT, use /usage to check your account usage and access available usage\n' +
+      'limit resets.';
+    const common = {
+      worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_rate_tip', workerState: 'running', dispatchStatus: 'running',
+        terminalState: 'active', agentTerminalHandle: 'term_rate_tip' }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    };
+    const tipOut = await runHeartbeat({
+      ...common, name: 'rate-limit-tip',
+      terminalRows: [{ handle: 'term_rate_tip', title: 'Codex tip', lastOutputAt: Date.now(), preview: tip }],
+    });
+    checkBool('heartbeat ignores the exact Codex standing usage tip', tipOut.includes('RATE LIMIT'), false);
+
+    const errorOut = await runHeartbeat({
+      ...common, name: 'rate-limit-error',
+      terminalRows: [{ handle: 'term_rate_tip', title: 'Codex error', lastOutputAt: Date.now(),
+        preview: "■ You've hit your usage limit. Try again after the limit resets." }],
+    });
+    checkBool('heartbeat reports a real-looking Codex rate-limit error', errorOut.includes('RATE LIMIT'), true);
+  }
+
   // A machine-wide worktree list may include another session's completed worktree. Only
   // paths carried by this session's run-scoped worker rows may enter the reminder.
   {

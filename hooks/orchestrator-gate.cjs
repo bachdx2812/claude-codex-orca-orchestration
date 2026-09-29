@@ -39,6 +39,7 @@ const HBL = require('./lib/heartbeat-liveness.cjs');
 const OWN = require('./lib/ownership.cjs');
 const OC = require('./lib/ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
+const { hasRateLimitError } = require('./lib/terminal-signals.cjs');
 
 const DIR = stateDir();
 const LOG = path.join(DIR, 'violations.log');
@@ -218,8 +219,6 @@ function hasEscalationReason(cfg, input) {
   return escalationMarker.test(text) && effortTried.test(text);
 }
 
-// Markers that a Codex worker is rate limited rather than working.
-const RATE_LIMIT_MARKER = /(rate.?limit|429\b|quota\s+exceeded|usage\s+limit|too\s+many\s+requests|retry[- ]after|overloaded_error)/i;
 // Markers that an orca command itself failed, which justifies the in-session fallback.
 const ORCA_FAILURE = /(command not found|connection refused|runtime (not|un)reachable|ECONNREFUSED)/i;
 
@@ -1573,7 +1572,7 @@ function onPostToolUseLocked(p, s, cfg) {
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
     // Only worker/terminal output counts; the panel's own quota inspection ("rate_limits" JSON) does not.
     const readsWorkerOutput = /\borca\b/.test(cmd) && /(worker-read|terminal (read|show))\b/.test(cmd);
-    if (readsWorkerOutput && RATE_LIMIT_MARKER.test(out.replace(/"rate_limits"/g, ''))) {
+    if (readsWorkerOutput && hasRateLimitError(out.replace(/"rate_limits"/g, ''))) {
       s.rate_limit_hits += 1;
       const until = Date.now() + RATE_LIMIT_BACKOFF_SECONDS * 1000;
       for (const w of Object.values(s.workers)) if (w.status === 'live') w.rate_limited_until = until;

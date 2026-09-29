@@ -40,13 +40,13 @@ const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { loadConfig, stateDir, closeDoneWorktreesEnabled } = require('./lib/config.cjs');
+const { hasRateLimitError } = require('./lib/terminal-signals.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
 // Overridable the same way ORCA_BIN is (tests point this at a deterministic stub); a bare
 // "git" resolves against PATH exactly like the bare "orca" default does.
 const GIT_BIN = process.env.ORCH_GIT_BIN || 'git';
-const RATE_LIMIT = /(rate.?limit|429\b|quota\s+exceeded|usage\s+limit|too\s+many\s+requests|retry[- ]after|overloaded_error)/i;
 const DONE_PR_STATES = new Set(['merged', 'closed']);
 // GitLab's MR state vocabulary uses "opened"/"merged"/"closed"/"locked" where GitHub's PR
 // vocabulary uses "open"/"merged"/"closed" — normalize the "still open" spelling so a linked
@@ -704,7 +704,7 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
  */
 function classifyTerminal(t, ctx) {
   if (!ctx.ownHandles || !ctx.ownHandles.has(t.handle)) return { kind: 'ignored' };
-  if (RATE_LIMIT.test(t.preview || '')) return { kind: 'rate_limit' };
+  if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (t.orphaned) return { kind: 'orphaned' };
   const supervised = (ctx.retainedHandles && ctx.retainedHandles.has(t.handle)) ||
     !ctx.baseHandles.has(t.handle) || t.lastOutputAt > ctx.started;
@@ -867,7 +867,7 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-  classifyTerminal, isHoldingResources, snapshotWorkers, sessionTerminalHandles, RATE_LIMIT,
+  classifyTerminal, isHoldingResources, snapshotWorkers, sessionTerminalHandles,
   workerWorktreePaths, worktreeKeys, sessionWorktreeKeys, retainedTerminalHandles,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,

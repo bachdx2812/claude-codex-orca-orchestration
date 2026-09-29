@@ -28,6 +28,7 @@ const OWN = require('../hooks/lib/ownership.cjs');
 const OC = require('../hooks/lib/ownership-claims.cjs');
 const PAC = require('../hooks/lib/parallel-agent-cap.cjs');
 const { acquireLock, releaseLock } = require('../hooks/lib/file-lock.cjs');
+const { hasRateLimitError } = require('../hooks/lib/terminal-signals.cjs');
 
 let pass = 0;
 const failures = [];
@@ -208,6 +209,18 @@ check('--spec in a different orca invocation does not count for this one',
 }
 
 // --- heartbeat classifyTerminal --------------------------------------------
+
+check('standing usage tip is not a rate-limit error', hasRateLimitError(
+  'Tip: When signed in with ChatGPT, use /usage to check your account usage and access available usage\nlimit resets.'
+), false);
+check('a diff excerpt mentioning a rate limit is not an error',
+  hasRateLimitError('+const message = "Error: 429 rate limit";'), false);
+check('a fenced code excerpt mentioning a rate limit is not an error',
+  hasRateLimitError('```text\nError: 429 rate limit\n```'), false);
+check('a Codex error bullet is a rate-limit error',
+  hasRateLimitError("■ You've hit your usage limit. Try again later."), true);
+check('an HTTP 429 response line is a rate-limit error',
+  hasRateLimitError('request failed with HTTP 429 Too Many Requests'), true);
 
 const NOW = 1800000000000;
 const ctx = {
