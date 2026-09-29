@@ -867,21 +867,46 @@ rmState(`${SID}-hard-off`);
   const env = quotaEnv('readiness-timeout-advice', 10, 30, { maxParallelCodexWorkers: 1 });
   const sid = `${SID}-readiness-timeout-advice`;
   const toolUseId = 'toolu_readiness_timeout_advice';
-  const command = 'orca orchestration worker-start --agent codex --spec @plans/readiness.md --json';
+  const command = 'orca orchestration worker-start --agent codex --spec "implement readiness.\nVerify: npm test\nOwns: src/readiness-timeout.ts" --json';
   rmState(sid);
-  invoke(mainBash(command, { sid, tool_use_id: toolUseId }), env);
+  invoke(mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: toolUseId }), env);
   const result = invoke(postBash(command, JSON.stringify({
     ok: false,
     result: {
       stage: 'agent_readiness', lastError: 'timeout', dispatchId: 'ctx_readiness_timeout',
       agentTerminalHandle: 'term_readiness_timeout',
     },
-  }), { sid, tool_use_id: toolUseId }), env);
+  }), { sid, cwd: FAKE_REPO, tool_use_id: toolUseId }), env);
   checkBool('failed readiness worker-start prints terminal-send and worker-retain recovery advice',
     result.out.includes('orca terminal send --terminal term_readiness_timeout') &&
       result.out.includes('--enter') &&
       result.out.includes('orca orchestration worker-retain --dispatch ctx_readiness_timeout'),
     true);
+
+  const timedOut = readState(sid)?.workers?.ctx_readiness_timeout;
+  checkBool('failed readiness worker-start tracks the returned worker and preserves its reservation metadata',
+    timedOut?.status === 'live' && timedOut?.agent === 'codex' && timedOut?.readinessTimeout === true &&
+      timedOut?.owns?.includes('src/readiness-timeout.ts') && timedOut?.ws === `${FAKE_REPO}|current`,
+    true);
+
+  invoke(postBash('orca orchestration worker-retain --dispatch ctx_readiness_timeout --json',
+    '{"ok":true}', { sid }), env);
+  const retained = readState(sid)?.workers?.ctx_readiness_timeout;
+  checkBool('retaining a readiness-timeout worker keeps it live and counted by the Codex cap',
+    retained?.retained === true && retained?.capExempt !== true,
+    true);
+
+  const capped = invoke(mainBash(
+    'orca orchestration worker-start --agent codex --spec "implement another.\nVerify: npm test\nOwns: src/other.ts"',
+    { sid, cwd: FAKE_REPO }), env);
+  checkBool('a retained readiness-timeout worker consumes the configured Codex slot',
+    capped.code === DENY && /max-parallel-codex-workers/.test(capped.err), true);
+
+  const overlap = invoke(mainBash(
+    'orca orchestration worker-start --agent codex --spec "implement overlap.\nVerify: npm test\nOwns: src/readiness-timeout.ts"',
+    { sid, cwd: FAKE_REPO }), { ...env, ORCH_MAX_PARALLEL_CODEX_WORKERS: '2' });
+  checkBool('a retained readiness-timeout worker keeps its Owns claim',
+    overlap.code === DENY && /ownership-overlap/.test(overlap.err), true);
   rmState(sid);
 }
 

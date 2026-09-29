@@ -1234,11 +1234,18 @@ function dropFailedToolState(s, toolUseId) {
 // set of dispatch-shaped sub-commands.
 const DISPATCH_SUBS = new Set(['orchestration worker-start', 'orchestration task-create', 'terminal create']);
 
-function readinessTimeoutAdvice(replyText) {
+function readinessTimeoutDetails(replyText) {
   if (!/"stage"\s*:\s*"agent_readiness"/i.test(replyText) ||
       !/"lastError"\s*:\s*"timeout"/i.test(replyText)) return null;
   const terminal = replyText.match(/"(?:agentTerminalHandle|terminalHandle)"\s*:\s*"([A-Za-z0-9_.:-]+)"/i)?.[1];
   const dispatch = replyText.match(/"dispatchId"\s*:\s*"([A-Za-z0-9_.:-]+)"/i)?.[1];
+  return { terminal, dispatch };
+}
+
+function readinessTimeoutAdvice(replyText) {
+  const details = readinessTimeoutDetails(replyText);
+  if (!details) return null;
+  const { terminal, dispatch } = details;
   const terminalArg = terminal || '<terminalHandle>';
   const dispatchArg = dispatch || '<dispatchId>';
   return 'orchestrator-gate: worker-start timed out at agent readiness, but its terminal may become usable. ' +
@@ -1311,17 +1318,27 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
     const failed = /"ok"\s*:\s*false/i.test(replyText);
     const agent = reservation ? reservation.agent
       : (inv.sub === 'orchestration worker-start' ? resolveWorkerStartAgent(inv, s) : null);
+    const worktreeIds = [...replyText.matchAll(/"worktreeId"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
 
     if (failed) {
+      const readiness = inv.sub === 'orchestration worker-start' && readinessTimeoutDetails(replyText);
+      if (readiness?.dispatch) {
+        s.workers[readiness.dispatch] = {
+          role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+          rate_limited_until: 0, group: readiness.dispatch, kind: WG.kindOf(readiness.dispatch), agent,
+          owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+          worktreeIds, readinessTimeout: true,
+        };
+        dirty = true;
+      }
       if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
-      const readinessAdvice = inv.sub === 'orchestration worker-start' && readinessTimeoutAdvice(replyText);
+      const readinessAdvice = readiness && readinessTimeoutAdvice(replyText);
       process.stdout.write(readinessAdvice ||
         'orchestrator-gate: orca worker-start reported "ok": false; nothing was registered.\n');
       return;
     }
 
     const ids = WG.idsFromOutput(replyText);
-    const worktreeIds = [...replyText.matchAll(/"worktreeId"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
     if (!ids.size) {
       if (!assumeDispatched) return; // unknown outcome on a failure event: keep the reservation.
       const pendingId = `pending-${Date.now()}-${idx}`;
@@ -1578,7 +1595,7 @@ function onPostToolUseLocked(p, s, cfg) {
       for (const [key, worker] of Object.entries(s.workers)) {
         if (worker.status === 'live' && WG.groupOf(worker, key) === group) {
           worker.retained = true;
-          worker.capExempt = true;
+          if (!worker.readinessTimeout) worker.capExempt = true;
           dirty = true;
         }
       }
