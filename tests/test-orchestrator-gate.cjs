@@ -257,10 +257,15 @@ check('a foreign terminal that produced output after startup is ignored',
   else process.env.ORCA_TERMINAL_HANDLE = previousPanelHandle;
 }
 
-check('a finished worker still holding a terminal is flagged',
-  heartbeat.isHoldingResources({ terminalState: 'retained' }), true);
+check('an explicitly retained terminal is not a finished-worker resource leak',
+  heartbeat.isHoldingResources({ terminalState: 'retained' }), false);
 check('a released worker holds nothing',
   heartbeat.isHoldingResources({ terminalState: 'released' }), false);
+check('a retained worker terminal remains in the session supervision set',
+  [...heartbeat.sessionTerminalHandles([
+    { workerState: 'failed', terminalState: 'retained', agentTerminalHandle: 'term_retained' },
+  ])],
+  ['term_retained']);
 check('heartbeat event snapshots exclude unsupervised context-only rows',
   [...heartbeat.snapshotWorkers([
     { dispatchId: 'ctx_context_only', workerState: 'unsupervised', dispatchStatus: 'created', terminalState: null },

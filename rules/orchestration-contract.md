@@ -262,6 +262,20 @@ gate state. Output from another session's terminal never wakes this panel. Conte
 worker rows marked `unsupervised`, and the panel's own `ORCA_TERMINAL_HANDLE`, are not
 supervised as worker terminals.
 
+If `worker-start` reports `stage: agent_readiness` / `lastError: timeout` but its terminal
+is live, do not create a replacement. Send the original spec into the existing terminal and
+retain the dispatch explicitly:
+
+```sh
+orca terminal send --terminal <terminalHandle> --text "$(cat <spec-file>)" --enter
+orca orchestration worker-retain --dispatch <dispatchId>
+```
+
+An explicitly retained row is supervised work, not a finished-terminal leak. The heartbeat
+continues watching its terminal for IDLE, and `Stop` is allowed only while that heartbeat is
+alive; without a live daemon the retained worker is refused as `workers-unwatched`. Release
+the worker when it is no longer needed.
+
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
 seconds pass with a live worker and no poll of either kind, the gate says so on every turn.

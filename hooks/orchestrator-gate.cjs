@@ -1538,6 +1538,29 @@ function onPostToolUseLocked(p, s, cfg) {
       }
     }
 
+    // `worker-retain` is an explicit operator decision to keep a failed/completed
+    // dispatch's terminal alive and continue through it. Mark the whole tracked group so
+    // Stop can distinguish that supervised terminal from an accidental resource leak.
+    for (const inv of orcaInvocations(cmd)) {
+      const target = WG.retainTarget(inv, flagValue);
+      if (!target) continue;
+      const retained = s.workers[target];
+      if (!retained) {
+        process.stdout.write(
+          `orchestrator-gate: ${inv.sub} named "${target}", which this session is not tracking; ` +
+          'nothing was marked retained. Check `orca orchestration worker-list`.\n');
+        continue;
+      }
+      const group = WG.groupOf(retained, target);
+      for (const [key, worker] of Object.entries(s.workers)) {
+        if (worker.status === 'live' && WG.groupOf(worker, key) === group) {
+          worker.retained = true;
+          worker.capExempt = true;
+          dirty = true;
+        }
+      }
+    }
+
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
     // Only worker/terminal output counts; the panel's own quota inspection ("rate_limits" JSON) does not.
     const readsWorkerOutput = /\borca\b/.test(cmd) && /(worker-read|terminal (read|show))\b/.test(cmd);
@@ -1674,7 +1697,11 @@ function onStop(p, s, cfg) {
   // watches them, so the panel is woken on the first event instead of going AFK.
   // Finished workers still holding a terminal must be released first, heartbeat or not.
   const DONE = /\[(succeeded|failed|stopped|cancelled|canceled)\//;
-  const finished = confirmed ? confirmed.filter((c) => DONE.test(c)) : [];
+  const explicitlyRetained = (confirmation) => {
+    const id = String(confirmation).split(' ')[0];
+    return /\/retained\]$/.test(confirmation) && !!s.workers[id]?.retained;
+  };
+  const finished = confirmed ? confirmed.filter((c) => DONE.test(c) && !explicitlyRetained(c)) : [];
   const stillRunning = confirmed ? confirmed.length - finished.length : ids.length;
   if (stillRunning > 0 || pending.length) {
     if (heartbeatAlive(s.session_id)) return;

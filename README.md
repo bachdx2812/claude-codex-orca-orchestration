@@ -60,6 +60,20 @@ orca orchestration worker-start --retry-of <dispatchId> ...
 
 — and reduce how many Codex workers run in parallel.
 
+**Readiness timeout with a live terminal.** `worker-start` can report
+`stage: agent_readiness` / `lastError: timeout` even though the Codex terminal started and
+is usable. Do not launch a replacement. Send the original spec to that terminal, then mark
+the worker explicitly retained:
+
+```sh
+orca terminal send --terminal <terminalHandle> --text "$(cat <spec-file>)" --enter
+orca orchestration worker-retain --dispatch <dispatchId>
+```
+
+The retained row remains supervised: keep `orca-heartbeat.cjs` alive while waiting so it
+can wake the panel when the terminal becomes IDLE. `Stop` refuses an explicitly retained
+worker when no live heartbeat is watching it. Release it normally when the work is done.
+
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
 worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree

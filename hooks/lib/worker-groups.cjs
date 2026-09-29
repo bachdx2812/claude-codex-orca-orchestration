@@ -261,6 +261,8 @@ const RELEASE_SUBS = new Set([
   'terminal close',
 ]);
 
+const RETAIN_SUB = 'orchestration worker-retain';
+
 /**
  * The id (dispatch/task/terminal) a release-shaped orca invocation targets: `--dispatch`
  * (or `--task`/`--terminal`, all =-joined-aware via the caller's `flagValue`), falling back
@@ -278,8 +280,15 @@ function releaseTarget(inv, flagValue) {
   return positional || null;
 }
 
+/** The tracked id explicitly retained by `orca orchestration worker-retain`. */
+function retainTarget(inv, flagValue) {
+  if (inv.sub !== RETAIN_SUB) return null;
+  const rest = inv.args.slice(inv.sub.split(' ').length);
+  return flagValue(rest, '--dispatch') || rest.find((a) => !a.startsWith('-')) || null;
+}
+
 module.exports = {
   idsFromOutput, splitJsonReplies, splitConcatenatedJson, isDispatchReply, kindOf,
   canonicalGroup, groupOf, countLiveGroups, liveGroupByTerminal, groupById, settleGroup,
-  RELEASE_SUBS, releaseTarget,
+  RELEASE_SUBS, releaseTarget, RETAIN_SUB, retainTarget,
 };

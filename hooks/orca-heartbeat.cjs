@@ -181,7 +181,7 @@ function sessionTerminalHandles(workerRows) {
 
 /** A worker still consuming machine resources, whatever its task status says. */
 function isHoldingResources(w) {
-  return w.terminalState && w.terminalState !== 'released';
+  return w.terminalState && !['released', 'retained'].includes(w.terminalState);
 }
 
 /**
