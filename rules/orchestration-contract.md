@@ -273,7 +273,8 @@ worker rows marked `unsupervised`, and the panel's own `ORCA_TERMINAL_HANDLE`, a
 supervised as worker terminals.
 
 If `worker-start` reports `stage: agent_readiness` / `lastError: timeout` but its terminal
-is live, do not create a replacement. Send the original spec into the existing terminal and
+is live, the gate prints the following recovery advice with any returned terminal/dispatch
+handles. Do not create a replacement. Send the original spec into the existing terminal and
 retain the dispatch explicitly:
 
 ```sh

@@ -860,6 +860,31 @@ rmState(`${SID}-hard-off`);
   rmState(sid);
 }
 
+// A failed readiness probe can still leave a usable terminal behind. The PostToolUse hook
+// must turn that otherwise-generic failure into concrete recovery advice for the returned
+// terminal and dispatch, without launching any real Codex process.
+{
+  const env = quotaEnv('readiness-timeout-advice', 10, 30, { maxParallelCodexWorkers: 1 });
+  const sid = `${SID}-readiness-timeout-advice`;
+  const toolUseId = 'toolu_readiness_timeout_advice';
+  const command = 'orca orchestration worker-start --agent codex --spec @plans/readiness.md --json';
+  rmState(sid);
+  invoke(mainBash(command, { sid, tool_use_id: toolUseId }), env);
+  const result = invoke(postBash(command, JSON.stringify({
+    ok: false,
+    result: {
+      stage: 'agent_readiness', lastError: 'timeout', dispatchId: 'ctx_readiness_timeout',
+      agentTerminalHandle: 'term_readiness_timeout',
+    },
+  }), { sid, tool_use_id: toolUseId }), env);
+  checkBool('failed readiness worker-start prints terminal-send and worker-retain recovery advice',
+    result.out.includes('orca terminal send --terminal term_readiness_timeout') &&
+      result.out.includes('--enter') &&
+      result.out.includes('orca orchestration worker-retain --dispatch ctx_readiness_timeout'),
+    true);
+  rmState(sid);
+}
+
 {
   const CAP2 = quotaEnv('cap-2', 10, 30, { maxParallelCodexWorkers: 2 });
   const GSID = `${SID}-cap`;

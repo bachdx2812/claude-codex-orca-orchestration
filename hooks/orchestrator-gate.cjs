@@ -1234,6 +1234,19 @@ function dropFailedToolState(s, toolUseId) {
 // set of dispatch-shaped sub-commands.
 const DISPATCH_SUBS = new Set(['orchestration worker-start', 'orchestration task-create', 'terminal create']);
 
+function readinessTimeoutAdvice(replyText) {
+  if (!/"stage"\s*:\s*"agent_readiness"/i.test(replyText) ||
+      !/"lastError"\s*:\s*"timeout"/i.test(replyText)) return null;
+  const terminal = replyText.match(/"(?:agentTerminalHandle|terminalHandle)"\s*:\s*"([A-Za-z0-9_.:-]+)"/i)?.[1];
+  const dispatch = replyText.match(/"dispatchId"\s*:\s*"([A-Za-z0-9_.:-]+)"/i)?.[1];
+  const terminalArg = terminal || '<terminalHandle>';
+  const dispatchArg = dispatch || '<dispatchId>';
+  return 'orchestrator-gate: worker-start timed out at agent readiness, but its terminal may become usable. ' +
+    'Do not launch a replacement. Send the original spec, then retain the dispatch:\n' +
+    `  orca terminal send --terminal ${terminalArg} --text "$(cat <spec-file>)" --enter\n` +
+    `  orca orchestration worker-retain --dispatch ${dispatchArg}\n`;
+}
+
 /**
  * Scans `out` (stdout+stderr on a success, or the failure event's own `error` text on a
  * failure) for every DISPATCH_SUBS invocation in `cmd` and registers whatever it finds,
@@ -1301,7 +1314,9 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
 
     if (failed) {
       if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
-      process.stdout.write('orchestrator-gate: orca worker-start reported "ok": false; nothing was registered.\n');
+      const readinessAdvice = inv.sub === 'orchestration worker-start' && readinessTimeoutAdvice(replyText);
+      process.stdout.write(readinessAdvice ||
+        'orchestrator-gate: orca worker-start reported "ok": false; nothing was registered.\n');
       return;
     }
 

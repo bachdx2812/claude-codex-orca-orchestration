@@ -72,8 +72,9 @@ orca orchestration worker-start --retry-of <dispatchId> ...
 
 **Readiness timeout with a live terminal.** `worker-start` can report
 `stage: agent_readiness` / `lastError: timeout` even though the Codex terminal started and
-is usable. Do not launch a replacement. Send the original spec to that terminal, then mark
-the worker explicitly retained:
+is usable. The gate prints this recovery advice with any terminal/dispatch handles returned
+by Orca. Do not launch a replacement. Send the original spec to that terminal, then mark the
+worker explicitly retained:
 
 ```sh
 orca terminal send --terminal <terminalHandle> --text "$(cat <spec-file>)" --enter
@@ -230,7 +231,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 826 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 871 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
