@@ -4,7 +4,7 @@
  * reversibly. Zero dependencies, Node >= 18.
  *
  * Usage:
- *   node install.mjs [--dry-run] [--force] [--no-pin-models] [--set-model <alias>]
+ *   node install.mjs [--dry-run] [--force] [--no-pin-models] [--set-model <alias>] [--replace-foreign-gate]
  *   node install.mjs --check
  *   node install.mjs --uninstall [--purge]
  *   node install.mjs --repair
@@ -96,11 +96,47 @@ const opt = (name) => {
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : null;
 };
 
+function usage(stream = process.stdout) {
+  stream.write(
+    'Usage:\n' +
+    '  node install.mjs [--dry-run] [--force] [--no-pin-models] [--set-model <alias>] [--replace-foreign-gate]\n' +
+    '  node install.mjs --check\n' +
+    '  node install.mjs --uninstall [--purge]\n' +
+    '  node install.mjs --repair\n' +
+    '  node install.mjs --help | -h\n');
+}
+
+const BOOLEAN_FLAGS = new Set([
+  '--dry-run', '--force', '--no-pin-models', '--replace-foreign-gate',
+  '--check', '--uninstall', '--purge', '--repair', '--help', '-h',
+]);
+let argvError = null;
+for (let i = 0; i < argv.length; i++) {
+  const arg = argv[i];
+  if (BOOLEAN_FLAGS.has(arg)) continue;
+  if (arg === '--set-model') {
+    if (!argv[i + 1] || argv[i + 1].startsWith('-')) argvError = '--set-model requires an alias value.';
+    else i += 1;
+    continue;
+  }
+  argvError = `Unknown option: ${arg}`;
+}
+if (flag('--help') || flag('-h')) {
+  usage();
+  process.exit(0);
+}
+if (argvError) {
+  console.error(argvError);
+  usage(process.stderr);
+  process.exit(2);
+}
+
 const DRY_RUN = flag('--dry-run');
 const FORCE = flag('--force');
 const NO_PIN = flag('--no-pin-models');
 const SET_MODEL = opt('--set-model');
 const PURGE = flag('--purge');
+const REPLACE_FOREIGN_GATE = flag('--replace-foreign-gate');
 
 function log(msg) { console.log(msg); }
 function warn(msg) { console.log(`WARNING: ${msg}`); }
@@ -237,6 +273,36 @@ function entryMatches(entry, matcher, command) {
     && entry.hooks.some((h) => h && h.type === 'command' && h.command === command);
 }
 
+function foreignGateCommands(settings, ownedCommands = []) {
+  const owned = new Set([commandFor(GATE_SCRIPT), ...ownedCommands].filter(Boolean));
+  const found = [];
+  for (const [event, entries] of Object.entries(settings?.hooks || {})) {
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (!Array.isArray(entry?.hooks)) continue;
+      for (const hook of entry.hooks) {
+        const command = hook?.type === 'command' ? hook.command : null;
+        if (typeof command === 'string' && /orchestrator-gate\.cjs(?:["']|\s|$)/.test(command) && !owned.has(command)) {
+          found.push({ event, matcher: entry.matcher, command });
+        }
+      }
+    }
+  }
+  return found;
+}
+
+function removeForeignGateCommands(settings, foreign) {
+  const commands = new Set(foreign.map((item) => item.command));
+  for (const [event, entries] of Object.entries(settings.hooks || {})) {
+    if (!Array.isArray(entries)) continue;
+    settings.hooks[event] = entries.flatMap((entry) => {
+      if (!Array.isArray(entry?.hooks)) return [entry];
+      const hooks = entry.hooks.filter((hook) => !(hook?.type === 'command' && commands.has(hook.command)));
+      return hooks.length ? [{ ...entry, hooks }] : [];
+    });
+  }
+}
+
 // `prevManifest` is this repo's own record from an earlier install, if any. A re-install
 // (the idempotent case) must keep claiming ownership of keys it created the first time,
 // even though those keys now already exist *because we created them* - recomputing
@@ -289,6 +355,15 @@ function installSettings(opts, prevManifest) {
 
   if (obj.disableAllHooks) warn('settings.json has "disableAllHooks": true — the installed hooks will not run until that is cleared.');
   if (obj.allowManagedHooksOnly) warn('settings.json has "allowManagedHooksOnly": true — verify the installed hooks are treated as managed, or they may be ignored.');
+
+  const foreign = foreignGateCommands(obj);
+  if (foreign.length && REPLACE_FOREIGN_GATE) {
+    removeForeignGateCommands(obj, foreign);
+    warn(`removed ${foreign.length} foreign orchestrator-gate.cjs registration(s) because --replace-foreign-gate was supplied.`);
+  } else if (foreign.length) {
+    warn(`FOREIGN orchestrator-gate.cjs registration(s) detected (${foreign.map((item) => item.command).join(', ')}). ` +
+      'They remain active alongside this package and may enforce conflicting rules. Re-run with --replace-foreign-gate to remove them.');
+  }
 
   const prevSettings = prevManifest && prevManifest.settings;
   const createdHooksKey = prevSettings ? !!prevSettings.createdHooksKey : obj.hooks === undefined;
@@ -632,6 +707,15 @@ function check() {
 
   log('\n--- install status ---');
   const manifest = readJSONSafe(MANIFEST_FILE, null);
+  const settingsForForeignCheck = readJSONSafe(SETTINGS_FILE, {});
+  const recordedCommands = Object.values(manifest?.settings?.events || {}).map((entry) => entry.command);
+  const foreign = foreignGateCommands(settingsForForeignCheck, recordedCommands);
+  if (foreign.length) {
+    log(`  PROBLEM: ${foreign.length} foreign orchestrator-gate.cjs registration(s) found in ${SETTINGS_FILE}:`);
+    for (const item of foreign) log(`    ${item.event} matcher "${item.matcher}": ${item.command}`);
+  } else {
+    log('  OK   no foreign orchestrator-gate.cjs registrations');
+  }
   if (!manifest) {
     log('Not installed (no install manifest at ' + MANIFEST_FILE + ').');
     return;

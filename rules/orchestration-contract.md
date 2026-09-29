@@ -130,6 +130,11 @@ path is checked with a file-exists test; the bare default name via `which`/`wher
 per-invocation cost beyond those two lookups, and never a live `worker-list` call just to
 decide routing.
 
+Live-cache refresh is single-flight across hook processes through a short lease in the
+state directory. The lease winner probes app-server; peers consume the refreshed value or
+the prior stale value instead of starting parallel probes. Process-local memoization stays
+enabled even when the file-cache TTL is `0`.
+
 Independent of that automatic fallback, the operator can always route explicitly:
 
 - `--exec-sonnet` (or `--code-model <code alias>`): an explicit, session-scoped operator
@@ -141,7 +146,10 @@ Independent of that automatic fallback, the operator can always route explicitly
 
 `node install.mjs --check` reports whether `orca` and `codex` are on `PATH`, whether Codex
 looks logged in, and the effective config (including `execFallbackWhenCodexUnavailable`)
-as the installed hooks would actually read it.
+as the installed hooks would actually read it. It also reports any registered foreign
+`orchestrator-gate.cjs` as a problem. Install preserves such registrations with a warning
+unless the operator explicitly supplies `--replace-foreign-gate`; the ordinary settings
+backup precedes their removal. Help and unknown options never enter the install path.
 
 ## Config
 
@@ -188,7 +196,8 @@ as the installed hooks would actually read it.
   process with `ORCH_CODEX_HANDOFF_USED`.
 - `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
   `codex app-server` quota reading or a failed probe is reused from `codex-quota-live.json` in the gate
-  state directory; `0` disables reuse. Overridable for one process with
+  state directory; `0` disables cross-process file reuse but not the memo inside one hook
+  process. Overridable for one process with
   `ORCH_CODEX_QUOTA_CACHE_SECONDS`.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
@@ -249,7 +258,9 @@ while everything is healthy.
 
 IDLE, orphan and rate-limit terminal events are limited to this session's own fleet: the
 run-scoped `worker-list` terminal handles plus bare terminals registered in this session's
-gate state. Output from another session's terminal never wakes this panel.
+gate state. Output from another session's terminal never wakes this panel. Context-only
+worker rows marked `unsupervised`, and the panel's own `ORCA_TERMINAL_HANDLE`, are not
+supervised as worker terminals.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
@@ -402,7 +413,8 @@ same paths also acquire the lock with a longer timeout than file-lock's own `sta
 default (10s) specifically so a merely-abandoned lock (not a genuinely live holder) is
 outlived and reclaimed instead of refused: the library's ordinary 2s acquire timeout used to
 give up well before a dead holder's lock ever looked stale, refusing for roughly
-`staleMs - timeoutMs` (~8s) after every such lock was created.
+`staleMs - timeoutMs` (~8s) after every such lock was created. A non-`EEXIST` filesystem
+failure is not contention and degrades to allow rather than producing that refusal.
 When both caps are unlimited or disabled, `worker-start` uses the ordinary 2-second lock
 timeout instead. When a finite cap's long initial acquisition cannot obtain a genuinely
 held lock, the dispatch is refused immediately after that one attempt rather than paying a
@@ -574,10 +586,11 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # all three suites
+npm test                                             # all four suites (791 checks)
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
-node tests/test-concurrency.cjs                      # genuine multi-process races (both caps)
+node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)
+node tests/test-install.cjs                          # CLI safety + foreign-gate handling
 ```
 
 Every false positive found in real use became a permanent case in these suites: a `>`

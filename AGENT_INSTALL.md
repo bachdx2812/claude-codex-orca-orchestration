@@ -76,7 +76,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 768 tests, fully hermetic
+npm test                       # 791 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -109,6 +109,12 @@ so `--uninstall` can reverse exactly this and nothing else:
    `<!-- orchestration:start -->` / `<!-- orchestration:end -->` markers (replacing the
    block in place on a re-install; creates the file if missing).
 
+If `settings.json` already registers a different `orchestrator-gate.cjs`, install warns
+prominently and leaves it in place. Inspect it, then rerun with
+`node install.mjs --replace-foreign-gate` to remove only those foreign registrations; the
+normal pre-mutation settings backup covers that replacement. `--help`/`-h` and invalid
+options never install (`--help` exits 0; invalid options print usage and exit 2).
+
 Steps 1-6 are validated *before* anything is written (settings.json parses, CLAUDE.md
 markers are balanced): if either check fails, install aborts with nothing written at all
 — never a partial install with hook files on disk but no manifest to account for or
@@ -132,6 +138,8 @@ Expect:
 - Hook entries: each of the six events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`,
   `PostToolUse`, `PostToolUseFailure`, `Stop`) is checked for real presence in
   `settings.json` — not just that the manifest claims to have added it.
+- Foreign gate check: any other registered `orchestrator-gate.cjs` is reported as a
+  `PROBLEM`, even when this package is not installed yet.
 - Effective environment: whether `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_FABLE_MODEL`
   are set in `settings.json`'s `env` block, a warning if `CLAUDE_CODE_SUBAGENT_MODEL` is
   set (it overrides subagent model routing and can fight this gate's instructions), and
@@ -272,7 +280,9 @@ Rollback without the uninstaller: every settings.json mutation is preceded by a
   4.5-second helper deadline that SIGKILLs an app-server child which ignores SIGTERM.
   Successful values and failed probes are cached as `codex-quota-live.json` in the gate state directory for
   `codexQuotaCacheSeconds` (default 60); `ORCH_CODEX_QUOTA_CACHE_SECONDS` overrides the
-  TTL and `0` disables reuse. If the live probe fails, the gate falls back to
+  TTL and `0` disables file-cache reuse while retaining one-hook-process memoization.
+  Expired-cache refreshes are single-flight through a short state-directory lease; peers
+  use the refreshed or stale value instead of stampeding app-server. If the live probe fails, the gate falls back to
   `~/.codex/sessions/**/*.jsonl` `rate_limits` events no older than six hours
   (`CODEX_HOME` honoured), then reports `unknown`, which keeps Codex as the default.
   Cached live reminders include their age; `rateLimitReachedType` or
@@ -282,6 +292,8 @@ Rollback without the uninstaller: every settings.json mutation is preceded by a
 - **Orca worker detection** uses `orca orchestration worker-list --json`'s
   `resource.id` field; a context-only `orchestration dispatch --to <handle>` (no
   `resource`) is never treated as a worker, so it stays gated like the main panel.
+  The heartbeat likewise excludes `workerState: "unsupervised"` context-only rows and its
+  own panel terminal handle from the set it supervises.
 - **File ownership (`Owns:`) is declared, not observed** — nothing checks that a worker's
   actual edits stayed within what it claimed. Workers started by a subagent, not the main
   panel, are not tracked or capped by `maxParallelCodexWorkers` or `maxParallelAgents`, the

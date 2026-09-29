@@ -39,7 +39,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own terminal going IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or a worktree whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). |
+| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or a worktree whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows and the panel's own terminal are excluded. |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -143,7 +143,9 @@ happens to be holding can never masquerade as "at capacity" for a cap that isn't
 anything. The lock acquisition on this path also deliberately outlives file-lock's own
 staleMs (10s) — a caller whose attempt starts less than ~8s after a dead holder's lock was
 created used to time out and refuse before ever living long enough to see it go stale;
-it now waits long enough to break and reclaim a truly abandoned lock itself. A
+it now waits long enough to break and reclaim a truly abandoned lock itself. A genuine
+lock filesystem failure (missing/unwritable state path, disk error) is distinct from
+contention and degrades to allow, as infrastructure failures must. A
 dispatch registered as `run_in_background: true` survives its own launch-returning
 `PostToolUse` and is instead released by a matching `<task-notification><tool-use-id>`, a
 120-minute TTL, or `--release-claims`, the same pattern `code-brief-needs-owns`'s `Owns:`
@@ -192,12 +194,16 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 768 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 791 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
 CONTRACT" banner. `node install.mjs --check` reports install status, prerequisite
-binaries, and the effective model-pin environment variable.
+binaries, the effective model-pin environment variable, and any foreign
+`orchestrator-gate.cjs` registration. Install warns and leaves a foreign gate intact by
+default; rerun with `--replace-foreign-gate` to remove those registrations under the
+normal `settings.json` backup. `--help`/`-h` only prints usage, and an unknown option exits
+2 without installing.
 
 Full agent-facing install/verify/customise/rollback steps: `AGENT_INSTALL.md`.
 
@@ -229,7 +235,9 @@ operator prompt
 
 Automatic routing reads Codex quota live from `codex app-server` without making a model
 call. Successful and failed probes are cached for 60 seconds in the gate state directory
-and memoized inside one hook process. If the live probe fails, routing falls back to the
+and memoized inside one hook process. Expired-cache refreshes use a short state-directory
+lease, so parallel hooks produce one app-server probe while peers consume the refreshed or
+stale value. If the live probe fails, routing falls back to the
 newest local Codex session-log rate-limit event no older than six hours, then to `unknown`
 (which deliberately keeps Codex as the default). The helper has its own 4.5-second deadline
 and escalates a child that ignores SIGTERM to SIGKILL. Per-turn reminders label a reading
@@ -258,8 +266,9 @@ The file is plain JSON — no comments — parsed as-is:
 ```
 
 (`codexHandoffUsedPercent: 60` means Codex keeps coding until 60% of its quota is used,
-up from the default 40; `codexQuotaCacheSeconds` controls the live-reading cache TTL
-(`0` disables reuse); `replyLanguage` accepts any language name, or `null` for no
+up from the default 40; `codexQuotaCacheSeconds` controls the cross-process live-reading
+cache TTL (`0` disables file-cache reuse but retains memoization inside one hook process);
+`replyLanguage` accepts any language name, or `null` for no
 language instruction at all; `maxParallelCodexWorkers` raises or lowers how many live
 Codex workers this session may hold at once (`0` = unlimited); `ownershipClaimTtlMinutes`
 changes how long a background Agent's `Owns:` claim survives before it auto-expires;
@@ -353,10 +362,10 @@ substituted content isn't visible to the per-invocation argument scanner.
 ## Development
 
 ```bash
-npm test   # node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-concurrency.cjs
+npm test   # unit + hook e2e + multi-process concurrency + installer tests
 ```
 
-All three suites are fully hermetic: state lives under a fresh temp `ORCH_STATE_DIR`, `orca`
+All four suites are fully hermetic: state lives under a fresh temp `ORCH_STATE_DIR`, `orca`
 is always a deterministic local stub selected via `ORCA_BIN`, and every path judged by the
 gate is synthetic — nothing depends on, or touches, your real `~/.claude/`. Most git-backed
 done-worktree checks use an equally deterministic `git` stub (`ORCH_GIT_BIN`); a handful
