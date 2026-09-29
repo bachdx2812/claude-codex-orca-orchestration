@@ -221,6 +221,10 @@ check('a displayed function call containing an HTTP 429 string is not an error',
   hasRateLimitError('console.error("HTTP 429 Too Many Requests")'), false);
 check('a displayed test assertion containing an API error code is not an error',
   hasRateLimitError("expect(message).toContain('rate_limit_exceeded');"), false);
+check('a progress line about rate-limit error handling is not an error',
+  hasRateLimitError('• Added retry handling for the rate limit error path'), false);
+check('a progress line about a usage-limit error message is not an error',
+  hasRateLimitError('I fixed the usage limit error message in the banner.'), false);
 check('a Codex error bullet is a rate-limit error',
   hasRateLimitError("■ You've hit your usage limit. Try again later."), true);
 check('an HTTP 429 response line is a rate-limit error',
