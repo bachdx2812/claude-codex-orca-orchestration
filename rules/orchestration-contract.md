@@ -261,8 +261,8 @@ The gate prints the exact command to start the heartbeat daemon the moment it se
 worker start (built from this install's own `process.execPath` and `__dirname`, so it is
 correct wherever the hooks were installed). The daemon polls Orca and exits the moment
 something needs a decision — a worker changing state, a finished worker still holding a
-terminal, a supervised terminal quiet longer than `heartbeat.idleSeconds`, an orphaned
-terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
+terminal, a supervised terminal quiet longer than `heartbeat.idleSeconds`, a Codex session
+that lost its app-server connection, an orphaned terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
 its exit is the wake-up: the panel does not have to remember to poll, and it costs nothing
 while everything is healthy.
 
@@ -289,6 +289,11 @@ an unchanged terminal is not re-reported after every daemon restart; new output 
 retained worker is refused as `workers-unwatched`. Orca's automatic
 `terminalState: retained` on a readiness failure does not get this exemption unless this
 session recorded an explicit `worker-retain`. Release the worker when it is no longer needed.
+
+Codex connection-lost/reconnect-failed messages are terminal even when the TUI keeps
+repainting. The heartbeat reports that terminal as `WORKER STUCK` once per session,
+persisted across daemon restarts; release and re-dispatch it because uncommitted work may
+have been lost.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`

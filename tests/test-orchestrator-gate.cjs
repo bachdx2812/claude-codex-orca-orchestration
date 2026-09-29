@@ -28,7 +28,7 @@ const OWN = require('../hooks/lib/ownership.cjs');
 const OC = require('../hooks/lib/ownership-claims.cjs');
 const PAC = require('../hooks/lib/parallel-agent-cap.cjs');
 const { acquireLock, releaseLock } = require('../hooks/lib/file-lock.cjs');
-const { hasRateLimitError } = require('../hooks/lib/terminal-signals.cjs');
+const { hasRateLimitError, hasCodexDisconnect } = require('../hooks/lib/terminal-signals.cjs');
 
 let pass = 0;
 const failures = [];
@@ -221,6 +221,14 @@ check('a Codex error bullet is a rate-limit error',
   hasRateLimitError("■ You've hit your usage limit. Try again later."), true);
 check('an HTTP 429 response line is a rate-limit error',
   hasRateLimitError('request failed with HTTP 429 Too Many Requests'), true);
+check('Codex connection-lost reconnect notice is a disconnect',
+  hasCodexDisconnect('■ Connection lost. Attempting to reconnect…'), true);
+check('Codex automatic reconnect failure is a disconnect',
+  hasCodexDisconnect('■ Automatic reconnect could not restore this session.'), true);
+check('Codex endpoint reconnect failure is a disconnect',
+  hasCodexDisconnect('Reconnect failed — check the endpoint, then relaunch'), true);
+check('a diff excerpt containing a reconnect failure is not a disconnect',
+  hasCodexDisconnect('+Reconnect failed — check the endpoint, then relaunch'), false);
 
 const NOW = 1800000000000;
 const ctx = {
@@ -231,6 +239,11 @@ const ctx = {
 check('rate limit in preview wins over everything',
   heartbeat.classifyTerminal({ handle: 'x', preview: 'Error: 429 rate limit', lastOutputAt: NOW }, ctx).kind,
   'rate_limit');
+
+check('app-server disconnect wins over continuing terminal output',
+  heartbeat.classifyTerminal({ handle: 'x', preview: '■ Connection lost. Attempting to reconnect…',
+    lastOutputAt: NOW }, ctx).kind,
+  'connection_lost');
 
 check('orphaned terminal is reported',
   heartbeat.classifyTerminal({ handle: 'x', preview: '', orphaned: true, lastOutputAt: NOW }, ctx).kind,

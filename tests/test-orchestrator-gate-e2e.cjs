@@ -2494,6 +2494,28 @@ async function heartbeatWorktreeTests() {
     checkBool('heartbeat reports a real-looking Codex rate-limit error', errorOut.includes('RATE LIMIT'), true);
   }
 
+  {
+    const common = {
+      worktrees: [], dirName: 'hb-codex-disconnect', sessionName: 'codex-disconnect',
+      workerRows: [{ dispatchId: 'ctx_disconnected', workerState: 'running', dispatchStatus: 'running',
+        terminalState: 'active', agentTerminalHandle: 'term_disconnected' }],
+      terminalRows: [{ handle: 'term_disconnected', title: 'Codex worker', lastOutputAt: Date.now(),
+        preview: '■ Connection lost. Attempting to reconnect…\n' +
+          '■ Automatic reconnect could not restore this session.\n' +
+          'Reconnect failed — check the endpoint, then relaunch' }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    };
+    const first = await runHeartbeat({ ...common, name: 'codex-disconnect-first' });
+    checkBool('heartbeat reports a repainting Codex app-server disconnect as WORKER STUCK',
+      first.includes('WORKER STUCK on term_disconnected') &&
+        first.includes('Codex session lost its app-server connection - its work since the last commit may be lost; release and re-dispatch'),
+      true);
+
+    const second = await runHeartbeat({ ...common, name: 'codex-disconnect-restart' });
+    checkBool('the same disconnected terminal is reported only once per session across daemon restarts',
+      second.includes('WORKER STUCK on term_disconnected'), false);
+  }
+
   // A machine-wide worktree list may include another session's completed worktree. Only
   // paths carried by this session's run-scoped worker rows may enter the reminder.
   {

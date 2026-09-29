@@ -27,7 +27,7 @@ detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
 directly and are never tracked by these hooks for supervision purposes — no heartbeat
 needed. Orca workers (Codex) run in their own terminal/worktree and must be supervised by
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
-terminal, an orphan, a rate limit, or one of this session's worktrees whose PR already
+terminal, a lost Codex app-server connection, an orphan, a rate limit, or one of this session's worktrees whose PR already
 merged/closed with no live terminal left on it; `Stop` refuses to end the session with one live and
 unwatched, or finished and unreleased. No more than `maxParallelCodexWorkers` (default 3)
 live Codex workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget

@@ -26,4 +26,16 @@ function hasRateLimitError(text) {
   return false;
 }
 
-module.exports = { hasRateLimitError, RATE_LIMIT_MARKER };
+function hasCodexDisconnect(text) {
+  let inFence = false;
+  for (const raw of terminalLines(text)) {
+    const line = raw.trimEnd();
+    if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence || isSourceExcerpt(line)) continue;
+    if (/^\s*■\s*(?:Connection lost\..*reconnect|Automatic reconnect could not restore this session\.)/i.test(line) ||
+        /^\s*Reconnect failed\b/i.test(line)) return true;
+  }
+  return false;
+}
+
+module.exports = { hasRateLimitError, hasCodexDisconnect, RATE_LIMIT_MARKER };

@@ -40,7 +40,7 @@ const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { loadConfig, stateDir, closeDoneWorktreesEnabled } = require('./lib/config.cjs');
-const { hasRateLimitError } = require('./lib/terminal-signals.cjs');
+const { hasRateLimitError, hasCodexDisconnect } = require('./lib/terminal-signals.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -78,6 +78,10 @@ const BEAT_FILE = path.join(DIR, `heartbeat-${SESSION}.json`);
 // exits to wake the panel, so process-local de-duplication alone would re-report the same
 // retained terminal after every restart. A changed lastOutputAt value starts a new stretch.
 const IDLE_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-idle-reported.json`);
+// A lost app-server connection is independent of terminal output activity: Codex can keep
+// repainting its TUI forever after the session is unrecoverable. Report each affected
+// terminal once for this session, including across heartbeat daemon restarts.
+const DISCONNECT_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-disconnect-reported.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -141,6 +145,24 @@ function savePersistedIdleReports(map) {
     const tmp = `${IDLE_REPORTED_FILE}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify([...map]));
     fs.renameSync(tmp, IDLE_REPORTED_FILE);
+  } catch {}
+}
+
+function loadPersistedDisconnectReports() {
+  try {
+    const handles = JSON.parse(fs.readFileSync(DISCONNECT_REPORTED_FILE, 'utf8'));
+    return new Set(Array.isArray(handles) ? handles.filter((handle) => typeof handle === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function savePersistedDisconnectReports(set) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${DISCONNECT_REPORTED_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...set]));
+    fs.renameSync(tmp, DISCONNECT_REPORTED_FILE);
   } catch {}
 }
 
@@ -705,6 +727,7 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
 function classifyTerminal(t, ctx) {
   if (!ctx.ownHandles || !ctx.ownHandles.has(t.handle)) return { kind: 'ignored' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
+  if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
   if (t.orphaned) return { kind: 'orphaned' };
   const supervised = (ctx.retainedHandles && ctx.retainedHandles.has(t.handle)) ||
     !ctx.baseHandles.has(t.handle) || t.lastOutputAt > ctx.started;
@@ -746,6 +769,7 @@ function main() {
   const ownedWorktreePaths = sessionWorktreeKeys(baseWorkers || [], baseTerms || [], ownTerminalHandles, sessionState);
   let prevWorkers = new Map(baseWorkerState);
   const reportedIdle = loadPersistedIdleReports();
+  const reportedDisconnect = loadPersistedDisconnectReports();
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
@@ -837,6 +861,14 @@ function main() {
             `RATE LIMIT on ${label}: back off, then retry the SAME dispatch with ` +
             '`orca orchestration worker-start --retry-of <dispatchId>`. Do not start a replacement, ' +
             'and reduce how many Codex workers run in parallel.'
+          );
+        } else if (verdict.kind === 'connection_lost') {
+          if (reportedDisconnect.has(t.handle)) continue;
+          reportedDisconnect.add(t.handle);
+          savePersistedDisconnectReports(reportedDisconnect);
+          events.push(
+            `WORKER STUCK on ${label}: Codex session lost its app-server connection - ` +
+            'its work since the last commit may be lost; release and re-dispatch'
           );
         } else if (verdict.kind === 'orphaned') {
           // Orphans already present at startup are backlog, not this run's event: reporting
