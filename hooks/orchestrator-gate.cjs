@@ -1234,6 +1234,22 @@ function dropFailedToolState(s, toolUseId) {
 // set of dispatch-shaped sub-commands.
 const DISPATCH_SUBS = new Set(['orchestration worker-start', 'orchestration task-create', 'terminal create']);
 
+/** Decode JSON command output before terminal-line classification so escaped newlines in
+ * worker-read previews become real line boundaries. Only string values are terminal text;
+ * object keys and numeric metadata must not create signal-shaped false positives. */
+function workerOutputSignalText(out) {
+  let parsed;
+  try { parsed = JSON.parse(out); } catch { return out; }
+  const strings = [];
+  const visit = (value) => {
+    if (typeof value === 'string') strings.push(value);
+    else if (Array.isArray(value)) value.forEach(visit);
+    else if (value && typeof value === 'object') Object.values(value).forEach(visit);
+  };
+  visit(parsed);
+  return strings.join('\n');
+}
+
 function readinessTimeoutDetails(replyText) {
   if (!/"stage"\s*:\s*"agent_readiness"/i.test(replyText) ||
       !/"lastError"\s*:\s*"timeout"/i.test(replyText)) return null;
@@ -1604,7 +1620,7 @@ function onPostToolUseLocked(p, s, cfg) {
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
     // Only worker/terminal output counts; the panel's own quota inspection ("rate_limits" JSON) does not.
     const readsWorkerOutput = /\borca\b/.test(cmd) && /(worker-read|terminal (read|show))\b/.test(cmd);
-    if (readsWorkerOutput && hasRateLimitError(out.replace(/"rate_limits"/g, ''))) {
+    if (readsWorkerOutput && hasRateLimitError(workerOutputSignalText(out).replace(/"rate_limits"/g, ''))) {
       s.rate_limit_hits += 1;
       const until = Date.now() + RATE_LIMIT_BACKOFF_SECONDS * 1000;
       for (const w of Object.values(s.workers)) if (w.status === 'live') w.rate_limited_until = until;

@@ -234,6 +234,11 @@ expect('running the unit suite is allowed',
     "■ You've hit your usage limit. Try again after the limit resets.", { sid }), CODEX_WINS);
   checkBool('a real-looking Codex usage-limit error marks workers rate-limited',
     readState(sid)?.rate_limit_hits, 1);
+
+  invoke(postBash('orca orchestration worker-read --dispatch ctx_rate_limit_lines --json',
+    JSON.stringify({ ok: true, result: { preview: '■ Rate limit hit\nRetry later' } }), { sid }), CODEX_WINS);
+  checkBool('worker-read --json scans unescaped string values for line-start rate-limit markers',
+    readState(sid)?.rate_limit_hits, 2);
   rmState(sid);
 }
 
