@@ -233,10 +233,12 @@ check('a bracketed ERROR log line is a rate-limit error',
   hasRateLimitError('[ERROR] rate limit hit'), true);
 check('a warning-prefixed usage-limit line is a rate-limit error',
   hasRateLimitError('⚠ You have reached your usage limit'), true);
-check('Codex connection-lost reconnect notice is a disconnect',
-  hasCodexDisconnect('■ Connection lost. Attempting to reconnect…'), true);
+check('a connection-lost reconnect attempt alone is not a terminal disconnect',
+  hasCodexDisconnect('■ Connection lost. Attempting to reconnect…'), false);
 check('Codex automatic reconnect failure is a disconnect',
   hasCodexDisconnect('■ Automatic reconnect could not restore this session.'), true);
+check('a connection-lost notice followed by reconnect failure is a disconnect',
+  hasCodexDisconnect('■ Connection lost. Attempting to reconnect…\n■ Automatic reconnect could not restore this session.'), true);
 check('Codex endpoint reconnect failure is a disconnect',
   hasCodexDisconnect('Reconnect failed — check the endpoint, then relaunch'), true);
 check('a bullet-prefixed reconnect failure is a disconnect',
@@ -256,10 +258,10 @@ check('rate limit in preview wins over everything',
   heartbeat.classifyTerminal({ handle: 'x', preview: 'Error: 429 rate limit', lastOutputAt: NOW }, ctx).kind,
   'rate_limit');
 
-check('app-server disconnect wins over continuing terminal output',
+check('a reconnect attempt with continuing terminal output remains working',
   heartbeat.classifyTerminal({ handle: 'x', preview: '■ Connection lost. Attempting to reconnect…',
     lastOutputAt: NOW }, ctx).kind,
-  'connection_lost');
+  'working');
 
 check('orphaned terminal is reported',
   heartbeat.classifyTerminal({ handle: 'x', preview: '', orphaned: true, lastOutputAt: NOW }, ctx).kind,

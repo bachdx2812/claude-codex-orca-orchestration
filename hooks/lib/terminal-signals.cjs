@@ -35,7 +35,7 @@ function hasCodexDisconnect(text) {
     const line = raw.trimEnd();
     if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
     if (inFence || isSourceExcerpt(line)) continue;
-    if (/^\s*■\s*(?:Connection lost\..*reconnect|Automatic reconnect could not restore this session\.)/i.test(line) ||
+    if (/^\s*■\s*Automatic reconnect could not restore this session\./i.test(line) ||
         /^\s*(?:■|└)?\s*Reconnect failed\b/i.test(line)) return true;
   }
   return false;
