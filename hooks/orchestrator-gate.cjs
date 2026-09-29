@@ -1736,16 +1736,18 @@ function onStop(p, s, cfg) {
   // Workers still running are a legitimate wait - but only while the heartbeat daemon
   // watches them, so the panel is woken on the first event instead of going AFK.
   // Finished workers still holding a terminal must be released first, heartbeat or not.
-  const DONE = /\[(succeeded|failed|stopped|cancelled|canceled)\//;
+  const DONE = /\[(succeeded|failed|completed|stopped|cancelled|canceled)\//;
   const explicitlyRetained = (confirmation) => {
     const id = String(confirmation).split(' ')[0];
     return /\/retained\]$/.test(confirmation) && !!s.workers[id]?.retained;
   };
   const finished = confirmed ? confirmed.filter((c) => DONE.test(c) && !explicitlyRetained(c)) : [];
-  const stillRunning = confirmed ? confirmed.length - finished.length : ids.length;
+  const runningList = confirmed
+    ? confirmed.filter((c) => !DONE.test(c)).map((c) => explicitlyRetained(c) ? `${c} (retained)` : c)
+    : ids;
+  const stillRunning = runningList.length;
   if (stillRunning > 0 || pending.length) {
     if (heartbeatAlive(s.session_id)) return;
-    const runningList = confirmed ? confirmed.filter((c) => !DONE.test(c)) : ids;
     const pendingList = pending.map(([k]) => `${k} (no dispatch id yet - run \`orca orchestration worker-list\` to resolve)`);
     const allShown = [...runningList, ...pendingList];
     d('workers-unwatched',
@@ -1755,7 +1757,11 @@ function onStop(p, s, cfg) {
     return;
   }
 
-  const shown = confirmed && confirmed.length ? confirmed : ids;
+  // Explicitly retained workers that Orca reports done are informational: their terminal
+  // may stay open for reuse, but no live execution remains for the heartbeat to supervise.
+  if (!finished.length) return;
+
+  const shown = confirmed ? finished : ids;
   const source = confirmed ? 'confirmed by orca worker-list' : 'per this session\'s record; orca did not answer';
   d('workers-unreconciled',
     `[orchestrator-gate:workers-unreconciled] ${shown.length} worker(s) still holding resources ` +

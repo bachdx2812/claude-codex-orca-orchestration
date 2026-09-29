@@ -824,8 +824,8 @@ rmState(`${SID}-hard-off`);
 // Gate A: max-parallel-codex-workers
 // =====================================================================================
 // A readiness-timeout worker may be retained and driven through its live terminal. Once
-// this session explicitly runs worker-retain, Stop treats it like other supervised work:
-// allowed with a live heartbeat, refused as unwatched without one.
+// this session explicitly runs worker-retain, a finished row is informational at Stop,
+// while a row that is still running must remain heartbeat-supervised.
 {
   const env = quotaEnv('retained-readiness-worker', 10, 30, { maxParallelCodexWorkers: 1 });
   const sid = `${SID}-retained-readiness`;
@@ -846,17 +846,31 @@ rmState(`${SID}-hard-off`);
     dispatchId,
     agentTerminalHandle: terminalHandle,
     terminalState: 'retained',
-    workerState: 'failed',
-    dispatchStatus: 'failed',
+    workerState: 'succeeded',
+    dispatchStatus: 'completed',
   }]) };
   const beatFile = path.join(STATE_DIR, `heartbeat-${sid}.json`);
   fs.writeFileSync(beatFile, JSON.stringify({ pid: process.pid, last_tick: Date.now(), interval: 20 }));
   expect('retained readiness: Stop is allowed while the heartbeat supervises the retained terminal',
     { session_id: sid, hook_event_name: 'Stop', effort: 'high', stop_hook_active: false }, ALLOW, retainedEnv);
   fs.unlinkSync(beatFile);
-  const unwatched = invoke({ session_id: sid, hook_event_name: 'Stop', effort: 'high', stop_hook_active: false }, retainedEnv);
-  checkBool('retained readiness: Stop without a heartbeat is refused as unwatched',
-    unwatched.code === DENY && /workers-unwatched/.test(unwatched.err) && !/workers-unreconciled/.test(unwatched.err), true);
+  expect('retained readiness: a succeeded retained worker is informational and needs no heartbeat at Stop',
+    { session_id: sid, hook_event_name: 'Stop', effort: 'high', stop_hook_active: false }, ALLOW, retainedEnv);
+
+  const runningEnv = { ...env, STUB_WORKERS_JSON: JSON.stringify([{
+    dispatchId,
+    agentTerminalHandle: terminalHandle,
+    terminalState: 'retained',
+    workerState: 'running',
+    dispatchStatus: 'running',
+  }]) };
+  const unwatched = invoke(
+    { session_id: sid, hook_event_name: 'Stop', effort: 'high', stop_hook_active: false }, runningEnv);
+  checkBool('retained readiness: a running retained worker without a heartbeat is listed as unwatched',
+    unwatched.code === DENY && /workers-unwatched/.test(unwatched.err) &&
+      /ctx_retained_readiness.*\(retained\)/.test(unwatched.err) &&
+      !/0 worker\(s\) still running/.test(unwatched.err),
+    true);
   rmState(sid);
 }
 
