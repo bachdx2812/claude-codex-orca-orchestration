@@ -222,6 +222,54 @@ async function maxParallelAgentsRaceTest() {
   return { pass, failures };
 }
 
+async function quotaProbeSingleFlightTest() {
+  let pass = 0;
+  const failures = [];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-quota-race-'));
+  const stateDir = path.join(dir, 'state');
+  const sessionsDir = path.join(dir, 'sessions');
+  const callsLog = path.join(dir, 'codex-calls.log');
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'codex-quota-live.json'), JSON.stringify({
+    usedPercent: 10,
+    resetsAt: Math.floor(Date.now() / 1000) + 3600,
+    fetchedAt: Date.now() - 61_000,
+  }));
+  const quotaLib = path.join(__dirname, '..', 'hooks', 'lib', 'exec-route-by-quota.cjs');
+  const codexStub = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
+  const env = {
+    ...BASE_ENV,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CODEX_BIN: codexStub,
+    CODEX_SESSIONS_DIR: sessionsDir,
+    STUB_CODEX_PRIMARY_USED: '25',
+    STUB_CODEX_CALLS_LOG: callsLog,
+  };
+  const spawnProbe = () => new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e',
+      'const q=require(process.argv[1]);const v=q.codexQuota(Date.now(),{stateDir:process.argv[2],cacheSeconds:60});process.stdout.write(JSON.stringify(v));',
+      quotaLib, stateDir], { env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+
+  const results = await Promise.all(Array.from({ length: 6 }, () => spawnProbe()));
+  const calls = fs.existsSync(callsLog)
+    ? fs.readFileSync(callsLog, 'utf8').trim().split('\n').filter(Boolean).length
+    : 0;
+  if (calls === 1) pass += 1;
+  else failures.push(`quota single-flight: expected one live app-server probe, got ${calls}`);
+  if (results.every((result) => result.code === 0 && result.stdout)) pass += 1;
+  else failures.push(`quota single-flight: every caller must receive a quota result (${JSON.stringify(results)})`);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { pass, failures };
+}
+
 async function main() {
   let pass = 0;
   const failures = [];
@@ -271,6 +319,10 @@ async function main() {
   const phase3 = await maxParallelAgentsRaceTest();
   pass += phase3.pass;
   failures.push(...phase3.failures);
+
+  const phase4 = await quotaProbeSingleFlightTest();
+  pass += phase4.pass;
+  failures.push(...phase4.failures);
 
   console.log(`${pass} passed, ${failures.length} failed`);
   for (const f of failures) console.log(`  FAIL ${f}`);

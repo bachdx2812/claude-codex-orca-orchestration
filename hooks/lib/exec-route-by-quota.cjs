@@ -21,6 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { acquireLock, releaseLock } = require('./file-lock.cjs');
 
 // Claude's cache is refreshed by an external hook; older than this it no longer reflects
 // this machine.
@@ -33,6 +34,7 @@ const TAIL_BYTES = 256 * 1024;
 const LIVE_TIMEOUT_MS = 5000;
 const DEFAULT_CACHE_SECONDS = 60;
 const LIVE_CACHE_FILE = 'codex-quota-live.json';
+const LIVE_PROBE_LOCK = '.codex-quota-probe.lock';
 const LIVE_PROBE = path.join(__dirname, 'codex-quota-probe.cjs');
 const processCache = new Map();
 
@@ -232,8 +234,21 @@ function cacheEntryFresh(cached, cacheSeconds, now) {
     now >= cached.fetchedAt && now - cached.fetchedAt < cacheSeconds * 1000;
 }
 
+function cachedQuotaResult(cached, now) {
+  if (!cached || typeof cached.fetchedAt !== 'number' || !Number.isFinite(cached.fetchedAt)) return null;
+  if (cached.failed === true) return { failed: true, fetchedAt: cached.fetchedAt };
+  if (typeof cached.usedPercent !== 'number' || !Number.isFinite(cached.usedPercent) ||
+      cached.usedPercent < 0 || cached.usedPercent > 100 ||
+      typeof cached.resetsAt !== 'number' || !Number.isFinite(cached.resetsAt) || cached.resetsAt < 0 ||
+      (cached.resetsAt && cached.resetsAt * 1000 <= now)) return null;
+  const effective = effectiveUsedPercent(cached, now);
+  return effective
+    ? { ...effective, fetchedAt: cached.fetchedAt, source: 'live', limitReached: cached.limitReached === true }
+    : null;
+}
+
 function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
-  if (!stateDir || cacheSeconds <= 0) return null;
+  if (!stateDir) return null;
   const file = cachePath(stateDir);
   try {
     // One hook process can ask for the route more than once while evaluating one Agent
@@ -241,28 +256,26 @@ function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
     // effectively free. Requiring the cache file to still exist keeps tests and operators
     // able to invalidate it explicitly by removing the file.
     const memoized = processCache.get(file);
-    if (memoized && fs.existsSync(file) && cacheEntryFresh(memoized, cacheSeconds, now)) {
-      if (memoized.failed === true) return { failed: true, fetchedAt: memoized.fetchedAt };
-      const effective = effectiveUsedPercent(memoized, now);
-      if (effective && !(memoized.resetsAt && memoized.resetsAt * 1000 <= now)) {
-        return { ...effective, fetchedAt: memoized.fetchedAt, source: 'live', limitReached: memoized.limitReached === true };
-      }
+    if (memoized && fs.existsSync(file) &&
+        (cacheSeconds <= 0 || cacheEntryFresh(memoized, cacheSeconds, now))) {
+      return cachedQuotaResult(memoized, now);
     }
+
+    if (cacheSeconds <= 0) return null;
 
     const cached = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (!cacheEntryFresh(cached, cacheSeconds, now)) return null;
-    if (cached.failed === true) {
-      processCache.set(file, cached);
-      return { failed: true, fetchedAt: cached.fetchedAt };
-    }
-    if (typeof cached.usedPercent !== 'number' || !Number.isFinite(cached.usedPercent) ||
-        cached.usedPercent < 0 || cached.usedPercent > 100 ||
-        typeof cached.resetsAt !== 'number' || !Number.isFinite(cached.resetsAt) || cached.resetsAt < 0 ||
-        (cached.resetsAt && cached.resetsAt * 1000 <= now)) return null;
-    const effective = effectiveUsedPercent(cached, now);
-    if (!effective) return null;
+    const result = cachedQuotaResult(cached, now);
+    if (!result) return null;
     processCache.set(file, cached);
-    return { ...effective, fetchedAt: cached.fetchedAt, source: 'live', limitReached: cached.limitReached === true };
+    return result;
+  } catch { return null; }
+}
+
+/** A structurally valid cache entry even when its file TTL expired, for probe-lock losers. */
+function readStaleCache(stateDir, now = Date.now()) {
+  try {
+    return cachedQuotaResult(JSON.parse(fs.readFileSync(cachePath(stateDir), 'utf8')), now);
   } catch { return null; }
 }
 
@@ -301,13 +314,34 @@ function codexQuota(now = Date.now(), options = {}) {
   const cached = readFreshCache(stateDir, cacheSeconds, now);
   if (cached && !cached.failed) return cached;
   if (cached && cached.failed) return readSessionQuota(now);
-  const live = liveQuota(now);
-  if (live) {
-    writeCache(stateDir, live, now);
-    return { ...live, fetchedAt: now, source: 'live' };
+  const probeLockDir = path.join(stateDir, LIVE_PROBE_LOCK);
+  const probeLock = acquireLock(probeLockDir, {
+    timeoutMs: 300,
+    retryMs: 25,
+    staleMs: LIVE_TIMEOUT_MS + 1000,
+  });
+  if (probeLock === false) {
+    const afterWait = readFreshCache(stateDir, cacheSeconds, now);
+    if (afterWait && !afterWait.failed) return afterWait;
+    if (afterWait && afterWait.failed) return readSessionQuota(now);
+    const stale = readStaleCache(stateDir, now);
+    return stale && !stale.failed ? stale : readSessionQuota(now);
   }
-  writeCache(stateDir, null, now);
-  return readSessionQuota(now);
+  try {
+    // Another process may have refreshed the cache while this process waited for the lease.
+    const afterAcquire = readFreshCache(stateDir, cacheSeconds, now);
+    if (afterAcquire && !afterAcquire.failed) return afterAcquire;
+    if (afterAcquire && afterAcquire.failed) return readSessionQuota(now);
+    const live = liveQuota(now);
+    if (live) {
+      writeCache(stateDir, live, now);
+      return { ...live, fetchedAt: now, source: 'live' };
+    }
+    writeCache(stateDir, null, now);
+    return readSessionQuota(now);
+  } finally {
+    if (probeLock) releaseLock(probeLockDir);
+  }
 }
 
 function formatAge(ageMs) {

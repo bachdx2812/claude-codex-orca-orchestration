@@ -1070,6 +1070,16 @@ check('a released worker holds nothing',
   delete process.env.STUB_CODEX_CALLS_LOG;
 
   clearCache(); clearStub();
+  try { fs.unlinkSync(callsLog); } catch {}
+  process.env.STUB_CODEX_CALLS_LOG = callsLog;
+  process.env.STUB_CODEX_PRIMARY_USED = '28';
+  q.codexQuota(sessionNow, { stateDir, cacheSeconds: 0 });
+  q.codexQuota(sessionNow + 1, { stateDir, cacheSeconds: 0 });
+  const zeroTtlProbeCalls = fs.readFileSync(callsLog, 'utf8').trim().split('\n').filter(Boolean).length;
+  eq('codex live: zero file-cache TTL still keeps one process-local probe result', zeroTtlProbeCalls, 1);
+  delete process.env.STUB_CODEX_CALLS_LOG;
+
+  clearCache(); clearStub();
   const oldOrchBin = process.env.ORCH_CODEX_BIN;
   delete process.env.ORCH_CODEX_BIN;
   process.env.CODEX_BIN = stub;
