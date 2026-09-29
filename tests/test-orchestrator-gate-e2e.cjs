@@ -303,12 +303,49 @@ expect('opus for execution is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'opus' }), DENY);
 expect('an agent name not in the configured escalation list gets no special treatment',
   dispatch({ subagent_type: 'not-configured-agent', description: 'review the diff' }), DENY);
+for (const description of [
+  'Update the parser to fix X',
+  'Write code for Y',
+  'Merge and implement follow-ups',
+  'Tag release v2 and fix changelog',
+]) {
+  const result = invoke(dispatch({ subagent_type: 'fullstack-developer', description, model: 'sonnet' }));
+  if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
+  else failures.push(`${description} must route as code\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
 expect('a neutral Commit verb is not misclassified by review-fix later in the description',
   dispatch({ subagent_type: 'git-manager', description: 'Commit review-fix round in worktree', model: 'sonnet' }), ALLOW);
 expect('a neutral Commit verb is not misclassified by a later plan noun',
   dispatch({ subagent_type: 'git-manager', description: 'Commit the plan file', model: 'sonnet' }), ALLOW);
 expect('a neutral Update verb is not misclassified by a later design noun',
   dispatch({ subagent_type: 'docs-manager', description: 'Update design tokens doc', model: 'sonnet' }), ALLOW);
+{
+  const result = invoke(dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'sonnet' }));
+  if (result.code === DENY && /route-review/.test(result.err)) pass += 1;
+  else failures.push(`Review the diff must route as review\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
+{
+  const result = invoke(dispatch({ subagent_type: 'fullstack-developer', description: 'Implement the plan', model: 'sonnet' }));
+  if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
+  else failures.push(`Implement the plan must route as code\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
+expect('Generate release notes is not code work',
+  dispatch({ subagent_type: 'content-creator', description: 'Generate release notes', model: 'sonnet' }), ALLOW);
+for (const description of ['Generate code', 'Generate assets', 'Generate components']) {
+  const result = invoke(dispatch({ subagent_type: 'fullstack-developer', description, model: 'sonnet' }));
+  if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
+  else failures.push(`${description} must route as code\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
+{
+  const result = invoke(dispatch({ subagent_type: 'code-reviewer', description: 'Update the findings', model: 'sonnet' }));
+  if (result.code === DENY && /route-review/.test(result.err)) pass += 1;
+  else failures.push(`a neutral first verb must preserve code-reviewer review routing\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
+{
+  const result = invoke(dispatch({ subagent_type: 'code-reviewer', description: 'Implement the plan', model: 'sonnet' }));
+  if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
+  else failures.push(`an execution first verb must override code-reviewer review routing\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
 
 // Main panel vs Orca worker terminal, via the deterministic stub (never a live Orca).
 expect('attended main panel is still gated',

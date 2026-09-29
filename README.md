@@ -34,9 +34,12 @@ wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The per-prompt 
 routing" line always shows the current coder and why.
 
 For Agent/Task descriptions, a recognized first verb governs intent before later nouns do:
-`Review ...` and `Plan ...` route to review, while `Implement ...` routes to code. Operational
-verbs (`commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`, `deploy`, `update`,
-`write`) are neutral, so `Commit review-fix round` is not mistaken for review work.
+`Review ...` and `Plan ...` route to review, while `Implement ...` and `Generate code/assets/components ...`
+route to code. Operational verbs (`commit`, `push`, `merge`, `publish`, `rebase`, `tag`,
+`release`, `deploy`, `update`, `write`) suppress later review nouns, so `Commit review-fix round`
+is not mistaken for review work; they do not suppress later code intent (`Update the parser to fix X`).
+Review-oriented `subagent_type` values still route to review unless the description starts with
+an execution verb.
 
 ## Subagents and parallel work
 

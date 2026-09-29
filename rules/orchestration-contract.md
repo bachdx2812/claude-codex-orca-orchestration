@@ -59,10 +59,13 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
     it is refused; wait for one to finish and release it, or raise the limit.
 
 Agent/Task intent classification gives a recognized first verb in the description priority
-over later nouns: `Review ...`/`Plan ...` are review work and `Implement ...` is code work.
+over later nouns: `Review ...`/`Plan ...` are review work, while `Implement ...` and
+`Generate code/assets/components ...` are code work.
 The operational first verbs `commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`,
-`deploy`, `update`, and `write` are neutral, so a later `review`, `plan`, or `design` token
-does not reroute the dispatch.
+`deploy`, `update`, and `write` suppress later `review`, `plan`, or `design` tokens, but later
+code intent still routes to code. Review-oriented `subagent_type` values remain review signals
+unless the description starts with an execution verb. Intent keywords inside hyphenated compounds
+do not count, so `Commit review-fix round` remains operational rather than code work.
 
 ## Activation
 
@@ -621,7 +624,7 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # all four suites (836 checks)
+npm test                                             # all four suites (848 checks)
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
 node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)

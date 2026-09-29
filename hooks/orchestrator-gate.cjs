@@ -192,9 +192,9 @@ function redirectTargets(cmd) {
 
 // Intent of a dispatched task. Generic English verbs — not tied to any operator's roster.
 const PLAN_REVIEW_INTENT = /\b(plan|planning|design|review|reviewer|verify|verification|audit|red.?team|critique|assess|architect)\b/i;
-const EXEC_INTENT = /\b(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets))\b/i;
+const EXEC_INTENT = /(?<![-\w])(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
-const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate)\b/i;
+const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
 const LOOKUP_INTENT = /\b(find|locate|search|grep|scout|explore|look\s*up|where\s+is|list\s+(all|the)|read\s+(the\s+)?(log|logs|output)|summari[sz]e\s+(the\s+)?(log|logs|output|test\s+results?))\b/i;
 // A code brief must let the coder check itself: a concrete test / build / lint command,
@@ -1037,19 +1037,22 @@ function onPreToolUse(p, s, cfg) {
     // "plan the refactor" is planning, "implement the plan" is execution. Whichever
     // intent word appears first in the task's own summary wins.
     const description = String(input.description || '').trim();
-    const hay = `${input.subagent_type || ''} ${description}`.trim() || String(input.prompt || '').slice(0, 400);
+    const type = String(input.subagent_type || '');
+    const hay = `${type} ${description}`.trim() || String(input.prompt || '').slice(0, 400);
     const firstIntent = PLAN_REVIEW_FIRST_VERB.test(description) ? 'review'
       : EXEC_FIRST_VERB.test(description) ? 'exec'
         : NEUTRAL_FIRST_VERB.test(description) ? 'neutral'
           : null;
-    const planAt = firstIntent ? -1 : hay.search(PLAN_REVIEW_INTENT);
-    const execAt = firstIntent ? -1 : hay.search(EXEC_INTENT);
+    const planAt = hay.search(PLAN_REVIEW_INTENT);
+    const execAt = hay.search(EXEC_INTENT);
+    const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(type);
     const wantsPlanReview = firstIntent === 'review' ||
+      (firstIntent !== 'exec' && typeWantsPlanReview) ||
       (!firstIntent && planAt >= 0 && (execAt < 0 || planAt < execAt));
     const wantsExec = firstIntent === 'exec' ||
-      (!firstIntent && execAt >= 0 && (planAt < 0 || execAt < planAt));
+      (firstIntent !== 'review' && execAt >= 0 &&
+        (firstIntent === 'neutral' || planAt < 0 || execAt < planAt));
     const model = String(input.model || '');
-    const type = String(input.subagent_type || '');
     const reviewAlias = cfg.models.review.alias;
     const escalationAlias = cfg.models.escalation.alias;
     const isEscalation = new RegExp(escapeRegex(escalationAlias), 'i').test(model)
