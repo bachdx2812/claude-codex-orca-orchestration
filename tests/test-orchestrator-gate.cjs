@@ -13,7 +13,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-unit-state-'));
 process.env.ORCH_STATE_DIR = STATE_DIR;
@@ -210,7 +210,10 @@ check('--spec in a different orca invocation does not count for this one',
 // --- heartbeat classifyTerminal --------------------------------------------
 
 const NOW = 1800000000000;
-const ctx = { baseHandles: new Set(['old']), started: NOW - 600000, now: NOW, idleSeconds: 90 };
+const ctx = {
+  baseHandles: new Set(['old']), ownHandles: new Set(['old', 'new', 'x']),
+  started: NOW - 600000, now: NOW, idleSeconds: 90,
+};
 
 check('rate limit in preview wins over everything',
   heartbeat.classifyTerminal({ handle: 'x', preview: 'Error: 429 rate limit', lastOutputAt: NOW }, ctx).kind,
@@ -235,6 +238,10 @@ check('a brand new terminal gone quiet is idle',
 check('a brand new terminal still producing output is working',
   heartbeat.classifyTerminal({ handle: 'new', preview: '', lastOutputAt: NOW - 5000 }, ctx).kind,
   'working');
+
+check('a foreign terminal that produced output after startup is ignored',
+  heartbeat.classifyTerminal({ handle: 'foreign', preview: '', lastOutputAt: NOW - 200000 }, ctx).kind,
+  'ignored');
 
 check('a finished worker still holding a terminal is flagged',
   heartbeat.isHoldingResources({ terminalState: 'retained' }), true);
@@ -946,6 +953,8 @@ check('a released worker holds nothing',
     delete process.env.STUB_CODEX_SECONDARY_RESET;
   };
 
+  const callsLog = path.join(root, 'codex-calls.log');
+
   clearStub(); clearCache();
   process.env.STUB_CODEX_PRIMARY_USED = '25';
   let quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
@@ -1017,9 +1026,60 @@ check('a released worker holds nothing',
   eq('codex live: malformed with no session is unknown and keeps Codex', [route.codexSource, route.route], ['unknown', 'codex']);
   eq('codex reminder: an unknown reading names the unknown source', route.summary.includes('Codex unknown (unknown)'), true);
 
+  clearCache();
+  try { fs.unlinkSync(callsLog); } catch {}
+  process.env.STUB_CODEX_CALLS_LOG = callsLog;
+  q.codexQuota(sessionNow, { stateDir, cacheSeconds: 60 });
+  q.codexQuota(sessionNow + 1, { stateDir, cacheSeconds: 60 });
+  const failedProbeCalls = fs.readFileSync(callsLog, 'utf8').trim().split('\n').filter(Boolean).length;
+  eq('codex live failure is cached and memoized for the configured TTL', failedProbeCalls, 1);
+  delete process.env.STUB_CODEX_CALLS_LOG;
+
   for (const [key, value] of Object.entries(oldEnv)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;
   }
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
+// The live-quota helper owns its app-server child after its synchronous parent dies. Its
+// internal deadline must kill a child that ignores SIGTERM, then let the orphaned helper
+// exit on its own. This never invokes the real Codex binary: ORCH_CODEX_BIN is the stub.
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-orphan-'));
+  const pidFile = path.join(root, 'stub.pid');
+  const stub = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
+  const quotaLib = path.join(__dirname, '..', 'hooks', 'lib', 'exec-route-by-quota.cjs');
+  const parent = spawn(process.execPath, ['-e', 'require(process.argv[1]).liveQuota()', quotaLib], {
+    detached: true,
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      ORCH_CODEX_BIN: stub,
+      STUB_CODEX_MODE: 'ignore-signals',
+      STUB_CODEX_PID_FILE: pidFile,
+    },
+  });
+  parent.unref();
+  const waitUntil = (predicate, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return true;
+      spawnSync('sleep', ['0.05']);
+    }
+    return predicate();
+  };
+  const pidWritten = waitUntil(() => fs.existsSync(pidFile), 2000);
+  let stubPid = null;
+  if (pidWritten) stubPid = Number(fs.readFileSync(pidFile, 'utf8'));
+  try { process.kill(parent.pid, 'SIGKILL'); } catch {}
+  const isAlive = (pid) => {
+    if (!pid) return false;
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  const childExited = waitUntil(() => !isAlive(stubPid), 6000);
+  check('codex quota helper kills its stubborn child after the parent is killed mid-probe',
+    [pidWritten, childExited], [true, true]);
+  try { process.kill(-parent.pid, 'SIGKILL'); } catch {}
   fs.rmSync(root, { recursive: true, force: true });
 }
 

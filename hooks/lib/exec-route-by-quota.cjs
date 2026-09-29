@@ -33,6 +33,7 @@ const LIVE_TIMEOUT_MS = 5000;
 const DEFAULT_CACHE_SECONDS = 60;
 const LIVE_CACHE_FILE = 'codex-quota-live.json';
 const LIVE_PROBE = path.join(__dirname, 'codex-quota-probe.cjs');
+const processCache = new Map();
 
 function codexSessionsDir() {
   // CODEX_SESSIONS_DIR lets tests point at a fixture instead of live data.
@@ -219,18 +220,42 @@ function cachePath(stateDir) {
   return path.join(stateDir, LIVE_CACHE_FILE);
 }
 
+function cacheEntryFresh(cached, cacheSeconds, now) {
+  return cached && typeof cached.fetchedAt === 'number' && Number.isFinite(cached.fetchedAt) &&
+    now >= cached.fetchedAt && now - cached.fetchedAt < cacheSeconds * 1000;
+}
+
 function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
   if (!stateDir || cacheSeconds <= 0) return null;
+  const file = cachePath(stateDir);
   try {
-    const cached = JSON.parse(fs.readFileSync(cachePath(stateDir), 'utf8'));
-    if (!cached || typeof cached.usedPercent !== 'number' || !Number.isFinite(cached.usedPercent) ||
+    // One hook process can ask for the route more than once while evaluating one Agent
+    // dispatch. Keep the parsed result in memory as well as on disk so the second lookup is
+    // effectively free. Requiring the cache file to still exist keeps tests and operators
+    // able to invalidate it explicitly by removing the file.
+    const memoized = processCache.get(file);
+    if (memoized && fs.existsSync(file) && cacheEntryFresh(memoized, cacheSeconds, now)) {
+      if (memoized.failed === true) return { failed: true, fetchedAt: memoized.fetchedAt };
+      const effective = effectiveUsedPercent(memoized, now);
+      if (effective && !(memoized.resetsAt && memoized.resetsAt * 1000 <= now)) {
+        return { ...effective, fetchedAt: memoized.fetchedAt, source: 'live' };
+      }
+    }
+
+    const cached = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!cacheEntryFresh(cached, cacheSeconds, now)) return null;
+    if (cached.failed === true) {
+      processCache.set(file, cached);
+      return { failed: true, fetchedAt: cached.fetchedAt };
+    }
+    if (typeof cached.usedPercent !== 'number' || !Number.isFinite(cached.usedPercent) ||
         cached.usedPercent < 0 || cached.usedPercent > 100 ||
         typeof cached.resetsAt !== 'number' || !Number.isFinite(cached.resetsAt) || cached.resetsAt < 0 ||
-        typeof cached.fetchedAt !== 'number' || !Number.isFinite(cached.fetchedAt) ||
-        now - cached.fetchedAt >= cacheSeconds * 1000 || now < cached.fetchedAt ||
         (cached.resetsAt && cached.resetsAt * 1000 <= now)) return null;
     const effective = effectiveUsedPercent(cached, now);
-    return effective ? { ...effective, fetchedAt: cached.fetchedAt, source: 'live' } : null;
+    if (!effective) return null;
+    processCache.set(file, cached);
+    return { ...effective, fetchedAt: cached.fetchedAt, source: 'live' };
   } catch { return null; }
 }
 
@@ -240,12 +265,14 @@ function writeCache(stateDir, quota, now = Date.now()) {
     fs.mkdirSync(stateDir, { recursive: true });
     const file = cachePath(stateDir);
     const temp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify({
+    const cached = quota ? {
       usedPercent: quota.usedPercent,
       resetsAt: quota.resetsAt || 0,
       fetchedAt: now,
-    }), { mode: 0o600 });
+    } : { failed: true, fetchedAt: now };
+    fs.writeFileSync(temp, JSON.stringify(cached), { mode: 0o600 });
     fs.renameSync(temp, file);
+    processCache.set(file, cached);
   } catch {}
 }
 
@@ -264,12 +291,14 @@ function codexQuota(now = Date.now(), options = {}) {
   stateDir ||= process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
   if (cacheSeconds === undefined) cacheSeconds = DEFAULT_CACHE_SECONDS;
   const cached = readFreshCache(stateDir, cacheSeconds, now);
-  if (cached) return cached;
+  if (cached && !cached.failed) return cached;
+  if (cached && cached.failed) return readSessionQuota(now);
   const live = liveQuota(now);
   if (live) {
     writeCache(stateDir, live, now);
     return { ...live, fetchedAt: now, source: 'live' };
   }
+  writeCache(stateDir, null, now);
   return readSessionQuota(now);
 }
 

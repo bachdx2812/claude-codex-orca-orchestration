@@ -157,7 +157,21 @@ function workers() {
     workerState: w.workerState,
     dispatchStatus: w.dispatchStatus,
     terminalState: w.terminalState,
+    agentTerminalHandle: w.agentTerminalHandle || '',
   }));
+}
+
+/** Terminal handles this session owns: worker-list is run-scoped, while the gate's own
+ * session state also records bare `terminal create` replies that have no worker row. */
+function sessionTerminalHandles(workerRows) {
+  const handles = new Set((workerRows || []).map((w) => w.agentTerminalHandle).filter(Boolean));
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(DIR, `${SESSION}.json`), 'utf8'));
+    for (const [id, worker] of Object.entries(state.workers || {})) {
+      if (worker && worker.status === 'live' && (worker.kind === 'terminal' || /^term_/.test(id))) handles.add(id);
+    }
+  } catch {}
+  return handles;
 }
 
 /** A worker still consuming machine resources, whatever its task status says. */
@@ -574,13 +588,15 @@ function processDoneWorktrees(data, events, started) {
  * Decide what one terminal means for supervision. Pure, so it can be tested
  * against synthetic input instead of a live Orca.
  *
- * A terminal counts as supervised when it appeared after the daemon started OR
- * it has produced output since then. The second case is the load-bearing one:
+ * Only a terminal owned by this session can be supervised. Within that set, a terminal
+ * counts as supervised when it appeared after the daemon started OR it has produced output
+ * since then. The second case is the load-bearing one:
  * the panel normally dispatches work first and starts the daemon second, so the
  * worker's terminal already exists at baseline and would otherwise never be
  * watched - which is precisely the IDLE blindness this daemon exists to fix.
  */
 function classifyTerminal(t, ctx) {
+  if (!ctx.ownHandles || !ctx.ownHandles.has(t.handle)) return { kind: 'ignored' };
   if (RATE_LIMIT.test(t.preview || '')) return { kind: 'rate_limit' };
   if (t.orphaned) return { kind: 'orphaned' };
   const supervised = !ctx.baseHandles.has(t.handle) || t.lastOutputAt > ctx.started;
@@ -613,6 +629,7 @@ function main() {
   // Baseline: only deviations from this state are worth waking the panel for.
   const baseTermHandles = new Set((baseTerms || []).map((t) => t.handle));
   const baseWorkerState = snapshotWorkers(baseWorkers || []);
+  const ownTerminalHandles = sessionTerminalHandles(baseWorkers || []);
   let prevWorkers = new Map(baseWorkerState);
   const reportedIdle = new Set();
   const reportedRateLimit = new Set();
@@ -652,6 +669,7 @@ function main() {
     const ws = workers();
     beat(started); // item L1: refresh liveness between round trips at a short --interval
     if (ws) {
+      for (const handle of sessionTerminalHandles(ws)) ownTerminalHandles.add(handle);
       const cur = snapshotWorkers(ws);
       for (const [id, state] of cur) {
         const before = prevWorkers.get(id);
@@ -684,7 +702,13 @@ function main() {
 
     const ts = terminals();
     if (ts) {
-      const ctx = { baseHandles: baseTermHandles, started, now, idleSeconds: IDLE_SECONDS };
+      // Re-read gate state each tick so a bare terminal created after daemon startup joins
+      // this session's set even though it has no worker-list row.
+      for (const handle of sessionTerminalHandles(ws || [])) ownTerminalHandles.add(handle);
+      const ctx = {
+        baseHandles: baseTermHandles, ownHandles: ownTerminalHandles,
+        started, now, idleSeconds: IDLE_SECONDS,
+      };
       for (const t of ts) {
         const verdict = classifyTerminal(t, ctx);
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
@@ -724,7 +748,7 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-  classifyTerminal, isHoldingResources, snapshotWorkers, RATE_LIMIT,
+  classifyTerminal, isHoldingResources, snapshotWorkers, sessionTerminalHandles, RATE_LIMIT,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,

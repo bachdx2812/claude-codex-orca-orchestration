@@ -8,15 +8,35 @@ const { spawn } = require('child_process');
 
 const codexBin = process.argv[2] || 'codex';
 const child = spawn(codexBin, ['app-server'], { stdio: ['pipe', 'pipe', 'ignore'] });
+const DEADLINE_MS = 4500;
+const STOP_GRACE_MS = 150;
 let buffer = '';
 let finished = false;
+let exitCode = 1;
+let forceTimer = null;
+
+const deadline = setTimeout(() => stop(1), DEADLINE_MS);
+
+function exitNow() {
+  clearTimeout(deadline);
+  if (forceTimer) clearTimeout(forceTimer);
+  process.exit(exitCode);
+}
 
 function stop(code, value) {
   if (finished) return;
   finished = true;
+  exitCode = code;
+  clearTimeout(deadline);
   if (value !== undefined) process.stdout.write(`${JSON.stringify(value)}\n`);
-  try { child.kill(); } catch {}
-  process.exit(code);
+  try { child.stdin.end(); } catch {}
+  try { child.kill('SIGTERM'); } catch {}
+  forceTimer = setTimeout(() => {
+    try { child.kill('SIGKILL'); } catch {}
+    // An `error` event can mean no child process was ever created, in which case no `exit`
+    // event is guaranteed. Give a killed child one event-loop turn, then leave regardless.
+    setTimeout(exitNow, 25);
+  }, STOP_GRACE_MS);
 }
 
 function send(message) {
@@ -24,7 +44,13 @@ function send(message) {
 }
 
 child.on('error', () => stop(1));
-child.on('exit', (code) => { if (!finished) stop(code === 0 ? 1 : (code || 1)); });
+child.on('exit', (code) => {
+  if (!finished) {
+    finished = true;
+    exitCode = code === 0 ? 1 : (code || 1);
+  }
+  exitNow();
+});
 child.stdout.on('data', (chunk) => {
   buffer += chunk;
   let newline;

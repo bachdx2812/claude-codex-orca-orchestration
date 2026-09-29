@@ -213,6 +213,38 @@ expect('a mutating verb quoted as prose is allowed',
 expect('running the unit suite is allowed',
   mainBash('node tests/test-orchestrator-gate.cjs && echo done'), ALLOW);
 
+// A single Agent PreToolUse evaluates routing twice along the execution path. A failed
+// live lookup is process-local memoized, so this one hook process may spawn at most one
+// quota probe. The real Codex CLI is never touched: ORCH_CODEX_BIN points at the stub.
+{
+  const dir = path.join(RUN_DIR, 'failed-quota-one-probe');
+  const callsLog = path.join(dir, 'codex-calls.log');
+  const stateDir = path.join(dir, 'state');
+  const sessionsDir = path.join(dir, 'sessions');
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_SESSIONS_DIR: sessionsDir,
+    STUB_CODEX_MODE: 'malformed',
+    STUB_CODEX_CALLS_LOG: callsLog,
+    ORCA_BIN: STUB,
+  };
+  const r = spawnSync(process.execPath, [GATE], {
+    input: JSON.stringify(dispatch({
+      subagent_type: 'fullstack-developer', description: 'implement x', model: 'sonnet',
+      prompt: 'Owns: n/a isolated probe\nVerify: npm test', isolation: 'worktree',
+    }, 'failed-quota-one-probe')),
+    encoding: 'utf8', env,
+  });
+  const calls = fs.readFileSync(callsLog, 'utf8').trim().split('\n').filter(Boolean).length;
+  if (r.status === DENY && calls === 1) pass += 1;
+  else failures.push(`one Agent PreToolUse should pay at most one failed quota probe; exit=${r.status}, probes=${calls}`);
+}
+
 // Still refused
 expect('real commit is refused', mainBash('git commit -m x'), DENY);
 expect('real push is refused', mainBash('git push origin main'), DENY);

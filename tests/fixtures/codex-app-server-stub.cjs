@@ -1,5 +1,18 @@
 #!/usr/bin/env node
 
+const fs = require('fs');
+
+if (process.env.STUB_CODEX_CALLS_LOG) {
+  fs.appendFileSync(process.env.STUB_CODEX_CALLS_LOG, `${Date.now()}\t${process.pid}\n`);
+}
+if (process.env.STUB_CODEX_PID_FILE) {
+  fs.writeFileSync(process.env.STUB_CODEX_PID_FILE, String(process.pid));
+}
+if (process.env.STUB_CODEX_MODE === 'ignore-signals') {
+  process.on('SIGTERM', () => {});
+  process.on('SIGINT', () => {});
+}
+
 let buffer = '';
 
 process.stdin.on('data', (chunk) => {
@@ -11,7 +24,7 @@ process.stdin.on('data', (chunk) => {
     let message;
     try { message = JSON.parse(line); } catch { continue; }
     if (message.id === 1) {
-      if (process.env.STUB_CODEX_MODE === 'timeout') continue;
+      if (process.env.STUB_CODEX_MODE === 'timeout' || process.env.STUB_CODEX_MODE === 'ignore-signals') continue;
       process.stdout.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
     } else if (message.id === 2) {
       if (process.env.STUB_CODEX_MODE === 'malformed') {
