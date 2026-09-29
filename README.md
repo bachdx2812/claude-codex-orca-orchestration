@@ -72,16 +72,23 @@ rule out a transition) and reports a worktree that is not main, not archived; **
 git alone might say — or, only when NEITHER is linked at all, a real `git merge-base
 --is-ancestor HEAD <base>` confirms HEAD is already in the worktree's own upstream default
 branch, resolved from `refs/remotes/origin/HEAD` with no `git fetch` ever run, AND HEAD's own
-commit postdates the worktree's creation — a worktree freshly branched off that base with
+commit postdates the worktree's creation (a worktree freshly branched off that base with
 zero new commits is trivially an "ancestor" too, and must not be mistaken for done-but-open
-work); **idle**
+work) AND the worktree's own branch reflog (`git reflog show --format=%gs HEAD`) actually
+records a `commit` entry — a worktree that only ever got rebased or fast-forwarded onto a
+base that itself advanced after the worktree was created can satisfy the commit-time check
+above without ever gaining a commit of its own, so both signals are required); **idle**
 (no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt` already past the
 heartbeat's idle threshold); and **clean** (`git status --porcelain` empty and no unpushed
 commits — or, lacking an upstream entirely, HEAD contained in that same resolved base) —
 naming which of these fired in its message, and the exact, quoted `orca worktree rm`
 command, but never running it itself. Every git call only ever runs for a worktree that
 already passed the idle check, each bounded to ~3s, and any git failure or uncertainty
-(unreadable repo, timeout, no resolvable base) means "not a candidate", never a guess.
+(unreadable repo, timeout, no resolvable base, empty reflog) means "not a candidate", never
+a guess. The very FIRST (seeding) pass never truncates its evaluation to the per-tick git
+budget (~10s) — every row is checked once so nothing pre-existing is silently left off the
+one-time backlog summary only to fire as a false "new" wake event once a later tick happens
+to reach it.
 Only a worktree that *becomes* done-but-open after the daemon's own session-scoped record
 of what it already reported wakes the panel; genuine backlog at a session's first-ever
 daemon start is listed once in a summary line instead — a LATER restart within the same
@@ -129,14 +136,25 @@ early, read-only capacity check runs first so an already-over-budget dispatch st
 this refusal promptly. At capacity, the gate first reconciles the caller's own session
 against a live Orca worker-list before refusing (a stale local "still live" entry Orca has
 already confirmed released frees its slot); if the state lock itself is contended, it
-refuses with a transient "retry" reason rather than risk over-admitting under load. A
+refuses with a transient "retry" reason rather than risk over-admitting under load — but
+ONLY while the cap is actually finite: a disabled gate or an unlimited (`maxParallelAgents:
+0`) cap returns allow before ever looking at the lock, so a `.lock` some other process
+happens to be holding can never masquerade as "at capacity" for a cap that isn't capping
+anything. The lock acquisition on this path also deliberately outlives file-lock's own
+staleMs (10s) — a caller whose attempt starts less than ~8s after a dead holder's lock was
+created used to time out and refuse before ever living long enough to see it go stale;
+it now waits long enough to break and reclaim a truly abandoned lock itself. A
 dispatch registered as `run_in_background: true` survives its own launch-returning
 `PostToolUse` and is instead released by a matching `<task-notification><tool-use-id>`, a
 120-minute TTL, or `--release-claims`, the same pattern `code-brief-needs-owns`'s `Owns:`
 claims already use. A `--terminal <h>` / `--retry-of <id>` replacement of an already-tracked
 live group is not a new slot. The refusal labels each unit `<sid8>:<id>` (its owning
-session's id, truncated to 8 characters). The `SessionStart` banner and every per-prompt
-reminder show `parallel budget: <n>/<N> (<cores> cores x <fraction>%)`.
+session's id, truncated to 8 characters), names the real `ORCH_STATE_DIR`-aware state dir in
+its recovery hint (never a hardcoded `~/.claude/orchestrator-gate/`), and shows `(<cores>
+cores x <fraction>%)` only when the limit was actually DERIVED from the machine's core
+count — an operator-set explicit `maxParallelAgents`/`ORCH_MAX_PARALLEL_AGENTS` never went
+through that math, so the refusal says `(explicit limit)` instead. The `SessionStart` banner
+and every per-prompt reminder show `parallel budget: <n>/<N> (<cores> cores x <fraction>%)`.
 
 Advisory only, never blocked by the gate: whether the files a worker actually touched
 matched what it declared (ownership is *declared*, not observed).
@@ -174,7 +192,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 702 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 731 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION

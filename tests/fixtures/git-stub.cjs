@@ -20,8 +20,25 @@
  *                              conservative default as every other knob here, since H1's
  *                              no-linked-PR/MR acceptance path needs a real answer here to
  *                              ever accept a worktree.
+ *   STUB_GIT_REFLOG_HAS_COMMIT=1  `reflog show --format=%gs HEAD` prints a line starting
+ *                              with "commit" (review round 3, item 3 — the worktree's own
+ *                              branch really gained a commit); unset means an empty reflog
+ *                              (exit 0, no output), same conservative "could not confirm a
+ *                              commit was ever made on this branch" default as every other
+ *                              knob here.
+ *   STUB_GIT_DELAY_MS          blocks this many milliseconds before answering ANY subcommand
+ *                              (review round 3, item 4 — simulates a git-heavy done-worktree
+ *                              pass so a test can exercise the GIT_BUDGET_MS cap without a
+ *                              real 10s budget); unset/0 means no delay at all.
  */
 const args = process.argv.slice(2);
+const delayMs = Number(process.env.STUB_GIT_DELAY_MS) || 0;
+if (delayMs > 0) {
+  // Synchronous block (this stub is a short-lived one-shot process, so a busy-wait costs
+  // nothing anyone else is waiting on) — Atomics.wait needs a SharedArrayBuffer, always
+  // available in a plain Node process.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+}
 // A leading global flag (e.g. `--no-optional-locks`, see the real `status --porcelain` call
 // in orca-heartbeat.cjs) must not be mistaken for the subcommand itself.
 const sub = args.find((a) => !a.startsWith('--'));
@@ -62,6 +79,10 @@ if (sub === 'log') {
   const t = process.env.STUB_GIT_HEAD_COMMIT_TIME;
   if (t === undefined) done('', 1);
   done(`${t}\n`, 0);
+}
+
+if (sub === 'reflog') {
+  done(process.env.STUB_GIT_REFLOG_HAS_COMMIT === '1' ? 'commit: real work\n' : '', 0);
 }
 
 process.stderr.write(`git-stub: unrecognised command ${sub}\n`);

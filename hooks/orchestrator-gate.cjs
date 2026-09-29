@@ -53,6 +53,16 @@ const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 // --- tunables ---------------------------------------------------------------
 const RATE_LIMIT_BACKOFF_SECONDS = 120; // wait before retrying a rate-limited worker
 const ORCA_DOWN_TTL_SECONDS = 900;      // how long an "Orca is down" declaration stays valid
+// Review round 3, item 2: file-lock's own stale-lock detection (staleMs, default 10s) only
+// ever fires for a caller whose OWN acquire attempt is still retrying when the lock crosses
+// that age. The max-parallel-agents cap paths used to acquire with the library's 2s default
+// timeoutMs, which is shorter than staleMs itself - any caller whose attempt started less than
+// (staleMs - timeoutMs) = ~8s after a dead holder's lock was created would time out and refuse
+// as "contended" before ever living long enough to see it go stale. Every cap-path acquire
+// (initial and reconcile-reacquire alike) uses this timeout instead, deliberately longer than
+// the default staleMs, so the worst case (a caller starting at the same instant the lock was
+// created) still lives long enough to observe and clear a truly abandoned lock itself.
+const CAP_LOCK_OPTS = { timeoutMs: 10500 };
 
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -555,12 +565,21 @@ function agentParallelLimit(cfg) {
 function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
   const invs = orcaInvocations(cmd).filter((inv) => inv.sub === 'terminal create' && !hasFlag(inv.args, '--help'));
   if (!invs.length || gateDisabled(cfg, 'max-parallel-agents')) return;
+  // Review round 3, item 1: this whole function exists ONLY to protect the hard
+  // max-parallel-agents cap (see the concurrency-review note below) — when that cap is
+  // disabled or the derived limit is non-finite (unlimited, maxParallelAgents 0), there is
+  // nothing here to refuse, so this returns allow BEFORE ever touching the lock. Checking
+  // this ahead of the lock acquisition (not just ahead of `!locked`) also means a `.lock`
+  // some other process happens to be holding, however long, can never masquerade as
+  // "at capacity" for a cap that isn't actually capping anything.
+  const limit = agentParallelLimit(cfg);
+  if (!Number.isFinite(limit)) return;
 
   const lockDir = path.join(DIR, '.lock');
   const toolUseId = p.tool_use_id || p.toolUseId || null;
   const baseId = toolUseId || `sid-${s.session_id}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   let violation = null;
-  let locked = acquireLock(lockDir, {});
+  let locked = acquireLock(lockDir, CAP_LOCK_OPTS);
   // Reservations THIS command's own earlier invocations already added, re-applied after a
   // mid-loop reconcile reload wipes the in-memory `fresh` object (same reasoning as
   // parallel-ownership-gates.cjs's identical localReservations pattern).
@@ -575,25 +594,23 @@ function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
     else {
       let fresh = load(s.session_id);
       for (let idx = 0; idx < invs.length && !violation; idx++) {
-        const limit = agentParallelLimit(cfg);
-        if (Number.isFinite(limit)) {
-          let usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
-          if (usage.total >= limit) {
-            // H3: reconcile THIS session's own Orca-tracked workers before refusing — the
-            // same out-of-lock-fetch + locked-reapply pattern the worker-start path uses.
-            releaseLock(lockDir); locked = false;
-            const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
-            locked = acquireLock(lockDir, {});
-            if (!locked) { violation = PAC.LOCK_CONTENTION_MESSAGE; break; }
-            fresh = load(s.session_id);
-            Object.assign(fresh.reservations, localReservations);
-            if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
-            usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
-          }
-          if (usage.total >= limit) {
-            violation = PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
-            break;
-          }
+        let usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
+        if (usage.total >= limit) {
+          // H3: reconcile THIS session's own Orca-tracked workers before refusing — the
+          // same out-of-lock-fetch + locked-reapply pattern the worker-start path uses.
+          releaseLock(lockDir); locked = false;
+          const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+          locked = acquireLock(lockDir, CAP_LOCK_OPTS);
+          if (!locked) { violation = PAC.LOCK_CONTENTION_MESSAGE; break; }
+          fresh = load(s.session_id);
+          Object.assign(fresh.reservations, localReservations);
+          if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
+          usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
+        }
+        if (usage.total >= limit) {
+          violation = PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg),
+            { explicitLimit: maxParallelAgents(cfg) != null, stateDir: DIR });
+          break;
         }
         const key = `term:${baseId}#${idx}`;
         const reservation = { ts: Date.now(), agent: 'terminal', owns: null, ws: null, codexSlot: false, newSlot: true };
@@ -613,7 +630,7 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
     p, s, cfg, cmd, d,
     deps: {
       hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled,
-      agentParallelLimit, machineWideLiveUnits: PAC.machineWideLiveUnits,
+      agentParallelLimit, maxParallelAgents, machineWideLiveUnits: PAC.machineWideLiveUnits,
       formatParallelAgentsRefusal: PAC.formatParallelAgentsRefusal, cores: PAC.cores, parallelCoreFraction,
       lockContentionMessage: PAC.LOCK_CONTENTION_MESSAGE,
     },
@@ -865,7 +882,8 @@ function checkParallelAgentCapacity(state, cfg) {
   if (!Number.isFinite(limit)) return null;
   const usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: state, currentSessionId: state.session_id });
   if (usage.total < limit) return null;
-  return PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg));
+  return PAC.formatParallelAgentsRefusal(usage, limit, PAC.cores(), parallelCoreFraction(cfg),
+    { explicitLimit: maxParallelAgents(cfg) != null, stateDir: DIR });
 }
 
 /**
@@ -885,6 +903,12 @@ function checkParallelAgentCapacity(state, cfg) {
  * returned `state` (reconciled when a reconcile actually ran, unchanged otherwise).
  */
 function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
+  // Review round 3, item 1: disabled or non-finite (unlimited) means there is nothing this
+  // cap could ever refuse — checked BEFORE `!locked` so a `.lock` some other process happens
+  // to be holding can never masquerade as "at capacity" for a cap that isn't capping anything.
+  if (gateDisabled(cfg, 'max-parallel-agents') || !Number.isFinite(agentParallelLimit(cfg))) {
+    return { state, violation: null, locked };
+  }
   // Concurrency review, Low item: a hard resource cap must never be evaluated unlocked — a
   // lock the caller could not acquire (contention timeout) means this check cannot trust
   // `state` against every other racing process, so it refuses with a transient-retry reason
@@ -894,7 +918,7 @@ function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
   if (!violation) return { state, violation: null, locked };
   releaseLock(lockDir);
   const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
-  const reacquired = acquireLock(lockDir, {});
+  const reacquired = acquireLock(lockDir, CAP_LOCK_OPTS);
   if (!reacquired) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked: false };
   const fresh = load(sessionId);
   if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
@@ -984,10 +1008,11 @@ function onPreToolUse(p, s, cfg) {
   // AGENT_REGISTRY_TTL_MS (120 minutes), since a refused dispatch never reaches PostToolUse
   // to release it. This early pass exists only so an already-over-budget dispatch gets the
   // max-parallel-agents refusal instead of walking through routing/ownership first.
-  if (tool === 'Agent' || tool === 'Task') {
+  if ((tool === 'Agent' || tool === 'Task') &&
+      !gateDisabled(cfg, 'max-parallel-agents') && Number.isFinite(agentParallelLimit(cfg))) {
     const lockDir = path.join(DIR, '.lock');
     let violation = null;
-    let locked = acquireLock(lockDir, {});
+    let locked = acquireLock(lockDir, CAP_LOCK_OPTS);
     try {
       // CRITICAL: reload fresh now the lock is held — same reasoning as every other
       // lock-protected read-decide-reserve section in this file. H3: reconcile against
@@ -1137,7 +1162,7 @@ function onPreToolUse(p, s, cfg) {
     {
       const lockDir = path.join(DIR, '.lock');
       let violation = null;
-      let locked = acquireLock(lockDir, {});
+      let locked = acquireLock(lockDir, CAP_LOCK_OPTS);
       try {
         // CRITICAL: reload fresh now the lock is held — same reasoning as every other
         // lock-protected read-decide-reserve section in this file. H3: reconcile against

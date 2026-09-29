@@ -261,18 +261,26 @@ main worktree, not already archived, and that is:
     the worktree's own upstream default branch, resolved from `refs/remotes/origin/HEAD`
     (falling back to `origin/main` then `main`; `git fetch` is never run), AND (no-PR/MR
     path only) HEAD's own commit postdates the worktree's creation (the mtime of its `.git`
-    file) — a worktree freshly branched off that base with zero new commits is trivially an
-    "ancestor" of it too, and must not be mistaken for done-but-open work;
+    file — a worktree freshly branched off that base with zero new commits is trivially an
+    "ancestor" of it too, and must not be mistaken for done-but-open work) AND the
+    worktree's own branch reflog (`git reflog show --format=%gs HEAD`) actually records a
+    `commit` entry — a worktree merely rebased or fast-forwarded onto a base that itself
+    advanced after the worktree was created can satisfy the commit-time check alone without
+    the worktree's own branch ever gaining a commit, so both signals are required together;
   - **clean** — `git status --porcelain` empty and no commits the branch holds that its
     upstream does not (`git rev-list @{u}..HEAD` empty), or, lacking an upstream entirely,
     HEAD contained in that same resolved base branch.
 
 Every git call here runs only for a worktree that already passed the idle check, each
 bounded to ~3s, and any git failure or uncertainty (unreadable repo, a timeout, no
-resolvable base) means "not a candidate" — never a guess. A worktree already reported once
-is skipped entirely on later ticks (its git calls are never re-run), and one tick's whole
-git-evaluating pass is capped at ~10s with the heartbeat's own liveness file refreshed
-between rows, so a fleet with many worktrees can never starve that file into looking dead.
+resolvable base, an empty reflog) means "not a candidate" — never a guess. A worktree
+already reported once is skipped entirely on later ticks (its git calls are never re-run),
+and one tick's whole git-evaluating pass is capped at ~10s (`ORCH_GIT_BUDGET_MS` overrides
+it for tests) with the heartbeat's own liveness file refreshed between rows, so a fleet with
+many worktrees can never starve that file into looking dead — EXCEPT the very first
+(seeding) pass, which never truncates on that budget: a row the seeding pass could not
+reach in time used to fall through to a later tick's steady-state branch and fire as a
+brand-new wake event, even though it had been part of the original backlog all along.
 The event line, `DONE worktree <name> (<reason>, no live terminal|quiet terminal(s)) — ...
 orca worktree rm --worktree 'path:<path>'` (control characters stripped, the path
 single-quote-escaped), names which of the above fired and which idle leg actually applied.
@@ -369,19 +377,32 @@ This runs for the `Agent`/`Task`, `worker-start`, and `terminal create` paths al
 state-file lock itself cannot be acquired at all (contended by many concurrent dispatches —
 exactly the condition this cap exists to catch), the check refuses with a distinct,
 transient "retry the same dispatch" reason rather than evaluating capacity unlocked, which
-would let every contending process fall through uncounted and all be admitted at once.
+would let every contending process fall through uncounted and all be admitted at once — but
+ONLY once the gate has confirmed the cap is actually finite and enabled: a disabled gate or
+an unlimited (`maxParallelAgents: 0`) cap returns allow BEFORE ever inspecting `locked`, on
+every one of these paths, so a `.lock` some other process happens to be holding (however
+long) can never masquerade as "at capacity" for a cap that isn't capping anything. These
+same paths also acquire the lock with a longer timeout than file-lock's own `staleMs`
+default (10s) specifically so a merely-abandoned lock (not a genuinely live holder) is
+outlived and reclaimed instead of refused: the library's ordinary 2s acquire timeout used to
+give up well before a dead holder's lock ever looked stale, refusing for roughly
+`staleMs - timeoutMs` (~8s) after every such lock was created.
 
 The check-and-reserve critical section runs under the SAME shared file lock every other
 reservation-taking gate here uses, and always reloads state fresh from disk once the lock is
 held, exactly like the Codex-only cap — the whole point being genuine cross-SESSION mutual
-exclusion, not merely cross-Bash-call. The refusal names the live total, the limit, the
-cores/fraction it was derived from, and up to 8 of the oldest live units labeled
-`<sid8>:<id>` (an 8-character session-id prefix, so two sessions' ids can never be confused
-in the same list): `<n>/<N> parallel units live on this machine (<cores> cores x
-<fraction>%): <k> Orca workers, <m> subagents [<sid8>:<id>, ...]`. Recovery is framed as the
-OPERATOR's call, never an invitation for the model to raise the limit itself: release a
-specific claim (`--release-claims <id>|all`, this session only — see below), delete a dead
-session's state file, or disable the gate (`disabledGates: ["max-parallel-agents"]`).
+exclusion, not merely cross-Bash-call. The refusal names the live total, the limit, and up
+to 8 of the oldest live units labeled `<sid8>:<id>` (an 8-character session-id prefix, so two
+sessions' ids can never be confused in the same list): `<n>/<N> parallel units live on this
+machine (<cores> cores x <fraction>%): <k> Orca workers, <m> subagents [<sid8>:<id>, ...]` —
+the `(<cores> cores x <fraction>%)` part reads `(explicit limit)` instead whenever the limit
+came from an operator-set `maxParallelAgents`/`ORCH_MAX_PARALLEL_AGENTS` rather than that
+derivation, since an explicit number never went through the cores/fraction math at all.
+Recovery is framed as the OPERATOR's call, never an invitation for the model to raise the
+limit itself: release a specific claim (`--release-claims <id>|all`, this session only — see
+below), delete a dead session's state file under the real, `ORCH_STATE_DIR`-aware state dir
+(never a hardcoded `~/.claude/orchestrator-gate/`), or disable the gate (`disabledGates:
+["max-parallel-agents"]`).
 
 A registered `Agent`/`Task` dispatch releases exactly like an ownership claim does: a
 foreground dispatch frees it at the matching `PostToolUse`; a background

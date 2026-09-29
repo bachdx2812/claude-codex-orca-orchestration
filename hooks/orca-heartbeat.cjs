@@ -65,9 +65,11 @@ const MAX_SECONDS = arg('max', cfg.heartbeat.maxSeconds);           // hard stop
 const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
 // A fleet with many worktrees means many per-row git subprocess calls (idle/accepted/clean,
 // each independently bounded ~3s by runGit) inside one `processDoneWorktrees` pass — capped
-// so a single git-heavy tick can never run long enough to starve the liveness file (see
-// `beat()` calls inside that loop) into looking dead.
-const GIT_BUDGET_MS = 10000;
+// (on the steady-state pass only, see processDoneWorktrees's item-4 note) so a single
+// git-heavy tick can never run long enough to starve the liveness file (see `beat()` calls
+// inside that loop) into looking dead. `ORCH_GIT_BUDGET_MS` overrides it for one process
+// (tests only — a real 10s budget would make exercising the cap prohibitively slow to test).
+const GIT_BUDGET_MS = Number(process.env.ORCH_GIT_BUDGET_MS) > 0 ? Number(process.env.ORCH_GIT_BUDGET_MS) : 10000;
 
 // Session whose panel started this daemon (inherited from the Claude Code Bash tool).
 const SESSION = String(process.env.CLAUDE_CODE_SESSION_ID || 'default').replace(/[^A-Za-z0-9_-]/g, '_');
@@ -300,16 +302,44 @@ function hasProducedMergedWork(w, git, stat) {
 }
 
 /**
+ * Review round 3, item 3 (H1 leftover false positive): whether this worktree's OWN checked-out
+ * branch ever actually gained a commit, straight from its reflog — `git reflog show
+ * --format=%gs HEAD` (HEAD, not a hardcoded branch name: a linked worktree's HEAD already
+ * points at whatever branch it has checked out, and a branch's reflog is shared across every
+ * worktree that has it checked out) lists one line per ref-log entry; any subject starting with
+ * "commit" (`commit: ...`, `commit (initial): ...`, `commit (amend): ...`, `commit (merge):
+ * ...`) is a real commit action taken ON THIS branch.
+ *
+ * `hasProducedMergedWork` above (the `.git`-marker-mtime vs HEAD-commit-time heuristic) has a
+ * false positive: a worktree with zero commits of its own, rebased or fast-forwarded onto a
+ * base that itself advanced AFTER the worktree was created, ends up with a HEAD commit time
+ * that postdates the worktree's own creation — exactly the signal `hasProducedMergedWork`
+ * reads as "this worktree produced work" — even though the worktree's own branch never
+ * recorded a single commit. This reflog check answers the actual question directly instead of
+ * inferring it from timestamps, so it is required IN ADDITION TO (not instead of)
+ * `hasProducedMergedWork` below: a real commit made on the branch satisfies both signals, a
+ * rebase/fast-forward with no own commits satisfies only the (now insufficient) old one. Same
+ * uncertainty rule as everywhere else in this file: a git failure, or an empty reflog, is
+ * never a pass.
+ */
+function hasOwnCommit(w, git) {
+  const r = git(['reflog', 'show', '--format=%gs', 'HEAD'], w.path);
+  if (!r || r.status !== 0 || !r.stdout) return false;
+  return r.stdout.split('\n').some((line) => /^commit\b/.test(line.trim()));
+}
+
+/**
  * The "accepted" leg of done-but-open: a merged/closed linked GitHub PR or GitLab MR, or —
  * only when NEITHER is linked at all — HEAD already contained in the worktree's own
  * upstream default branch AND that worktree actually produced a new, now-merged commit
- * (`hasProducedMergedWork`, item H1 — otherwise a freshly-created, never-touched worktree
- * would qualify too). A still-open PR/MR is never accepted, whatever git alone might say
- * about the branch. Git is consulted ONLY in the no-linked-PR/MR case: the cheap,
- * Orca-reported PR/MR state always decides first when one exists, so a real git call never
- * runs for the (common) linked-PR case's acceptance leg — a PR/MR's own merged/closed state
- * is already external evidence real work happened, so H1's extra check does not apply there.
- * Returns `{ accepted, reason }` so a caller can name which path fired.
+ * (`hasProducedMergedWork` AND `hasOwnCommit`, item H1 — otherwise a freshly-created,
+ * never-touched worktree, or one merely rebased/fast-forwarded onto a moved base without ever
+ * gaining a commit of its own, would both qualify too). A still-open PR/MR is never accepted,
+ * whatever git alone might say about the branch. Git is consulted ONLY in the no-linked-PR/MR
+ * case: the cheap, Orca-reported PR/MR state always decides first when one exists, so a real
+ * git call never runs for the (common) linked-PR case's acceptance leg — a PR/MR's own
+ * merged/closed state is already external evidence real work happened, so H1's extra checks do
+ * not apply there. Returns `{ accepted, reason }` so a caller can name which path fired.
  */
 function resolveAcceptance(w, git, stat) {
   if (w.prState != null) {
@@ -326,6 +356,7 @@ function resolveAcceptance(w, git, stat) {
   const base = resolveBaseRef(w.path, git);
   if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: null };
   if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: null };
+  if (!hasOwnCommit(w, git)) return { accepted: false, reason: null };
   return { accepted: true, reason: `no linked PR, HEAD already merged into ${base}` };
 }
 
@@ -480,19 +511,27 @@ function processDoneWorktrees(data, events, started) {
     // calls entirely instead of re-running them on every future tick forever. Before the
     // first seed, every row must still be evaluated once to establish the backlog / diff
     // against a persisted restart, so nothing is skipped yet at that point.
-    const candidates = doneWtSeeded
-      ? data.rows.filter((w) => !(w && typeof w.path === 'string' && reportedDoneWorktrees.has(w.path)))
-      : data.rows;
+    const isSeedingPass = !doneWtSeeded;
+    const candidates = isSeedingPass
+      ? data.rows
+      : data.rows.filter((w) => !(w && typeof w.path === 'string' && reportedDoneWorktrees.has(w.path)));
     // A git-heavy pass (many worktrees left to evaluate) must never run long enough to make
     // the liveness file look stale: cap it to ~GIT_BUDGET_MS total and beat() between rows.
     // Whatever does not fit in the budget is simply retried next tick — evaluateDoneButOpen
     // is pure/idempotent per row, so a partial pass here is a delay, never a correctness bug.
+    //
+    // The ONE pass that budget cap must never truncate is the seeding pass itself: seeding
+    // marks EVERY row it does not evaluate as implicitly "not backlog" (never added to
+    // `reportedDoneWorktrees`/`doneWtPersisted` below), so a row skipped here by the budget
+    // would fall through to the steady-state branch on some later tick and fire as a brand
+    // new wake event for what was actually pre-existing backlog all along. `beat(started)`
+    // still runs per row regardless, so liveness stays fresh even on a long first pass.
     const budgetDeadline = Date.now() + GIT_BUDGET_MS;
     const allEvaluated = [];
     for (const w of candidates) {
       allEvaluated.push({ w, verdict: evaluateDoneButOpen(w, { now, idleSeconds: IDLE_SECONDS, git: runGit }) });
       beat(started);
-      if (Date.now() >= budgetDeadline) break;
+      if (!isSeedingPass && Date.now() >= budgetDeadline) break;
     }
     const evaluated = allEvaluated.filter((e) => e.verdict.done);
 
@@ -689,5 +728,5 @@ module.exports = {
   classifyTerminal, isHoldingResources, snapshotWorkers, RATE_LIMIT,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
-  statMtimeMs, headCommitTimeMs, hasProducedMergedWork,
+  statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
 };

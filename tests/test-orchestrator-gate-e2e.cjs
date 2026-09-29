@@ -1813,23 +1813,41 @@ const postAgent = (sid, toolUseId) => ({
     after.workers.ctx_h3_stale.status === 'settled', true);
 }
 
+/** Holds `lockDir` genuinely live for the duration of `fn()` — a separate process keeps its
+ * mtime refreshed every 200ms, so it never LOOKS abandoned/stale to a concurrent acquirer
+ * no matter how long that acquirer's own timeout is. Used to simulate real, ongoing lock
+ * contention (as opposed to a merely-abandoned lock, which review round 3, item 2 made the
+ * cap paths' own longer acquire timeout outlive on its own — see item 2's own test below). */
+function withHeldLock(lockDir, fn) {
+  fs.mkdirSync(lockDir, { recursive: true });
+  const keepAlive = spawn(process.execPath, ['-e',
+    'const fs=require("fs");const d=process.argv[1];' +
+    'setInterval(()=>{try{const t=Date.now()/1000;fs.utimesSync(d,t,t);}catch{}},200);',
+    lockDir], { stdio: 'ignore' });
+  try { fn(); } finally { keepAlive.kill(); fs.rmSync(lockDir, { recursive: true, force: true }); }
+}
+
 // 10. Concurrency review, Low item: a max-parallel-agents check that cannot acquire the
 // state-file lock at all (contended by another process) must refuse with a distinct,
 // transient-retry reason — never silently evaluate capacity unlocked (which, under exactly
 // the many-concurrent-dispatches condition that causes lock contention, would let every
-// contending process fall through uncounted and all be admitted at once). Simulated here by
-// pre-holding the lock directory for longer than the gate's own ~2s acquire timeout.
+// contending process fall through uncounted and all be admitted at once). Simulated here by a
+// lock directory a separate live process keeps refreshing (mtime touched every 200ms) for the
+// whole test — genuine, ongoing contention, never merely stale. (Review round 3, item 2 made
+// the cap paths' own acquire timeout longer than file-lock's staleMs specifically so a lock
+// that ISN'T being refreshed gets outlived instead of refused — see items 14/15 below — so a
+// merely-abandoned lock no longer exercises this path at all; only an actively-held one does.)
 {
   const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 5 }); // generous cap: contention, not capacity, must be the cause
   const sid = 'mpa-lock-contention';
   const lockDir = path.join(stateDir, '.lock');
-  fs.mkdirSync(lockDir, { recursive: true });
-  const r = invoke(mpaLookup(sid, 'toolu_mpa_lock_1'), env);
-  if (r.code === DENY && /max-parallel-agents/.test(r.err) && /transient/i.test(r.err) && /retry/i.test(r.err)) pass += 1;
-  else failures.push(`lock contention: expected a transient-retry max-parallel-agents refusal (code ${r.code}, err ${r.err.slice(0, 300)})`);
-  checkBool('lock contention: the ordinary at-capacity wording is NOT used for a lock-contention refusal',
-    /parallel units live on this machine/.test(r.err), false);
-  fs.rmSync(lockDir, { recursive: true, force: true });
+  withHeldLock(lockDir, () => {
+    const r = invoke(mpaLookup(sid, 'toolu_mpa_lock_1'), env);
+    if (r.code === DENY && /max-parallel-agents/.test(r.err) && /transient/i.test(r.err) && /retry/i.test(r.err)) pass += 1;
+    else failures.push(`lock contention: expected a transient-retry max-parallel-agents refusal (code ${r.code}, err ${r.err.slice(0, 300)})`);
+    checkBool('lock contention: the ordinary at-capacity wording is NOT used for a lock-contention refusal',
+      /parallel units live on this machine/.test(r.err), false);
+  });
   expect('lock contention: once the lock is free again, a dispatch is admitted normally',
     mpaLookup(sid, 'toolu_mpa_lock_2'), ALLOW, env);
 }
@@ -1904,6 +1922,55 @@ const postAgent = (sid, toolUseId) => ({
     !after.agents.toolu_leaked_fg2, true);
   checkBool('C1 backstop (Stop): a BACKGROUND registration survives untouched',
     !!after.agents.toolu_leaked_bg2, true);
+}
+
+// 14. Review round 3, item 1: lock contention must refuse ONLY while the cap is actually
+// finite — `reconcileParallelAgentsAtCap` (the Agent/Task path) and
+// `handleTerminalCreateAgentCap` (the bare `orca terminal create` path) used to check
+// `!locked` BEFORE checking gate-disabled/non-finite, so a held `.lock` refused even with the
+// cap unlimited (maxParallelAgents 0) or the gate disabled outright. Both must now allow. Uses
+// a GENUINELY held (continuously refreshed) lock, never a merely-abandoned one — item 2's own
+// longer acquire timeout would otherwise outlive a plain abandoned lock on its own and mask
+// whether this fix (checking disabled/unlimited BEFORE `!locked`) is actually what admits it.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 0 }); // 0 = unlimited
+  const lockDir = path.join(stateDir, '.lock');
+  withHeldLock(lockDir, () => {
+    expect('item 1: a genuinely held .lock + unlimited (0) cap still admits an Agent dispatch',
+      mpaLookup('mpa-r3-i1-agent-unlimited', 'toolu_r3i1_agent_u'), ALLOW, env);
+    expect('item 1: a genuinely held .lock + unlimited (0) cap still admits `orca terminal create`',
+      mainBash('orca terminal create --json', { sid: 'mpa-r3-i1-term-unlimited' }), ALLOW, env);
+  });
+}
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 1, disabledGates: ['max-parallel-agents'] });
+  const lockDir = path.join(stateDir, '.lock');
+  withHeldLock(lockDir, () => {
+    expect('item 1: a genuinely held .lock + disabledGates still admits an Agent dispatch',
+      mpaLookup('mpa-r3-i1-agent-disabled', 'toolu_r3i1_agent_d'), ALLOW, env);
+    expect('item 1: a genuinely held .lock + disabledGates still admits `orca terminal create`',
+      mainBash('orca terminal create --json', { sid: 'mpa-r3-i1-term-disabled' }), ALLOW, env);
+  });
+}
+
+// 15. Review round 3, item 2: the cap paths' own lock acquisition (2s default) gave up well
+// before file-lock's own staleMs (10s) ever made the lock look abandoned — any caller whose
+// attempt started less than (staleMs - timeoutMs) ~= 8s after a dead holder's lock was
+// created refused as "contended" instead of outliving it. A FRESH (not pre-backdated) lock,
+// combined with a finite cap so the dispatch is not trivially allowed some other way, and a
+// remaining life short enough that the OLD 2s timeout could never outlast it but comfortably
+// inside the NEW timeout, must now be admitted instead of refused.
+{
+  const { env, stateDir } = mpaTestEnv({ maxParallelAgents: 5 }); // generous: contention, not capacity
+  const lockDir = path.join(stateDir, '.lock');
+  fs.mkdirSync(lockDir, { recursive: true });
+  // Backdate the lock dir by 7s: 3s of "life" remain before file-lock's own 10s staleMs
+  // would call it abandoned. The old 2s timeout could never wait that long; the new ~10.5s
+  // timeout comfortably can.
+  const backdated = Date.now() / 1000 - 7;
+  fs.utimesSync(lockDir, backdated, backdated);
+  expect('item 2: a not-yet-stale-but-soon-to-be lock is outlasted, not refused as contended (Agent)',
+    mpaLookup('mpa-r3-i2-agent', 'toolu_r3i2_agent'), ALLOW, env);
 }
 
 // --- orca-heartbeat.cjs: done-but-open worktree reminder (real spawned daemon + stubs) --
@@ -2261,14 +2328,19 @@ async function heartbeatWorktreeTests() {
   // check via the git stub — accepted when HEAD is confirmed merged, refused when it isn't.
   // H1: acceptance also requires HEAD's own commit to postdate the worktree's `.git` marker
   // (`hasProducedMergedWork`), so `pMerged`'s marker is forced well into the past and the
-  // stub's HEAD commit time well after it.
+  // stub's HEAD commit time well after it. Review round 3, item 3: acceptance ALSO requires
+  // the branch's own reflog to record a real commit (`hasOwnCommit`), so the stub is told to
+  // answer that too — see the dedicated real-git tests further down for the false-positive
+  // case (a rebased/fast-forwarded worktree with no commits of its own) this stub-based pair
+  // cannot reproduce with a fake mtime/commit-time pair alone.
   {
     const pMerged = realWtDirWithGitMarker('np', Date.now() - 3_600_000);
     const outMerged = await runHeartbeat({
       name: 'no-pr-ancestor',
       worktrees: [{ path: pMerged, displayName: 'np', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 0 }],
-      gitEnv: { STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)) },
+      gitEnv: { STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)),
+        STUB_GIT_REFLOG_HAS_COMMIT: '1' },
       args: ['--interval', '1', '--idle', '60', '--max', '1'],
     });
     checkBool('no linked PR/MR + git confirms HEAD is an ancestor of base + clean is done-but-open',
@@ -2283,6 +2355,22 @@ async function heartbeatWorktreeTests() {
     });
     checkBool('no linked PR/MR + git confirms HEAD is NOT an ancestor is never done-but-open',
       outNotMerged.includes('pre-existing'), false);
+
+    // Review round 3, item 3: ancestor + a postdating HEAD commit time (the OLD sufficient
+    // signal) but an empty reflog (no commit ever made ON this branch) must still refuse —
+    // this is the stub-reachable half of the H1 false positive (the other half, actually
+    // producing that combination through a real rebase/fast-forward, needs real git; see the
+    // dedicated real-git tests below).
+    const pNoOwnCommit = realWtDirWithGitMarker('np3', Date.now() - 3_600_000);
+    const outNoOwnCommit = await runHeartbeat({
+      name: 'no-pr-ancestor-no-own-commit',
+      worktrees: [{ path: pNoOwnCommit, displayName: 'np3', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0 }],
+      gitEnv: { STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)) },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('H1: ancestor + postdating HEAD commit time but an empty reflog (no own commit) is never done-but-open',
+      outNoOwnCommit.includes('pre-existing'), false);
   }
 
   // 13. A merged PR whose worktree git reports DIRTY (uncommitted changes) is never
@@ -2328,6 +2416,34 @@ async function heartbeatWorktreeTests() {
     checkBool('a reply with no `worktrees` array never produces a startup summary', out.includes('pre-existing'), false);
     checkBool('a reply with no `worktrees` array never crashes the daemon',
       out.includes('orca-heartbeat: Orca is not answering'), false);
+  }
+
+  // 16. Review round 3, item 4: the FIRST (seeding) pass must never be truncated by the
+  // GIT_BUDGET_MS cap. Before this fix, a row the seeding pass could not reach in time was
+  // simply left out of both `reportedDoneWorktrees` and the startup summary — on a LATER tick,
+  // the steady-state branch would then evaluate it, find it done, and fire it as a genuine
+  // wake event, even though it had been part of the original backlog all along. `ORCH_GIT_BUDGET_MS`
+  // + `STUB_GIT_DELAY_MS` shrink the budget and slow the git stub enough to make a single tick's
+  // naive git-call total exceed the budget with only a few worktrees, without needing a real
+  // 10s wait.
+  {
+    const worktrees = Array.from({ length: 5 }, (_, i) => ({
+      path: realWtDir(`gb${i}`), displayName: `gb${i}`, isMainWorktree: false, isArchived: false,
+      liveTerminalCount: 0, linkedPR: { state: 'merged', number: 100 + i },
+    }));
+    const out = await runHeartbeat({
+      name: 'git-budget-seeding',
+      worktrees,
+      gitEnv: { STUB_GIT_DELAY_MS: '60' },
+      envOverrides: { ORCH_GIT_BUDGET_MS: '100' },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    for (const w of worktrees) {
+      checkBool(`item 4: ${w.displayName} appears in the one-time startup summary despite the tight git budget`,
+        out.includes(`${w.displayName} (${w.path})`), true);
+    }
+    checkBool('item 4: no worktree the budget-constrained seeding pass could not reach in one tick fires as a later wake event',
+      out.includes('DONE worktree'), false);
   }
 }
 
@@ -2394,6 +2510,30 @@ async function heartbeatH1RealGitTests() {
   });
   checkBool('H1 (real git): a fresh worktree with zero new commits is never reported done-but-open',
     outFresh.includes('pre-existing') || outFresh.includes('DONE worktree'), false);
+
+  // Negative (review round 3, item 3 — the H1 false positive this fixes): the worktree
+  // branches off origin/main, origin/main THEN advances with a REAL commit made directly on
+  // origin (not on the worktree), and the worktree is fast-forwarded onto that advanced
+  // origin/main WITHOUT ever gaining a commit of its own. The `.git` marker is forced an hour
+  // into the past, so HEAD's real commit time genuinely postdates it — the OLD heuristic alone
+  // (`hasProducedMergedWork`) reads exactly this as "done"; `hasOwnCommit` (an empty reflog on
+  // this worktree's own branch) must still refuse it.
+  const rebasedPath = addRealWorktree(origin, 'rebased', now - 3_600_000);
+  fs.writeFileSync(path.join(origin.repoDir, 'advance.txt'), 'base advanced\n');
+  sh('git', ['add', 'advance.txt'], origin.repoDir, REAL_GIT_ENV);
+  sh('git', ['commit', '--quiet', '-m', 'advance base'], origin.repoDir, REAL_GIT_ENV);
+  sh('git', ['push', '--quiet', 'origin', 'main'], origin.repoDir, REAL_GIT_ENV);
+  sh('git', ['fetch', '--quiet', 'origin'], rebasedPath, REAL_GIT_ENV);
+  sh('git', ['merge', '--quiet', '--ff-only', 'origin/main'], rebasedPath, REAL_GIT_ENV);
+  const outRebased = await runHeartbeat({
+    name: 'h1-rebased-no-own-commit',
+    dirName: 'hb-h1-rebased',
+    worktrees: [{ path: rebasedPath, displayName: 'rebased', isMainWorktree: false, isArchived: false, liveTerminalCount: 0 }],
+    envOverrides: { ORCH_GIT_BIN: 'git' },
+    args: ['--interval', '1', '--idle', '60', '--max', '1'],
+  });
+  checkBool('H1 (real git): a worktree rebased/fast-forwarded onto a moved base with no commits of its own is never reported done-but-open (the false-positive case)',
+    outRebased.includes('pre-existing') || outRebased.includes('DONE worktree'), false);
 
   // Positive: a REAL new commit, force-pushed onto the bare origin's `main` and fetched back,
   // so `origin/main` genuinely contains it. The `.git` marker's mtime is forced an hour into

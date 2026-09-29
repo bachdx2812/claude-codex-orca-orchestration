@@ -226,8 +226,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled,
   } = deps;
   // deps also carries (and this function reads directly, so not destructured above):
-  // agentParallelLimit, machineWideLiveUnits, formatParallelAgentsRefusal, cores,
-  // parallelCoreFraction — the max-parallel-agents machine-wide budget's own helpers.
+  // agentParallelLimit, maxParallelAgents, machineWideLiveUnits, formatParallelAgentsRefusal,
+  // cores, parallelCoreFraction — the max-parallel-agents machine-wide budget's own helpers.
 
   const invs = orcaInvocations(cmd).filter((inv) =>
     (inv.sub === 'orchestration worker-start' || inv.sub === 'orchestration task-create') &&
@@ -420,7 +420,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             }
             if (usage.total >= limit) {
               violation = { gate: 'max-parallel-agents', reason:
-                deps.formatParallelAgentsRefusal(usage, limit, deps.cores(), deps.parallelCoreFraction(cfg)) };
+                deps.formatParallelAgentsRefusal(usage, limit, deps.cores(), deps.parallelCoreFraction(cfg),
+                  { explicitLimit: deps.maxParallelAgents(cfg) != null, stateDir: DIR }) };
               break;
             }
           }

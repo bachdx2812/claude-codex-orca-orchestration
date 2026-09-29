@@ -13,6 +13,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-unit-state-'));
 process.env.ORCH_STATE_DIR = STATE_DIR;
@@ -264,6 +265,12 @@ check('a released worker holds nothing',
       // acceptance path. Default (700s -> 700_000ms) sits after the default `stat` fixture
       // below (500_000ms), so the common backdrop is "this worktree really did advance".
       if (sub === 'log') return pick(overrides, 'log', { status: 0, stdout: '700' });
+      // Review round 3, item 3: the worktree branch's own reflog, consulted alongside the
+      // mtime/commit-time signal above on the same no-linked-PR/MR acceptance path. Default
+      // is "a real commit happened" (matching the "everything checks out" backdrop the other
+      // defaults on this fixture already use), so a test proving the H1 false positive
+      // overrides this specifically to an empty reflog.
+      if (sub === 'reflog') return pick(overrides, 'reflog', { status: 0, stdout: 'commit: real work' });
       if (sub === 'rev-parse') {
         const ref = args[args.length - 1];
         if (ref === 'origin/main') return pick(overrides, 'revParseOriginMain', { status: 0, stdout: 'sha' });
@@ -331,6 +338,32 @@ check('a released worker holds nothing',
     heartbeat.hasProducedMergedWork(noPrIdle, fakeGit(), () => 500_000), true);
   check('H1: hasProducedMergedWork is false when HEAD predates the worktree\'s creation',
     heartbeat.hasProducedMergedWork(noPrIdle, fakeGit(), () => 900_000), false);
+
+  // Review round 3, item 3: hasOwnCommit reads the branch's OWN reflog directly, straight
+  // from a "commit"-prefixed subject line, regardless of any mtime/commit-time timestamp.
+  check('hasOwnCommit is true when the reflog has a "commit:" line',
+    heartbeat.hasOwnCommit(noPrIdle, fakeGit()), true);
+  check('hasOwnCommit is false when the reflog is empty (no commit was ever made on this branch)',
+    heartbeat.hasOwnCommit(noPrIdle, fakeGit({ reflog: { status: 0, stdout: '' } })), false);
+  check('hasOwnCommit recognizes "commit (amend)" as a real commit action',
+    heartbeat.hasOwnCommit(noPrIdle, fakeGit({ reflog: { status: 0, stdout: 'commit (amend): fixup' } })), true);
+  check('hasOwnCommit recognizes "commit (merge)" as a real commit action',
+    heartbeat.hasOwnCommit(noPrIdle, fakeGit({ reflog: { status: 0, stdout: 'commit (merge): merge feature' } })), true);
+  check('hasOwnCommit is false when only non-commit reflog entries exist (e.g. a rebase/fast-forward)',
+    heartbeat.hasOwnCommit(noPrIdle, fakeGit({ reflog: { status: 0, stdout: 'rebase (finish): returning to refs/heads/feature' } })), false);
+  check('hasOwnCommit is false on a git failure (never a pass on uncertainty)',
+    heartbeat.hasOwnCommit(noPrIdle, fakeGit({ reflog: null })), false);
+
+  // Review round 3, item 3 (H1 leftover false positive): the OLD mtime/commit-time signal
+  // alone (`hasProducedMergedWork`) is satisfied by a worktree that was merely rebased/
+  // fast-forwarded onto a base that itself advanced after the worktree's creation — HEAD's
+  // commit time postdates the worktree's own creation even though the worktree's own branch
+  // never gained a commit. `resolveAcceptance`/`isDoneButOpen` must additionally require
+  // `hasOwnCommit`, so this combination (old signal true, reflog empty) must still refuse.
+  check('H1: a postdating HEAD commit time alone (no reflog commit of its own) is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ git: { reflog: { status: 0, stdout: '' } } })), false);
+  check('H1: evaluateDoneButOpen reports not-done for the same rebased/no-own-commit case',
+    heartbeat.evaluateDoneButOpen(noPrIdle, ctx({ git: { reflog: { status: 0, stdout: '' } } })).done, false);
 
   // No upstream: the clean check falls back to "HEAD is an ancestor of the resolved base".
   const noPrNoUpstream = ctx({ git: { upstream: { status: 128, stdout: '' } } });
@@ -683,6 +716,25 @@ check('a released worker holds nothing',
     /ask the operator/i.test(refusal) && /--release-claims/.test(refusal) && /disabledGates/.test(refusal), true);
   check('formatParallelAgentsRefusal never invites the model to just raise the limit itself',
     /or raise maxParallelAgents/.test(refusal), false);
+  // Review round 3, item 5: the "(N cores x fraction%)" derivation is only ever true when the
+  // limit came FROM that derivation — an operator-set explicit limit never went through any
+  // core/fraction math, so the message must say so instead of printing a fabricated-looking
+  // "(18 cores x 80%)" next to a number the operator picked directly.
+  const explicitRefusal = PAC.formatParallelAgentsRefusal(usage, 3, 18, 0.8, { explicitLimit: true });
+  check('formatParallelAgentsRefusal says "explicit limit" instead of a cores/fraction derivation when the limit is explicit',
+    explicitRefusal.includes('(explicit limit):'), true);
+  check('formatParallelAgentsRefusal with an explicit limit never prints the cores x fraction wording',
+    /\d+ cores x \d+%/.test(explicitRefusal), false);
+  check('formatParallelAgentsRefusal without meta.explicitLimit keeps the derived cores/fraction wording',
+    refusal.includes('(18 cores x 80%):'), true);
+  // Review round 3, item 5: the recovery hint must name the REAL, ORCH_STATE_DIR-aware state
+  // dir, not a hardcoded ~/.claude/orchestrator-gate/ that is wrong whenever ORCH_STATE_DIR
+  // points elsewhere (every test in this suite, for one).
+  const customDirRefusal = PAC.formatParallelAgentsRefusal(usage, 3, 18, 0.8, { stateDir: '/custom/state/dir' });
+  check('formatParallelAgentsRefusal names the real (meta.stateDir) state dir when given one',
+    customDirRefusal.includes("delete a dead session's state file under /custom/state/dir/"), true);
+  check('formatParallelAgentsRefusal falls back to the ~/.claude/orchestrator-gate/ default when no stateDir is given',
+    refusal.includes("delete a dead session's state file under ") && refusal.includes('orchestrator-gate/'), true);
 
   // M1: another session's units only count while it has a recent liveness signal (its own
   // state file changed recently, OR its heartbeat daemon is alive) — a session with NEITHER
@@ -1379,6 +1431,91 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   check('parseOwns: mixed comma-and-space list outside any brace splits on both, as before',
     OWN.parseOwns('x\nOwns: src/api/**, src/models/user.ts foo/bar.py', { repoRoot: REPO }).owns,
     ['src/api/**', 'src/models/user.ts', 'foo/bar.py']);
+}
+
+// --- orca-heartbeat.cjs: H1 leftover false positive, against a REAL git repo (round 3, item 3) --
+//
+// The fakeGit-based tests above prove the mechanism (hasOwnCommit reads the reflog); these
+// prove it against an actual git worktree, which is the only way to really produce the false
+// positive's precondition: a worktree with zero commits of its own whose HEAD nonetheless ends
+// up with a commit TIME that postdates its own `.git` marker, because the BASE branch (not the
+// worktree) advanced after the worktree was created, and the worktree was then rebased/
+// fast-forwarded onto it. A synthetic mtime/commit-time pair can assert the same outcome, but
+// only a real rebase/fast-forward actually exercises the code path that produces it.
+{
+  const gitAvailable = (() => {
+    try { return spawnSync('git', ['--version']).status === 0; } catch { return false; }
+  })();
+  if (!gitAvailable) {
+    console.log('H1 real-git tests skipped: no git binary on PATH');
+  } else {
+    function sh(args, cwd) {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      if (r.status !== 0) throw new Error(`git ${args.join(' ')} in ${cwd} failed: ${r.stderr || r.stdout}`);
+      return (r.stdout || '').trim();
+    }
+    const realGit = (args, cwd) => {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      if (r.error || r.status === null || r.status === undefined) return null;
+      return { status: r.status, stdout: (r.stdout || '').trim() };
+    };
+    const rowFor = (wtPath) => ({
+      path: wtPath, displayName: path.basename(wtPath), isMainWorktree: false, isArchived: false, liveTerminalCount: 0,
+    });
+    const realCtx = () => ({ now: Date.now(), idleSeconds: 60, git: realGit, stat: heartbeat.statMtimeMs });
+    // `hasProducedMergedWork` compares a commit's %ct (whole SECONDS) against a `.git` marker's
+    // mtime (sub-second precision) — a real worktree-add followed immediately by a commit can
+    // otherwise land in the same wall-clock second, making the commit's truncated-to-the-second
+    // timestamp read as EARLIER than the marker's own more precise mtime. A short real sleep
+    // between "create the worktree" and "commit something that should postdate it" removes that
+    // ordering ambiguity; this is over-1s, not a busy loop, so it costs real time but no CPU.
+    const sleepPastSecondBoundary = () => { spawnSync('sleep', ['1.2']); };
+
+    const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-h1-realgit-'));
+    const base = path.join(ROOT, 'base');
+    fs.mkdirSync(base);
+    sh(['init', '-q', '-b', 'main'], base);
+    sh(['config', 'user.email', 'orch-test@example.invalid'], base);
+    sh(['config', 'user.name', 'Orch Test'], base);
+    fs.writeFileSync(path.join(base, 'f.txt'), 'a\n');
+    sh(['add', '.'], base);
+    sh(['commit', '-q', '-m', 'initial'], base);
+    const commitA = sh(['rev-parse', 'HEAD'], base);
+
+    // Case 1 — fresh: a worktree just branched off base, zero commits of its own -> not done.
+    const freshPath = path.join(ROOT, 'wt-fresh');
+    sh(['worktree', 'add', '-q', '-b', 'feature-fresh', freshPath, commitA], base);
+    check('H1 real-git: a fresh worktree with zero commits of its own is never done-but-open',
+      heartbeat.isDoneButOpen(rowFor(freshPath), realCtx()), false);
+
+    // Case 2 — rebased/fast-forwarded, no own commits: the worktree branches off A, base then
+    // advances to B, and the worktree is fast-forwarded onto B WITHOUT ever gaining a commit of
+    // its own. HEAD (B) now postdates the worktree's own `.git` marker (created before B
+    // existed) — the OLD heuristic (`hasProducedMergedWork`) alone reads this as "done"; this is
+    // the exact false positive item 3 fixes.
+    const rebasedPath = path.join(ROOT, 'wt-rebased');
+    sh(['worktree', 'add', '-q', '-b', 'feature-rebased', rebasedPath, commitA], base);
+    sleepPastSecondBoundary();
+    fs.writeFileSync(path.join(base, 'f.txt'), 'b\n');
+    sh(['commit', '-q', '-am', 'advance base'], base);
+    sh(['merge', '-q', '--ff-only', 'main'], rebasedPath);
+    check('H1 real-git: a worktree rebased/fast-forwarded onto a moved base with no commits of its own is never done-but-open (the false-positive case)',
+      heartbeat.isDoneButOpen(rowFor(rebasedPath), realCtx()), false);
+
+    // Case 3 — own commit merged into base: a real commit made ON the worktree's own branch,
+    // then fast-forward-merged back into base -> done.
+    const ownPath = path.join(ROOT, 'wt-own');
+    sh(['worktree', 'add', '-q', '-b', 'feature-own', ownPath, 'main'], base);
+    sleepPastSecondBoundary();
+    fs.writeFileSync(path.join(ownPath, 'g.txt'), 'own work\n');
+    sh(['add', '.'], ownPath);
+    sh(['commit', '-q', '-m', 'real work'], ownPath);
+    sh(['merge', '-q', '--ff-only', 'feature-own'], base);
+    check('H1 real-git: a worktree whose own commit is merged into base is done-but-open',
+      heartbeat.isDoneButOpen(rowFor(ownPath), realCtx()), true);
+
+    fs.rmSync(ROOT, { recursive: true, force: true });
+  }
 }
 
 // --- report -----------------------------------------------------------------

@@ -202,15 +202,26 @@ function machineWideLiveUnits(dir, nowMs = Date.now(), opts = {}) {
  * once two sessions' ids can collide in the same list. Recovery is framed as the OPERATOR's
  * call, never the model's: raising the machine-wide budget or clearing a stuck registration
  * is a resource decision, so this never invites the model to just raise the limit itself.
+ *
+ * `meta.explicitLimit` (review round 3, item 5): the `(<cores> cores x <fraction>%)` derivation
+ * is only ever true when the limit was DERIVED from the machine's core count — an operator who
+ * set `maxParallelAgents`/`ORCH_MAX_PARALLEL_AGENTS` explicitly never picked that number via any
+ * fraction of any core count, so printing one next to their own explicit number is meaningless
+ * (and actively misleading if the machine's core count differs from whatever they were picturing
+ * when they set it). `meta.stateDir` (same item): the recovery hint used to hardcode
+ * `~/.claude/orchestrator-gate/` regardless of `ORCH_STATE_DIR` — wrong, and useless, whenever a
+ * session actually runs with a different state dir (every test in this suite, for one).
  */
-function formatParallelAgentsRefusal(usage, limit, coreCount, fraction) {
+function formatParallelAgentsRefusal(usage, limit, coreCount, fraction, meta = {}) {
   const idsPart = usage.ids.length ? ` [${usage.ids.join(', ')}]` : '';
   const limitText = Number.isFinite(limit) ? limit : 'unlimited';
+  const limitSource = meta.explicitLimit ? 'explicit limit' : `${coreCount} cores x ${Math.round(fraction * 100)}%`;
+  const dir = meta.stateDir || path.join(os.homedir(), '.claude', 'orchestrator-gate');
   return `${usage.total}/${limitText} parallel units live on this machine ` +
-    `(${coreCount} cores x ${Math.round(fraction * 100)}%): ${usage.orcaWorkers} Orca workers, ` +
+    `(${limitSource}): ${usage.orcaWorkers} Orca workers, ` +
     `${usage.subagents} subagents${idsPart}. Wait for one to finish and release it, or ask the operator to: ` +
     'release a specific claim (--release-claims <id>|all, this session only), ' +
-    "delete a dead session's state file under ~/.claude/orchestrator-gate/, " +
+    `delete a dead session's state file under ${dir}/, ` +
     'or disable this gate (disabledGates: ["max-parallel-agents"]).';
 }
 
