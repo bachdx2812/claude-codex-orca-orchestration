@@ -22,7 +22,7 @@ function hasRateLimitError(text) {
     const line = raw.trimEnd();
     if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
     if (inFence || /^\s*(?:└\s*)?Tip:/i.test(line) || isSourceExcerpt(line)) continue;
-    const errorShaped = /^\s*(?:■|ERROR\b|error:)/i.test(line);
+    const errorShaped = /(?:^\s*(?:■|⚠|error:)|\bERROR\b)/i.test(line);
     if ((errorShaped && RATE_LIMIT_MARKER.test(line)) || STRONG_RATE_LIMIT_MARKER.test(line)) return true;
   }
   return false;

@@ -225,6 +225,12 @@ check('a Codex error bullet is a rate-limit error',
   hasRateLimitError("■ You've hit your usage limit. Try again later."), true);
 check('an HTTP 429 response line is a rate-limit error',
   hasRateLimitError('request failed with HTTP 429 Too Many Requests'), true);
+check('a timestamped ERROR log line is a rate-limit error',
+  hasRateLimitError('2026-09-30T12:00:00Z ERROR codex_core: rate limit hit'), true);
+check('a bracketed ERROR log line is a rate-limit error',
+  hasRateLimitError('[ERROR] rate limit hit'), true);
+check('a warning-prefixed usage-limit line is a rate-limit error',
+  hasRateLimitError('⚠ You have reached your usage limit'), true);
 check('Codex connection-lost reconnect notice is a disconnect',
   hasCodexDisconnect('■ Connection lost. Attempting to reconnect…'), true);
 check('Codex automatic reconnect failure is a disconnect',
