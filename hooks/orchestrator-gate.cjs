@@ -46,9 +46,9 @@ const LOG = path.join(DIR, 'violations.log');
 const ORCA_DOWN_FLAG = process.env.ORCA_DOWN_FLAG_PATH || path.join(DIR, 'orca-unavailable');
 // ORCA_BIN lets the test suite point at a stub instead of a real `orca` on PATH.
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
-// CODEX_BIN lets the test suite point at a stub or a deliberately missing path, exactly
-// like ORCA_BIN, so "codex is not on PATH" is testable without touching a real install.
-const CODEX_BIN = process.env.CODEX_BIN || 'codex';
+// ORCH_CODEX_BIN is the documented override for both reachability and live quota probing.
+// CODEX_BIN remains a backwards-compatible alias so existing hermetic setups keep working.
+const CODEX_BIN = process.env.ORCH_CODEX_BIN || process.env.CODEX_BIN || 'codex';
 
 // --- tunables ---------------------------------------------------------------
 const RATE_LIMIT_BACKOFF_SECONDS = 120; // wait before retrying a rate-limited worker

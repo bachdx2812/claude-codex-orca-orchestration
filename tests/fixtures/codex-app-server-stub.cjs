@@ -42,7 +42,12 @@ process.stdin.on('data', (chunk) => {
       if (secondaryRaw !== undefined) {
         rateLimits.secondary = { usedPercent: Number(secondaryRaw), resetsAt: secondaryReset };
       }
-      process.stdout.write(`${JSON.stringify({ id: 2, result: { rateLimits } })}\n`);
+      const result = { rateLimits };
+      if (process.env.STUB_CODEX_RATE_LIMIT_REACHED_TYPE) {
+        result.rateLimitReachedType = process.env.STUB_CODEX_RATE_LIMIT_REACHED_TYPE;
+      }
+      if (process.env.STUB_CODEX_ORDINARY_USAGE_ALLOWED === 'false') result.ordinaryUsageAllowed = false;
+      process.stdout.write(`${JSON.stringify({ id: 2, result })}\n`);
     }
   }
 });

@@ -905,7 +905,7 @@ check('a released worker holds nothing',
   eq('codex: newer file without limits falls through; secondary is the tighter window', q.codexRemaining(now), 30);
   writeCodex('c.jsonl', [rl({ used_percent: 95, resets_at: now / 1000 - 60 }, null)], now);
   eq('codex: a window past resets_at counts as 0% used', q.codexRemaining(now), 100);
-  eq('codex: old reading is not discarded by age', q.codexRemaining(now + 30 * 86400000), 100);
+  eq('codex: a session-log reading older than 6h is ignored', q.codexRemaining(now + 30 * 86400000), null);
   writeCodex('d.jsonl', [rl({ used_percent: 0.5, resets_at: future }, null)], now + 1);
   eq('codex: used_percent in (0,1) is a genuine low reading, never treated as a fraction', q.codexRemaining(now), 99.5);
 
@@ -960,11 +960,13 @@ check('a released worker holds nothing',
   let quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
   eq('codex live: app-server reading is used', [quota.usedPercent, quota.source], [25, 'live']);
   eq('codex reminder: a live reading names the live source',
-    q.execRoute(40, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live)'), true);
+    q.execRoute(40, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live, 0s ago)'), true);
 
   process.env.STUB_CODEX_PRIMARY_USED = '90';
   const cached = q.codexQuota(quota.fetchedAt + 30_000, { stateDir, cacheSeconds: 60 });
   eq('codex live cache: a fresh value wins before another probe', cached.usedPercent, 25);
+  eq('codex reminder: a cached live reading includes its age',
+    q.execRoute(40, quota.fetchedAt + 30_000, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live, 30s ago)'), true);
   const refreshed = q.codexQuota(quota.fetchedAt + 60_000, { stateDir, cacheSeconds: 60 });
   eq('codex live cache: an expired value is refreshed', refreshed.usedPercent, 90);
 
@@ -1000,6 +1002,22 @@ check('a released worker holds nothing',
   quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
   eq('codex live: a passed reset counts as zero percent used', quota.usedPercent, 0);
 
+  clearCache(); clearStub();
+  process.env.STUB_CODEX_PRIMARY_USED = '5';
+  process.env.STUB_CODEX_RATE_LIMIT_REACHED_TYPE = 'ordinary';
+  quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
+  eq('codex live: rateLimitReachedType is treated as fully used', [quota.usedPercent, quota.limitReached], [100, true]);
+  eq('codex reminder: a reached limit is surfaced explicitly',
+    q.execRoute(40, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('limit reached'), true);
+  delete process.env.STUB_CODEX_RATE_LIMIT_REACHED_TYPE;
+
+  clearCache(); clearStub();
+  process.env.STUB_CODEX_PRIMARY_USED = '5';
+  process.env.STUB_CODEX_ORDINARY_USAGE_ALLOWED = 'false';
+  quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
+  eq('codex live: ordinaryUsageAllowed=false is treated as fully used', quota.usedPercent, 100);
+  delete process.env.STUB_CODEX_ORDINARY_USAGE_ALLOWED;
+
   const sessionFile = path.join(day, 'fallback.jsonl');
   const sessionNow = Date.now();
   fs.writeFileSync(sessionFile, `${JSON.stringify({ timestamp: new Date(sessionNow - 5 * 60_000).toISOString(), payload: { rate_limits: {
@@ -1034,6 +1052,16 @@ check('a released worker holds nothing',
   const failedProbeCalls = fs.readFileSync(callsLog, 'utf8').trim().split('\n').filter(Boolean).length;
   eq('codex live failure is cached and memoized for the configured TTL', failedProbeCalls, 1);
   delete process.env.STUB_CODEX_CALLS_LOG;
+
+  clearCache(); clearStub();
+  const oldOrchBin = process.env.ORCH_CODEX_BIN;
+  delete process.env.ORCH_CODEX_BIN;
+  process.env.CODEX_BIN = stub;
+  process.env.STUB_CODEX_PRIMARY_USED = '12';
+  quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
+  eq('codex live: legacy CODEX_BIN remains an accepted probe alias', quota.usedPercent, 12);
+  process.env.ORCH_CODEX_BIN = oldOrchBin;
+  delete process.env.CODEX_BIN;
 
   for (const [key, value] of Object.entries(oldEnv)) {
     if (value === undefined) delete process.env[key]; else process.env[key] = value;

@@ -590,7 +590,7 @@ expect('a neutral scouting dispatch is allowed',
     ...BASE_ENV, CODEX_SESSIONS_DIR: path.join(dir, 'empty-codex'),
     CK_USAGE_CACHE_PATH: path.join(dir, 'no-such-claude-cache.json'),
     ORCA_DOWN_FLAG_PATH: FLAG, ORCH_STATE_DIR: STATE_DIR, ORCH_CONFIG_PATH: CONFIG_FILE,
-    ORCA_BIN: orcaBin, CODEX_BIN: codexBin, ORCH_CODEX_BIN: noCodexBin,
+    ORCA_BIN: orcaBin, CODEX_BIN: codexBin, ORCH_CODEX_BIN: codexBin,
   });
   const FSID = `${SID}-fallback-nodata`;
   const codeBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' };

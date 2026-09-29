@@ -25,6 +25,7 @@ const { spawnSync } = require('child_process');
 // Claude's cache is refreshed by an external hook; older than this it no longer reflects
 // this machine.
 const CLAUDE_STALE_MS = 6 * 60 * 60 * 1000;
+const CODEX_SESSION_STALE_MS = 6 * 60 * 60 * 1000;
 // Session files probed, newest first, for one carrying a rate_limits event.
 const MAX_CODEX_FILES = 10;
 // Only the tail of a session file is read; rate_limits events repeat throughout.
@@ -154,16 +155,17 @@ function readSessionQuota(now = Date.now()) {
     for (const file of newestSessionFiles(codexSessionsDir())) {
       const event = lastRateLimits(file);
       if (!event) continue; // e.g. a session that has not finished its first turn yet
+      let observedAt = event.observedAt;
+      if (!Number.isFinite(observedAt)) {
+        try { observedAt = fs.statSync(file).mtimeMs; } catch { observedAt = now; }
+      }
+      if (now - observedAt > CODEX_SESSION_STALE_MS) continue;
       const rl = event.rateLimits;
       const used = [rl.primary, rl.secondary]
         .filter(Boolean)
         .map((w) => windowUsed(w.used_percent, w.resets_at ? w.resets_at * 1000 : 0, now, false))
         .filter((v) => v !== null);
       if (used.length) {
-        let observedAt = event.observedAt;
-        if (!Number.isFinite(observedAt)) {
-          try { observedAt = fs.statSync(file).mtimeMs; } catch { observedAt = now; }
-        }
         return {
           usedPercent: Math.max(...used),
           resetsAt: 0,
@@ -196,6 +198,9 @@ function effectiveUsedPercent(window, now) {
 function parseLiveQuota(result, now = Date.now()) {
   const limits = result && result.rateLimits;
   if (!limits || typeof limits !== 'object') return null;
+  const limitReached = !!(result.rateLimitReachedType || limits.rateLimitReachedType) ||
+    result.ordinaryUsageAllowed === false || limits.ordinaryUsageAllowed === false;
+  if (limitReached) return { usedPercent: 100, resetsAt: 0, limitReached: true };
   const windows = [limits.primary, limits.secondary]
     .map((window) => effectiveUsedPercent(window, now))
     .filter(Boolean);
@@ -206,7 +211,7 @@ function parseLiveQuota(result, now = Date.now()) {
 }
 
 function liveQuota(now = Date.now()) {
-  const codexBin = process.env.ORCH_CODEX_BIN || 'codex';
+  const codexBin = process.env.ORCH_CODEX_BIN || process.env.CODEX_BIN || 'codex';
   const probe = spawnSync(process.execPath, [LIVE_PROBE, codexBin], {
     encoding: 'utf8',
     timeout: LIVE_TIMEOUT_MS,
@@ -238,7 +243,7 @@ function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
       if (memoized.failed === true) return { failed: true, fetchedAt: memoized.fetchedAt };
       const effective = effectiveUsedPercent(memoized, now);
       if (effective && !(memoized.resetsAt && memoized.resetsAt * 1000 <= now)) {
-        return { ...effective, fetchedAt: memoized.fetchedAt, source: 'live' };
+        return { ...effective, fetchedAt: memoized.fetchedAt, source: 'live', limitReached: memoized.limitReached === true };
       }
     }
 
@@ -255,7 +260,7 @@ function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
     const effective = effectiveUsedPercent(cached, now);
     if (!effective) return null;
     processCache.set(file, cached);
-    return { ...effective, fetchedAt: cached.fetchedAt, source: 'live' };
+    return { ...effective, fetchedAt: cached.fetchedAt, source: 'live', limitReached: cached.limitReached === true };
   } catch { return null; }
 }
 
@@ -269,6 +274,7 @@ function writeCache(stateDir, quota, now = Date.now()) {
       usedPercent: quota.usedPercent,
       resetsAt: quota.resetsAt || 0,
       fetchedAt: now,
+      limitReached: quota.limitReached === true,
     } : { failed: true, fetchedAt: now };
     fs.writeFileSync(temp, JSON.stringify(cached), { mode: 0o600 });
     fs.renameSync(temp, file);
@@ -333,7 +339,7 @@ function execRoute(handoffUsedPct = 40, now = Date.now(), options = {}) {
     ? `Claude ${fmt(claudeLeft)} (cache, ${formatAge(claudeQuota.ageMs)} old)`
     : 'Claude unknown';
   const codexSource = !quota ? 'unknown' : quota.source === 'live'
-    ? 'live'
+    ? `${quota.limitReached ? 'limit reached, ' : ''}live, ${formatAge(Math.max(0, now - quota.fetchedAt))} ago`
     : `session log, ${formatAge(quota.ageMs)} old`;
   return {
     route: pickExecRoute(claudeLeft, codexLeft, handoffUsedPct),
