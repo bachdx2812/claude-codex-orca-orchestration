@@ -113,9 +113,11 @@ either, regardless of what the operator's standing override says.
 
 Codex is the deliberately-preferred default, so **only a missing binary triggers the
 execution fallback — never merely an unknown quota reading.** Automatic routing first
-uses a fresh state-dir live cache, then queries `codex app-server` JSON-RPC
-`account/rateLimits/read` (5-second timeout, no model call), then scans local Codex
-session logs. If all three sources are unavailable, the reading is unknown; that is not
+uses a fresh state-dir live cache (including cached failures), then queries `codex app-server`
+JSON-RPC `account/rateLimits/read` (5-second parent timeout, 4.5-second helper deadline,
+no model call), then scans local Codex session logs no older than six hours. A helper that
+must stop its app-server child escalates from SIGTERM to SIGKILL. If all three sources are
+unavailable, the reading is unknown; that is not
 evidence Codex is unusable, and routing still prefers it. If `orca` or `codex` itself is
 not on `PATH`,
 though, Codex genuinely cannot be dispatched to at all, and with
@@ -123,7 +125,7 @@ though, Codex genuinely cannot be dispatched to at all, and with
 back to the configured code model instead. Set `execFallbackWhenCodexUnavailable` to
 `null` to disable this and always prefer Codex regardless of either binary's presence.
 
-The gate checks `orca`/`codex` reachability itself (an absolute `ORCA_BIN`/`CODEX_BIN`
+The gate checks `orca`/`codex` reachability itself (an absolute `ORCA_BIN`/`ORCH_CODEX_BIN`
 path is checked with a file-exists test; the bare default name via `which`/`where`) — no
 per-invocation cost beyond those two lookups, and never a live `worker-list` call just to
 decide routing.
@@ -185,7 +187,7 @@ as the installed hooks would actually read it.
   over once Codex has used this much of its tightest quota window. Overridable for one
   process with `ORCH_CODEX_HANDOFF_USED`.
 - `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
-  `codex app-server` quota reading is reused from `codex-quota-live.json` in the gate
+  `codex app-server` quota reading or a failed probe is reused from `codex-quota-live.json` in the gate
   state directory; `0` disables reuse. Overridable for one process with
   `ORCH_CODEX_QUOTA_CACHE_SECONDS`.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
@@ -226,7 +228,8 @@ Env overrides: `ORCH_CONFIG_PATH` (which file to read), `ORCH_STATE_DIR` (where 
 state, the violations log and heartbeat liveness files live — default
 `~/.claude/orchestrator-gate/`), `ORCA_BIN` (which `orca` executable to invoke — mainly
 for tests), `ORCH_CODEX_BIN` (which `codex` executable the live quota probe invokes —
-mainly for tests), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
+and which executable the routing fallback checks; legacy `CODEX_BIN` remains a lower-priority
+alias), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
 `ORCH_CLOSE_DONE_WORKTREES`. An invalid or missing config value never crashes
 the gate; it falls back to the default for that field alone and reports the fallback as a
 warning in the SessionStart banner. Config is re-read on every hook invocation (each is
@@ -243,6 +246,10 @@ terminal, a supervised terminal quiet longer than `heartbeat.idleSeconds`, an or
 terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
 its exit is the wake-up: the panel does not have to remember to poll, and it costs nothing
 while everything is healthy.
+
+IDLE, orphan and rate-limit terminal events are limited to this session's own fleet: the
+run-scoped `worker-list` terminal handles plus bare terminals registered in this session's
+gate state. Output from another session's terminal never wakes this panel.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
@@ -396,6 +403,10 @@ default (10s) specifically so a merely-abandoned lock (not a genuinely live hold
 outlived and reclaimed instead of refused: the library's ordinary 2s acquire timeout used to
 give up well before a dead holder's lock ever looked stale, refusing for roughly
 `staleMs - timeoutMs` (~8s) after every such lock was created.
+When both caps are unlimited or disabled, `worker-start` uses the ordinary 2-second lock
+timeout instead. When a finite cap's long initial acquisition cannot obtain a genuinely
+held lock, the dispatch is refused immediately after that one attempt rather than paying a
+second long wait in the reconcile path.
 
 The check-and-reserve critical section runs under the SAME shared file lock every other
 reservation-taking gate here uses, and always reloads state fresh from disk once the lock is

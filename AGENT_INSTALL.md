@@ -76,7 +76,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 756 tests, fully hermetic
+npm test                       # 767 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -268,13 +268,17 @@ Rollback without the uninstaller: every settings.json mutation is preceded by a
 ## Known limits
 
 - **Codex quota** is queried live through `codex app-server` JSON-RPC
-  `account/rateLimits/read`, with no model call and a 5-second timeout. Successful values
-  are cached as `codex-quota-live.json` in the gate state directory for
+  `account/rateLimits/read`, with no model call, a 5-second parent timeout, and a
+  4.5-second helper deadline that SIGKILLs an app-server child which ignores SIGTERM.
+  Successful values and failed probes are cached as `codex-quota-live.json` in the gate state directory for
   `codexQuotaCacheSeconds` (default 60); `ORCH_CODEX_QUOTA_CACHE_SECONDS` overrides the
   TTL and `0` disables reuse. If the live probe fails, the gate falls back to
-  `~/.codex/sessions/**/*.jsonl` `rate_limits` events (`CODEX_HOME` honoured), then
-  reports `unknown`, which keeps Codex as the default. `ORCH_CODEX_BIN` selects the probe
-  executable for hermetic tests.
+  `~/.codex/sessions/**/*.jsonl` `rate_limits` events no older than six hours
+  (`CODEX_HOME` honoured), then reports `unknown`, which keeps Codex as the default.
+  Cached live reminders include their age; `rateLimitReachedType` or
+  `ordinaryUsageAllowed=false` is labelled `limit reached` and treated as 100% used.
+  `ORCH_CODEX_BIN` selects both the probe executable and the binary checked for routing;
+  legacy `CODEX_BIN` is still accepted as a lower-priority alias.
 - **Orca worker detection** uses `orca orchestration worker-list --json`'s
   `resource.id` field; a context-only `orchestration dispatch --to <handle>` (no
   `resource`) is never treated as a worker, so it stays gated like the main panel.

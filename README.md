@@ -39,7 +39,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, an orphaned terminal, a rate-limit signal, or a worktree whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). |
+| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own terminal going IDLE past `heartbeat.idleSeconds`, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or a worktree whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -192,7 +192,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 756 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 767 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -228,11 +228,13 @@ operator prompt
 ```
 
 Automatic routing reads Codex quota live from `codex app-server` without making a model
-call. A successful reading is cached for 60 seconds in the gate state directory; if the
-live probe fails, routing falls back to the newest local Codex session-log rate-limit
-event, then to `unknown` (which deliberately keeps Codex as the default). Per-turn
-reminders label the reading `(live)`, `(session log, <age>)`, or `(unknown)` and show the
-age of the optional Claude usage cache.
+call. Successful and failed probes are cached for 60 seconds in the gate state directory
+and memoized inside one hook process. If the live probe fails, routing falls back to the
+newest local Codex session-log rate-limit event no older than six hours, then to `unknown`
+(which deliberately keeps Codex as the default). The helper has its own 4.5-second deadline
+and escalates a child that ignores SIGTERM to SIGKILL. Per-turn reminders label a reading
+`(live, <age> ago)`, `(session log, <age> old)`, `(limit reached, live, <age> ago)`, or
+`(unknown)` and show the age of the optional Claude usage cache.
 
 ## Customise
 
