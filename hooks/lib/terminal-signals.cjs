@@ -9,6 +9,7 @@ function terminalLines(text) {
 }
 
 function isSourceExcerpt(line) {
+  if (/^\s*429\s*(?:[|:│-]\s*)?Too Many Requests\b/i.test(line)) return false;
   return /^\s*(?:```|~~~|@@|diff\s+--git\b|index\s+[0-9a-f]+\.\.|[+-](?!\s*(?:ERROR\b|error:|■))|\d+\s*[|:│]|[|│┃]\s*)/i.test(line) ||
     /^\s*(?:const|let|var|function|class|if|for|while|return|check|expect|assert)\b/.test(line) ||
     /^\s*(?:\/\/|#)(?:\s|$)/.test(line) ||

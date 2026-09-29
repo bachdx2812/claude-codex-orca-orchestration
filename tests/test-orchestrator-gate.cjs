@@ -225,6 +225,8 @@ check('a Codex error bullet is a rate-limit error',
   hasRateLimitError("■ You've hit your usage limit. Try again later."), true);
 check('an HTTP 429 response line is a rate-limit error',
   hasRateLimitError('request failed with HTTP 429 Too Many Requests'), true);
+check('a bare 429 response is not mistaken for a numbered source excerpt',
+  hasRateLimitError('429: Too Many Requests'), true);
 check('a timestamped ERROR log line is a rate-limit error',
   hasRateLimitError('2026-09-30T12:00:00Z ERROR codex_core: rate limit hit'), true);
 check('a bracketed ERROR log line is a rate-limit error',
