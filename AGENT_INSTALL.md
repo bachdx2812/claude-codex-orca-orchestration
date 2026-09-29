@@ -29,7 +29,9 @@ needed. Orca workers (Codex) run in their own terminal/worktree and must be supe
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
 terminal, a lost Codex app-server connection, an orphan, a rate limit, or one of this session's worktrees whose PR already
 merged/closed with no live terminal left on it; `Stop` refuses to end the session with one live and
-unwatched, or finished and unreleased. No more than `maxParallelCodexWorkers` (default 3)
+unwatched, or finished and unreleased (an explicitly retained worker Orca reports done is
+informational). A terminal reported disconnected skips idle/orphan classification for that poll.
+No more than `maxParallelCodexWorkers` (default 3)
 live Codex workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget
 (default `max(1, floor(0.8 x cores))`, `0` = unlimited) caps every live Orca worker group
 (any agent) plus every live in-session Agent/Task dispatch, summed across every recent
@@ -81,7 +83,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 873 tests, fully hermetic
+npm test                       # 888 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`

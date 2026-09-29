@@ -286,15 +286,17 @@ An explicitly retained row is supervised work, not a finished-terminal leak. The
 continues watching its terminal for IDLE even when it was already quiet before daemon
 startup. Reported quiet stretches are persisted per session as `handle` + `lastOutputAt`, so
 an unchanged terminal is not re-reported after every daemon restart; new output re-arms it.
-`Stop` is allowed only while that heartbeat is alive; without a live daemon the
-retained worker is refused as `workers-unwatched`. Orca's automatic
+While Orca still reports the retained worker running, `Stop` is allowed only while that
+heartbeat is alive; without a live daemon the worker is refused as `workers-unwatched`.
+A retained worker Orca reports done (`succeeded`, `failed`, or `completed`) is informational
+and needs no heartbeat at `Stop`. Orca's automatic
 `terminalState: retained` on a readiness failure does not get this exemption unless this
 session recorded an explicit `worker-retain`. Release the worker when it is no longer needed.
 
 Codex connection-lost/reconnect-failed messages are terminal even when the TUI keeps
 repainting. The heartbeat reports that terminal as `WORKER STUCK` once per session,
 persisted across daemon restarts; release and re-dispatch it because uncommitted work may
-have been lost.
+have been lost. A reported disconnected terminal skips its idle and orphan checks.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
@@ -631,7 +633,7 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # all four suites (854 checks)
+npm test                                             # all four suites (888 checks)
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
 node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)

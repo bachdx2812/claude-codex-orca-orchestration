@@ -263,6 +263,15 @@ check('a reconnect attempt with continuing terminal output remains working',
     lastOutputAt: NOW }, ctx).kind,
   'working');
 
+check('a reported disconnect skips the same terminal\'s orphan and idle checks',
+  heartbeat.classifyTerminal({ handle: 'x', preview: '■ Automatic reconnect could not restore this session.',
+    orphaned: true, lastOutputAt: NOW - 200000 }, ctx).kind,
+  'connection_lost');
+
+const contract = fs.readFileSync(path.join(__dirname, '..', 'rules', 'orchestration-contract.md'), 'utf8');
+check('the contract documents that disconnected terminals skip idle and orphan checks',
+  /A reported disconnected terminal skips its idle and orphan checks\./.test(contract), true);
+
 check('orphaned terminal is reported',
   heartbeat.classifyTerminal({ handle: 'x', preview: '', orphaned: true, lastOutputAt: NOW }, ctx).kind,
   'orphaned');

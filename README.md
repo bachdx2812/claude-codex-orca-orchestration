@@ -86,13 +86,15 @@ before the daemon started: keep `orca-heartbeat.cjs` alive while waiting so it c
 panel when the terminal becomes IDLE. Each `handle` + `lastOutputAt` quiet stretch is persisted
 for the session, so restarting the daemon does not wake the panel repeatedly for unchanged
 output; new output re-arms the next quiet-stretch report. `Stop` refuses an explicitly retained
-worker when no live heartbeat is watching it. A readiness-failure row Orca labels `retained` is not treated
+worker that is still running when no live heartbeat is watching it; a retained worker Orca
+reports done is informational and does not need a heartbeat. A readiness-failure row Orca labels `retained` is not treated
 as this operator decision unless this session actually ran `worker-retain`. Release it
 normally when the work is done.
 
 If Codex prints a lost/reconnect-failed app-server message, continuing TUI repaint output
 does not count as progress. The heartbeat reports `WORKER STUCK` once for that terminal in
-the session; release it and re-dispatch because work since the last commit may be lost.
+the session; release it and re-dispatch because work since the last commit may be lost. Once
+reported disconnected, that terminal skips the idle and orphan checks for the same poll.
 
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
@@ -231,7 +233,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 873 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 888 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
