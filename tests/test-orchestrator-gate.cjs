@@ -467,6 +467,7 @@ check('a released worker holds nothing',
   check('default activation is orca-only', defaults.activation, 'orca-only');
   check('default review alias is opus', defaults.models.review.alias, 'opus');
   check('default codexHandoffUsedPercent is 40', defaults.codexHandoffUsedPercent, 40);
+  check('default codexQuotaCacheSeconds is 60', defaults.codexQuotaCacheSeconds, 60);
   check('default agents.lookup is [Explore]', defaults.agents.lookup, ['Explore']);
   check('default agents.escalation is empty', defaults.agents.escalation, []);
   check('default config has no warnings', defaults.warnings, []);
@@ -498,6 +499,19 @@ check('a released worker holds nothing',
   process.env.ORCH_CODEX_HANDOFF_USED = 'not-a-number';
   check('an invalid override falls back to config', config.handoffUsed(defaults), defaults.codexHandoffUsedPercent);
   if (before === undefined) delete process.env.ORCH_CODEX_HANDOFF_USED; else process.env.ORCH_CODEX_HANDOFF_USED = before;
+
+  const goodQuotaCache = withConfig({ codexQuotaCacheSeconds: 15 }, () => config.loadConfig());
+  check('a valid codex quota cache TTL is kept as-is', goodQuotaCache.codexQuotaCacheSeconds, 15);
+  const badQuotaCache = withConfig({ codexQuotaCacheSeconds: 3601 }, () => config.loadConfig());
+  check('an invalid codex quota cache TTL falls back to default', badQuotaCache.codexQuotaCacheSeconds, 60);
+  check('an invalid codex quota cache TTL produces a warning', badQuotaCache.warnings.length > 0, true);
+  const beforeQuotaCache = process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS;
+  process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS = '0';
+  check('ORCH_CODEX_QUOTA_CACHE_SECONDS overrides the config value', config.codexQuotaCacheSeconds(defaults), 0);
+  process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS = 'bad';
+  check('an invalid quota cache override falls back to config', config.codexQuotaCacheSeconds(defaults), 60);
+  if (beforeQuotaCache === undefined) delete process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS;
+  else process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS = beforeQuotaCache;
 
   check('default closeDoneWorktrees is true', defaults.closeDoneWorktrees, true);
   check('closeDoneWorktreesEnabled defaults to the config value', config.closeDoneWorktreesEnabled(defaults), true);
@@ -900,6 +914,112 @@ check('a released worker holds nothing',
   writeClaude({ five_hour: { utilization: 5 } }, now - 7 * 3600e3);
   eq('claude: cache older than 6h is unknown', q.claudeRemaining(now), null);
   delete process.env.CODEX_SESSIONS_DIR; delete process.env.CK_USAGE_CACHE_PATH;
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
+// Live Codex quota via app-server, including cache and every fallback edge. The stub
+// speaks the real initialize -> initialized -> account/rateLimits/read exchange.
+{
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'quota-live-'));
+  const stateDir = path.join(root, 'state');
+  const sessions = path.join(root, 'sessions');
+  const day = path.join(sessions, '2026', '09', '29');
+  fs.mkdirSync(day, { recursive: true });
+  const stub = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
+  try { fs.chmodSync(stub, 0o755); } catch {}
+  const oldEnv = {};
+  for (const key of ['ORCH_CODEX_BIN', 'STUB_CODEX_MODE', 'STUB_CODEX_PRIMARY_USED',
+    'STUB_CODEX_SECONDARY_USED', 'STUB_CODEX_PRIMARY_RESET', 'STUB_CODEX_SECONDARY_RESET',
+    'CODEX_SESSIONS_DIR']) oldEnv[key] = process.env[key];
+  process.env.ORCH_CODEX_BIN = stub;
+  process.env.CODEX_SESSIONS_DIR = sessions;
+  const q = require('../hooks/lib/exec-route-by-quota.cjs');
+  const eq = (name, got, want) => {
+    if (JSON.stringify(got) === JSON.stringify(want)) pass += 1;
+    else failures.push(`${name}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+  };
+  const clearCache = () => { try { fs.unlinkSync(path.join(stateDir, 'codex-quota-live.json')); } catch {} };
+  const clearStub = () => {
+    delete process.env.STUB_CODEX_MODE;
+    delete process.env.STUB_CODEX_SECONDARY_USED;
+    delete process.env.STUB_CODEX_PRIMARY_RESET;
+    delete process.env.STUB_CODEX_SECONDARY_RESET;
+  };
+
+  clearStub(); clearCache();
+  process.env.STUB_CODEX_PRIMARY_USED = '25';
+  let quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
+  eq('codex live: app-server reading is used', [quota.usedPercent, quota.source], [25, 'live']);
+  eq('codex reminder: a live reading names the live source',
+    q.execRoute(40, quota.fetchedAt, { stateDir, cacheSeconds: 60 }).summary.includes('Codex 75% left (live)'), true);
+
+  process.env.STUB_CODEX_PRIMARY_USED = '90';
+  const cached = q.codexQuota(quota.fetchedAt + 30_000, { stateDir, cacheSeconds: 60 });
+  eq('codex live cache: a fresh value wins before another probe', cached.usedPercent, 25);
+  const refreshed = q.codexQuota(quota.fetchedAt + 60_000, { stateDir, cacheSeconds: 60 });
+  eq('codex live cache: an expired value is refreshed', refreshed.usedPercent, 90);
+
+  clearCache(); clearStub();
+  const crossoverNow = Date.now();
+  process.env.STUB_CODEX_PRIMARY_USED = '70';
+  process.env.STUB_CODEX_SECONDARY_USED = '60';
+  process.env.STUB_CODEX_PRIMARY_RESET = String(Math.floor(crossoverNow / 1000) + 30);
+  process.env.STUB_CODEX_SECONDARY_RESET = String(Math.floor(crossoverNow / 1000) + 3600);
+  quota = q.codexQuota(crossoverNow, { stateDir, cacheSeconds: 60 });
+  eq('codex live cache: the initially tighter window is cached', quota.usedPercent, 70);
+  quota = q.codexQuota(Math.floor(crossoverNow / 1000) * 1000 + 30_000, { stateDir, cacheSeconds: 60 });
+  eq('codex live cache: the exact reset invalidates cache so the active secondary wins', quota.usedPercent, 60);
+
+  clearCache(); clearStub();
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'codex-quota-live.json'), JSON.stringify({
+    usedPercent: 80, fetchedAt: Date.now(),
+  }));
+  process.env.STUB_CODEX_PRIMARY_USED = '35';
+  quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
+  eq('codex live cache: a malformed schema is ignored in favour of live data', quota.usedPercent, 35);
+
+  clearCache(); clearStub();
+  process.env.STUB_CODEX_PRIMARY_USED = '10';
+  process.env.STUB_CODEX_SECONDARY_USED = '70';
+  quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
+  eq('codex live: secondary wins when it is tighter than primary', quota.usedPercent, 70);
+
+  clearCache(); clearStub();
+  process.env.STUB_CODEX_PRIMARY_USED = '95';
+  process.env.STUB_CODEX_PRIMARY_RESET = String(Math.floor(Date.now() / 1000) - 1);
+  quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
+  eq('codex live: a passed reset counts as zero percent used', quota.usedPercent, 0);
+
+  const sessionFile = path.join(day, 'fallback.jsonl');
+  const sessionNow = Date.now();
+  fs.writeFileSync(sessionFile, `${JSON.stringify({ timestamp: new Date(sessionNow - 5 * 60_000).toISOString(), payload: { rate_limits: {
+    primary: { used_percent: 65, resets_at: Math.floor(sessionNow / 1000) + 3600 },
+  } } })}\n`);
+  fs.utimesSync(sessionFile, sessionNow / 1000, sessionNow / 1000);
+
+  clearCache(); clearStub();
+  process.env.STUB_CODEX_MODE = 'malformed';
+  quota = q.codexQuota(sessionNow, { stateDir, cacheSeconds: 60 });
+  eq('codex live: a malformed reply falls back to the session log', [quota.usedPercent, quota.source], [65, 'session log']);
+  eq('codex reminder: a session fallback names its source and age',
+    q.execRoute(40, sessionNow, { stateDir, cacheSeconds: 0 }).summary.includes('Codex 35% left (session log, 5m old)'), true);
+
+  clearCache(); clearStub();
+  process.env.STUB_CODEX_MODE = 'timeout';
+  quota = q.codexQuota(sessionNow, { stateDir, cacheSeconds: 60 });
+  eq('codex live: a timeout falls back to the session log', [quota.usedPercent, quota.source], [65, 'session log']);
+
+  clearCache();
+  fs.rmSync(sessions, { recursive: true, force: true });
+  process.env.STUB_CODEX_MODE = 'malformed';
+  const route = q.execRoute(40, sessionNow, { stateDir, cacheSeconds: 0 });
+  eq('codex live: malformed with no session is unknown and keeps Codex', [route.codexSource, route.route], ['unknown', 'codex']);
+  eq('codex reminder: an unknown reading names the unknown source', route.summary.includes('Codex unknown (unknown)'), true);
+
+  for (const [key, value] of Object.entries(oldEnv)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  }
   fs.rmSync(root, { recursive: true, force: true });
 }
 

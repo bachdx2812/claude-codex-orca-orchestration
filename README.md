@@ -192,7 +192,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 731 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 751 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -227,6 +227,13 @@ operator prompt
                  (once Codex has used codexHandoffUsedPercent, or via --code-model / --exec-sonnet)
 ```
 
+Automatic routing reads Codex quota live from `codex app-server` without making a model
+call. A successful reading is cached for 60 seconds in the gate state directory; if the
+live probe fails, routing falls back to the newest local Codex session-log rate-limit
+event, then to `unknown` (which deliberately keeps Codex as the default). Per-turn
+reminders label the reading `(live)`, `(session log, <age>)`, or `(unknown)` and show the
+age of the optional Claude usage cache.
+
 ## Customise
 
 Edit `~/.claude/orchestration.config.json` (created from
@@ -238,6 +245,7 @@ The file is plain JSON — no comments — parsed as-is:
 ```json
 {
   "codexHandoffUsedPercent": 60,
+  "codexQuotaCacheSeconds": 60,
   "replyLanguage": "Vietnamese",
   "maxParallelCodexWorkers": 5,
   "ownershipClaimTtlMinutes": 60,
@@ -248,7 +256,8 @@ The file is plain JSON — no comments — parsed as-is:
 ```
 
 (`codexHandoffUsedPercent: 60` means Codex keeps coding until 60% of its quota is used,
-up from the default 40; `replyLanguage` accepts any language name, or `null` for no
+up from the default 40; `codexQuotaCacheSeconds` controls the live-reading cache TTL
+(`0` disables reuse); `replyLanguage` accepts any language name, or `null` for no
 language instruction at all; `maxParallelCodexWorkers` raises or lowers how many live
 Codex workers this session may hold at once (`0` = unlimited); `ownershipClaimTtlMinutes`
 changes how long a background Agent's `Owns:` claim survives before it auto-expires;

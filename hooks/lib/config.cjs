@@ -47,6 +47,7 @@ const DEFAULT_CONFIG = {
     lookup: ['Explore'],
   },
   codexHandoffUsedPercent: 40,
+  codexQuotaCacheSeconds: 60,
   execFallbackWhenCodexUnavailable: 'sonnet',
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
   maxParallelCodexWorkers: 3, // 0 = unlimited
@@ -152,6 +153,14 @@ function loadConfig() {
     merged.codexHandoffUsedPercent = threshold;
   }
 
+  const quotaCacheSeconds = Number(merged.codexQuotaCacheSeconds);
+  if (!Number.isInteger(quotaCacheSeconds) || quotaCacheSeconds < 0 || quotaCacheSeconds > 3600) {
+    warnings.push(`codexQuotaCacheSeconds "${merged.codexQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.codexQuotaCacheSeconds}.`);
+    merged.codexQuotaCacheSeconds = DEFAULT_CONFIG.codexQuotaCacheSeconds;
+  } else {
+    merged.codexQuotaCacheSeconds = quotaCacheSeconds;
+  }
+
   if (!Array.isArray(merged.disabledGates)) {
     warnings.push('disabledGates must be an array; ignoring.');
     merged.disabledGates = [];
@@ -237,6 +246,19 @@ function handoffUsed(cfg) {
     if (Number.isInteger(n) && n >= 0 && n <= 100) return n;
   }
   return cfg.codexHandoffUsedPercent;
+}
+
+/**
+ * Seconds a successful live Codex quota reading remains fresh (0 disables reuse).
+ * `ORCH_CODEX_QUOTA_CACHE_SECONDS` overrides the config for one process.
+ */
+function codexQuotaCacheSeconds(cfg) {
+  const envOverride = process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 3600) return n;
+  }
+  return cfg.codexQuotaCacheSeconds;
 }
 
 /** Directory holding session state (`<sid>.json`, heartbeat files, violations.log). */
@@ -327,6 +349,6 @@ function maxParallelAgents(cfg) {
 
 module.exports = {
   GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
-  maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
+  codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   parallelCoreFraction, maxParallelAgents,
 };

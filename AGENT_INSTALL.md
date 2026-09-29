@@ -76,7 +76,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 731 tests, fully hermetic
+npm test                       # 751 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -171,13 +171,15 @@ The file is plain JSON — no comments — parsed as-is:
 ```json
 {
   "codexHandoffUsedPercent": 60,
+  "codexQuotaCacheSeconds": 60,
   "replyLanguage": "Vietnamese",
   "disabledGates": ["code-brief-needs-verify"]
 }
 ```
 
-(`codexHandoffUsedPercent: 60` is up from the default 40; `replyLanguage` accepts any
-language name, or `null` for no language sentence at all.)
+(`codexHandoffUsedPercent: 60` is up from the default 40; `codexQuotaCacheSeconds`
+controls the live-reading cache TTL and accepts `0` to disable reuse; `replyLanguage`
+accepts any language name, or `null` for no language sentence at all.)
 
 Several more keys gate parallel work: `maxParallelCodexWorkers` (integer 0-32, default 3,
 `0` = unlimited) caps how many live Codex `worker-start` dispatches this session may hold
@@ -232,9 +234,10 @@ standing override.
 
 ## 6. No Orca / no Codex
 
-If `orca` is not on `PATH`, or Codex has no readable `rate_limits` reading yet, automatic
-routing keeps defaulting to Codex (an unknown Codex quota is not evidence Codex is
-unusable) — which will then refuse in-session code dispatches until you either:
+If `orca` is not on `PATH`, or Codex quota is unknown after the live app-server probe and
+session-log fallback, automatic routing keeps defaulting to Codex (an unknown Codex quota
+is not evidence Codex is unusable) — which will then refuse in-session code dispatches
+until you either:
 
 - pass `--exec-sonnet` (or `--code-model <your configured code alias>`) — an honest,
   session-scoped preference that never claims Orca is down, or
@@ -264,10 +267,14 @@ Rollback without the uninstaller: every settings.json mutation is preceded by a
 
 ## Known limits
 
-- **Codex quota** is read from `~/.codex/sessions/**/*.jsonl` `rate_limits` events
-  (`CODEX_HOME` honoured, defaults to `~/.codex`). No reading yet (a session that hasn't
-  finished its first turn) is reported as "unknown," which keeps Codex as the default
-  route rather than refusing to route at all.
+- **Codex quota** is queried live through `codex app-server` JSON-RPC
+  `account/rateLimits/read`, with no model call and a 5-second timeout. Successful values
+  are cached as `codex-quota-live.json` in the gate state directory for
+  `codexQuotaCacheSeconds` (default 60); `ORCH_CODEX_QUOTA_CACHE_SECONDS` overrides the
+  TTL and `0` disables reuse. If the live probe fails, the gate falls back to
+  `~/.codex/sessions/**/*.jsonl` `rate_limits` events (`CODEX_HOME` honoured), then
+  reports `unknown`, which keeps Codex as the default. `ORCH_CODEX_BIN` selects the probe
+  executable for hermetic tests.
 - **Orca worker detection** uses `orca orchestration worker-list --json`'s
   `resource.id` field; a context-only `orchestration dispatch --to <handle>` (no
   `resource`) is never treated as a worker, so it stays gated like the main panel.

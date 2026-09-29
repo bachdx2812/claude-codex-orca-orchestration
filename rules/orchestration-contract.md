@@ -112,10 +112,12 @@ either, regardless of what the operator's standing override says.
 ## No Orca / no Codex
 
 Codex is the deliberately-preferred default, so **only a missing binary triggers the
-fallback — never merely an unknown quota reading.** A fresh Codex install that has not
-completed a first turn yet has no `rate_limits` event to read (see `codexRemaining()` in
-`hooks/lib/exec-route-by-quota.cjs`); that unknown reading is not evidence Codex is
-unusable, and routing still prefers it. If `orca` or `codex` itself is not on `PATH`,
+execution fallback — never merely an unknown quota reading.** Automatic routing first
+uses a fresh state-dir live cache, then queries `codex app-server` JSON-RPC
+`account/rateLimits/read` (5-second timeout, no model call), then scans local Codex
+session logs. If all three sources are unavailable, the reading is unknown; that is not
+evidence Codex is unusable, and routing still prefers it. If `orca` or `codex` itself is
+not on `PATH`,
 though, Codex genuinely cannot be dispatched to at all, and with
 `execFallbackWhenCodexUnavailable` at `"sonnet"` (the default) automatic routing falls
 back to the configured code model instead. Set `execFallbackWhenCodexUnavailable` to
@@ -157,6 +159,7 @@ as the installed hooks would actually read it.
   },
   "agents": { "escalation": [], "lookup": ["Explore"] },
   "codexHandoffUsedPercent": 40,
+  "codexQuotaCacheSeconds": 60,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,
@@ -181,6 +184,10 @@ as the installed hooks would actually read it.
 - `codexHandoffUsedPercent`: integer 0-100. Sonnet-or-whatever-your-code-model-is takes
   over once Codex has used this much of its tightest quota window. Overridable for one
   process with `ORCH_CODEX_HANDOFF_USED`.
+- `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
+  `codex app-server` quota reading is reused from `codex-quota-live.json` in the gate
+  state directory; `0` disables reuse. Overridable for one process with
+  `ORCH_CODEX_QUOTA_CACHE_SECONDS`.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
   the SessionStart banner.
@@ -218,7 +225,9 @@ as the installed hooks would actually read it.
 Env overrides: `ORCH_CONFIG_PATH` (which file to read), `ORCH_STATE_DIR` (where session
 state, the violations log and heartbeat liveness files live — default
 `~/.claude/orchestrator-gate/`), `ORCA_BIN` (which `orca` executable to invoke — mainly
-for tests), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CLOSE_DONE_WORKTREES`. An invalid or missing config value never crashes
+for tests), `ORCH_CODEX_BIN` (which `codex` executable the live quota probe invokes —
+mainly for tests), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
+`ORCH_CLOSE_DONE_WORKTREES`. An invalid or missing config value never crashes
 the gate; it falls back to the default for that field alone and reports the fallback as a
 warning in the SessionStart banner. Config is re-read on every hook invocation (each is
 its own Node process), so an edit takes effect on the very next tool call — no restart

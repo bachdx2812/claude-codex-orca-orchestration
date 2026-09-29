@@ -27,6 +27,15 @@ try { fs.chmodSync(STUB, 0o755); } catch {}
 const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-concurrency-'));
 const STATE_DIR = path.join(RUN_DIR, 'state');
 fs.mkdirSync(STATE_DIR, { recursive: true });
+function seedQuota(stateDir, usedPercent = 30) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'codex-quota-live.json'), JSON.stringify({
+    usedPercent,
+    resetsAt: Math.floor(Date.now() / 1000) + 3600,
+    fetchedAt: Date.now(),
+  }));
+}
+seedQuota(STATE_DIR);
 const CONFIG_FILE = path.join(RUN_DIR, 'orchestration.config.json');
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({
   activation: 'always',
@@ -81,6 +90,7 @@ async function raceReconcileTest() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-race-'));
   const stateDir = path.join(dir, 'state');
   fs.mkdirSync(stateDir, { recursive: true });
+  seedQuota(stateDir);
   const configFile = path.join(dir, 'orchestration.config.json');
   fs.writeFileSync(configFile, JSON.stringify({ activation: 'always', maxParallelCodexWorkers: 1, disabledGates: [] }));
   const slowOrca = path.join(dir, 'slow-orca.cjs');
@@ -146,6 +156,7 @@ async function maxParallelAgentsRaceTest() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-agents-race-'));
   const stateDir = path.join(dir, 'state');
   fs.mkdirSync(stateDir, { recursive: true });
+  seedQuota(stateDir);
   const configFile = path.join(dir, 'orchestration.config.json');
   fs.writeFileSync(configFile, JSON.stringify({
     activation: 'always', maxParallelAgents: 3, maxParallelCodexWorkers: 0, disabledGates: [],

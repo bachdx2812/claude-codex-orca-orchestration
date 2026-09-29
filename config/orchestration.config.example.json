@@ -13,6 +13,7 @@
     "lookup": ["Explore"]
   },
   "codexHandoffUsedPercent": 40,
+  "codexQuotaCacheSeconds": 60,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,

@@ -5,22 +5,22 @@
  * Codex is the default coder; the in-session code model takes over once Codex has used
  * `handoffUsed(cfg)` percent or more of its tightest rate-limit window (default 40).
  *
- * Sources (both local, no network):
+ * Sources (all local, no model call):
  *   - Claude: OPTIONAL. Read only if a usage-limits cache file exists and parses — either
  *     `CK_USAGE_CACHE_PATH`, or `${os.tmpdir()}/ck-usage-limits-cache.json`. This is a
  *     ClaudeKit-specific convention, not a Claude Code one, so its absence is normal and
  *     Claude quota is reported as "unknown", never an error. It is informational only —
  *     routing depends solely on Codex quota, never on Claude's.
- *   - Codex: the newest `rate_limits` event among the most recent session files under
- *     `$CODEX_HOME/sessions` (YYYY/MM/DD/*.jsonl): primary/secondary used_percent.
- * Remaining = 100 - the tightest window. A window whose resets_at has passed counts as
- * 0% used, on both sides. Codex readings never go stale by age: no newer session means
- * no newer Codex usage, and resets_at already says when each window refilled.
+ *   - Codex: a short-lived state-dir cache, then a live `codex app-server` JSON-RPC
+ *     account/rateLimits/read, then the newest session-log `rate_limits` event.
+ * Remaining = 100 - the tightest window. A window whose reset time has passed counts as
+ * 0% used. Unknown Codex quota still keeps Codex as the preferred route.
  */
 
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 
 // Claude's cache is refreshed by an external hook; older than this it no longer reflects
 // this machine.
@@ -29,6 +29,10 @@ const CLAUDE_STALE_MS = 6 * 60 * 60 * 1000;
 const MAX_CODEX_FILES = 10;
 // Only the tail of a session file is read; rate_limits events repeat throughout.
 const TAIL_BYTES = 256 * 1024;
+const LIVE_TIMEOUT_MS = 5000;
+const DEFAULT_CACHE_SECONDS = 60;
+const LIVE_CACHE_FILE = 'codex-quota-live.json';
+const LIVE_PROBE = path.join(__dirname, 'codex-quota-probe.cjs');
 
 function codexSessionsDir() {
   // CODEX_SESSIONS_DIR lets tests point at a fixture instead of live data.
@@ -59,7 +63,7 @@ function windowUsed(pct, resetsAtMs, now, allowFraction) {
 }
 
 /** Percent of Claude quota left, or null when no cache is present/parseable/stale. */
-function claudeRemaining(now = Date.now()) {
+function readClaudeQuota(now = Date.now()) {
   const file = claudeUsageCachePath();
   if (!file) return null;
   try {
@@ -72,10 +76,19 @@ function claudeRemaining(now = Date.now()) {
       .map((w) => windowUsed(w.utilization, w.resets_at ? Date.parse(w.resets_at) : 0, now, true))
       .filter((v) => v !== null);
     if (!used.length) return null;
-    return Math.max(0, 100 - Math.max(...used));
+    return {
+      remaining: Math.max(0, 100 - Math.max(...used)),
+      ageMs: Math.max(0, now - Number(cache.timestamp || 0)),
+    };
   } catch {
     return null;
   }
+}
+
+/** Percent of Claude quota left, or null when no cache is present/parseable/stale. */
+function claudeRemaining(now = Date.now()) {
+  const quota = readClaudeQuota(now);
+  return quota ? quota.remaining : null;
 }
 
 /** Entry names of dir sorted descending (YYYY/MM/DD and rollout-<ts> names sort by time). */
@@ -111,7 +124,7 @@ function newestSessionFiles(root, limit = MAX_CODEX_FILES) {
   return out;
 }
 
-/** The last rate_limits object in a session file's tail, or null. */
+/** The last rate_limits object and its event timestamp in a session file's tail, or null. */
 function lastRateLimits(file) {
   try {
     const size = fs.statSync(file).size;
@@ -122,8 +135,12 @@ function lastRateLimits(file) {
     const lines = buf.toString('utf8').split('\n').filter((l) => l.includes('"rate_limits"'));
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
-        const rl = JSON.parse(lines[i]).payload.rate_limits;
-        if (rl && (rl.primary || rl.secondary)) return rl;
+        const event = JSON.parse(lines[i]);
+        const rl = event.payload.rate_limits;
+        if (rl && (rl.primary || rl.secondary)) {
+          const observedAt = typeof event.timestamp === 'string' ? Date.parse(event.timestamp) : NaN;
+          return { rateLimits: rl, observedAt: Number.isFinite(observedAt) ? observedAt : null };
+        }
       } catch {}
     }
   } catch {}
@@ -131,21 +148,139 @@ function lastRateLimits(file) {
 }
 
 /** Percent of Codex quota left, or null when no session carries a rate_limits event. */
-function codexRemaining(now = Date.now()) {
+function readSessionQuota(now = Date.now()) {
   try {
     for (const file of newestSessionFiles(codexSessionsDir())) {
-      const rl = lastRateLimits(file);
-      if (!rl) continue; // e.g. a session that has not finished its first turn yet
+      const event = lastRateLimits(file);
+      if (!event) continue; // e.g. a session that has not finished its first turn yet
+      const rl = event.rateLimits;
       const used = [rl.primary, rl.secondary]
         .filter(Boolean)
         .map((w) => windowUsed(w.used_percent, w.resets_at ? w.resets_at * 1000 : 0, now, false))
         .filter((v) => v !== null);
-      if (used.length) return Math.max(0, 100 - Math.max(...used));
+      if (used.length) {
+        let observedAt = event.observedAt;
+        if (!Number.isFinite(observedAt)) {
+          try { observedAt = fs.statSync(file).mtimeMs; } catch { observedAt = now; }
+        }
+        return {
+          usedPercent: Math.max(...used),
+          resetsAt: 0,
+          fetchedAt: observedAt,
+          source: 'session log',
+          ageMs: Math.max(0, now - observedAt),
+        };
+      }
     }
     return null;
   } catch {
     return null;
   }
+}
+
+/** Percent of Codex quota left from the legacy session-log source, or null. */
+function codexRemaining(now = Date.now()) {
+  const quota = readSessionQuota(now);
+  return quota ? Math.max(0, 100 - quota.usedPercent) : null;
+}
+
+function effectiveUsedPercent(window, now) {
+  if (!window || typeof window.usedPercent !== 'number' || !Number.isFinite(window.usedPercent) ||
+      window.usedPercent < 0 || window.usedPercent > 100) return null;
+  const resetsAt = typeof window.resetsAt === 'number' && Number.isFinite(window.resetsAt) ? window.resetsAt : 0;
+  return { usedPercent: resetsAt && resetsAt * 1000 <= now ? 0 : window.usedPercent, resetsAt };
+}
+
+/** Convert a live app-server result to the tightest usable window. */
+function parseLiveQuota(result, now = Date.now()) {
+  const limits = result && result.rateLimits;
+  if (!limits || typeof limits !== 'object') return null;
+  const windows = [limits.primary, limits.secondary]
+    .map((window) => effectiveUsedPercent(window, now))
+    .filter(Boolean);
+  if (!windows.length) return null;
+  return windows.reduce((tightest, window) => (
+    window.usedPercent > tightest.usedPercent ? window : tightest
+  ));
+}
+
+function liveQuota(now = Date.now()) {
+  const codexBin = process.env.ORCH_CODEX_BIN || 'codex';
+  const probe = spawnSync(process.execPath, [LIVE_PROBE, codexBin], {
+    encoding: 'utf8',
+    timeout: LIVE_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+  });
+  if (probe.error || probe.status !== 0 || !probe.stdout) return null;
+  try { return parseLiveQuota(JSON.parse(probe.stdout.trim()), now); } catch { return null; }
+}
+
+function cachePath(stateDir) {
+  return path.join(stateDir, LIVE_CACHE_FILE);
+}
+
+function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
+  if (!stateDir || cacheSeconds <= 0) return null;
+  try {
+    const cached = JSON.parse(fs.readFileSync(cachePath(stateDir), 'utf8'));
+    if (!cached || typeof cached.usedPercent !== 'number' || !Number.isFinite(cached.usedPercent) ||
+        cached.usedPercent < 0 || cached.usedPercent > 100 ||
+        typeof cached.resetsAt !== 'number' || !Number.isFinite(cached.resetsAt) || cached.resetsAt < 0 ||
+        typeof cached.fetchedAt !== 'number' || !Number.isFinite(cached.fetchedAt) ||
+        now - cached.fetchedAt >= cacheSeconds * 1000 || now < cached.fetchedAt ||
+        (cached.resetsAt && cached.resetsAt * 1000 <= now)) return null;
+    const effective = effectiveUsedPercent(cached, now);
+    return effective ? { ...effective, fetchedAt: cached.fetchedAt, source: 'live' } : null;
+  } catch { return null; }
+}
+
+function writeCache(stateDir, quota, now = Date.now()) {
+  if (!stateDir) return;
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    const file = cachePath(stateDir);
+    const temp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify({
+      usedPercent: quota.usedPercent,
+      resetsAt: quota.resetsAt || 0,
+      fetchedAt: now,
+    }), { mode: 0o600 });
+    fs.renameSync(temp, file);
+  } catch {}
+}
+
+/** Fresh cache -> live app-server -> session log -> unknown. */
+function codexQuota(now = Date.now(), options = {}) {
+  let stateDir = options.stateDir;
+  let cacheSeconds = options.cacheSeconds;
+  if (!stateDir || cacheSeconds === undefined) {
+    try {
+      const config = require('./config.cjs');
+      const cfg = config.loadConfig();
+      if (!stateDir) stateDir = config.stateDir();
+      if (cacheSeconds === undefined) cacheSeconds = config.codexQuotaCacheSeconds(cfg);
+    } catch {}
+  }
+  stateDir ||= process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
+  if (cacheSeconds === undefined) cacheSeconds = DEFAULT_CACHE_SECONDS;
+  const cached = readFreshCache(stateDir, cacheSeconds, now);
+  if (cached) return cached;
+  const live = liveQuota(now);
+  if (live) {
+    writeCache(stateDir, live, now);
+    return { ...live, fetchedAt: now, source: 'live' };
+  }
+  return readSessionQuota(now);
+}
+
+function formatAge(ageMs) {
+  const seconds = Math.max(0, Math.floor(ageMs / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours}h`;
+  return `${Math.floor(hours / 24)}d`;
 }
 
 /**
@@ -159,16 +294,28 @@ function pickExecRoute(claudeLeft, codexLeft, handoffUsedPct = 40) {
 }
 
 /** Current routing verdict with the numbers that produced it. */
-function execRoute(handoffUsedPct = 40, now = Date.now()) {
-  const claudeLeft = claudeRemaining(now);
-  const codexLeft = codexRemaining(now);
+function execRoute(handoffUsedPct = 40, now = Date.now(), options = {}) {
+  const claudeQuota = readClaudeQuota(now);
+  const quota = codexQuota(now, options);
+  const claudeLeft = claudeQuota ? claudeQuota.remaining : null;
+  const codexLeft = quota ? Math.max(0, 100 - quota.usedPercent) : null;
   const fmt = (v) => (v === null ? 'unknown' : `${Math.round(v)}% left`);
+  const claudeSummary = claudeQuota
+    ? `Claude ${fmt(claudeLeft)} (cache, ${formatAge(claudeQuota.ageMs)} old)`
+    : 'Claude unknown';
+  const codexSource = !quota ? 'unknown' : quota.source === 'live'
+    ? 'live'
+    : `session log, ${formatAge(quota.ageMs)} old`;
   return {
     route: pickExecRoute(claudeLeft, codexLeft, handoffUsedPct),
     claudeLeft,
     codexLeft,
-    summary: `Claude ${fmt(claudeLeft)} vs Codex ${fmt(codexLeft)}`,
+    codexSource,
+    summary: `${claudeSummary} vs Codex ${fmt(codexLeft)} (${codexSource})`,
   };
 }
 
-module.exports = { pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles };
+module.exports = {
+  pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
+  parseLiveQuota, liveQuota, codexQuota, readFreshCache, formatAge,
+};

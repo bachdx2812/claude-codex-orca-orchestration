@@ -24,6 +24,8 @@ const STUB = path.join(__dirname, 'fixtures', 'orca-stub.cjs');
 try { fs.chmodSync(STUB, 0o755); } catch {}
 const GIT_STUB = path.join(__dirname, 'fixtures', 'git-stub.cjs');
 try { fs.chmodSync(GIT_STUB, 0o755); } catch {}
+const CODEX_APP_SERVER_STUB = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
+try { fs.chmodSync(CODEX_APP_SERVER_STUB, 0o755); } catch {}
 
 // The process this suite runs in may itself be an orchestrated Claude Code session (it
 // is, when run under the operator's own setup) and so may carry ORCHESTRATOR_GATE,
@@ -62,6 +64,7 @@ const DEFAULT_CFG = {
   },
   agents: { escalation: ['escalation-agent'], lookup: ['Explore', 'scout'] },
   codexHandoffUsedPercent: 40,
+  codexQuotaCacheSeconds: 60,
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
   // Unlimited by default so the many unrelated tests sharing SID/state below (most never
   // issue the matching PostToolUse that would consume a reservation) cannot spuriously hit
@@ -101,6 +104,8 @@ function quotaEnv(name, claudeUsed, codexUsed, extraCfg) {
     ORCA_DOWN_FLAG_PATH: FLAG,
     ORCH_STATE_DIR: STATE_DIR,
     ORCH_CONFIG_PATH: configFile,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    STUB_CODEX_PRIMARY_USED: String(codexUsed),
     ORCA_BIN: STUB, CODEX_BIN: STUB,
   };
 }
@@ -111,12 +116,31 @@ let pass = 0;
 const failures = [];
 
 /** One hook invocation, as the CLI performs it. */
-function invoke(payload, env = CODEX_WINS) {
-  const r = spawnSync(process.execPath, [GATE], {
+function primeQuotaCache(env) {
+  // Most E2E cases exercise gate wiring, not the app-server protocol itself (covered by
+  // the unit suite). Prime the same live-cache format production writes so hundreds of
+  // unrelated hook subprocesses do not each pay for a JSON-RPC child process.
+  if (env.ORCH_STATE_DIR && env.STUB_CODEX_PRIMARY_USED !== undefined) {
+    fs.mkdirSync(env.ORCH_STATE_DIR, { recursive: true });
+    fs.writeFileSync(path.join(env.ORCH_STATE_DIR, 'codex-quota-live.json'), JSON.stringify({
+      usedPercent: Number(env.STUB_CODEX_PRIMARY_USED),
+      resetsAt: Math.floor(Date.now() / 1000) + 3600,
+      fetchedAt: Date.now(),
+    }));
+  }
+}
+
+function spawnGate(payload, env = CODEX_WINS) {
+  primeQuotaCache(env);
+  return spawnSync(process.execPath, [GATE], {
     input: JSON.stringify(payload),
     encoding: 'utf8',
     env,
   });
+}
+
+function invoke(payload, env = CODEX_WINS) {
+  const r = spawnGate(payload, env);
   return { code: r.status, err: (r.stderr || '').trim(), out: r.stdout || '' };
 }
 
@@ -388,10 +412,10 @@ expect('fable escalation naming opus (xhigh) is allowed',
 // Review regressions for --code-model and the auto-route banner text.
 {
   const RS = `${SID}-rv`;
-  const out = spawnSync(process.execPath, [GATE], { input: JSON.stringify(promptSubmit(RS, 'status?')), encoding: 'utf8', env: SONNET_WINS }).stdout;
+  const out = spawnGate(promptSubmit(RS, 'status?'), SONNET_WINS).stdout;
   if (/code -> in-session subagent \(Agent model "sonnet"\)/.test(out) && !/undefined/.test(out)) pass += 1;
   else failures.push(`auto route to the code model must name model "sonnet", never "undefined": ${out.slice(0, 200)}`);
-  const bare = spawnSync(process.execPath, [GATE], { input: JSON.stringify(promptSubmit(RS, 'please --code-model')), encoding: 'utf8', env: CODEX_WINS }).stdout;
+  const bare = spawnGate(promptSubmit(RS, 'please --code-model'), CODEX_WINS).stdout;
   if (/needs a value/.test(bare)) pass += 1; else failures.push('a bare --code-model must print a notice');
   invoke(promptSubmit(RS, '--code-model codex:openai/gpt-5'), CODEX_WINS);
   { const st = readState(RS); if (!st || st.execAgent == null) pass += 1; else failures.push(`a value with "/" must be rejected, not truncated (${st.execAgent})`); }
@@ -424,10 +448,10 @@ expect('fable escalation naming opus (xhigh) is allowed',
 // Light lookups: advised toward the lookup model, never blocked.
 {
   const payload = dispatch({ subagent_type: 'Explore', description: 'find where the loader is defined' });
-  const r = spawnSync(process.execPath, [GATE], { input: JSON.stringify(payload), encoding: 'utf8', env: CODEX_WINS });
+  const r = spawnGate(payload, CODEX_WINS);
   if (r.status === 0 && /Prefer model \\"haiku\\"|Prefer model "haiku"/.test(r.stdout)) pass += 1;
   else failures.push(`lookup dispatch should be allowed with a haiku advice (exit ${r.status}, stdout ${String(r.stdout).slice(0, 80)})`);
-  const r2 = spawnSync(process.execPath, [GATE], { input: JSON.stringify(dispatch({ subagent_type: 'Explore', description: 'find the loader', model: 'haiku' })), encoding: 'utf8', env: CODEX_WINS });
+  const r2 = spawnGate(dispatch({ subagent_type: 'Explore', description: 'find the loader', model: 'haiku' }), CODEX_WINS);
   if (r2.status === 0 && !/haiku/.test(r2.stdout)) pass += 1;
   else failures.push('a haiku lookup dispatch should pass silently');
 }
@@ -534,7 +558,7 @@ expect('a neutral scouting dispatch is allowed',
     ...BASE_ENV, CODEX_SESSIONS_DIR: path.join(dir, 'empty-codex'),
     CK_USAGE_CACHE_PATH: path.join(dir, 'no-such-claude-cache.json'),
     ORCA_DOWN_FLAG_PATH: FLAG, ORCH_STATE_DIR: STATE_DIR, ORCH_CONFIG_PATH: CONFIG_FILE,
-    ORCA_BIN: orcaBin, CODEX_BIN: codexBin,
+    ORCA_BIN: orcaBin, CODEX_BIN: codexBin, ORCH_CODEX_BIN: noCodexBin,
   });
   const FSID = `${SID}-fallback-nodata`;
   const codeBrief = { subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' };
@@ -563,7 +587,7 @@ expect('a neutral scouting dispatch is allowed',
 // The per-turn banner names the exact configured model id alongside its alias.
 {
   const RSID = `${SID}-modelid`;
-  const out = spawnSync(process.execPath, [GATE], { input: JSON.stringify(promptSubmit(RSID, 'status?')), encoding: 'utf8', env: CODEX_WINS }).stdout;
+  const out = spawnGate(promptSubmit(RSID, 'status?'), CODEX_WINS).stdout;
   if (/model "opus" \(claude-opus-5-5\)/.test(out)) pass += 1;
   else failures.push(`banner must show the review model's exact id: ${out.slice(0, 200)}`);
   rmState(RSID);
@@ -581,10 +605,10 @@ expect('a neutral scouting dispatch is allowed',
   const noLangEnv = quotaEnv('no-lang', 10, 30, { replyLanguage: null });
   const withLangEnv = quotaEnv('with-lang', 10, 30, { replyLanguage: 'Vietnamese' });
   const RSID = `${SID}-lang`;
-  const out1 = spawnSync(process.execPath, [GATE], { input: JSON.stringify(promptSubmit(RSID, 'status?')), encoding: 'utf8', env: noLangEnv }).stdout;
+  const out1 = spawnGate(promptSubmit(RSID, 'status?'), noLangEnv).stdout;
   if (!/Reply to the operator/.test(out1)) pass += 1; else failures.push('replyLanguage null must omit the language sentence');
   rmState(RSID);
-  const out2 = spawnSync(process.execPath, [GATE], { input: JSON.stringify(promptSubmit(RSID, 'status?')), encoding: 'utf8', env: withLangEnv }).stdout;
+  const out2 = spawnGate(promptSubmit(RSID, 'status?'), withLangEnv).stdout;
   if (/Reply to the operator in Vietnamese/.test(out2)) pass += 1; else failures.push('a configured replyLanguage must appear in the reminder');
   rmState(RSID);
 }
@@ -593,7 +617,7 @@ expect('a neutral scouting dispatch is allowed',
 {
   const t60Env = quotaEnv('threshold-60', 10, 30, { codexHandoffUsedPercent: 60 });
   const RSID = `${SID}-threshold`;
-  const out = spawnSync(process.execPath, [GATE], { input: JSON.stringify({ session_id: RSID, hook_event_name: 'SessionStart' }), encoding: 'utf8', env: t60Env }).stdout;
+  const out = spawnGate({ session_id: RSID, hook_event_name: 'SessionStart' }, t60Env).stdout;
   if (/>= 60% used/.test(out)) pass += 1; else failures.push(`SessionStart banner must reflect a configured threshold of 60: ${out.slice(0, 200)}`);
   rmState(RSID);
 }
@@ -647,10 +671,10 @@ rmState(`${SID}-hard-off`);
   fs.writeFileSync(beatF, JSON.stringify({ pid: process.pid, last_tick: Date.now(), interval: 20 }));
   const p1 = promptSubmit(HSID, 'status?');
   st.workers.ctx_e2e_fake.status = 'live'; fs.writeFileSync(stateF, JSON.stringify(st));
-  const out1 = spawnSync(process.execPath, [GATE], { input: JSON.stringify(p1), encoding: 'utf8', env: CODEX_WINS }).stdout;
+  const out1 = spawnGate(p1, CODEX_WINS).stdout;
   if (/Heartbeat daemon alive/.test(out1)) pass += 1; else failures.push(`reminder did not see a live heartbeat: ${out1.slice(0, 120)}`);
   fs.writeFileSync(beatF, JSON.stringify({ pid: 999999, last_tick: Date.now(), interval: 20 }));
-  const out2 = spawnSync(process.execPath, [GATE], { input: JSON.stringify(p1), encoding: 'utf8', env: CODEX_WINS }).stdout;
+  const out2 = spawnGate(p1, CODEX_WINS).stdout;
   if (/NO heartbeat daemon/.test(out2)) pass += 1; else failures.push(`reminder trusted a dead heartbeat pid: ${out2.slice(0, 120)}`);
   for (const f of [stateF, beatF]) { try { fs.unlinkSync(f); } catch {} }
 }
