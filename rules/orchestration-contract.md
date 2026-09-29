@@ -64,8 +64,9 @@ over later nouns: `Review ...`/`Plan ...` are review work, while `Implement ...`
 The operational first verbs `commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`,
 `deploy`, `update`, and `write` suppress later `review`, `plan`, or `design` tokens, but later
 code intent still routes to code. Review-oriented `subagent_type` values remain review signals
-unless the description starts with an execution verb. Intent keywords inside hyphenated compounds
-do not count, so `Commit review-fix round` remains operational rather than code work.
+unless the description contains code intent, which wins when both signals are present. Code intent
+inside ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` counts; only review-style
+prefixes such as `review-fix` are excluded, so `Commit review-fix round` remains operational.
 
 ## Activation
 
@@ -624,7 +625,7 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # all four suites (848 checks)
+npm test                                             # all four suites (854 checks)
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
 node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)

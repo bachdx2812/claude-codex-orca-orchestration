@@ -308,6 +308,9 @@ for (const description of [
   'Write code for Y',
   'Merge and implement follow-ups',
   'Tag release v2 and fix changelog',
+  'Re-implement the parser',
+  'Hot-fix the heartbeat',
+  'Bug-fix the heartbeat',
 ]) {
   const result = invoke(dispatch({ subagent_type: 'fullstack-developer', description, model: 'sonnet' }));
   if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
@@ -315,6 +318,10 @@ for (const description of [
 }
 expect('a neutral Commit verb is not misclassified by review-fix later in the description',
   dispatch({ subagent_type: 'git-manager', description: 'Commit review-fix round in worktree', model: 'sonnet' }), ALLOW);
+expect('a neutral Update verb is not misclassified by red-team-fix later in the description',
+  dispatch({ subagent_type: 'docs-manager', description: 'Update red-team-fix notes', model: 'sonnet' }), ALLOW);
+expect('a neutral Merge verb is not misclassified by plan-build later in the description',
+  dispatch({ subagent_type: 'git-manager', description: 'Merge the plan-build notes', model: 'sonnet' }), ALLOW);
 expect('a neutral Commit verb is not misclassified by a later plan noun',
   dispatch({ subagent_type: 'git-manager', description: 'Commit the plan file', model: 'sonnet' }), ALLOW);
 expect('a neutral Update verb is not misclassified by a later design noun',
@@ -345,6 +352,11 @@ for (const description of ['Generate code', 'Generate assets', 'Generate compone
   const result = invoke(dispatch({ subagent_type: 'code-reviewer', description: 'Implement the plan', model: 'sonnet' }));
   if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
   else failures.push(`an execution first verb must override code-reviewer review routing\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
+{
+  const result = invoke(dispatch({ subagent_type: 'code-reviewer', description: 'Update the parser to fix X', model: 'sonnet' }));
+  if (result.code === DENY && /route-execution-to-codex/.test(result.err) && !/route-review/.test(result.err)) pass += 1;
+  else failures.push(`code intent must override code-reviewer review routing\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
 }
 
 // Main panel vs Orca worker terminal, via the deterministic stub (never a live Orca).

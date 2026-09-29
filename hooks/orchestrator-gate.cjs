@@ -192,7 +192,7 @@ function redirectTargets(cmd) {
 
 // Intent of a dispatched task. Generic English verbs — not tied to any operator's roster.
 const PLAN_REVIEW_INTENT = /\b(plan|planning|design|review|reviewer|verify|verification|audit|red.?team|critique|assess|architect)\b/i;
-const EXEC_INTENT = /(?<![-\w])(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
+const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
@@ -1045,13 +1045,13 @@ function onPreToolUse(p, s, cfg) {
           : null;
     const planAt = hay.search(PLAN_REVIEW_INTENT);
     const execAt = hay.search(EXEC_INTENT);
-    const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(type);
-    const wantsPlanReview = firstIntent === 'review' ||
-      (firstIntent !== 'exec' && typeWantsPlanReview) ||
-      (!firstIntent && planAt >= 0 && (execAt < 0 || planAt < execAt));
     const wantsExec = firstIntent === 'exec' ||
       (firstIntent !== 'review' && execAt >= 0 &&
         (firstIntent === 'neutral' || planAt < 0 || execAt < planAt));
+    const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(type);
+    const wantsPlanReview = !wantsExec && (firstIntent === 'review' ||
+      (firstIntent !== 'exec' && typeWantsPlanReview) ||
+      (!firstIntent && planAt >= 0 && (execAt < 0 || planAt < execAt)));
     const model = String(input.model || '');
     const reviewAlias = cfg.models.review.alias;
     const escalationAlias = cfg.models.escalation.alias;

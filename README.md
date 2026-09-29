@@ -38,8 +38,9 @@ For Agent/Task descriptions, a recognized first verb governs intent before later
 route to code. Operational verbs (`commit`, `push`, `merge`, `publish`, `rebase`, `tag`,
 `release`, `deploy`, `update`, `write`) suppress later review nouns, so `Commit review-fix round`
 is not mistaken for review work; they do not suppress later code intent (`Update the parser to fix X`).
-Review-oriented `subagent_type` values still route to review unless the description starts with
-an execution verb.
+Code intent in ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` still counts; only
+review-style compounds such as `review-fix` are excluded. Code intent also overrides a
+review-oriented `subagent_type` when both signals are present.
 
 ## Subagents and parallel work
 
