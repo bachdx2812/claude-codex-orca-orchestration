@@ -71,18 +71,22 @@ orca terminal send --terminal <terminalHandle> --text "$(cat <spec-file>)" --ent
 orca orchestration worker-retain --dispatch <dispatchId>
 ```
 
-The retained row remains supervised: keep `orca-heartbeat.cjs` alive while waiting so it
-can wake the panel when the terminal becomes IDLE. `Stop` refuses an explicitly retained
-worker when no live heartbeat is watching it. Release it normally when the work is done.
+An explicitly retained row remains supervised even when its terminal was already quiet
+before the daemon started: keep `orca-heartbeat.cjs` alive while waiting so it can wake the
+panel when the terminal becomes IDLE. `Stop` refuses an explicitly retained worker when no
+live heartbeat is watching it. A readiness-failure row Orca labels `retained` is not treated
+as this operator decision unless this session actually ran `worker-retain`. Release it
+normally when the work is done.
 
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
 worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree
 too: `orca worktree rm --worktree path:<path>`. Never remove a worktree with an open PR or
 unsaved work; sweep periodically with `orca worktree ps --json`. `orca-heartbeat.cjs`
-backs this up: each tick it also checks `orca worktree ps --json` (`--limit 500`) but only
-evaluates paths owned by this session's run-scoped worker rows; another session's worktree
-can never produce its summary or wake event. A page
+backs this up: each tick it also checks `orca worktree ps --json` (`--limit 500`) and joins
+its `worktreeId` values to this session's nested worker resources/projections, worker-start
+replies, and tracked terminal rows (falling back to the path suffix after `::`). Another
+session's worktree can never produce its summary or wake event. A page
 Orca itself reports `truncated` is never acted on — a partial page can neither confirm nor
 rule out a transition — and reports a worktree that is not main, not archived; **accepted**
 (a linked GitHub PR or GitLab MR already merged/closed — an open one never counts, whatever
@@ -211,7 +215,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 791 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 826 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -220,7 +224,7 @@ binaries, the effective model-pin environment variable, and any foreign
 `orchestrator-gate.cjs` registration. Install warns and leaves a foreign gate intact by
 default; rerun with `--replace-foreign-gate` to remove those registrations under the
 normal `settings.json` backup. `--help`/`-h` only prints usage, and an unknown option exits
-2 without installing.
+2 without installing. Check mode exits 1 whenever it reports a `MISS`, `FAIL`, or `PROBLEM`.
 
 Full agent-facing install/verify/customise/rollback steps: `AGENT_INSTALL.md`.
 

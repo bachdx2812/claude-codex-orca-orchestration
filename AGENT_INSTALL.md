@@ -45,8 +45,10 @@ Full detail: `README.md#subagents-and-parallel-work`.
 orchestration worker-release --dispatch <id>`. Once its PR is merged/closed and the
 worktree is clean (no uncommitted or unpushed work), close it too: `orca worktree rm
 --worktree path:<path>`. Never remove a worktree with an open PR or unsaved work; sweep
-with `orca worktree ps --json`. The heartbeat filters that machine-wide list to worktree
-paths owned by this session's run-scoped workers; it never reports another session's path.
+with `orca worktree ps --json`. The heartbeat joins that machine-wide list by the real
+`worktreeId` carried in nested worker resources/projections, this session's worker-start
+replies, and tracked terminal rows (with the id's `::` path suffix as fallback); it never
+reports another session's path.
 `closeDoneWorktrees` (default `true`, or `ORCH_CLOSE_DONE_WORKTREES` set to
 `1`/`true`/`0`/`false`) controls whether
 `orca-heartbeat.cjs` reminds about this automatically — it judges a worktree as
@@ -143,6 +145,7 @@ Expect:
   `settings.json` — not just that the manifest claims to have added it.
 - Foreign gate check: any other registered `orchestrator-gate.cjs` is reported as a
   `PROBLEM`, even when this package is not installed yet.
+- Exit status: any emitted `MISS`, `FAIL`, or `PROBLEM` makes `--check` exit 1.
 - Effective environment: whether `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_FABLE_MODEL`
   are set in `settings.json`'s `env` block, a warning if `CLAUDE_CODE_SUBAGENT_MODEL` is
   set (it overrides subagent model routing and can fight this gate's instructions), and

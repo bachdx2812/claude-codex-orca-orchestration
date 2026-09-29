@@ -121,6 +121,16 @@ const lookalikeSettings = JSON.parse(fs.readFileSync(path.join(lookalike.home, '
 check('--replace-foreign-gate preserves test-orchestrator-gate.cjs',
   JSON.stringify(lookalikeSettings).includes('/custom/hooks/test-orchestrator-gate.cjs'), true);
 
+const missingHome = 'check-missing-artifact';
+const installedForMissing = run([], missingHome);
+check('fixture install for missing-artifact check succeeds', installedForMissing.status, 0);
+const missingManifest = JSON.parse(fs.readFileSync(
+  path.join(installedForMissing.home, '.claude', 'hooks', 'orchestration', 'install-manifest.json'), 'utf8'));
+fs.unlinkSync(path.join(installedForMissing.home, '.claude', 'hooks', 'orchestration', missingManifest.files[0]));
+const missingCheck = run(['--check'], missingHome);
+check('--check prints MISS for a missing installed artifact', /\bMISS\b/.test(missingCheck.stdout), true);
+check('--check exits 1 whenever it prints MISS', missingCheck.status, 1);
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`${passed} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  FAIL ${failure}`);

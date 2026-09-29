@@ -227,6 +227,14 @@ check('a terminal that existed at baseline and stayed quiet is ignored',
   heartbeat.classifyTerminal({ handle: 'old', preview: '', lastOutputAt: ctx.started - 60000 }, ctx).kind,
   'ignored');
 
+check('an explicitly retained terminal that was already quiet before startup is idle',
+  heartbeat.classifyTerminal(
+    { handle: 'retained-old', preview: '', lastOutputAt: ctx.started - 60000 },
+    { ...ctx, baseHandles: new Set(['retained-old']), ownHandles: new Set(['retained-old']),
+      retainedHandles: new Set(['retained-old']) }
+  ).kind,
+  'idle');
+
 check('a terminal that existed at baseline but produced output since is supervised, and is idle',
   heartbeat.classifyTerminal({ handle: 'old', preview: '', lastOutputAt: NOW - 200000 }, ctx).kind,
   'idle');
@@ -258,13 +266,15 @@ check('a foreign terminal that produced output after startup is ignored',
 }
 
 check('an explicitly retained terminal is not a finished-worker resource leak',
-  heartbeat.isHoldingResources({ terminalState: 'retained' }), false);
+  heartbeat.isHoldingResources({ terminalState: 'retained' }, true), false);
+check('an Orca auto-retained readiness failure still holds resources without explicit worker-retain',
+  heartbeat.isHoldingResources({ terminalState: 'retained' }, false), true);
 check('a released worker holds nothing',
   heartbeat.isHoldingResources({ terminalState: 'released' }), false);
 check('a retained worker terminal remains in the session supervision set',
   [...heartbeat.sessionTerminalHandles([
     { workerState: 'failed', terminalState: 'retained', agentTerminalHandle: 'term_retained' },
-  ])],
+  ], { workers: { ctx_retained: { status: 'live', retained: true, group: 'ctx_retained' } } })],
   ['term_retained']);
 check('heartbeat event snapshots exclude unsupervised context-only rows',
   [...heartbeat.snapshotWorkers([

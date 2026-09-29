@@ -272,9 +272,11 @@ orca orchestration worker-retain --dispatch <dispatchId>
 ```
 
 An explicitly retained row is supervised work, not a finished-terminal leak. The heartbeat
-continues watching its terminal for IDLE, and `Stop` is allowed only while that heartbeat is
-alive; without a live daemon the retained worker is refused as `workers-unwatched`. Release
-the worker when it is no longer needed.
+continues watching its terminal for IDLE even when it was already quiet before daemon
+startup, and `Stop` is allowed only while that heartbeat is alive; without a live daemon the
+retained worker is refused as `workers-unwatched`. Orca's automatic
+`terminalState: retained` on a readiness failure does not get this exemption unless this
+session recorded an explicit `worker-retain`. Release the worker when it is no longer needed.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
@@ -291,9 +293,11 @@ After a worker finishes: read its result, then `orca orchestration worker-releas
 periodically with `orca worktree ps --json` to find worktrees nobody closed.
 
 The heartbeat daemon backs this up automatically: each tick it also reads `orca worktree
-ps --json --limit 500`, then filters that machine-wide page to paths owned by this
-session's run-scoped worker rows. Another session's worktree is never summarized or emitted
-as a wake event. A page Orca itself marks `truncated` is never acted on — a partial
+ps --json --limit 500`, then filters that machine-wide page by joining the real
+`worktreeId` to this session's run-scoped worker rows (`resource.worktreeId` or
+`projection.workspace.id`), worker-start replies, and tracked terminal rows; the absolute
+path suffix after `::` is the compatibility fallback. Another session's worktree is never
+summarized or emitted as a wake event. A page Orca itself marks `truncated` is never acted on — a partial
 page can neither confirm nor rule out a transition — and flags a worktree that is not the
 main worktree, not already archived, and that is:
   - **idle** — no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt`
@@ -378,7 +382,10 @@ is closed by a file lock around "reload the state fresh from disk under the lock
 count, then reserve, then save" — every process that races this section reads the
 PREVIOUS winner's just-saved reservation, not a stale pre-lock snapshot, so the losing
 call sees the winner's reservation and is refused before either registers a real worker,
-and one process's save can never silently overwrite another's.
+and one process's save can never silently overwrite another's. A byte-identical command is
+only treated as a retry that may replace its unresolved same-hash reservation once that
+reservation is at least two seconds old; a fresh one can be a second call in the same
+parallel batch and must still see the first reservation.
 
 **`max-parallel-agents`.** A MACHINE-wide budget, on top of (never instead of) the
 Codex-only cap above: the resource is this machine's cores, not any one session's own
@@ -556,7 +563,9 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
 Codex workers and file ownership" above). `reservations` and `agentClaims` are both
 transient — a reservation is consumed by the matching `PostToolUse` (dropped outright on a
 failed tool call or an Orca `"ok":false` reply, or expires after 10 minutes if nothing ever
-resolves it), and an `agentClaims` entry is removed at release, whichever of the paths
+resolves it). A genuine `UserPromptSubmit` does not sweep Bash reservations because the
+tool call may still be in flight; `Stop`, explicit release, reply consumption, and TTL are
+the safe cleanup paths. An `agentClaims` entry is removed at release, whichever of the paths
 above fires first. A worker Orca reports done but still holding its terminal is marked
 `capExempt: true` — it no longer counts toward `maxParallelCodexWorkers`, but stays `live`
 so the Stop gate still catches it as an unreleased resource. An `agentClaims` entry from a

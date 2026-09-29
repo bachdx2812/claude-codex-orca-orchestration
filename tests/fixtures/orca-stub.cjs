@@ -63,7 +63,11 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
   process.exit(0);
 }
 if (args[0] === 'terminal' && args[1] === 'list') {
-  process.stdout.write(JSON.stringify({ result: { terminals: [] } }));
+  let terminals = [];
+  if (process.env.STUB_TERMINALS_JSON) {
+    try { terminals = JSON.parse(process.env.STUB_TERMINALS_JSON); } catch { terminals = []; }
+  }
+  process.stdout.write(JSON.stringify({ result: { terminals } }));
   process.exit(0);
 }
 if (args[0] === 'worktree' && args[1] === 'ps') {

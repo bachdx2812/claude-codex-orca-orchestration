@@ -30,6 +30,11 @@ const OWNS_BRIEF_HELP =
   'markdown-bold "**Owns:**" or an "Owns:" appearing mid-sentence is not read.)\n' +
   'Or isolate it: --worktree new-child / Agent isolation:"worktree".';
 
+// A same-command reservation younger than this may belong to a genuinely parallel,
+// byte-for-byte identical tool call. Only an older unresolved reservation is evidence of
+// the later-hook-denial retry case this replacement path exists to recover from.
+const SAME_COMMAND_RETRY_AGE_MS = 2000;
+
 /**
  * The agent a `worker-start` invocation targets: the explicit `--agent`, else — only when
  * `--terminal <h>` names a still-live tracked group — that group's own stored agent, else
@@ -286,7 +291,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     // A later exact retry in the same session is the same attempted dispatch, not a
     // competing owner: replace its unresolved reservation before overlap/cap accounting.
     for (const [key, reservation] of Object.entries(s.reservations || {})) {
-      if (reservation && reservation.commandHash === commandHash) delete s.reservations[key];
+      if (reservation && reservation.commandHash === commandHash &&
+          Number.isFinite(reservation.ts) && Date.now() - reservation.ts >= SAME_COMMAND_RETRY_AGE_MS) {
+        delete s.reservations[key];
+      }
     }
     // A finite cap cannot be evaluated safely after its one long acquisition attempt failed.
     // Refuse now instead of entering the at-cap reconcile branch and paying the same long

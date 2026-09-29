@@ -687,8 +687,11 @@ function versionOf(bin, args = ['--version']) {
 
 function check() {
   checkPlatform();
+  let checkFailed = false;
   log('--- prerequisites ---');
-  log(`node: ${process.version} (${process.version.replace('v', '').split('.').map(Number)[0] >= 18 ? 'OK, >= 18' : 'TOO OLD, need >= 18'})`);
+  const nodeOk = process.version.replace('v', '').split('.').map(Number)[0] >= 18;
+  log(`node: ${process.version} (${nodeOk ? 'OK, >= 18' : 'FAIL, need >= 18'})`);
+  if (!nodeOk) checkFailed = true;
   log(`claude: ${which('claude') ? (versionOf('claude') || 'present') : 'NOT FOUND on PATH'}`);
   const hasOrca = which('orca');
   log(`orca: ${hasOrca ? (versionOf('orca') || 'present') : 'NOT FOUND on PATH'}`);
@@ -713,24 +716,30 @@ function check() {
   if (foreign.length) {
     log(`  PROBLEM: ${foreign.length} foreign orchestrator-gate.cjs registration(s) found in ${SETTINGS_FILE}:`);
     for (const item of foreign) log(`    ${item.event} matcher "${item.matcher}": ${item.command}`);
-    process.exitCode = 1;
+    checkFailed = true;
   } else {
     log('  OK   no foreign orchestrator-gate.cjs registrations');
   }
   if (!manifest) {
     log('Not installed (no install manifest at ' + MANIFEST_FILE + ').');
+    if (checkFailed) process.exitCode = 1;
     return;
   }
   log(`Installed: ${manifest.installedAt}`);
   for (const rel of manifest.files) {
     const p = path.join(HOOKS_DIR, rel);
-    log(`  ${fs.existsSync(p) ? 'OK  ' : 'MISS'} ${p}`);
+    const present = fs.existsSync(p);
+    log(`  ${present ? 'OK  ' : 'MISS'} ${p}`);
+    if (!present) checkFailed = true;
   }
-  log(`  ${fs.existsSync(RULES_FILE) ? 'OK  ' : 'MISS'} ${RULES_FILE}`);
-  log(`  ${fs.existsSync(CONFIG_FILE) ? 'OK  ' : 'MISS'} ${CONFIG_FILE}`);
-  log(`  ${fs.existsSync(SETTINGS_FILE) ? 'OK  ' : 'MISS'} ${SETTINGS_FILE}`);
+  for (const p of [RULES_FILE, CONFIG_FILE, SETTINGS_FILE]) {
+    const present = fs.existsSync(p);
+    log(`  ${present ? 'OK  ' : 'MISS'} ${p}`);
+    if (!present) checkFailed = true;
+  }
   const nodeExists = fs.existsSync(manifest.nodePath);
   log(`  node path recorded at install: ${manifest.nodePath} (${nodeExists ? 'exists' : 'MISSING - run --repair'})`);
+  if (!nodeExists) checkFailed = true;
   if (looksVersioned(manifest.nodePath)) {
     warn(`the recorded node path sits inside a version-numbered directory (${manifest.nodePath}) - a Node ` +
       'upgrade or uninstall can remove it out from under the hooks. Run --repair to re-point at the current PATH node.');
@@ -742,6 +751,7 @@ function check() {
     const present = Array.isArray(settingsNow.hooks?.[event])
       && settingsNow.hooks[event].some((e) => entryMatches(e, rec.matcher, rec.command));
     log(`  ${present ? 'OK  ' : 'MISS'} ${event} (matcher "${rec.matcher}")`);
+    if (!present) checkFailed = true;
   }
 
   log('\n--- effective environment ---');
@@ -766,6 +776,7 @@ function check() {
   } catch (err) {
     warn(`could not evaluate the installed config: ${err.message}`);
   }
+  if (checkFailed) process.exitCode = 1;
 }
 
 function repair() {

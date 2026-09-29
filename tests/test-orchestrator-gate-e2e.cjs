@@ -868,6 +868,20 @@ rmState(`${SID}-hard-off`);
     rmState(RaceSID);
   }
 
+  // Two genuinely parallel tool calls can carry byte-for-byte identical commands. A fresh
+  // same-hash reservation belongs to the first in-flight call, not a denied/retried call.
+  {
+    const CAP1 = quotaEnv('cap-1-identical-race', 10, 30, { maxParallelCodexWorkers: 1 });
+    const RaceSID = `${SID}-cap-identical-race`;
+    const command = 'orca orchestration worker-start --agent codex --task identical';
+    rmState(RaceSID);
+    expect('identical cap race: the first worker-start reserves the only opening',
+      mainBash(command, { sid: RaceSID, tool_use_id: 'toolu_identical_1' }), ALLOW, CAP1);
+    expect('identical cap race: a second fresh same-command start is refused while the first is in flight',
+      mainBash(command, { sid: RaceSID, tool_use_id: 'toolu_identical_2' }), DENY, CAP1);
+    rmState(RaceSID);
+  }
+
   // A failed start ("ok": false) drops its reservation instead of leaving it live forever.
   {
     const CAP1 = quotaEnv('cap-1-fail', 10, 30, { maxParallelCodexWorkers: 1 });
@@ -2058,6 +2072,9 @@ function withHeldLock(lockDir, fn) {
   rmState(sid);
   expect('pending retry: the original worker-start reserves its claim and slot',
     mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_pending_original' }), ALLOW, env);
+  const aged = readState(sid);
+  aged.reservations['toolu_pending_original#0'].ts = Date.now() - 3000;
+  fs.writeFileSync(path.join(STATE_DIR, `${sid}.json`), JSON.stringify(aged));
   expect('pending retry: the exact same command replaces its unresolved reservation',
     mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_pending_retry' }), ALLOW, env);
   const afterRetry = readState(sid);
@@ -2072,9 +2089,9 @@ function withHeldLock(lockDir, fn) {
   rmState(sid);
 }
 
-// 15. The next genuine operator prompt and Stop both sweep unresolved Bash reservations,
-// just as they already sweep leaked foreground Agent registrations.
-for (const event of ['UserPromptSubmit', 'Stop']) {
+// 15. Stop sweeps unresolved Bash reservations. UserPromptSubmit cannot: the Bash call may
+// still be in flight, and its eventual PostToolUse needs the reservation's Owns claim.
+for (const event of ['Stop']) {
   const env = quotaEnv(`pending-sweep-${event.toLowerCase()}`, 10, 30, { maxParallelCodexWorkers: 1 });
   const sid = `pending-sweep-${event.toLowerCase()}`;
   const command = `orca orchestration worker-start --agent codex --task ${event.toLowerCase()}`;
@@ -2087,6 +2104,41 @@ for (const event of ['UserPromptSubmit', 'Stop']) {
   const after = readState(sid);
   checkBool(`pending sweep (${event}): unresolved reservations are removed`,
     Object.keys(after.reservations || {}).length === 0, true);
+  rmState(sid);
+}
+
+{
+  const env = quotaEnv('pending-prompt-in-flight', 10, 30, { maxParallelCodexWorkers: 2 });
+  const sid = 'pending-prompt-in-flight';
+  const command = 'orca orchestration worker-start --agent codex --spec "implement a.\nVerify: npm test\nOwns: src/in-flight.ts"';
+  rmState(sid);
+  invoke(mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_in_flight' }), env);
+  invoke(promptSubmit(sid, 'keep supervising while that Bash call runs'), env);
+  invoke(postBash(command, '{"dispatchId":"ctx_in_flight"}',
+    { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_in_flight' }), env);
+  const after = readState(sid);
+  checkBool('in-flight prompt: worker registration retains the reservation Owns claim',
+    JSON.stringify(after.workers.ctx_in_flight?.owns), JSON.stringify(['src/in-flight.ts']));
+  const overlap = invoke(mainBash(
+    'orca orchestration worker-start --agent codex --spec "implement b.\nVerify: npm test\nOwns: src/in-flight.ts"',
+    { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_in_flight_overlap' }), env);
+  checkBool('in-flight prompt: a later overlapping dispatch is still refused',
+    overlap.code === DENY && /ownership-overlap/.test(overlap.err), true);
+  rmState(sid);
+}
+
+{
+  const env = quotaEnv('worker-reply-worktree-id', 10, 30, { maxParallelCodexWorkers: 2 });
+  const sid = 'worker-reply-worktree-id';
+  const command = 'orca orchestration worker-start --agent codex --task worktree-id';
+  rmState(sid);
+  invoke(mainBash(command, { sid, tool_use_id: 'toolu_worktree_id' }), env);
+  invoke(postBash(command,
+    '{"result":{"dispatchId":"ctx_worktree_id","resource":{"worktreeId":"repo_reply::/tmp/reply-wt"}}}',
+    { sid, tool_use_id: 'toolu_worktree_id' }), env);
+  checkBool('worker-start reply: real nested worktreeId is retained in session state',
+    JSON.stringify(readState(sid).workers.ctx_worktree_id?.worktreeIds),
+    JSON.stringify(['repo_reply::/tmp/reply-wt']));
   rmState(sid);
 }
 
@@ -2203,30 +2255,43 @@ for (const event of ['UserPromptSubmit', 'Stop']) {
  * (or is force-killed after 8s as a safety net). */
 function runHeartbeat({
   name, worktrees, args, cfgOverrides, envOverrides, gitEnv, mutateAfterCalls, mutateTo,
-  dirName, sessionName, workerRows,
+  dirName, sessionName, workerRows, terminalRows, seedState,
 }) {
   return new Promise((resolve) => {
     const dir = path.join(RUN_DIR, dirName || `hb-${name}`);
     fs.mkdirSync(dir, { recursive: true });
     const cfgFile = path.join(dir, 'orchestration.config.json');
     fs.writeFileSync(cfgFile, JSON.stringify({ ...DEFAULT_CFG, ...cfgOverrides }));
+    const withRealWorktreeIds = (rows) => (rows || []).map((w) =>
+      w && typeof w.path === 'string' && !w.worktreeId
+        ? { ...w, worktreeId: `repo_hb::${w.path}` }
+        : w);
+    const initialWorktrees = withRealWorktreeIds(worktrees);
     const wtFile = path.join(dir, 'worktrees.json');
-    fs.writeFileSync(wtFile, JSON.stringify(worktrees || []));
+    fs.writeFileSync(wtFile, JSON.stringify(initialWorktrees));
     const callsLogFile = path.join(dir, 'wt-calls.log');
     const scopedWorkerRows = workerRows === undefined
-      ? (worktrees || []).filter((w) => w && typeof w.path === 'string').map((w, i) => ({
+      ? initialWorktrees.filter((w) => w && typeof w.path === 'string').map((w, i) => ({
         dispatchId: `ctx_hb_${i}`,
         workerState: 'running',
         dispatchStatus: 'running',
         terminalState: 'active',
-        worktreePath: w.path,
-        resource: { path: w.path },
+        resource: { worktreeId: w.worktreeId },
+        projection: { workspace: { id: w.worktreeId } },
       }))
       : workerRows;
+    const heartbeatSession = `hb-${sessionName || name}-${process.pid}`;
+    if (seedState) {
+      fs.writeFileSync(path.join(dir, `${heartbeatSession}.json`), JSON.stringify({
+        session_id: heartbeatSession, workers: {}, reservations: {}, agentClaims: {}, agents: {}, tasks: {},
+        ...seedState,
+      }));
+    }
     const env = {
       ...BASE_ENV, ORCA_BIN: STUB, ORCH_GIT_BIN: GIT_STUB, ORCH_STATE_DIR: dir, ORCH_CONFIG_PATH: cfgFile,
-      CLAUDE_CODE_SESSION_ID: `hb-${sessionName || name}-${process.pid}`, STUB_WORKTREES_JSON: `@${wtFile}`,
+      CLAUDE_CODE_SESSION_ID: heartbeatSession, STUB_WORKTREES_JSON: `@${wtFile}`,
       STUB_WORKTREE_PS_CALLS_LOG: callsLogFile, STUB_WORKERS_JSON: JSON.stringify(scopedWorkerRows),
+      STUB_TERMINALS_JSON: JSON.stringify(terminalRows || []),
       STUB_GIT_CLEAN: '1', STUB_GIT_HAS_UPSTREAM: '1',
       ...(gitEnv || {}), ...(envOverrides || {}),
     };
@@ -2236,7 +2301,7 @@ function runHeartbeat({
     child.stderr.on('data', (d) => { out += d; });
     if (mutateAfterCalls != null) {
       waitForCalls(callsLogFile, mutateAfterCalls).then(() => {
-        try { fs.writeFileSync(wtFile, JSON.stringify(mutateTo)); } catch {}
+        try { fs.writeFileSync(wtFile, JSON.stringify(withRealWorktreeIds(mutateTo))); } catch {}
       });
     }
     const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 8000);
@@ -2306,7 +2371,8 @@ async function heartbeatWorktreeTests() {
           liveTerminalCount: 1, linkedPR: { state: 'open', number: 502 } },
       ],
       workerRows: [{ dispatchId: 'ctx_session_owned', workerState: 'running', dispatchStatus: 'running',
-        terminalState: 'active', worktreePath: owned, resource: { path: owned } }],
+        terminalState: 'active', resource: { worktreeId: `repo_hb::${owned}` },
+        projection: { workspace: { id: `repo_hb::${owned}` } } }],
       mutateAfterCalls: 1,
       mutateTo: [
         { path: owned, displayName: 'session-owned', isMainWorktree: false, isArchived: false,
@@ -2320,6 +2386,59 @@ async function heartbeatWorktreeTests() {
       out.includes('DONE worktree session-owned'), true);
     checkBool('done-worktree reminder never reports another session\'s worktree',
       out.includes('foreign-session'), false);
+  }
+
+  // Readiness failures can have resource:null; projection.workspace.id is the real fallback.
+  {
+    const p = realWtDir('projection-owned');
+    const worktreeId = `repo_hb::${p}`;
+    const out = await runHeartbeat({
+      name: 'projection-owned',
+      worktrees: [{ path: p, worktreeId, displayName: 'projection-owned', isMainWorktree: false,
+        isArchived: false, liveTerminalCount: 0, linkedPR: { state: 'merged', number: 31 } }],
+      workerRows: [{ dispatchId: 'ctx_projection', workerState: 'failed', dispatchStatus: 'failed',
+        terminalState: 'retained', resource: null, projection: { workspace: { id: worktreeId } } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('real row shape: projection.workspace.id owns a worktree when resource is null',
+      out.includes(`pre-existing done-but-open worktree(s) at startup: projection-owned (${p})`), true);
+  }
+
+  // A worktree created by this session can be recovered from its tracked terminal row even
+  // when worker-list has not yet attached a resource/projection worktree id.
+  {
+    const p = realWtDir('terminal-owned');
+    const worktreeId = `repo_hb::${p}`;
+    const out = await runHeartbeat({
+      name: 'terminal-owned',
+      worktrees: [{ path: p, worktreeId, displayName: 'terminal-owned', isMainWorktree: false,
+        isArchived: false, liveTerminalCount: 0, linkedPR: { state: 'merged', number: 32 } }],
+      workerRows: [],
+      terminalRows: [{ handle: 'term_session_created', title: 'created', lastOutputAt: 0,
+        worktreePath: p, worktreeId }],
+      seedState: { workers: { term_session_created: { status: 'live', kind: 'terminal',
+        group: 'term_session_created', started: Date.now() } } },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('real row shape: a tracked session terminal contributes its worktreeId',
+      out.includes(`pre-existing done-but-open worktree(s) at startup: terminal-owned (${p})`), true);
+  }
+
+  // M-1: an explicit worker-retain decision makes a baseline-old retained terminal
+  // supervised even when it emitted nothing after daemon startup.
+  {
+    const old = Date.now() - 60_000;
+    const out = await runHeartbeat({
+      name: 'explicit-retained-idle', worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_explicit_retained', workerState: 'failed', dispatchStatus: 'failed',
+        terminalState: 'retained', agentTerminalHandle: 'term_explicit_retained' }],
+      terminalRows: [{ handle: 'term_explicit_retained', title: 'explicit retained', lastOutputAt: old }],
+      seedState: { workers: { ctx_explicit_retained: { status: 'live', retained: true,
+        group: 'ctx_explicit_retained', started: old } } },
+      args: ['--interval', '1', '--idle', '2', '--max', '3'],
+    });
+    checkBool('explicit retained terminal silent before daemon startup is reported IDLE',
+      out.includes('IDLE') && out.includes('term_explicit_retained'), true);
   }
 
   // 1. A worktree already done-but-open at startup: only the one-time summary line, never

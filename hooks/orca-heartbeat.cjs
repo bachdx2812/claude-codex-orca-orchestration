@@ -143,6 +143,7 @@ function terminals() {
     orphaned: !!t.orphaned,
     connected: !!t.connected,
     worktreePath: t.worktreePath || '',
+    worktreeId: t.worktreeId || '',
   }));
 }
 
@@ -158,6 +159,11 @@ function workers() {
     dispatchStatus: w.dispatchStatus,
     terminalState: w.terminalState,
     agentTerminalHandle: w.agentTerminalHandle || '',
+    worktreeIds: [
+      w.worktreeId,
+      w.resource && w.resource.worktreeId,
+      w.projection && w.projection.workspace && w.projection.workspace.id,
+    ].filter((candidate) => typeof candidate === 'string' && candidate.length > 0),
     worktreePaths: [
       w.worktreePath,
       w.resourcePath,
@@ -168,25 +174,77 @@ function workers() {
   }));
 }
 
-/** Worktree paths owned by this run-scoped worker list. */
+/** Every stable join key for a worktree id/path. Real Orca ids are `<repoId>::<abs path>`;
+ * the suffix keeps the reminder compatible with older rows that expose only the path. */
+function worktreeKeys(worktreeId, worktreePath) {
+  const keys = new Set();
+  if (typeof worktreeId === 'string' && worktreeId) {
+    keys.add(worktreeId);
+    const split = worktreeId.indexOf('::');
+    if (split >= 0 && worktreeId.slice(split + 2)) keys.add(worktreeId.slice(split + 2));
+  }
+  if (typeof worktreePath === 'string' && worktreePath) keys.add(worktreePath);
+  return keys;
+}
+
+/** Worktree ids/paths owned by this run-scoped worker list. */
 function workerWorktreePaths(workerRows) {
   const owned = new Set();
   for (const worker of workerRows || []) {
+    for (const id of worker?.worktreeIds || []) {
+      for (const key of worktreeKeys(id, '')) owned.add(key);
+    }
     for (const candidate of worker?.worktreePaths || []) owned.add(candidate);
+  }
+  return owned;
+}
+
+function loadSessionState() {
+  try { return JSON.parse(fs.readFileSync(path.join(DIR, `${SESSION}.json`), 'utf8')); }
+  catch { return { workers: {} }; }
+}
+
+function stateWorkerForRow(row, state) {
+  const ids = [row?.dispatchId, row?.taskId, row?.agentTerminalHandle].filter(Boolean);
+  for (const id of ids) if (state?.workers?.[id]) return state.workers[id];
+  return null;
+}
+
+function retainedTerminalHandles(workerRows, state = loadSessionState()) {
+  const handles = new Set();
+  for (const row of workerRows || []) {
+    if (row && row.agentTerminalHandle && stateWorkerForRow(row, state)?.retained) {
+      handles.add(row.agentTerminalHandle);
+    }
+  }
+  return handles;
+}
+
+/** Add worktrees recorded in this session's worker-start/terminal-create replies and the
+ * terminal-list rows for handles this session tracks. */
+function sessionWorktreeKeys(workerRows, terminalRows, ownHandles, state = loadSessionState()) {
+  const owned = workerWorktreePaths(workerRows);
+  for (const worker of Object.values(state.workers || {})) {
+    for (const id of worker?.worktreeIds || []) {
+      for (const key of worktreeKeys(id, '')) owned.add(key);
+    }
+  }
+  for (const terminal of terminalRows || []) {
+    if (!terminal || !ownHandles.has(terminal.handle)) continue;
+    for (const key of worktreeKeys(terminal.worktreeId, terminal.worktreePath)) owned.add(key);
   }
   return owned;
 }
 
 /** Terminal handles this session owns: worker-list is run-scoped, while the gate's own
  * session state also records bare `terminal create` replies that have no worker row. */
-function sessionTerminalHandles(workerRows) {
+function sessionTerminalHandles(workerRows, state = loadSessionState()) {
   const panelHandle = process.env.ORCA_TERMINAL_HANDLE || '';
   const handles = new Set((workerRows || [])
     .filter((w) => w && w.workerState !== 'unsupervised')
     .map((w) => w.agentTerminalHandle)
     .filter((handle) => handle && handle !== panelHandle));
   try {
-    const state = JSON.parse(fs.readFileSync(path.join(DIR, `${SESSION}.json`), 'utf8'));
     for (const [id, worker] of Object.entries(state.workers || {})) {
       if (worker && worker.status === 'live' && id !== panelHandle &&
           (worker.kind === 'terminal' || /^term_/.test(id))) handles.add(id);
@@ -196,8 +254,9 @@ function sessionTerminalHandles(workerRows) {
 }
 
 /** A worker still consuming machine resources, whatever its task status says. */
-function isHoldingResources(w) {
-  return w.terminalState && !['released', 'retained'].includes(w.terminalState);
+function isHoldingResources(w, explicitlyRetained = false) {
+  return !!w.terminalState && w.terminalState !== 'released' &&
+    !(w.terminalState === 'retained' && explicitlyRetained);
 }
 
 /**
@@ -231,6 +290,7 @@ function worktrees() {
       .filter((w) => w && typeof w.path === 'string')
       .map((w) => ({
         path: w.path,
+        worktreeId: typeof w.worktreeId === 'string' ? w.worktreeId : '',
         displayName: w.displayName || w.path,
         isMainWorktree: !!w.isMainWorktree,
         isArchived: !!w.isArchived,
@@ -546,7 +606,8 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
     // first seed, every row must still be evaluated once to establish the backlog / diff
     // against a persisted restart, so nothing is skipped yet at that point.
     const isSeedingPass = !doneWtSeeded;
-    const sessionRows = data.rows.filter((w) => w && ownedWorktreePaths.has(w.path));
+    const sessionRows = data.rows.filter((w) => w &&
+      [...worktreeKeys(w.worktreeId, w.path)].some((key) => ownedWorktreePaths.has(key)));
     const candidates = isSeedingPass
       ? sessionRows
       : sessionRows.filter((w) => !reportedDoneWorktrees.has(w.path));
@@ -621,7 +682,8 @@ function classifyTerminal(t, ctx) {
   if (!ctx.ownHandles || !ctx.ownHandles.has(t.handle)) return { kind: 'ignored' };
   if (RATE_LIMIT.test(t.preview || '')) return { kind: 'rate_limit' };
   if (t.orphaned) return { kind: 'orphaned' };
-  const supervised = !ctx.baseHandles.has(t.handle) || t.lastOutputAt > ctx.started;
+  const supervised = (ctx.retainedHandles && ctx.retainedHandles.has(t.handle)) ||
+    !ctx.baseHandles.has(t.handle) || t.lastOutputAt > ctx.started;
   if (!supervised || !t.lastOutputAt) return { kind: 'ignored' };
   const quiet = Math.round((ctx.now - t.lastOutputAt) / 1000);
   return quiet >= ctx.idleSeconds ? { kind: 'idle', quiet } : { kind: 'working', quiet };
@@ -643,6 +705,7 @@ function main() {
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => process.exit(0));
   const baseTerms = terminals();
   const baseWorkers = workers();
+  const sessionState = loadSessionState();
 
   if (baseTerms === null && baseWorkers === null) {
     console.log('orca-heartbeat: Orca is not answering; no supervision is possible.');
@@ -654,8 +717,9 @@ function main() {
   // Baseline: only deviations from this state are worth waking the panel for.
   const baseTermHandles = new Set((baseTerms || []).map((t) => t.handle));
   const baseWorkerState = snapshotWorkers(baseWorkers || []);
-  const ownedWorktreePaths = workerWorktreePaths(baseWorkers || []);
-  const ownTerminalHandles = sessionTerminalHandles(baseWorkers || []);
+  const ownTerminalHandles = sessionTerminalHandles(baseWorkers || [], sessionState);
+  const explicitRetainedHandles = retainedTerminalHandles(baseWorkers || [], sessionState);
+  const ownedWorktreePaths = sessionWorktreeKeys(baseWorkers || [], baseTerms || [], ownTerminalHandles, sessionState);
   let prevWorkers = new Map(baseWorkerState);
   const reportedIdle = new Set();
   const reportedRateLimit = new Set();
@@ -697,6 +761,7 @@ function main() {
     if (ws) {
       for (const worktreePath of workerWorktreePaths(ws)) ownedWorktreePaths.add(worktreePath);
       for (const handle of sessionTerminalHandles(ws)) ownTerminalHandles.add(handle);
+      for (const handle of retainedTerminalHandles(ws)) explicitRetainedHandles.add(handle);
       const cur = snapshotWorkers(ws);
       for (const [id, state] of cur) {
         const before = prevWorkers.get(id);
@@ -712,7 +777,7 @@ function main() {
         (w) =>
           w.workerState !== 'unsupervised' &&
           ['succeeded', 'failed', 'stopped'].includes(w.workerState) &&
-          isHoldingResources(w) &&
+          isHoldingResources(w, !!stateWorkerForRow(w, loadSessionState())?.retained) &&
           baseWorkerState.get(w.dispatchId) !== `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`
       );
       if (newDoneHolding.length) {
@@ -733,9 +798,10 @@ function main() {
       // Re-read gate state each tick so a bare terminal created after daemon startup joins
       // this session's set even though it has no worker-list row.
       for (const handle of sessionTerminalHandles(ws || [])) ownTerminalHandles.add(handle);
+      for (const key of sessionWorktreeKeys(ws || [], ts, ownTerminalHandles)) ownedWorktreePaths.add(key);
       const ctx = {
         baseHandles: baseTermHandles, ownHandles: ownTerminalHandles,
-        started, now, idleSeconds: IDLE_SECONDS,
+        retainedHandles: explicitRetainedHandles, started, now, idleSeconds: IDLE_SECONDS,
       };
       for (const t of ts) {
         const verdict = classifyTerminal(t, ctx);
@@ -777,7 +843,7 @@ if (require.main === module) main();
 
 module.exports = {
   classifyTerminal, isHoldingResources, snapshotWorkers, sessionTerminalHandles, RATE_LIMIT,
-  workerWorktreePaths,
+  workerWorktreePaths, worktreeKeys, sessionWorktreeKeys, retainedTerminalHandles,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,

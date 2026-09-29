@@ -740,21 +740,13 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (releasedAny) save(s);
   }
 
-  // Backstop: sweep every unresolved Bash reservation and FOREGROUND (`background: false`)
-  // `s.agents` registration on
-  // every genuine operator turn (never an injected notification/reminder — same test as the
-  // operator-flag rule right below). A foreground dispatch's slot is normally released at its
-  // own matching PostToolUse; this exists only for the rare case where that never happened
-  // (a dispatch refused by a later gate before this fix, or a session that crashed mid-turn),
-  // so a leaked slot cannot outlive the very next real prompt the operator sends. Background
-  // registrations are untouched here — they rely on their own <task-notification> release,
-  // TTL, or --release-claims instead, exactly like a background Owns: claim.
+  // Backstop: sweep leaked FOREGROUND (`background: false`) `s.agents` registrations on
+  // every genuine operator turn. Bash reservations are deliberately NOT swept here: a Bash
+  // tool call can still be in flight when another operator prompt is submitted, and its
+  // eventual PostToolUse needs the reservation to transfer Owns/cap metadata to the worker.
+  // Stop remains the safe backstop for unresolved Bash reservations.
   if (!NON_OPERATOR_TURN.test(raw)) {
     let purgedAny = false;
-    if (Object.keys(s.reservations || {}).length) {
-      s.reservations = {};
-      purgedAny = true;
-    }
     for (const [id, a] of Object.entries(s.agents || {})) {
       if (a && a.background === false) { delete s.agents[id]; purgedAny = true; }
     }
@@ -1302,6 +1294,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
     }
 
     const ids = WG.idsFromOutput(replyText);
+    const worktreeIds = [...replyText.matchAll(/"worktreeId"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
     if (!ids.size) {
       if (!assumeDispatched) return; // unknown outcome on a failure event: keep the reservation.
       const pendingId = `pending-${Date.now()}-${idx}`;
@@ -1309,6 +1302,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
         role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
         rate_limited_until: 0, unverified: true, group: pendingId, kind: 'worker', agent,
         owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+        worktreeIds,
       };
       dirty = true;
       process.stdout.write(
@@ -1322,6 +1316,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
           rate_limited_until: 0, group, kind: WG.kindOf(id), agent,
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+          worktreeIds,
         };
       }
       dirty = true;
