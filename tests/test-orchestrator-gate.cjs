@@ -969,6 +969,31 @@ check('a released worker holds nothing',
 
   const callsLog = path.join(root, 'codex-calls.log');
 
+  const contendedStateDir = path.join(root, 'contended-state');
+  fs.mkdirSync(contendedStateDir, { recursive: true });
+  const contendedNow = Date.now();
+  fs.writeFileSync(path.join(contendedStateDir, 'codex-quota-live.json'), JSON.stringify({
+    usedPercent: 33,
+    resetsAt: Math.floor(contendedNow / 1000) + 3600,
+    fetchedAt: contendedNow - 120_000,
+  }));
+  const probeLease = path.join(contendedStateDir, '.codex-quota-probe.lock');
+  const heldProbeLease = acquireLock(probeLease, { timeoutMs: 50, retryMs: 5 });
+  try {
+    const firstStarted = Date.now();
+    const firstContended = q.codexQuota(contendedNow, { stateDir: contendedStateDir, cacheSeconds: 60 });
+    const firstElapsed = Date.now() - firstStarted;
+    const secondStarted = Date.now();
+    const secondContended = q.codexQuota(contendedNow + 1, { stateDir: contendedStateDir, cacheSeconds: 60 });
+    const secondElapsed = Date.now() - secondStarted;
+    eq('codex live contention: both reads use the stale quota fallback',
+      [firstContended.usedPercent, secondContended.usedPercent], [33, 33]);
+    check('codex live contention: two reads in one process wait for the held lease at most once',
+      firstElapsed >= 250 && secondElapsed < 150, true);
+  } finally {
+    if (heldProbeLease) releaseLock(probeLease);
+  }
+
   clearStub(); clearCache();
   process.env.STUB_CODEX_PRIMARY_USED = '25';
   let quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });

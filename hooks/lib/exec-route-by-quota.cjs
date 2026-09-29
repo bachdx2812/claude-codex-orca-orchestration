@@ -37,6 +37,7 @@ const LIVE_CACHE_FILE = 'codex-quota-live.json';
 const LIVE_PROBE_LOCK = '.codex-quota-probe.lock';
 const LIVE_PROBE = path.join(__dirname, 'codex-quota-probe.cjs');
 const processCache = new Map();
+const processFallbackCache = new Map();
 
 function codexSessionsDir() {
   // CODEX_SESSIONS_DIR lets tests point at a fixture instead of live data.
@@ -272,10 +273,32 @@ function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
   } catch { return null; }
 }
 
-/** A structurally valid cache entry even when its file TTL expired, for probe-lock losers. */
-function readStaleCache(stateDir, now = Date.now()) {
+/** A stale fallback already selected by this process while another process held the lease. */
+function readProcessFallback(stateDir, now = Date.now()) {
+  const file = cachePath(stateDir);
+  const memoized = processFallbackCache.get(file);
+  if (!memoized) return null;
   try {
-    return cachedQuotaResult(JSON.parse(fs.readFileSync(cachePath(stateDir), 'utf8')), now);
+    if (fs.readFileSync(file, 'utf8') !== memoized.text) {
+      processFallbackCache.delete(file);
+      return null;
+    }
+    return cachedQuotaResult(memoized.cached, now);
+  } catch {
+    processFallbackCache.delete(file);
+    return null;
+  }
+}
+
+/** A structurally valid cache entry even when its file TTL expired, for probe-lock losers. */
+function readStaleCache(stateDir, now = Date.now(), memoize = false) {
+  try {
+    const file = cachePath(stateDir);
+    const text = fs.readFileSync(file, 'utf8');
+    const cached = JSON.parse(text);
+    const result = cachedQuotaResult(cached, now);
+    if (memoize && result) processFallbackCache.set(file, { text, cached });
+    return result;
   } catch { return null; }
 }
 
@@ -314,6 +337,9 @@ function codexQuota(now = Date.now(), options = {}) {
   const cached = readFreshCache(stateDir, cacheSeconds, now);
   if (cached && !cached.failed) return cached;
   if (cached && cached.failed) return readSessionQuota(now);
+  const processFallback = readProcessFallback(stateDir, now);
+  if (processFallback && !processFallback.failed) return processFallback;
+  if (processFallback && processFallback.failed) return readSessionQuota(now);
   const probeLockDir = path.join(stateDir, LIVE_PROBE_LOCK);
   const probeLock = acquireLock(probeLockDir, {
     timeoutMs: 300,
@@ -324,7 +350,7 @@ function codexQuota(now = Date.now(), options = {}) {
     const afterWait = readFreshCache(stateDir, cacheSeconds, Math.max(now, Date.now()));
     if (afterWait && !afterWait.failed) return afterWait;
     if (afterWait && afterWait.failed) return readSessionQuota(now);
-    const stale = readStaleCache(stateDir, now);
+    const stale = readStaleCache(stateDir, now, true);
     return stale && !stale.failed ? stale : readSessionQuota(now);
   }
   try {
