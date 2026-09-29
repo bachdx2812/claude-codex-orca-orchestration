@@ -197,10 +197,12 @@ function effectiveUsedPercent(window, now) {
 /** Convert a live app-server result to the tightest usable window. */
 function parseLiveQuota(result, now = Date.now()) {
   const limits = result && result.rateLimits;
-  if (!limits || typeof limits !== 'object') return null;
-  const limitReached = !!(result.rateLimitReachedType || limits.rateLimitReachedType) ||
-    result.ordinaryUsageAllowed === false || limits.ordinaryUsageAllowed === false;
+  const limitReached = !!(result && result.rateLimitReachedType) ||
+    !!(limits && limits.rateLimitReachedType) ||
+    !!(result && result.ordinaryUsageAllowed === false) ||
+    !!(limits && limits.ordinaryUsageAllowed === false);
   if (limitReached) return { usedPercent: 100, resetsAt: 0, limitReached: true };
+  if (!limits || typeof limits !== 'object') return null;
   const windows = [limits.primary, limits.secondary]
     .map((window) => effectiveUsedPercent(window, now))
     .filter(Boolean);

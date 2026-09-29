@@ -995,6 +995,8 @@ check('a released worker holds nothing',
   process.env.STUB_CODEX_SECONDARY_USED = '70';
   quota = q.codexQuota(Date.now(), { stateDir, cacheSeconds: 60 });
   eq('codex live: secondary wins when it is tighter than primary', quota.usedPercent, 70);
+  eq('codex live: a denied ordinary-use flag needs no quota windows to count as limit reached',
+    q.parseLiveQuota({ ordinaryUsageAllowed: false }), { usedPercent: 100, resetsAt: 0, limitReached: true });
 
   clearCache(); clearStub();
   process.env.STUB_CODEX_PRIMARY_USED = '95';

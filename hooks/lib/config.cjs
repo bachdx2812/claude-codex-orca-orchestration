@@ -249,7 +249,8 @@ function handoffUsed(cfg) {
 }
 
 /**
- * Seconds a successful live Codex quota reading remains fresh (0 disables reuse).
+ * Seconds a successful live Codex quota reading or failed probe remains fresh
+ * (0 disables reuse).
  * `ORCH_CODEX_QUOTA_CACHE_SECONDS` overrides the config for one process.
  */
 function codexQuotaCacheSeconds(cfg) {
