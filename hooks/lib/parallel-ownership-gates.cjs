@@ -15,6 +15,7 @@
 'use strict';
 
 const path = require('path');
+const { createHash } = require('crypto');
 const WG = require('./worker-groups.cjs');
 const OWN = require('./ownership.cjs');
 const OC = require('./ownership-claims.cjs');
@@ -240,6 +241,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   const sessionId = s.session_id;
   const toolUseId = p.tool_use_id || p.toolUseId || null;
   const baseId = toolUseId || `sid-${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const commandHash = createHash('sha256').update(cmd).digest('hex');
   const cap = maxParallelCodexWorkers(cfg);
   const ttl = ownershipClaimTtlMinutes(cfg);
   const agentCapActive = !gateDisabled(cfg, 'max-parallel-agents') &&
@@ -279,6 +281,13 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     // an outright dropped write). Every read and mutation below must go through this
     // freshly-loaded copy, never the stale `s` parameter.
     s = load(sessionId);
+    // Another PreToolUse hook can deny the Bash call after this gate admitted it. Claude
+    // Code then emits no PostToolUse event for this gate, leaving its reservation pending.
+    // A later exact retry in the same session is the same attempted dispatch, not a
+    // competing owner: replace its unresolved reservation before overlap/cap accounting.
+    for (const [key, reservation] of Object.entries(s.reservations || {})) {
+      if (reservation && reservation.commandHash === commandHash) delete s.reservations[key];
+    }
     // A finite cap cannot be evaluated safely after its one long acquisition attempt failed.
     // Refuse now instead of entering the at-cap reconcile branch and paying the same long
     // timeout a second time against the same live holder.
@@ -481,6 +490,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
       const reservation = {
         ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, newSlot,
+        commandHash,
       };
       localReservations[`${baseId}#${idx}`] = reservation;
       s.reservations[`${baseId}#${idx}`] = reservation;

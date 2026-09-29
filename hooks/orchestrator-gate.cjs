@@ -234,7 +234,7 @@ function blank(sid) {
     execAgent: null,        // null (auto by quota) | 'code' | 'codex' | 'codex:<model>' | 'claude:<alias>'
     workers: {},            // label -> { role, started, status, last_seen, rate_limited_until,
                              //            group, kind, agent, owns, ws }
-    reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot, newSlot } —
+    reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot, newSlot, commandHash } —
                              // the gap between a Bash dispatch being admitted and its PostToolUse resolving it
     agentClaims: {},        // toolUseId -> { owns, ws, ts } — in-session Agent/Task Owns: claims
     agents: {},             // toolUseId -> { ts, background, type, model } — EVERY main-panel
@@ -739,7 +739,8 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (releasedAny) save(s);
   }
 
-  // C1 backstop: sweep out every FOREGROUND (`background: false`) `s.agents` registration on
+  // Backstop: sweep every unresolved Bash reservation and FOREGROUND (`background: false`)
+  // `s.agents` registration on
   // every genuine operator turn (never an injected notification/reminder — same test as the
   // operator-flag rule right below). A foreground dispatch's slot is normally released at its
   // own matching PostToolUse; this exists only for the rare case where that never happened
@@ -749,6 +750,10 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   // TTL, or --release-claims instead, exactly like a background Owns: claim.
   if (!NON_OPERATOR_TURN.test(raw)) {
     let purgedAny = false;
+    if (Object.keys(s.reservations || {}).length) {
+      s.reservations = {};
+      purgedAny = true;
+    }
     for (const [id, a] of Object.entries(s.agents || {})) {
       if (a && a.background === false) { delete s.agents[id]; purgedAny = true; }
     }
@@ -1604,17 +1609,21 @@ function unsettledPerOrca(ids) {
 function onStop(p, s, cfg) {
   if (s.bypass || p.stop_hook_active) return;
 
-  // C1 backstop: sweep out every FOREGROUND (`background: false`) `s.agents` registration at
-  // every Stop, regardless of whether any Orca worker is live — a session with zero workers
-  // but a leaked max-parallel-agents slot (see the identical UserPromptSubmit backstop above
-  // `onPreToolUse` for why one can exist at all) must still get it cleaned up here. Reloads
-  // fresh under the lock, since `s` is main()'s pre-lock snapshot.
+  // Backstop: sweep every unresolved Bash reservation and FOREGROUND (`background: false`)
+  // `s.agents` registration at every Stop, regardless of whether any Orca worker is live.
+  // A later hook may have denied an admitted tool call before it ran, so no PostToolUse
+  // event exists to release that reservation. Reload fresh under the lock, since `s` is
+  // main()'s pre-lock snapshot.
   {
     const lockDir = path.join(DIR, '.lock');
     const locked = acquireLock(lockDir, {});
     try {
       const fresh = load(p.session_id);
       let purgedAny = false;
+      if (Object.keys(fresh.reservations || {}).length) {
+        fresh.reservations = {};
+        purgedAny = true;
+      }
       for (const [id, a] of Object.entries(fresh.agents || {})) {
         if (a && a.background === false) { delete fresh.agents[id]; purgedAny = true; }
       }

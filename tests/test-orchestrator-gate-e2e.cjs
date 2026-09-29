@@ -1804,8 +1804,8 @@ const postAgent = (sid, toolUseId) => ({
   const { env } = mpaTestEnv({ maxParallelAgents: 1, maxParallelCodexWorkers: 5 });
   const sid = 'mpa-worker-start';
   expect('a worker-start is admitted under max-parallel-agents cap 1',
-    mainBash('orca orchestration worker-start --agent codex --json', { sid }), ALLOW, env);
-  const r2 = invoke(mainBash('orca orchestration worker-start --agent codex --json', { sid }), env);
+    mainBash('orca orchestration worker-start --agent codex --task first --json', { sid }), ALLOW, env);
+  const r2 = invoke(mainBash('orca orchestration worker-start --agent codex --task second --json', { sid }), env);
   if (r2.code === DENY && /max-parallel-agents/.test(r2.err)) pass += 1;
   else failures.push(`a second worker-start at max-parallel-agents cap 1 should be refused (code ${r2.code}, err ${r2.err.slice(0, 200)})`);
 }
@@ -2010,7 +2010,50 @@ function withHeldLock(lockDir, fn) {
     !!after.agents.toolu_leaked_bg2, true);
 }
 
-// 14. Review round 3, item 1: lock contention must refuse ONLY while the cap is actually
+// 14. A worker-start admitted by this gate can still be refused by a later PreToolUse hook,
+// which means no PostToolUse event ever arrives. An exact retry in the same session must
+// replace that pending reservation, while a different overlapping command remains refused.
+{
+  const env = quotaEnv('pending-retry-replacement', 10, 30, { maxParallelCodexWorkers: 1 });
+  const sid = 'pending-retry-replacement';
+  const command = 'orca orchestration worker-start --agent codex --spec "implement retry.\nVerify: npm test\nOwns: src/retry.ts"';
+  const differentCommand = 'orca orchestration worker-start --agent codex --spec "implement something else.\nVerify: npm test\nOwns: src/retry.ts"';
+  rmState(sid);
+  expect('pending retry: the original worker-start reserves its claim and slot',
+    mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_pending_original' }), ALLOW, env);
+  expect('pending retry: the exact same command replaces its unresolved reservation',
+    mainBash(command, { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_pending_retry' }), ALLOW, env);
+  const afterRetry = readState(sid);
+  checkBool('pending retry: the replaced tool-use reservation is gone',
+    !afterRetry.reservations['toolu_pending_original#0'], true);
+  checkBool('pending retry: the retry owns the one remaining reservation',
+    !!afterRetry.reservations['toolu_pending_retry#0'] && Object.keys(afterRetry.reservations).length === 1, true);
+  const overlap = invoke(mainBash(differentCommand,
+    { sid, cwd: FAKE_REPO, tool_use_id: 'toolu_pending_different' }), env);
+  checkBool('pending retry: a different overlapping command is still refused',
+    overlap.code === DENY && /ownership-overlap/.test(overlap.err), true);
+  rmState(sid);
+}
+
+// 15. The next genuine operator prompt and Stop both sweep unresolved Bash reservations,
+// just as they already sweep leaked foreground Agent registrations.
+for (const event of ['UserPromptSubmit', 'Stop']) {
+  const env = quotaEnv(`pending-sweep-${event.toLowerCase()}`, 10, 30, { maxParallelCodexWorkers: 1 });
+  const sid = `pending-sweep-${event.toLowerCase()}`;
+  const command = `orca orchestration worker-start --agent codex --task ${event.toLowerCase()}`;
+  rmState(sid);
+  invoke(mainBash(command, { sid, tool_use_id: `toolu_pending_${event}` }), env);
+  const payload = event === 'UserPromptSubmit'
+    ? promptSubmit(sid, 'continue after the denied tool call')
+    : { session_id: sid, hook_event_name: 'Stop', effort: 'high', stop_hook_active: false };
+  invoke(payload, env);
+  const after = readState(sid);
+  checkBool(`pending sweep (${event}): unresolved reservations are removed`,
+    Object.keys(after.reservations || {}).length === 0, true);
+  rmState(sid);
+}
+
+// 16. Review round 3, item 1: lock contention must refuse ONLY while the cap is actually
 // finite — `reconcileParallelAgentsAtCap` (the Agent/Task path) and
 // `handleTerminalCreateAgentCap` (the bare `orca terminal create` path) used to check
 // `!locked` BEFORE checking gate-disabled/non-finite, so a held `.lock` refused even with the
