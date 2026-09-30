@@ -29,7 +29,8 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    its quota — Codex at `codexHandoffUsedPercent` (default 95), Kimi at the separate
    `kimiHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. Routing
    spreads every Codex task class — code, builds, refactors, tests, bulk conversions, and
-   fix loops — across both peers. Among eligible coders, pick fewer live workers, then more
+   fix loops — across both peers. Among eligible coders, pick fewer live worker groups across
+   every recent session on this machine, then more
    headroom below the coder's own threshold, then the coder other than `lastCoder`, and
    finally Codex as the last tie-break. A coder that is not installed, signed in, or
    launchable on this machine is excluded; both coders exhausted or unusable means Sonnet.
@@ -629,7 +630,7 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
 ```json
 { "session_id": "...", "created": "<ISO-8601>", "bypass": false,
   "bypassSince": null, "execAgent": null, "execAgentSince": null,
-  "workers": { "<label>": { "role": "codex-exec", "started": 0,
+  "workers": { "<label>": { "role": "<agent>-exec", "started": 0,
                              "status": "live|settled", "last_seen": 0,
                              "rate_limited_until": 0,
                              "group": "ctx_x", "kind": "worker|terminal", "agent": "codex",
@@ -644,10 +645,18 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
   "last_heartbeat": 0, "rate_limit_hits": 0 }
 ```
 
-`execAgent` is one of `null` (automatic, by quota), `"codex"`, `"codex:<model>"`, or
-`"claude:<alias>"`. Any other persisted value is reset to `null` and reported once. The
+`execAgent` is one of `null` (automatic, by coder pool), `"codex"`, `"codex:<model>"`,
+`"kimi"`, `"kimi:<model>"`, or `"claude:<alias>"`. A Kimi model suffix is a persisted
+preference shown in reminders; Orca cannot pin it, so the worker still launches without
+`--model`. Any other persisted value is reset to `null` and reported once. The
 `*Since` fields contain ISO-8601 timestamps only while their corresponding override is
 active.
+
+Machine-wide coder routing state lives at `<ORCH_STATE_DIR>/coder-route-state.json` as
+`{ "lastCoder": "codex|kimi", "updatedAt": 0 }`. The gate writes `lastCoder` atomically
+under the shared state lock only when a `worker-start` reply registers a real Codex or Kimi
+worker. Automatic routing uses it after the machine-wide live-count and per-coder headroom
+ties, so equal peers alternate without trusting free-text command output.
 
 `group`/`kind`/`agent`/`owns`/`ws` on a worker entry, `reservations`, `agentClaims` and
 `tasks` are the parallel-Codex-worker cap and file-ownership bookkeeping (see "Parallel
@@ -685,7 +694,7 @@ processes racing the same session id can otherwise silently drop each other's wr
   summaries never count as the operator's own prompt, so quoted flags cannot toggle
   bypass or execution routing. While bypass is active, every prompt and the `SessionStart`
   banner show when it began and name `--orchestrate` as the recovery command.
-- `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` toggle only
+- `--exec-sonnet` / `--exec-codex` / `--exec-kimi` / `--exec-auto` and `--code-model <value>` toggle only
   execution routing, honestly — narrower than a full bypass.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees one or every
   tracked `Owns:` claim OR `max-parallel-agents` registration — the deliberate manual

@@ -45,10 +45,13 @@ fs.writeFileSync(CONFIG_FILE, JSON.stringify({
   disabledGates: [],
 }));
 
-const BASE_ENV = Object.fromEntries(
-  Object.entries(process.env).filter(([k]) =>
-    !/^(ORCHESTRATOR_GATE|ORCH_|ORCA_TERMINAL_HANDLE|CODEX_HOME|CLAUDE_CODE_)/.test(k))
-);
+const BASE_ENV = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) =>
+    !/^(ORCHESTRATOR_GATE|ORCH_|ORCA_TERMINAL_HANDLE|CODEX_HOME|CLAUDE_CODE_)/.test(k))),
+  ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+  ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+};
 const ENV = {
   ...BASE_ENV,
   ORCH_STATE_DIR: STATE_DIR,

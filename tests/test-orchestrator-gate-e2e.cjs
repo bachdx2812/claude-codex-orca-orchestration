@@ -32,10 +32,14 @@ try { fs.chmodSync(CODEX_APP_SERVER_STUB, 0o755); } catch {}
 // ORCH_*, ORCA_TERMINAL_HANDLE, CODEX_HOME or CLAUDE_CODE_* from its real environment.
 // Every test env is built from this stripped base, never raw process.env, so the suite's
 // outcome depends only on what each test explicitly sets.
-const BASE_ENV = Object.fromEntries(
-  Object.entries(process.env).filter(([k]) =>
-    !/^(ORCHESTRATOR_GATE|ORCH_|ORCA_TERMINAL_HANDLE|CODEX_HOME|CLAUDE_CODE_)/.test(k))
-);
+const BASE_ENV = {
+  ...Object.fromEntries(Object.entries(process.env).filter(([k]) =>
+    !/^(ORCHESTRATOR_GATE|ORCH_|ORCA_TERMINAL_HANDLE|CODEX_HOME|CLAUDE_CODE_)/.test(k))),
+  ORCH_KIMI_HOME: path.join(os.tmpdir(), `orch-e2e-empty-kimi-${process.pid}`),
+  ORCH_KIMI_BIN: path.join(os.tmpdir(), `orch-e2e-missing-kimi-${process.pid}`),
+  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+};
+fs.mkdirSync(BASE_ENV.ORCH_KIMI_HOME, { recursive: true });
 
 const SID = `e2e-${process.pid}`;
 const SRC = '/work/proj/src/app.py'; // synthetic, not under any real tmp/home path
@@ -598,7 +602,7 @@ expect('fable escalation naming opus (xhigh) is allowed',
 {
   const RS = `${SID}-rv`;
   const out = spawnGate(promptSubmit(RS, 'status?'), SONNET_WINS).stdout;
-  if (/code -> in-session subagent \(Agent model "sonnet"\)/.test(out) && !/undefined/.test(out)) pass += 1;
+  if (/code -> Sonnet: Codex quota 97% used .*Kimi not installed/.test(out) && !/undefined/.test(out)) pass += 1;
   else failures.push(`auto route to the code model must name model "sonnet", never "undefined": ${out.slice(0, 200)}`);
   const bare = spawnGate(promptSubmit(RS, 'please --code-model'), CODEX_WINS).stdout;
   if (/needs a value/.test(bare)) pass += 1; else failures.push('a bare --code-model must print a notice');
@@ -1976,13 +1980,9 @@ rmState(`${SID}-hard-off`);
   rmState(G4dSID);
 }
 
-// Round 5, item 1 (HIGH regression fix): a dispatch made WITHOUT --json can still print a
-// plain-text id line with no `{` anywhere (e.g. "Dispatched worker ctx_abc123 for task
-// task_xyz"). The prior round's `definitelyNoJson` check only looked for `{`, so this real,
-// successful dispatch was wrongly treated as "affirmative evidence nothing was dispatched" and
-// its reservation was dropped immediately — the worker then ran unmetered against the parallel-
-// Codex cap. The fix also checks WG.idsFromOutput for a bare ctx_/task_/term_ token before
-// concluding nothing was dispatched, and registers the plain-text id exactly like a JSON reply.
+// A worker-start id is trusted only from that invocation's own JSON reply. Free-text output
+// can contain formatter output or a chained worker-list with unrelated ids, so it must never
+// create worker registrations. On an ambiguous failure, retain the reservation until TTL.
 {
   const CAP5aEnv = quotaEnv('round5-item1-plaintext-id', 10, 30, { maxParallelCodexWorkers: 1 });
   const G5aSID = `${SID}-round5-item1`;
@@ -1994,10 +1994,9 @@ rmState(`${SID}-hard-off`);
     tool_input: { command: cmd5a }, tool_use_id: tu5a,
     error: 'Exit code 1\nDispatched worker ctx_abc123 for task task_xyz' }, CAP5aEnv);
   const after5a = readState(G5aSID);
-  if (after5a && after5a.workers && after5a.workers.ctx_abc123 && after5a.workers.ctx_abc123.status === 'live'
-      && !after5a.reservations[`${tu5a}#0`]) pass += 1;
-  else failures.push(`round5 item1: a plain-text dispatch id in a failed command's error text must register a real worker, not drop the reservation as if nothing happened (${JSON.stringify(after5a && { workers: after5a.workers, reservations: after5a.reservations })})`);
-  expect('round5 item1: the next worker-start at cap 1 is now correctly REFUSED (the plain-text-id dispatch is really running)',
+  if (after5a && !after5a.workers.ctx_abc123 && after5a.reservations[`${tu5a}#0`]) pass += 1;
+  else failures.push(`plain-text ids must not register workers; the ambiguous reservation must remain (${JSON.stringify(after5a && { workers: after5a.workers, reservations: after5a.reservations })})`);
+  expect('the retained ambiguous reservation keeps the next worker-start at cap 1 refused',
     mainBash('orca orchestration worker-start --agent codex --spec @b.md --json', { sid: G5aSID, cwd: FAKE_REPO }), DENY, CAP5aEnv);
   rmState(G5aSID);
 }

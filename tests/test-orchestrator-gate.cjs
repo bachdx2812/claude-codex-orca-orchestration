@@ -968,9 +968,13 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('currentExecRoute: configured code-model override carries its alias',
     gate.currentExecRoute(cfg, { execAgent: 'claude:sonnet' }).alias, 'sonnet');
   check('currentExecRoute: operator override "codex"',
-    gate.currentExecRoute(cfg, { execAgent: 'codex' }).route, 'codex');
+    gate.currentExecRoute(cfg, { execAgent: 'codex', session_id: 'unit-route', workers: {} }).route, 'external');
   check('currentExecRoute: operator override "codex:<model>" carries the model',
-    gate.currentExecRoute(cfg, { execAgent: 'codex:gpt-5-custom' }).codexModel, 'gpt-5-custom');
+    gate.currentExecRoute(cfg, { execAgent: 'codex:gpt-5-custom', session_id: 'unit-route', workers: {} }).codexModel, 'gpt-5-custom');
+  check('currentExecRoute: operator override "kimi" is external',
+    gate.currentExecRoute(cfg, { execAgent: 'kimi', session_id: 'unit-route', workers: {} }).pick, 'kimi');
+  check('currentExecRoute: operator override "kimi:<model>" carries the preference',
+    gate.currentExecRoute(cfg, { execAgent: 'kimi:k3', session_id: 'unit-route', workers: {} }).kimiModel, 'k3');
   check('currentExecRoute: operator override "claude:opus" carries the alias',
     gate.currentExecRoute(cfg, { execAgent: 'claude:opus' }).alias, 'opus');
 

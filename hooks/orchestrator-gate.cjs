@@ -8,11 +8,11 @@
  *      edits or mutates anything itself (outside .claude/, plans/, docs/, scratch, tmp).
  *   2. Planning / review / verification go to the configured review model in-session;
  *      the escalation model only after the review model failed, even at higher effort.
- *   3. Execution and token-heavy work goes to Codex in Orca workers, or the configured
- *      in-session code model once Codex has used the handoff percentage of its quota,
+ *   3. Execution and token-heavy work is spread across Codex and Kimi Orca workers, or the configured
+ *      in-session code model once neither external coder is eligible,
  *      or whichever model the operator explicitly picked with --code-model.
  *   4. Everything is delegated, parallel wherever ownership allows.
- *   5. Parallel Codex workers hit rate limits; the heartbeat must detect that and retry
+ *   5. Parallel external coder workers hit rate limits; the heartbeat must detect that and retry
  *      with backoff rather than leaving a worker wedged.
  *
  * Main-vs-subagent detection is empirical, not guessed: a main-panel hook payload
@@ -31,7 +31,8 @@ const path = require('path');
 const os = require('os');
 const {
   loadConfig, gateDisabled, handoffUsed, stateDir,
-  maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
+  codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
+  kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
 } = require('./lib/config.cjs');
 const WG = require('./lib/worker-groups.cjs');
 const PAC = require('./lib/parallel-agent-cap.cjs');
@@ -39,10 +40,14 @@ const HBL = require('./lib/heartbeat-liveness.cjs');
 const OWN = require('./lib/ownership.cjs');
 const OC = require('./lib/ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
-const { hasRateLimitError } = require('./lib/terminal-signals.cjs');
+const { hasRateLimitError, hasKimiUsageExhausted } = require('./lib/terminal-signals.cjs');
+const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
+const CODER_POOL = require('./lib/coder-pool-route.cjs');
+const EXEC_QUOTA = require('./lib/exec-route-by-quota.cjs');
 
 const DIR = stateDir();
 const LOG = path.join(DIR, 'violations.log');
+const CODER_ROUTE_STATE = path.join(DIR, 'coder-route-state.json');
 // ORCA_DOWN_FLAG_PATH lets the test suite use a temp flag instead of the real one.
 const ORCA_DOWN_FLAG = process.env.ORCA_DOWN_FLAG_PATH || path.join(DIR, 'orca-unavailable');
 // ORCA_BIN lets the test suite point at a stub instead of a real `orca` on PATH.
@@ -234,7 +239,7 @@ function blank(sid) {
     created: new Date().toISOString(),
     bypass: false,
     bypassSince: null,
-    execAgent: null,        // null (auto by quota) | 'codex' | 'codex:<model>' | 'claude:<alias>'
+    execAgent: null,        // null (auto by pool) | 'codex' | 'codex:<model>' | 'kimi' | 'kimi:<model>' | 'claude:<alias>'
     execAgentSince: null,
     workers: {},            // label -> { role, started, status, last_seen, rate_limited_until,
                              //            group, kind, agent, owns, ws }
@@ -251,8 +256,8 @@ function blank(sid) {
 }
 
 function validPersistedExecAgent(value) {
-  return value === null || value === 'codex' ||
-    (typeof value === 'string' && (/^codex:.+/.test(value) || /^claude:.+/.test(value)));
+  return value === null || value === 'codex' || value === 'kimi' ||
+    (typeof value === 'string' && (/^codex:.+/.test(value) || /^kimi:.+/.test(value) || /^claude:.+/.test(value)));
 }
 
 function load(sid) {
@@ -367,6 +372,8 @@ function parseCodeModel(cfg, v) {
   if (x === String(cfg.models.lookup.alias || '').toLowerCase()) return `claude:${cfg.models.lookup.alias}`;
   if (x === 'codex') return 'codex';
   if (x.startsWith('codex:') && x.length > 6) return `codex:${x.slice(6)}`;
+  if (x === 'kimi') return 'kimi';
+  if (x.startsWith('kimi:') && x.length > 5) return `kimi:${x.slice(5)}`;
   if (/^gpt-/.test(x) || (cfg.models.codex.id && x === String(cfg.models.codex.id).toLowerCase())) return `codex:${x}`;
   return 'invalid';
 }
@@ -380,45 +387,112 @@ const { orcaInvocations } = require('./lib/shell-orca-invocations.cjs');
 function describeOverride(cfg, o) {
   if (o === 'codex') return 'Codex in an Orca worker';
   if (o.startsWith('codex:')) return `Codex (${o.slice(6)}) in an Orca worker`;
+  if (o === 'kimi') return 'Kimi in an Orca worker';
+  if (o.startsWith('kimi:')) return `Kimi (${o.slice(5)}, set as default_model in ~/.kimi-code/config.toml; Orca cannot pin it) in an Orca worker`;
   return `in-session Agent with model "${o.slice(7)}"`;
+}
+
+function readLastCoder() {
+  try {
+    const value = JSON.parse(fs.readFileSync(CODER_ROUTE_STATE, 'utf8'));
+    return value && (value.lastCoder === 'codex' || value.lastCoder === 'kimi') ? value.lastCoder : null;
+  } catch { return null; }
+}
+
+/** Called only while the shared state lock is held. */
+function writeLastCoder(coder) {
+  if (coder !== 'codex' && coder !== 'kimi') return;
+  writeJsonAtomic(CODER_ROUTE_STATE, { lastCoder: coder, updatedAt: Date.now() });
+}
+
+function machineWideCoderLive(s, now = Date.now()) {
+  const result = { codex: 0, kimi: 0 };
+  const currentName = `${String(s.session_id).replace(/[^A-Za-z0-9_-]/g, '_')}.json`;
+  for (const file of PAC.recentSessionStateFiles(DIR, now)) {
+    if (path.basename(file) === currentName) continue;
+    const other = PAC.readSessionState(file);
+    if (!other) continue;
+    result.codex += WG.countLiveGroups(other.workers, 'codex');
+    result.kimi += WG.countLiveGroups(other.workers, 'kimi');
+  }
+  result.codex += WG.countLiveGroups(s.workers, 'codex');
+  result.kimi += WG.countLiveGroups(s.workers, 'kimi');
+  return result;
+}
+
+function coderPoolRoute(cfg, s, now = Date.now()) {
+  const availabilityTtlMs = coderAvailabilityCacheSeconds(cfg) * 1000;
+  let authState = EXEC_QUOTA.codexAuthState(DIR, now, availabilityTtlMs);
+  const orcaInstalled = orcaOnPath();
+  const codexInstalled = binOnPath(process.env.ORCH_CODEX_BIN || CODEX_BIN);
+  const kimiOverrideMissing = Object.prototype.hasOwnProperty.call(process.env, 'ORCH_KIMI_BIN') &&
+    !binOnPath(process.env.ORCH_KIMI_BIN);
+  let availability = CODER_AVAILABILITY.coderAvailability({
+    stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
+    orcaInstalled, env: process.env, codexAuthState: authState,
+    fresh: !orcaInstalled || !codexInstalled || kimiOverrideMissing,
+  });
+  const quotas = { codex: null, kimi: null };
+  if (availability.codex?.usable) {
+    const reading = EXEC_QUOTA.codexQuota(now, { stateDir: DIR, cacheSeconds: codexQuotaCacheSeconds(cfg) });
+    if (reading?.authState === 'logged-out') {
+      authState = 'logged-out';
+      availability = CODER_AVAILABILITY.coderAvailability({
+        stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
+        orcaInstalled, env: process.env, codexAuthState: authState,
+        fresh: true,
+      });
+    } else if (reading && !reading.failed) {
+      quotas.codex = reading;
+    }
+  }
+  if (availability.kimi?.usable) {
+    const reading = EXEC_QUOTA.kimiQuota(now, {
+      stateDir: DIR, cacheSeconds: kimiQuotaCacheSeconds(cfg), env: process.env,
+    });
+    if (reading && !reading.failed) quotas.kimi = reading;
+  }
+  return CODER_POOL.pickCoderPool({
+    availability, quotas,
+    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg) },
+    exhaustion: CODER_AVAILABILITY.readCoderExhaustion(DIR, now),
+    live: machineWideCoderLive(s, now),
+    caps: { codex: maxParallelCodexWorkers(cfg), kimi: maxParallelKimiWorkers(cfg) },
+    lastCoder: readLastCoder(),
+    fallbackEnabled: cfg.execFallbackWhenCodexUnavailable === 'sonnet' ? true : null,
+  });
 }
 
 /**
  * Who writes code for this session. An operator override wins:
- *   s.execAgent = 'codex' | 'codex:<model>' | 'claude:<alias>'
- * (set by --code-model <value>, or the --exec-sonnet / --exec-codex shortcuts);
- * otherwise automatic: Codex first, the configured code model once Codex has used the
- * handoff percentage. Returns { route: 'code' | 'codex' | 'claude', alias?, codexModel?, why }.
+ *   s.execAgent = 'codex' | 'codex:<model>' | 'kimi' | 'kimi:<model>' | 'claude:<alias>'
+ * (set by --code-model <value>, or an --exec-* shortcut); otherwise automatic: spread
+ * work across eligible external coders, then use the configured in-session code model.
  */
 function currentExecRoute(cfg, s) {
   const a = s.execAgent;
-  if (a === 'codex') return { route: 'codex', why: 'operator override (codex)' };
-  if (typeof a === 'string' && a.startsWith('codex:')) {
-    return { route: 'codex', codexModel: a.slice(6), why: `operator override (codex ${a.slice(6)})` };
-  }
   if (typeof a === 'string' && a.startsWith('claude:')) {
     return { route: 'claude', alias: a.slice(7), why: `operator override (${a.slice(7)})` };
   }
+  let pool;
   try {
-    const r = require('./lib/exec-route-by-quota.cjs').execRoute(handoffUsed(cfg));
-    if (r.route === 'sonnet') return { route: 'code', alias: cfg.models.code.alias, why: `auto: ${r.summary}` };
-    // execFallbackWhenCodexUnavailable fires only when Codex genuinely cannot be
-    // dispatched to at all - `orca` or `codex` itself missing from PATH - never merely
-    // because its quota reading is unknown (e.g. a fresh Codex install that has not run a
-    // first turn yet). Codex is the deliberately-preferred default: an unknown quota is
-    // not evidence Codex is unusable, only a missing binary is. (A quota that IS known and
-    // simply under the handoff threshold already returned 'codex' above via r.route.)
-    if (cfg.execFallbackWhenCodexUnavailable === 'sonnet' && (!orcaOnPath() || !codexOnPath())) {
-      const missing = [!orcaOnPath() && 'orca', !codexOnPath() && 'codex'].filter(Boolean).join('/');
-      return {
-        route: 'code', alias: cfg.models.code.alias,
-        why: `auto: ${r.summary}; ${missing} not on PATH, falling back to "${cfg.models.code.alias}" per execFallbackWhenCodexUnavailable`,
-      };
-    }
-    return { route: 'codex', why: `auto: ${r.summary}` };
+    pool = coderPoolRoute(cfg, s);
   } catch {
-    return { route: 'codex', why: 'auto: quota unreadable, default Codex' };
+    pool = { route: 'external', pick: 'codex', order: ['codex'], coders: {}, why: 'auto: coder pool unreadable, default Codex' };
   }
+  if (a === 'codex' || a === 'kimi' || (typeof a === 'string' && /^(?:codex|kimi):/.test(a))) {
+    const pick = a.startsWith('kimi') ? 'kimi' : 'codex';
+    const state = pool.coders[pick];
+    const warning = state?.state === 'eligible' || !state ? '' : ` WARNING: ${pick === 'codex' ? 'Codex' : 'Kimi'} unusable: ${state.reason || state.state || 'unavailable'}.`;
+    return {
+      route: 'external', pick, order: [pick], coders: pool.coders,
+      ...(pick === 'codex' && a.startsWith('codex:') ? { codexModel: a.slice(6) } : {}),
+      ...(pick === 'kimi' && a.startsWith('kimi:') ? { kimiModel: a.slice(5) } : {}),
+      why: `operator override (${a})${warning}`,
+    };
+  }
+  if (pool.route === 'code') return { ...pool, route: 'code', alias: cfg.models.code.alias };
+  return pool;
 }
 
 /**
@@ -670,7 +744,8 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
   return PARALLEL_OWNERSHIP.handleOrcaDispatchGates({
     p, s, cfg, cmd, d,
     deps: {
-      hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, ownershipClaimTtlMinutes, save, load, gateDisabled,
+      hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, maxParallelKimiWorkers,
+      ownershipClaimTtlMinutes, save, load, gateDisabled,
       agentParallelLimit, maxParallelAgents, machineWideLiveUnits: PAC.machineWideLiveUnits,
       formatParallelAgentsRefusal: PAC.formatParallelAgentsRefusal, cores: PAC.cores, parallelCoreFraction,
       lockContentionMessage: PAC.LOCK_CONTENTION_MESSAGE, capLockOpts: CAP_LOCK_OPTS,
@@ -712,8 +787,14 @@ function activeOverrideLines(cfg, s) {
     } else if (s.execAgent === 'codex') {
       target = 'Codex';
       flag = '--exec-codex';
+    } else if (s.execAgent === 'kimi') {
+      target = 'Kimi';
+      flag = '--exec-kimi';
     } else if (s.execAgent.startsWith('codex:')) {
       target = `Codex (${s.execAgent.slice(6)})`;
+      flag = `--code-model ${s.execAgent}`;
+    } else if (s.execAgent.startsWith('kimi:')) {
+      target = `Kimi (${s.execAgent.slice(5)}, set as default_model; Orca cannot pin it)`;
       flag = `--code-model ${s.execAgent}`;
     } else {
       target = s.execAgent.slice(7);
@@ -730,7 +811,9 @@ function onSessionStart(p, s, cfg) {
   const escalation = cfg.models.escalation.alias;
   const lookup = cfg.models.lookup.alias;
   const code = cfg.models.code.alias;
-  const threshold = handoffUsed(cfg);
+  const codexThreshold = handoffUsed(cfg);
+  const kimiThreshold = kimiHandoffUsed(cfg);
+  const route = currentExecRoute(cfg, s);
   const warnings = (cfg.warnings || []).map((w) => `- CONFIG WARNING: ${w}\n`).join('');
   const overrideWarnings = activeOverrideLines(cfg, s).map((line) => `- ACTIVE OVERRIDE: ${line}\n`).join('');
   process.stdout.write(
@@ -740,22 +823,22 @@ function onSessionStart(p, s, cfg) {
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
-    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> Codex (${code} once Codex >= ${threshold}% used) codes -> ${review} reviews.\n` +
+    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> Codex + Kimi coder peers -> ${review} reviews.\n` +
     `- Planning / red-team / review / verification -> in-session subagent on model ${modelLabel(cfg.models.review)}.\n` +
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (Codex spec or in-session prompt) names the exact test / build command to run green.\n' +
-    `- Code: Codex first; "${code}" once Codex has used >= ${threshold}% of its live-read quota ` +
-    '(configure codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED):\n' +
-    '    Codex  -> Orca worker: orca orchestration task-create ... && worker-start ...\n' +
+    `- Code: split across usable Codex (handoff >= ${codexThreshold}% used) and Kimi (handoff >= ${kimiThreshold}% used); next -> ${route.pick ? (route.pick === 'codex' ? 'Codex' : 'Kimi') : code}.\n` +
+    '    Codex -> Orca worker: orca orchestration task-create ... && worker-start --agent codex --model ...\n' +
+    '    Kimi  -> Orca worker: orca orchestration task-create ... && worker-start --agent kimi (no --model)\n' +
     '             then worker-list | worker-read | worker-release\n' +
     `    ${code[0].toUpperCase()}${code.slice(1)} -> in-session Agent with model "${code}".\n` +
-    `  Operator-only override from the main panel: --code-model <${review}|${code}|${lookup}|${escalation}|codex|codex:<model>|auto>\n` +
-    '  (session-scoped, last flag wins; --exec-sonnet / --exec-codex are shortcuts, --exec-auto = --code-model auto).\n' +
+    `  Operator-only override from the main panel: --code-model <${review}|${code}|${lookup}|${escalation}|codex|codex:<model>|kimi|kimi:<model>|auto>\n` +
+    '  (session-scoped, last flag wins; --exec-sonnet / --exec-codex / --exec-kimi are shortcuts, --exec-auto = --code-model auto).\n' +
     '  If Orca itself is unreachable: `touch ~/.claude/orchestrator-gate/orca-unavailable` (15 min) permits in-session code\n' +
     `  (even a codex override falls back to "${code}" while that flag is active).\n` +
     `- Poll every live worker at least every ${cfg.heartbeat.idleSeconds}s. Never let one sit IDLE unattended.\n` +
-    '- Codex workers get rate limited when run in parallel: on a rate-limit signal, back off and retry\n' +
+    '- External coder workers get rate limited when run in parallel: on a rate-limit signal, back off and retry\n' +
     `  after ~${RATE_LIMIT_BACKOFF_SECONDS}s instead of abandoning or re-dispatching immediately.\n` +
     '- Release or close a worker as soon as it is done and not reusable.\n' +
     `- ${parallelBudgetLine(cfg, s)}: machine-wide live Orca workers + subagents, summed across\n` +
@@ -852,21 +935,22 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   // orca-unavailable flag: it never claims Orca is unreachable, and it does not
   // self-expire — the operator sets it once and reverts it once, both by hand.
   // --code-model <value> lets the operator pick the coding model directly; --exec-sonnet /
-  // --exec-codex are shortcuts for the configured code model / Codex. Whichever of these
+  // --exec-codex / --exec-kimi are shortcuts for the configured code model / external coders. Whichever of these
   // appears last in the prompt wins.
   const flagAt = (f) => (operatorFlag(prompt, f) ? promptLower.lastIndexOf(f) : -1);
   const cm = [...prompt.matchAll(/(^|\s)--code-model(?:=|\s+)(\S+)/gi)].pop();
   const bareCm = !cm && /(^|\s)--code-model(?:=)?\s*$/i.test(prompt);
   if (bareCm) {
-    process.stdout.write(`orchestrator-gate: --code-model needs a value (${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | auto); nothing changed.\n`);
+    process.stdout.write(`orchestrator-gate: --code-model needs a value (${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | kimi | kimi:<model> | auto); nothing changed.\n`);
   }
   const cmAt = cm ? cm.index + cm[1].length : -1;
-  const lastFlag = ['--exec-sonnet', '--exec-codex', '--exec-auto']
+  const lastFlag = ['--exec-sonnet', '--exec-codex', '--exec-kimi', '--exec-auto']
     .map((f) => [f, flagAt(f)]).concat(cm ? [['--code-model', cmAt]] : [])
     .filter(([, i]) => i >= 0).sort((a, b) => b[1] - a[1]).map(([f]) => f)[0];
   let override;
   if (lastFlag === '--exec-sonnet') override = `claude:${cfg.models.code.alias}`;
   else if (lastFlag === '--exec-codex') override = 'codex';
+  else if (lastFlag === '--exec-kimi') override = 'kimi';
   else if (lastFlag === '--exec-auto') override = null;
   else if (lastFlag === '--code-model') override = parseCodeModel(cfg, cm[2]);
   if (override !== undefined && override !== 'invalid') {
@@ -874,10 +958,10 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     s.execAgentSince = override === null ? null : new Date().toISOString();
     save(s);
     process.stdout.write(override === null
-      ? `orchestrator-gate: coding model back to automatic (Codex first, "${cfg.models.code.alias}" past the Codex handoff %).\n`
+      ? `orchestrator-gate: coding model back to automatic (Codex + Kimi load-balanced, "${cfg.models.code.alias}" when neither is eligible).\n`
       : `orchestrator-gate: coding model set by the operator for this session: ${describeOverride(cfg, override)}. Revert with --code-model auto.\n`);
   } else if (override === 'invalid') {
-    process.stdout.write(`orchestrator-gate: ignored --code-model ${cm[2]} (use ${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | auto).\n`);
+    process.stdout.write(`orchestrator-gate: ignored --code-model ${cm[2]} (use ${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | kimi | kimi:<model> | auto).\n`);
   }
 
   // Operator-only manual release of a stuck ownership claim (foreground release is
@@ -924,9 +1008,30 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   const ex = currentExecRoute(cfg, s);
   const codexModelShown = ex.codexModel || cfg.models.codex.id;
   const roleByAlias = (alias) => Object.values(cfg.models).find((m) => m.alias === alias) || { alias, id: null };
-  const codeRoute = ex.route === 'codex'
-    ? `Codex in an Orca worker${codexModelShown ? ` (worker-start --agent codex --model ${codexModelShown})` : ''}`
-    : `in-session subagent (Agent model ${modelLabel(ex.route === 'claude' ? roleByAlias(ex.alias) : cfg.models.code)})`;
+  let codeRoute;
+  if (ex.route === 'external' && ex.pick === 'codex') {
+    codeRoute = `Codex in an Orca worker${codexModelShown ? ` (worker-start --agent codex --model ${codexModelShown})` : ''}`;
+  } else if (ex.route === 'external' && ex.pick === 'kimi') {
+    codeRoute = `Kimi in an Orca worker (worker-start --agent kimi, no --model)${ex.kimiModel ? ` (${ex.kimiModel} via default_model; Orca cannot pin it)` : ''}`;
+  } else {
+    const reasons = ex.coders
+      ? ['codex', 'kimi'].map((coder) => `${coder === 'codex' ? 'Codex' : 'Kimi'} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ')
+      : ex.why;
+    codeRoute = `${String(cfg.models.code.alias).replace(/^./, (c) => c.toUpperCase())}: ${reasons}`;
+  }
+  if (ex.route === 'external' && ex.order?.length > 1 && ex.coders) {
+    const coderText = (coder) => {
+      const c = ex.coders[coder];
+      const liveText = `${c.live} live`;
+      const headroomText = c.headroom === null ? 'quota unknown' : `${Math.max(0, Math.round(c.headroom))}% headroom`;
+      return `${coder === 'codex' ? 'Codex' : 'Kimi'} (${liveText}, ${headroomText})`;
+    };
+    codeRoute = `split: ${coderText('codex')} + ${coderText('kimi')}; next -> ${ex.pick === 'codex' ? 'Codex' : 'Kimi'}`;
+  } else if (ex.route === 'external' && ex.coders) {
+    const other = ex.pick === 'codex' ? 'kimi' : 'codex';
+    const otherState = ex.coders[other];
+    codeRoute += `; ${other === 'codex' ? 'Codex' : 'Kimi'} ${otherState?.reason || otherState?.state || 'unavailable'}; next -> ${ex.pick === 'codex' ? 'Codex' : 'Kimi'}`;
+  }
   parts.push(`Model routing: plan/red-team/review -> model ${modelLabel(cfg.models.review)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);
   if (live.length) {
@@ -1088,6 +1193,12 @@ function onPreToolUse(p, s, cfg) {
         additionalContext: `orchestrator-gate advice: pin the Codex model explicitly - add --model ${cfg.models.codex.id} ` +
           'to this worker-start so the fleet cannot silently drift onto a different default.' } }));
     }
+    const kimiInv = orcaInvocations(cmd).find((inv) =>
+      inv.sub === 'orchestration worker-start' && flagValue(inv.args, '--agent') === 'kimi');
+    if (kimiInv && hasFlag(kimiInv.args, '--model')) {
+      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
+        additionalContext: 'orchestrator-gate advice: drop --model for --agent kimi; Kimi uses default_model from ~/.kimi-code/config.toml and Orca cannot pin it.' } }));
+    }
   }
 
   // Gate: max-parallel-agents — EARLY, READ-ONLY fast-fail. A MACHINE-wide budget (this
@@ -1175,16 +1286,16 @@ function onPreToolUse(p, s, cfg) {
 
     if (wantsExec) {
       const ex = currentExecRoute(cfg, s);
-      const inSession = ex.route !== 'codex' || orcaFallbackActive();
+      const inSession = ex.route !== 'external' || orcaFallbackActive();
       const wantAlias = ex.route === 'claude' ? ex.alias : cfg.models.code.alias;
       if (!inSession) {
         d('route-execution-to-codex',
-          `Code goes to Codex in an Orca worker right now [${ex.why}].\n` +
+          `Code goes to an external coder (${ex.pick === 'kimi' ? 'Kimi' : 'Codex'}) in an Orca worker right now [${ex.why}].\n` +
           'Use: orca orchestration task-create -> worker-start -> worker-read/worker-list -> worker-release.\n' +
           'If Orca genuinely cannot open a worker, declare the fallback first:\n' +
           '  date -u +%Y-%m-%dT%H:%M:%SZ > ~/.claude/orchestrator-gate/orca-unavailable\n' +
           `That declaration expires after ${Math.round(ORCA_DOWN_TTL_SECONDS / 60)} minutes, on purpose.\n` +
-          'The operator (only) can pick the coding model with --code-model <alias|codex|codex:<model>|auto>.');
+          'The operator (only) can pick the coding model with --code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>.');
       }
       if (!model.toLowerCase().includes(String(wantAlias || '').toLowerCase())) {
         d('execution-model-mismatch',
@@ -1380,7 +1491,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
   const dispatchInvs = orcaInvocations(cmd).filter((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
   if (!dispatchInvs.length) return false;
   const toolUseId = p.tool_use_id || p.toolUseId || null;
-  const rawReplies = dispatchInvs.length > 1 ? WG.splitJsonReplies(out) : null;
+  const rawReplies = WG.splitJsonReplies(out);
   // A count mismatch (e.g. one invocation's reply got swallowed by a log-line prefix that
   // defeated the line-start discriminator, or a stray object was miscounted as a reply) means
   // positional zipping (`replies[idx]` <-> `dispatchInvs[idx]`) cannot be trusted AT ALL — it
@@ -1389,22 +1500,19 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
   // command is treated as id-less: each falls through to its own "no ids found" handling
   // (a pending placeholder on the success path, an untouched reservation on the failure path),
   // which is always safe even when wrong, unlike a confident-but-incorrect attribution.
-  const mismatched = !!rawReplies && rawReplies.length !== dispatchInvs.length;
+  const mismatched = rawReplies.length !== dispatchInvs.length;
   const replies = mismatched ? null : rawReplies;
-  const replySlice = (idx) => {
-    if (mismatched) return '';
-    return replies ? (replies[idx] !== undefined ? JSON.stringify(replies[idx]) : '') : out;
-  };
+  const replyAt = (idx) => mismatched ? null : replies[idx] || null;
   let dirty = false;
 
   dispatchInvs.forEach((inv, idx) => {
     const resId = toolUseId ? `${toolUseId}#${idx}` : null;
     const reservation = resId ? s.reservations[resId] : null;
-    const replyText = replySlice(idx);
+    const reply = replyAt(idx);
+    const replyText = reply ? JSON.stringify(reply) : '';
 
     if (inv.sub === 'orchestration task-create') {
-      const idMatch = replyText.match(/"taskId"\s*:\s*"([^"]+)"/) || replyText.match(/\b(task_[A-Za-z0-9_-]+)\b/);
-      const taskId = idMatch && idMatch[1];
+      const taskId = reply && WG.fieldValuesFromReply(reply, 'taskId').find((id) => /^task_[A-Za-z0-9_-]+$/.test(id));
       if (taskId) {
         s.tasks[taskId] = { owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null };
         if (resId) delete s.reservations[resId];
@@ -1422,17 +1530,18 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
     const failed = /"ok"\s*:\s*false/i.test(replyText);
     const agent = reservation ? reservation.agent
       : (inv.sub === 'orchestration worker-start' ? resolveWorkerStartAgent(inv, s) : null);
-    const worktreeIds = [...replyText.matchAll(/"worktreeId"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
+    const worktreeIds = reply ? WG.fieldValuesFromReply(reply, 'worktreeId') : [];
 
     if (failed) {
       const readiness = inv.sub === 'orchestration worker-start' && readinessTimeoutDetails(replyText);
       if (readiness?.dispatch) {
         s.workers[readiness.dispatch] = {
-          role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+          role: `${agent || 'worker'}-exec`, started: Date.now(), status: 'live', last_seen: Date.now(),
           rate_limited_until: 0, group: readiness.dispatch, kind: WG.kindOf(readiness.dispatch), agent,
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
           worktreeIds, readinessTimeout: true,
         };
+        if (inv.sub === 'orchestration worker-start') writeLastCoder(agent);
         dirty = true;
       }
       if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
@@ -1442,12 +1551,12 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
       return;
     }
 
-    const ids = WG.idsFromOutput(replyText);
+    const ids = reply ? WG.idsFromReply(reply) : new Set();
     if (!ids.size) {
       if (!assumeDispatched) return; // unknown outcome on a failure event: keep the reservation.
       const pendingId = `pending-${Date.now()}-${idx}`;
       s.workers[pendingId] = {
-        role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+        role: `${agent || 'worker'}-exec`, started: Date.now(), status: 'live', last_seen: Date.now(),
         rate_limited_until: 0, unverified: true, group: pendingId, kind: 'worker', agent,
         owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
         worktreeIds,
@@ -1461,12 +1570,13 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
       const group = WG.canonicalGroup(ids) || `start-${Date.now()}-${idx}`;
       for (const id of ids) {
         s.workers[id] = {
-          role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+          role: `${agent || 'worker'}-exec`, started: Date.now(), status: 'live', last_seen: Date.now(),
           rate_limited_until: 0, group, kind: WG.kindOf(id), agent,
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
           worktreeIds,
         };
       }
+      if (inv.sub === 'orchestration worker-start') writeLastCoder(agent);
       dirty = true;
       if (!heartbeatAlive(s.session_id)) {
         process.stdout.write(
@@ -1630,7 +1740,7 @@ function onPostToolUseLocked(p, s, cfg) {
         for (const pendingId of pendingIds) {
           const real = newIds.shift();
           if (real) {
-            s.workers[real] = { ...s.workers[pendingId], role: 'codex-exec', unverified: false };
+            s.workers[real] = { ...s.workers[pendingId], role: `${s.workers[pendingId].agent || 'worker'}-exec`, unverified: false };
             delete s.workers[pendingId];
           } else {
             s.workers[pendingId].status = 'settled';
@@ -1708,14 +1818,38 @@ function onPostToolUseLocked(p, s, cfg) {
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
     // Only worker/terminal output counts; the panel's own quota inspection ("rate_limits" JSON) does not.
     const readsWorkerOutput = /\borca\b/.test(cmd) && /(worker-read|terminal (read|show))\b/.test(cmd);
-    if (readsWorkerOutput && hasRateLimitError(workerOutputSignalText(out).replace(/"rate_limits"/g, ''))) {
+    const signalText = workerOutputSignalText(out).replace(/"rate_limits"/g, '');
+    const readTargets = orcaInvocations(cmd).map((inv) => WG.outputTarget(inv, flagValue)).filter(Boolean);
+    const trackedReadWorkers = readTargets.map((target) => [target, s.workers[target]]).filter(([, worker]) => worker);
+    const kimiGroups = new Set(trackedReadWorkers
+      .filter(([, worker]) => worker.agent === 'kimi')
+      .map(([target, worker]) => WG.groupOf(worker, target)));
+    const targetsKimiOnly = trackedReadWorkers.length > 0 &&
+      trackedReadWorkers.length === readTargets.length && trackedReadWorkers.every(([, worker]) => worker.agent === 'kimi');
+    if (readsWorkerOutput && targetsKimiOnly && hasKimiUsageExhausted(signalText)) {
+      CODER_AVAILABILITY.markCoderExhausted(DIR, 'kimi', {
+        now: Date.now(), reason: 'usage limit reached for this billing cycle',
+      });
+      const until = Date.now() + RATE_LIMIT_BACKOFF_SECONDS * 1000;
+      for (const [key, worker] of Object.entries(s.workers)) {
+        if (worker.status === 'live' && worker.agent === 'kimi' && kimiGroups.has(WG.groupOf(worker, key))) {
+          worker.rate_limited_until = until;
+        }
+      }
+      dirty = true;
+      process.stdout.write(
+        'orchestrator-gate: Kimi usage limit detected for the tracked Kimi worker. Route new code to Codex, ' +
+        'or Sonnet if Codex is also unavailable; do not retry Kimi until reset.\n'
+      );
+    }
+    if (readsWorkerOutput && hasRateLimitError(signalText)) {
       s.rate_limit_hits += 1;
       const until = Date.now() + RATE_LIMIT_BACKOFF_SECONDS * 1000;
       for (const w of Object.values(s.workers)) if (w.status === 'live') w.rate_limited_until = until;
       dirty = true;
       process.stdout.write(
-        'orchestrator-gate: Codex rate limit detected. Do NOT re-dispatch immediately — that deepens the limit.\n' +
-        `Back off ~${RATE_LIMIT_BACKOFF_SECONDS}s, reduce the number of parallel Codex workers, then retry the same worker ` +
+        'orchestrator-gate: external coder rate limit detected. Do NOT re-dispatch immediately — that deepens the limit.\n' +
+        `Back off ~${RATE_LIMIT_BACKOFF_SECONDS}s, reduce the number of parallel coder workers, then retry the same worker ` +
         'with `orca orchestration worker-read` before starting anything new.\n'
       );
     }

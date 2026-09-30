@@ -86,7 +86,7 @@ function pickCoderPool(options = {}) {
       state = 'exhausted';
       reason = exhaustion[coder].reason || 'quota exhaustion marker active';
     }
-    coders[coder] = { state, leftPct, live: liveCount, cap, reason };
+    coders[coder] = { state, leftPct, headroom: headroomFor(coder), live: liveCount, cap, reason };
   }
 
   const order = CODERS.filter((coder) => coders[coder].state === 'eligible');
@@ -112,7 +112,9 @@ function pickCoderPool(options = {}) {
   }
   const pick = order[0];
   let pickReason = 'only eligible coder';
-  if (order.length > 1) {
+  if (!freeSlot(pick)) {
+    pickReason = 'all at cap, wait';
+  } else if (order.length > 1) {
     const other = order[1];
     if (freeSlot(pick) !== freeSlot(other)) pickReason = 'free capacity';
     else if (coders[pick].live !== coders[other].live) pickReason = 'fewer live';

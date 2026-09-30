@@ -36,6 +36,41 @@ function idsFromOutput(out) {
   return ids;
 }
 
+/** IDs carried by authoritative fields in one parsed worker-start reply. Free-text string
+ * values are deliberately never scanned: prompts, formatter output and chained worker-list
+ * summaries can mention arbitrary ctx_/task_/term_ ids that do not belong to this start. */
+function idsFromReply(reply) {
+  const ids = new Set();
+  const idKeys = new Set(['dispatchId', 'taskId', 'handle', 'terminalHandle', 'agentTerminalHandle']);
+  const visit = (value) => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    for (const [key, child] of Object.entries(value)) {
+      if (idKeys.has(key) && typeof child === 'string' && /^(?:ctx|task|term)_[A-Za-z0-9_-]+$/.test(child)) {
+        ids.add(child);
+      } else if (child && typeof child === 'object') {
+        visit(child);
+      }
+    }
+  };
+  visit(reply);
+  return ids;
+}
+
+function fieldValuesFromReply(reply, field) {
+  const values = [];
+  const visit = (value) => {
+    if (!value || typeof value !== 'object') return;
+    if (Array.isArray(value)) { value.forEach(visit); return; }
+    for (const [key, child] of Object.entries(value)) {
+      if (key === field && typeof child === 'string') values.push(child);
+      else if (child && typeof child === 'object') visit(child);
+    }
+  };
+  visit(reply);
+  return values;
+}
+
 /**
  * True when a parsed value is a real orca reply envelope worth attributing to a dispatch
  * invocation, rather than noise a lenient parser happened to accept: it must be a plain
@@ -287,8 +322,21 @@ function retainTarget(inv, flagValue) {
   return flagValue(rest, '--dispatch') || rest.find((a) => !a.startsWith('-')) || null;
 }
 
+/** Worker/terminal id whose output an inspection invocation returns. */
+function outputTarget(inv, flagValue) {
+  const supported = new Set([
+    'orchestration worker-read', 'orchestration worker-show', 'terminal read', 'terminal show',
+  ]);
+  if (!supported.has(inv.sub)) return null;
+  const rest = inv.args.slice(inv.sub.split(' ').length);
+  return flagValue(rest, '--dispatch') || flagValue(rest, '--task') ||
+    flagValue(rest, '--terminal') || flagValue(rest, '--handle') ||
+    rest.find((a) => !a.startsWith('-')) || null;
+}
+
 module.exports = {
-  idsFromOutput, splitJsonReplies, splitConcatenatedJson, isDispatchReply, kindOf,
+  idsFromOutput, idsFromReply, fieldValuesFromReply,
+  splitJsonReplies, splitConcatenatedJson, isDispatchReply, kindOf,
   canonicalGroup, groupOf, countLiveGroups, liveGroupByTerminal, groupById, settleGroup,
-  RELEASE_SUBS, releaseTarget, RETAIN_SUB, retainTarget,
+  RELEASE_SUBS, releaseTarget, RETAIN_SUB, retainTarget, outputTarget,
 };

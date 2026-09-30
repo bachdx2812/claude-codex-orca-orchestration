@@ -347,7 +347,9 @@ async function run() {
     check('fewer live workers beats quota headroom', pick({
       live: { codex: 2, kimi: 0 }, quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 20 } },
     }).pick, 'kimi');
-    check('both at cap stay external and rank by headroom', pick({ live: { codex: 3, kimi: 3 } }).route, 'external');
+    const bothAtCap = pick({ live: { codex: 3, kimi: 3 } });
+    check('both at cap stay external and rank by headroom', bothAtCap.route, 'external');
+    ok('both at cap tells the operator to wait', /all at cap, wait/.test(bothAtCap.why));
     check('unknown quota ranks by fewer live workers', pick({ quotas: { codex: null, kimi: null }, live: { codex: 2, kimi: 1 } }).pick, 'kimi');
     check('unknown quota tie prefers Codex', pick({ quotas: { codex: null, kimi: null } }).pick, 'codex');
     check('fallback false no longer resurrects an unusable Codex', pick({
@@ -368,8 +370,8 @@ async function run() {
     const spread = pick({ live: { codex: 2, kimi: 0 }, quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 20 } } });
     ok('why names the spread reason', /auto: spread, pick Kimi \(fewer live\)/.test(spread.why));
     check('omitted thresholds never compare NaN', pick({
-      quotas: { codex: { usedPercent: 50 }, kimi: { usedPercent: 80 } }, thresholds: {},
-    }).pick, 'codex');
+      quotas: { codex: { usedPercent: 80 }, kimi: { usedPercent: 50 } }, thresholds: {},
+    }).pick, 'kimi');
     check('omitted thresholds still rank by headroom against the default', pick({
       quotas: { codex: { usedPercent: 96 }, kimi: { usedPercent: 50 } }, thresholds: {},
     }).pick, 'kimi');
