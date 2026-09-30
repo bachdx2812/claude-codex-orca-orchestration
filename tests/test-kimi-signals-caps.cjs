@@ -279,8 +279,9 @@ check('without agent info the sentence is only a generic rate limit',
   const event = heartbeat.reportUsageExhausted({ reported, handle: 'term_k1', label: 'term_k1 (Kimi worker)', coder: 'kimi' });
   check('the first usage-exhausted report emits the KIMI USAGE LIMIT event',
     typeof event === 'string' && event.startsWith('KIMI USAGE LIMIT on term_k1'), true);
-  check('the event says to release and not retry',
-    event.includes('release this worker, do not retry it until reset'), true);
+  check('the event says to preserve WIP before release and not retry',
+    event.includes('commit WIP and HANDOVER.md before stopping/releasing this worker') &&
+      event.includes('do not retry it until reset'), true);
   check('the exhaustion hook fired once for kimi', calls, ['kimi']);
   check('the reported handle is persisted for a daemon restart',
     heartbeat.loadPersistedUsageExhaustedReports().has('term_k1'), true);

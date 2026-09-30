@@ -36,17 +36,33 @@
  * terminals that were already open when it started cannot drown the signal.
  */
 
-const { execFileSync, spawnSync } = require('child_process');
+const { execFileSync, spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, stateDir, closeDoneWorktreesEnabled } = require('./lib/config.cjs');
-const { hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted } = require('./lib/terminal-signals.cjs');
+const {
+  loadConfig, stateDir, closeDoneWorktreesEnabled, stallSeconds, handoffUsed, kimiHandoffUsed,
+  codexQuotaCacheSeconds, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds,
+  autoResumeAfterReset,
+} = require('./lib/config.cjs');
+const {
+  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, hasCodexUsageExhausted,
+  approvalPromptFingerprint,
+} = require('./lib/terminal-signals.cjs');
+const {
+  workerProgressSample, observeWorkerProgress, recordsFromJSON,
+} = require('./lib/worker-progress-fingerprint.cjs');
+const QUOTA = require('./lib/exec-route-by-quota.cjs');
+const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
+const CODER_POOL = require('./lib/coder-pool-route.cjs');
+const HANDOVER = require('./lib/worker-quota-handover.cjs');
+const RESUME = require('./lib/quota-reset-resume.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
 // Overridable the same way ORCA_BIN is (tests point this at a deterministic stub); a bare
 // "git" resolves against PATH exactly like the bare "orca" default does.
 const GIT_BIN = process.env.ORCH_GIT_BIN || 'git';
+const RESUME_SCHEDULER = path.join(__dirname, 'orca-resume-scheduler.cjs');
 const DONE_PR_STATES = new Set(['merged', 'closed']);
 // GitLab's MR state vocabulary uses "opened"/"merged"/"closed"/"locked" where GitHub's PR
 // vocabulary uses "open"/"merged"/"closed" — normalize the "still open" spelling so a linked
@@ -62,7 +78,9 @@ const cfg = loadConfig();
 const IDLE_SECONDS = arg('idle', cfg.heartbeat.idleSeconds);        // quiet terminal => needs a decision
 const INTERVAL_SECONDS = arg('interval', cfg.heartbeat.intervalSeconds);
 const MAX_SECONDS = arg('max', cfg.heartbeat.maxSeconds);           // hard stop so a forgotten daemon dies
+const STALL_SECONDS = stallSeconds(cfg);
 const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
+const AUTO_RESUME = autoResumeAfterReset(cfg);
 // A fleet with many worktrees means many per-row git subprocess calls (idle/accepted/clean,
 // each independently bounded ~3s by runGit) inside one `processDoneWorktrees` pass — capped
 // (on the steady-state pass only, see processDoneWorktrees's item-4 note) so a single
@@ -87,6 +105,10 @@ const DISCONNECT_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-disconnect
 // restarts, same mechanism as the disconnect report) so a restart never re-marks Kimi
 // exhausted.
 const USAGE_EXHAUSTED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-usage-exhausted-reported.json`);
+// Per-terminal fingerprint, last real progress time and once-per-episode report marker.
+// This survives daemon restarts because emitting any wake event intentionally exits.
+const STALL_PROGRESS_FILE = path.join(DIR, `heartbeat-${SESSION}-stall-progress.json`);
+const APPROVAL_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-approval-reported.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -189,6 +211,47 @@ function savePersistedUsageExhaustedReports(set) {
   } catch {}
 }
 
+function loadPersistedStallProgress() {
+  try { return recordsFromJSON(JSON.parse(fs.readFileSync(STALL_PROGRESS_FILE, 'utf8'))); }
+  catch { return new Map(); }
+}
+
+function savePersistedStallProgress(records) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${STALL_PROGRESS_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...records]));
+    fs.renameSync(tmp, STALL_PROGRESS_FILE);
+  } catch {}
+}
+
+function loadPersistedApprovalReports() {
+  try {
+    const pairs = JSON.parse(fs.readFileSync(APPROVAL_REPORTED_FILE, 'utf8'));
+    return new Map(Array.isArray(pairs) ? pairs.filter((pair) =>
+      Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' &&
+      typeof pair[1] === 'string') : []);
+  } catch {
+    return new Map();
+  }
+}
+
+function savePersistedApprovalReports(reported) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${APPROVAL_REPORTED_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...reported]));
+    fs.renameSync(tmp, APPROVAL_REPORTED_FILE);
+  } catch {}
+}
+
+function reportApprovalWaiting({ reported, handle, fingerprint, identity, agent }) {
+  if (reported.get(handle) === fingerprint) return null;
+  reported.set(handle, fingerprint);
+  savePersistedApprovalReports(reported);
+  return `WORKER WAITING FOR APPROVAL ${identity || handle} (${agent || 'unknown'})`;
+}
+
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
 // exhaustion marker the routing code reads to exclude that coder until reset. The module
 // providing it may not exist yet (it lands with the routing lane) — a missing/failing
@@ -221,8 +284,81 @@ function reportUsageExhausted({ reported, handle, label, coder }) {
   reported.add(handle);
   savePersistedUsageExhaustedReports(reported);
   onCoderExhausted(coder);
-  return `KIMI USAGE LIMIT on ${label}: Kimi is exhausted for this billing cycle - ` +
-    'route new code to Codex (or Sonnet if Codex is also out); release this worker, do not retry it until reset';
+  const name = coder === 'codex' ? 'Codex' : 'Kimi';
+  const other = coder === 'codex' ? 'Kimi' : 'Codex';
+  return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
+    `route new code to ${other} (or Sonnet if ${other} is also out); follow the WORKER HANDOVER recipe ` +
+    'to commit WIP and HANDOVER.md before stopping/releasing this worker; do not retry it until reset';
+}
+
+function pidAlive(pid, file) {
+  try {
+    process.kill(pid, 0);
+    if (process.platform === 'win32') return true;
+    const command = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8', timeout: 1000,
+    });
+    return command.includes('orca-resume-scheduler.cjs') && (!file || command.includes(file));
+  } catch { return false; }
+}
+
+function spawnResumeScheduler(file) {
+  try {
+    const child = spawn(process.execPath, [RESUME_SCHEDULER, '--job', file], {
+      detached: true, stdio: 'ignore', env: process.env,
+    });
+    child.unref();
+    return child.pid || 0;
+  } catch { return 0; }
+}
+
+/** Probe only coders with live supervised workers. The existing quota helpers own the
+ * shared cache and single-flight lock, so a fresh gate reading makes this effectively free. */
+function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
+  const result = { codex: null, kimi: null };
+  if (agents.has('codex')) {
+    const reading = (deps.codexQuota || QUOTA.codexQuota)(now, {
+      stateDir: DIR, cacheSeconds: codexQuotaCacheSeconds(cfg),
+    });
+    if (reading && !reading.failed) result.codex = reading;
+  }
+  if (agents.has('kimi')) {
+    const reading = (deps.kimiQuota || QUOTA.kimiQuota)(now, {
+      stateDir: DIR, cacheSeconds: kimiQuotaCacheSeconds(cfg), env: process.env,
+    });
+    if (reading && !reading.failed) result.kimi = reading;
+  }
+  return result;
+}
+
+/** Supplement live-worker readings with fresh cache-only data for destination selection.
+ * This keeps an idle/exhausted alternative out of the recommendation without probing it. */
+function cachedCoderQuotas(now = Date.now(), deps = {}) {
+  const codex = (deps.readCodexCache || QUOTA.readFreshCache)(DIR, codexQuotaCacheSeconds(cfg), now);
+  const kimi = (deps.readKimiCache || QUOTA.readFreshKimiCache)(DIR, kimiQuotaCacheSeconds(cfg), now);
+  return {
+    codex: codex && !codex.failed ? codex : null,
+    kimi: kimi && !kimi.failed ? kimi : null,
+  };
+}
+
+function buildHandoverPool(quotas, now = Date.now(), deps = {}) {
+  const authState = (deps.codexAuthState || QUOTA.codexAuthState)(
+    DIR, now, coderAvailabilityCacheSeconds(cfg) * 1000
+  );
+  const availability = deps.availability || CODER_AVAILABILITY.coderAvailability({
+    stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
+    orcaInstalled: true, env: process.env, codexAuthState: authState,
+  });
+  return (deps.pickCoderPool || CODER_POOL.pickCoderPool)({
+    availability, quotas,
+    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg) },
+    exhaustion: (deps.readCoderExhaustion || CODER_AVAILABILITY.readCoderExhaustion)(DIR, now),
+    live: { codex: 0, kimi: 0 }, caps: { codex: 0, kimi: 0 },
+    // Handover must never recommend an unavailable destination. The legacy null fallback
+    // mode applies only to default new-work routing, not recovery of an in-flight task.
+    fallbackEnabled: true,
+  });
 }
 
 /** Run an orca command and return parsed JSON, or null when orca cannot answer. */
@@ -252,9 +388,37 @@ function terminals() {
   }));
 }
 
+function parseTerminalScreen(reply) {
+  if (!reply || reply.ok === false) return null;
+  const result = reply.result ?? reply;
+  const terminal = result && result.terminal ? result.terminal : result;
+  if (!terminal) return null;
+  if (Array.isArray(terminal.tail)) return terminal.tail.join('\n');
+  if (typeof terminal.tail === 'string') return terminal.tail;
+  return null;
+}
+
+/** Rendered screen text is authoritative; list previews are lossy repaint composites. */
+function terminalReadArgs(handle) {
+  return ['terminal', 'read', '--terminal', handle, '--screen', '--json'];
+}
+
+function terminalScreen(handle) {
+  return parseTerminalScreen(orca(terminalReadArgs(handle), 2000));
+}
+
+function resolveTerminalScreen(readText, previousText, listPreview) {
+  if (readText !== null) return readText;
+  if (typeof previousText === 'string') return previousText;
+  return listPreview || '';
+}
+
 function workers() {
-  const d = orca(['orchestration', 'worker-list', '--json']);
-  if (!d) return null;
+  return parseWorkerRows(orca(['orchestration', 'worker-list', '--json']));
+}
+
+function parseWorkerRows(d) {
+  if (!d || d.ok === false) return null;
   const r = d.result ?? d;
   const list = Array.isArray(r) ? r : r.workers || [];
   return list.map((w) => ({
@@ -263,6 +427,7 @@ function workers() {
     workerState: w.workerState,
     dispatchStatus: w.dispatchStatus,
     terminalState: w.terminalState,
+    agent: w.agent || '',
     agentTerminalHandle: w.agentTerminalHandle || '',
     worktreeIds: [
       w.worktreeId,
@@ -277,6 +442,33 @@ function workers() {
       w.worktree && w.worktree.path,
     ].filter((candidate) => typeof candidate === 'string' && candidate.length > 0),
   }));
+}
+
+function terminalWorktreePath(terminal, workerRows) {
+  if (terminal.worktreePath) return terminal.worktreePath;
+  const terminalKeys = [...worktreeKeys(terminal.worktreeId, '')];
+  const terminalPath = terminalKeys.find((key) => path.isAbsolute(key));
+  if (terminalPath) return terminalPath;
+  const worker = (workerRows || []).find((row) => row.agentTerminalHandle === terminal.handle);
+  if (!worker) return '';
+  const candidates = [
+    ...(worker.worktreePaths || []),
+    ...(worker.worktreeIds || []).flatMap((id) => [...worktreeKeys(id, '')]),
+  ];
+  return candidates.find((candidate) => path.isAbsolute(candidate)) || '';
+}
+
+/** Four bounded probes keep one supervised worker's git fingerprint near 3s total. */
+function runProgressGit(args, cwd) {
+  try {
+    const r = spawnSync(GIT_BIN, args, {
+      cwd, encoding: 'utf8', timeout: 750, maxBuffer: 8 * 1024 * 1024,
+    });
+    if (r.error || r.status === null || r.status === undefined) return null;
+    return { status: r.status, stdout: r.stdout || '' };
+  } catch {
+    return null;
+  }
 }
 
 /** Every stable join key for a worktree id/path. Real Orca ids are `<repoId>::<abs path>`;
@@ -791,8 +983,14 @@ function classifyTerminal(t, ctx) {
   // or prose narrating it, must never mark Kimi exhausted).
   if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'kimi' &&
       hasKimiUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'kimi' };
+  if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'codex' &&
+      hasCodexUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'codex' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
+  const approvalFingerprint = approvalPromptFingerprint(
+    ctx.approvalText !== undefined ? ctx.approvalText : (t.preview || '')
+  );
+  if (approvalFingerprint) return { kind: 'approval_waiting', fingerprint: approvalFingerprint };
   if (t.orphaned) return { kind: 'orphaned' };
   const supervised = (ctx.retainedHandles && ctx.retainedHandles.has(t.handle)) ||
     !ctx.baseHandles.has(t.handle) || t.lastOutputAt > ctx.started;
@@ -808,6 +1006,45 @@ function snapshotWorkers(list) {
     m.set(w.dispatchId, `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`);
   }
   return m;
+}
+
+const TERMINAL_WORKER_STATES = new Set(['succeeded', 'failed', 'stopped', 'cancelled', 'completed']);
+
+function terminalWorkerStates(workerRows) {
+  const states = new Map();
+  for (const row of workerRows || []) {
+    if (row && row.agentTerminalHandle && row.workerState) {
+      const previous = states.get(row.agentTerminalHandle);
+      if (!TERMINAL_WORKER_STATES.has(previous) || TERMINAL_WORKER_STATES.has(row.workerState)) {
+        states.set(row.agentTerminalHandle, row.workerState);
+      }
+    }
+  }
+  return states;
+}
+
+function stallThresholdForAgent(agent, heartbeatConfig, globalThreshold) {
+  return Object.hasOwn(heartbeatConfig.stallSecondsByAgent, agent)
+    ? heartbeatConfig.stallSecondsByAgent[agent]
+    : globalThreshold;
+}
+
+function shouldTrackWorkerProgress(verdictKind, workerState) {
+  return ['working', 'idle'].includes(verdictKind) && !TERMINAL_WORKER_STATES.has(workerState);
+}
+
+/** Absence-based cleanup is safe only after Orca supplied an authoritative worker list. */
+function clearMissingPendingJobsForTick(workerRows, stateDir, session, activeHandles,
+  clear = RESUME.clearMissingPendingJobs) {
+  if (!Array.isArray(workerRows)) return 0;
+  return clear(stateDir, session, activeHandles);
+}
+
+function formatStallEvent({ dispatchId, handle, agent, stalledSeconds }) {
+  const identity = dispatchId || handle;
+  return `WORKER STALLED ${identity} (${agent}, no file change or new output for ` +
+    `${Math.floor(stalledSeconds / 60)}m) - nudge it (terminal send "continue ..."), ` +
+    'or stop it and re-dispatch the same brief to the other coder';
 }
 
 function main() {
@@ -836,6 +1073,12 @@ function main() {
   const reportedIdle = loadPersistedIdleReports();
   const reportedDisconnect = loadPersistedDisconnectReports();
   const reportedUsageExhausted = loadPersistedUsageExhaustedReports();
+  const stallProgress = loadPersistedStallProgress();
+  const lastScreenText = new Map([...stallProgress]
+    .filter(([, record]) => record && typeof record.screenText === 'string')
+    .map(([handle, record]) => [handle, record.screenText]));
+  const reportedApproval = loadPersistedApprovalReports();
+  const handoverRecords = HANDOVER.loadRecords(DIR, SESSION);
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
@@ -869,6 +1112,8 @@ function main() {
     beat(started);
     const events = [];
     const now = Date.now();
+    events.push(...RESUME.resumeJobEvents(DIR, SESSION, now, pidAlive));
+    RESUME.sweepJobs(DIR, SESSION, now);
 
     const ws = workers();
     beat(started); // item L1: refresh liveness between round trips at a short --interval
@@ -917,10 +1162,16 @@ function main() {
       // Which coder each supervised terminal runs — the usage-exhausted signal is only ever
       // attributed to a terminal whose tracked worker agent is kimi (RT-3).
       const handleAgent = new Map();
+      const handleDispatch = new Map();
+      const handleAliases = new Map();
+      const handleWorkerState = terminalWorkerStates(ws || []);
       for (const row of ws || []) {
         if (row && row.agentTerminalHandle) {
           const agent = stateWorkerForRow(row, tickState)?.agent || row.agent;
           if (agent) handleAgent.set(row.agentTerminalHandle, agent);
+          if (row.dispatchId) handleDispatch.set(row.agentTerminalHandle, row.dispatchId);
+          handleAliases.set(row.agentTerminalHandle,
+            [row.agentTerminalHandle, row.dispatchId, row.taskId].filter(Boolean));
         }
       }
       for (const [id, w] of Object.entries(tickState.workers || {})) {
@@ -933,43 +1184,229 @@ function main() {
         retainedHandles: explicitRetainedHandles, started, now, idleSeconds: IDLE_SECONDS,
         handleAgent,
       };
+      const panelHandle = process.env.ORCA_TERMINAL_HANDLE || '';
+      let panelLimited = false;
+      let panelAvailable = false;
+      if (panelHandle) {
+        const panelTerminal = ts.find((terminal) => terminal.handle === panelHandle);
+        if (panelTerminal) {
+          const panelScreen = terminalScreen(panelHandle) || panelTerminal.preview || '';
+          beat(started);
+          const recentPanelScreen = panelScreen.split(/\r?\n/).slice(-8).join('\n');
+          const panelLimit = RESUME.claudeLimitInfo(recentPanelScreen, now);
+          panelLimited = panelLimit.limited;
+          panelAvailable = !panelLimited;
+          if (panelLimited && AUTO_RESUME && cfg.autoResumePanel) {
+            const parked = RESUME.park({
+              stateDir: DIR, session: SESSION, handle: panelHandle, identity: panelHandle,
+              agent: 'claude', resetAt: panelLimit.resetAt, limitLine: panelLimit.line,
+              panel: true, panelHandle, now, spawnScheduler: spawnResumeScheduler, pidAlive,
+            });
+            if (parked.event) events.push(parked.event);
+          } else if (!AUTO_RESUME || !cfg.autoResumePanel) {
+            RESUME.clearJob(DIR, SESSION, panelHandle);
+          } else if (!panelLimited) {
+            // Recovery ends a settled episode so a later, separate limit can be parked.
+            // Pending jobs remain scheduler-owned even if the live quota recovers early.
+            RESUME.clearSettledJob(DIR, SESSION, panelHandle);
+          }
+        }
+      }
+      const liveWorkerHandles = new Set((ws || []).filter((worker) => worker &&
+        worker.workerState !== 'unsupervised' &&
+        !TERMINAL_WORKER_STATES.has(worker.workerState) &&
+        !TERMINAL_WORKER_STATES.has(worker.dispatchStatus) && worker.terminalState !== 'released')
+        .map((worker) => worker.agentTerminalHandle).filter(Boolean));
+      const activeResumeHandles = new Set(ts.filter((terminal) =>
+        ownTerminalHandles.has(terminal.handle) &&
+        liveWorkerHandles.has(terminal.handle) &&
+        ['codex', 'kimi', 'claude'].includes(handleAgent.get(terminal.handle))
+      ).map((terminal) => terminal.handle));
+      const activeCoderHandles = new Set([...activeResumeHandles]
+        .filter((handle) => ['codex', 'kimi'].includes(handleAgent.get(handle))));
+      const authorizedResumeHandles = new Set(activeResumeHandles);
+      if (panelHandle && ts.some((terminal) => terminal.handle === panelHandle)) {
+        authorizedResumeHandles.add(panelHandle);
+      }
+      clearMissingPendingJobsForTick(ws, DIR, SESSION, authorizedResumeHandles);
+      const liveCoderAgents = new Set([...activeCoderHandles].map((handle) => handleAgent.get(handle)));
+      const liveQuotas = probeLiveCoderQuotas(liveCoderAgents, now);
+      beat(started);
+      const cachedQuotas = liveCoderAgents.size ? cachedCoderQuotas(now) : { codex: null, kimi: null };
+      const routingQuotas = {
+        codex: liveQuotas.codex || cachedQuotas.codex,
+        kimi: liveQuotas.kimi || cachedQuotas.kimi,
+      };
+      const handoverPool = liveCoderAgents.size ? buildHandoverPool(routingQuotas, now) : null;
+      let handoverChanged = false;
+      for (const handle of [...handoverRecords.keys()]) {
+        if (!activeCoderHandles.has(handle)) {
+          handoverRecords.delete(handle);
+          handoverChanged = true;
+        }
+      }
       for (const t of ts) {
-        const verdict = classifyTerminal(t, ctx);
+        const workerState = handleWorkerState.get(t.handle);
+        let screenText = t.preview;
+        if (ownTerminalHandles.has(t.handle) && !TERMINAL_WORKER_STATES.has(workerState)) {
+          const readText = terminalScreen(t.handle);
+          beat(started);
+          if (readText !== null) {
+            lastScreenText.set(t.handle, readText);
+          }
+          screenText = resolveTerminalScreen(readText, lastScreenText.get(t.handle), t.preview);
+        }
+        const verdict = classifyTerminal(t, { ...ctx, approvalText: screenText });
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
         if (verdict.kind === 'usage_exhausted') {
           const event = reportUsageExhausted({
             reported: reportedUsageExhausted, handle: t.handle, label, coder: verdict.coder,
           });
-          if (!event) continue;
-          events.push(event);
+          if (event) events.push(event);
         } else if (verdict.kind === 'rate_limit') {
-          if (reportedRateLimit.has(t.handle)) continue;
-          reportedRateLimit.add(t.handle);
-          events.push(
-            `RATE LIMIT on ${label}: back off, then retry the SAME dispatch with ` +
-            '`orca orchestration worker-start --retry-of <dispatchId>`. Do not start a replacement, ' +
-            'and reduce how many coder workers run in parallel.'
-          );
+          if (!reportedRateLimit.has(t.handle)) {
+            reportedRateLimit.add(t.handle);
+            events.push(
+              `RATE LIMIT on ${label}: back off, then retry the SAME dispatch with ` +
+              '`orca orchestration worker-start --retry-of <dispatchId>`. Do not start a replacement, ' +
+              'and reduce how many coder workers run in parallel.'
+            );
+          }
         } else if (verdict.kind === 'connection_lost') {
-          if (reportedDisconnect.has(t.handle)) continue;
-          reportedDisconnect.add(t.handle);
-          savePersistedDisconnectReports(reportedDisconnect);
-          events.push(
-            `WORKER STUCK on ${label}: Codex session lost its app-server connection - ` +
-            'its work since the last commit may be lost; release and re-dispatch'
-          );
+          if (!reportedDisconnect.has(t.handle)) {
+            reportedDisconnect.add(t.handle);
+            savePersistedDisconnectReports(reportedDisconnect);
+            events.push(
+              `WORKER STUCK on ${label}: Codex session lost its app-server connection - ` +
+              'its work since the last commit may be lost; release and re-dispatch'
+            );
+          }
+        } else if (verdict.kind === 'approval_waiting') {
+          if (TERMINAL_WORKER_STATES.has(workerState)) {
+            if (reportedApproval.delete(t.handle)) savePersistedApprovalReports(reportedApproval);
+            continue;
+          }
+          const event = reportApprovalWaiting({
+            reported: reportedApproval,
+            handle: t.handle,
+            fingerprint: verdict.fingerprint,
+            identity: handleDispatch.get(t.handle) || t.handle,
+            agent: handleAgent.get(t.handle) || 'unknown',
+          });
+          if (event) events.push(event);
         } else if (verdict.kind === 'orphaned') {
           // Orphans already present at startup are backlog, not this run's event: reporting
           // them would make every restarted daemon exit on its first tick, breaking the loop.
-          if (baseOrphans.has(t.handle) || reportedOrphans.has(t.handle)) continue;
-          reportedOrphans.add(t.handle);
-          events.push(`ORPHANED terminal ${label} — close it.`);
+          if (!baseOrphans.has(t.handle) && !reportedOrphans.has(t.handle)) {
+            reportedOrphans.add(t.handle);
+            events.push(`ORPHANED terminal ${label} — close it.`);
+          }
         } else if (verdict.kind === 'idle' && reportedIdle.get(t.handle) !== t.lastOutputAt) {
           reportedIdle.set(t.handle, t.lastOutputAt);
           savePersistedIdleReports(reportedIdle);
           events.push(`IDLE ${verdict.quiet}s: ${label} — read it and decide: re-prompt, retry, or release.`);
         }
+
+        if (verdict.kind !== 'approval_waiting' && reportedApproval.delete(t.handle)) {
+          savePersistedApprovalReports(reportedApproval);
+        }
+
+        const agent = handleAgent.get(t.handle) || 'unknown';
+        if (agent === 'claude' && activeResumeHandles.has(t.handle)) {
+          const claudeLimit = RESUME.claudeLimitInfo(screenText, now);
+          if (claudeLimit.limited && AUTO_RESUME) {
+            const parked = RESUME.park({
+              stateDir: DIR, session: SESSION, handle: t.handle,
+              identity: handleDispatch.get(t.handle) || t.handle, agent,
+              resetAt: claudeLimit.resetAt, limitLine: claudeLimit.line, panelHandle,
+              authorizedHandles: activeResumeHandles, now,
+              spawnScheduler: spawnResumeScheduler, pidAlive,
+            });
+            if (parked.event) events.push(parked.event);
+          } else if (!AUTO_RESUME) {
+            RESUME.clearJob(DIR, SESSION, t.handle);
+          } else if (!claudeLimit.limited) {
+            RESUME.clearSettledJob(DIR, SESSION, t.handle);
+          }
+        }
+        if (activeCoderHandles.has(t.handle)) {
+          const quota = liveQuotas[agent];
+          const exhausted = verdict.kind === 'usage_exhausted';
+          // An unknown/failed probe is absence of evidence, not recovery. Preserve an
+          // existing episode until a known below-margin reading or worker completion.
+          if (exhausted || typeof quota?.usedPercent === 'number') {
+            const threshold = agent === 'kimi' ? kimiHandoffUsed(cfg) : handoffUsed(cfg);
+            let target = HANDOVER.pickNextCoder(agent, handoverPool);
+            const limited = exhausted || quota.usedPercent >= 100;
+            // Sonnet lives inside the panel. If that panel is itself quota-limited, there
+            // is no viable handover destination and the resumable worker must be parked.
+            target = RESUME.availableHandoverTarget(target, panelAvailable);
+            if (RESUME.shouldPark({ limited, handoverTarget: target })) {
+              if (handoverRecords.delete(t.handle)) handoverChanged = true;
+              if (AUTO_RESUME) {
+                const parked = RESUME.park({
+                  stateDir: DIR, session: SESSION, handle: t.handle,
+                  identity: handleDispatch.get(t.handle) || t.handle, agent,
+                  resetAt: RESUME.quotaResetAt(quota), panelHandle, threshold,
+                  authorizedHandles: activeCoderHandles, now,
+                  spawnScheduler: spawnResumeScheduler, pidAlive,
+                });
+                if (parked.event) events.push(parked.event);
+              } else {
+                RESUME.clearJob(DIR, SESSION, t.handle);
+              }
+            } else if (target) {
+              const handover = HANDOVER.observe(handoverRecords, {
+                handle: t.handle,
+                identity: handleDispatch.get(t.handle) || t.handle,
+                agent,
+                usedPercent: quota?.usedPercent,
+                threshold,
+                warnMargin: cfg.handoverWarnMarginPercent,
+                exhausted,
+                target,
+                aliases: handleAliases.get(t.handle) || [t.handle],
+                worktreePath: terminalWorktreePath(t, ws || []),
+                now,
+              });
+              // Only a real warning/handover supersedes the scheduler. A below-margin
+              // reading can arrive before reset+grace and must not erase a pending job.
+              if (handover.record) RESUME.clearJob(DIR, SESSION, t.handle);
+              if (handover.changed) handoverChanged = true;
+              if (handover.event) events.push(handover.event);
+            }
+          }
+        }
+
+        // Fatal/quota signals above take precedence and are never mislabeled as stalls.
+        if (!shouldTrackWorkerProgress(verdict.kind, workerState)) {
+          if (!TERMINAL_WORKER_STATES.has(workerState)) continue;
+          if (stallProgress.delete(t.handle)) savePersistedStallProgress(stallProgress);
+          continue;
+        }
+        const threshold = stallThresholdForAgent(agent, cfg.heartbeat, STALL_SECONDS);
+        const previousProgress = stallProgress.get(t.handle);
+        const sample = workerProgressSample({
+          terminalText: screenText,
+          worktreePath: terminalWorktreePath(t, ws || []),
+          git: runProgressGit,
+          previousGitParts: previousProgress && previousProgress.gitParts,
+        });
+        const progress = observeWorkerProgress(stallProgress, {
+          handle: t.handle, fingerprint: sample.fingerprint, now, stallSeconds: threshold,
+          activeChild: sample.activeChild, gitParts: sample.gitParts, screenText,
+        });
+        beat(started);
+        if (progress.changed || progress.stalled) savePersistedStallProgress(stallProgress);
+        if (progress.stalled) {
+          events.push(formatStallEvent({
+            dispatchId: handleDispatch.get(t.handle), handle: t.handle, agent,
+            stalledSeconds: progress.stalledSeconds,
+          }));
+        }
       }
+      if (handoverChanged) HANDOVER.saveRecords(DIR, SESSION, handoverRecords);
+      beat(started);
     }
 
     if (events.length) { flushAndExit(events, now); return; }
@@ -993,4 +1430,13 @@ module.exports = {
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
+  terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
+  formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
+  shouldTrackWorkerProgress,
+  clearMissingPendingJobsForTick,
+  loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
+  parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen,
+  parseWorkerRows,
+  probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
+  pidAlive, spawnResumeScheduler,
 };

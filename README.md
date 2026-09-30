@@ -60,7 +60,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, losing its Codex app-server connection, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
+| Orca worker | Codex (`gpt-5.6-sol`) or Kimi | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, making no real progress past its configured stall threshold, losing its Codex app-server connection, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -106,6 +106,94 @@ If Codex prints a lost/reconnect-failed app-server message, continuing TUI repai
 does not count as progress. The heartbeat reports `WORKER STUCK` once for that terminal in
 the session; release it and re-dispatch because work since the last commit may be lost. Once
 reported disconnected, that terminal skips the idle and orphan checks for the same poll.
+
+**Progress-based stall detection.** A busy-looking TUI is not necessarily making progress.
+For each supervised worker, the heartbeat fingerprints the worker worktree's `HEAD`,
+`git status --porcelain`, full `git diff`, and changed/untracked file size and mtime together
+with meaningful terminal output from the rendered screen (`orca terminal read --terminal
+<handle> --screen`), not the lossy one-line list preview. Reads are bounded and limited to this
+session's supervised terminals; a failed read reuses the last good screen, falling back to
+the list preview only before any read succeeds. A timed-out git probe likewise reuses that
+terminal's last good git sample, so transient repository slowness is not mistaken for progress.
+Spinner frames, elapsed-time counters, rotating `Tip:` lines, context/token counters, and
+prompt box chrome are ignored; Kimi's completed-tool count remains progress. Rate-limit,
+disconnect, and usage-limit diagnoses continue to use the live list preview so stale
+scrollback cannot retrigger them. If that fingerprint does not change for
+`heartbeat.stallSeconds` (default 900 seconds), or the agent-specific value in
+`heartbeat.stallSecondsByAgent` (Kimi defaults to 600 seconds), the daemon emits one
+`WORKER STALLED` wake event. Nudge the terminal with `continue`, or stop it and re-dispatch
+the same brief to the other coder; the daemon never kills it automatically. The report is
+persisted once per unchanged episode across daemon restarts and is re-armed by a file or
+meaningful-output change. Disconnected, rate-limited, and usage-exhausted workers keep their
+more specific diagnosis instead of also being labeled stalled. Set `ORCH_STALL_SECONDS` to
+override the global threshold for one process; blank or invalid values fall back to config.
+An active `Waiting for background terminal` / `background terminal running` status gets a
+grace period of twice the applicable stall threshold; if neither the child status nor any
+other progress changes by then, the same informational stall event fires. Workers Orca
+already reports succeeded, failed, stopped, or completed are excluded.
+
+Interactive worker screens wake the panel immediately instead of waiting for either IDLE
+or the stall threshold. Kimi/Codex permission menus, approval questions, and selection UI
+such as `Select permission mode`, `Allow`/`Deny`, or `↑↓ navigate · Enter select` emit
+`WORKER WAITING FOR APPROVAL <dispatch|terminal> (<agent>)`. The detector requires prompt
+shape—such as numbered choices, confirm/cancel key help, selection navigation, or a prompt
+box—rather than isolated keywords, so normal output discussing “allow”, “deny”, or “approve”
+is ignored. Codex's `Would you like to run the following command?` / `make the following
+edits?` confirmations are included. Only the normalized prompt block, including the
+question and command, forms the episode
+signature, so rotating tips, timers, and spinners cannot re-fire it. Reports persist once
+per unchanged prompt episode across heartbeat restarts and re-arm after the prompt
+disappears; the heartbeat never answers automatically.
+
+**Mid-task quota handover.** While a supervised Codex or Kimi worker is live, the heartbeat
+reuses that coder's cached single-flight quota probe. At
+`handoverWarnMarginPercent` (default 5) below the coder's own handoff threshold it emits a
+once-per-episode warning; at the threshold, or on a terminal usage-exhaustion signal, it
+emits `WORKER HANDOVER <dispatch|terminal> (<agent> <used>% >= <threshold>%)`. Kimi hands
+over to eligible Codex, and Codex hands over to eligible Kimi; either direction falls back
+to Sonnet when the other external coder is unavailable or exhausted. The gate repeats
+persisted pending handovers in each prompt reminder.
+
+If the old worker still responds, send it: `Stop now: commit all work-in-progress as wip:
+handover and write HANDOVER.md (done / remaining / next step / how to verify), commit it,
+then stop.` Wait up to about three minutes, then stop and release it without deleting its
+worktree or branch. Dispatch the same brief to the selected coder in that same worktree and
+branch, prefixed: `Continue a task handed over from <agent>. Read HANDOVER.md and git log
+first; do not redo finished steps.` For Sonnet, point the in-session Agent at that worktree.
+
+**Park and resume after quota reset.** When a worker is fully exhausted and neither the
+other external coder nor the in-session Sonnet panel is available, the heartbeat emits
+`WORKER PARKED <id> (<agent> limit, resets <local time>) - will auto-resume`. It starts one
+detached scheduler per parked terminal, persisted with its PID and reset time. At the known
+reset plus 90 seconds—or every 15 minutes when reset time is unknown—the scheduler rechecks
+quota and, once it is below the coder's handoff threshold, sends the worker the guarded
+continue message and verifies that the terminal started another turn. Kimi permission mode
+is returned to Never Ask first when its screen shows another mode. Claude worker screens use
+the same parking path as the panel. Reset hints also accept month/day and an explicit IANA
+timezone, for example `resets Oct 3, 5pm (Asia/Saigon)`. Only live, supervised, non-released
+terminal handles from this session are eligible.
+
+If Kimi presents its long-idle session menu after the resume message, the scheduler verifies
+the menu cursor, moves it to `Compact and continue` when necessary, presses Enter once, and
+then verifies that compaction or the resumed turn started.
+
+The scheduler persists its attempt count and first-attempt time and stops after 768 attempts
+or eight days. It never retypes a resume after a successful terminal send: if no new turn can
+be confirmed—or a scheduler dies after persisting its pre-send marker—the heartbeat reports
+`WORKER RESUME UNVERIFIED ... do not retype` for manual
+inspection. If Claude responds to that send with a fresh limit banner, that is a new quota
+episode and is parked at the newly parsed reset instead. Expired schedulers are also reported,
+and reported/finished scheduler records are removed after one day. Until that cleanup,
+`resumed-unverified` and `expired` deliberately block automatic re-parking of the same
+terminal for up to 24 hours; inspect and resolve the reported terminal manually.
+
+`autoResumeAfterReset` defaults to `true`; `ORCH_AUTO_RESUME=false` disables scheduling for
+one process (blank is unset). `autoResumePanel` also defaults to `true`: when the exact panel
+terminal shows a Claude limit message such as `resets 5pm`, `resets at 17:00`, or `try again
+in 2h`, it gets its own scheduler and orchestration-specific resume message. Set it to
+`false` to opt the panel out. In-session Agent subagents cannot survive a rate-limited panel
+turn, so the resumed panel must re-dispatch them; prefer Orca workers for long resumable code
+tasks.
 
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
@@ -308,6 +396,9 @@ The file is plain JSON — no comments — parsed as-is:
 {
   "codexHandoffUsedPercent": 90,
   "kimiHandoffUsedPercent": 95,
+  "handoverWarnMarginPercent": 5,
+  "autoResumeAfterReset": true,
+  "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
@@ -325,6 +416,8 @@ The file is plain JSON — no comments — parsed as-is:
 
 (`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95;
 `kimiHandoffUsedPercent` is Kimi's own, separate threshold (default 95) — both are
+used for new routing and live-worker handover. `handoverWarnMarginPercent` warns that many
+percentage points before either threshold (default 5; set 0 to disable the early warning).
 tunable via this file or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`);
 `kimiQuotaCacheSeconds` and `coderAvailabilityCacheSeconds` (default 600, the per-machine
 "is this coder installed and signed in?" probe TTL) mirror the Codex cache key;

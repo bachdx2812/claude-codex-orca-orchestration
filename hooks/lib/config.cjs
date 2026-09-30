@@ -49,6 +49,9 @@ const DEFAULT_CONFIG = {
     lookup: ['Explore'],
   },
   codexHandoffUsedPercent: 95,
+  handoverWarnMarginPercent: 5,
+  autoResumeAfterReset: true,
+  autoResumePanel: true,
   codexQuotaCacheSeconds: 60,
   kimiHandoffUsedPercent: 95,
   kimiQuotaCacheSeconds: 60,
@@ -56,7 +59,13 @@ const DEFAULT_CONFIG = {
   coderHeadroomTieBand: 10, // headroom points within which two coders tie (falls back to fewer live workers)
   unknownHeadroomAssumed: 30, // headroom points a quota-unknown coder is ranked as
   execFallbackWhenCodexUnavailable: 'sonnet',
-  heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
+  heartbeat: {
+    intervalSeconds: 20,
+    idleSeconds: 60,
+    maxSeconds: 3600,
+    stallSeconds: 900,
+    stallSecondsByAgent: { kimi: 600 },
+  },
   maxParallelCodexWorkers: 3, // 0 = unlimited
   maxParallelKimiWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
@@ -167,6 +176,21 @@ function loadConfig() {
     merged.codexHandoffUsedPercent = threshold;
   }
 
+  const handoverWarnMargin = configuredNumber(merged.handoverWarnMarginPercent);
+  if (!Number.isInteger(handoverWarnMargin) || handoverWarnMargin < 0 || handoverWarnMargin > 100) {
+    warnings.push(`handoverWarnMarginPercent "${merged.handoverWarnMarginPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.handoverWarnMarginPercent}.`);
+    merged.handoverWarnMarginPercent = DEFAULT_CONFIG.handoverWarnMarginPercent;
+  } else {
+    merged.handoverWarnMarginPercent = handoverWarnMargin;
+  }
+
+  for (const key of ['autoResumeAfterReset', 'autoResumePanel']) {
+    if (typeof merged[key] !== 'boolean') {
+      warnings.push(`${key} must be a boolean; using ${DEFAULT_CONFIG[key]}.`);
+      merged[key] = DEFAULT_CONFIG[key];
+    }
+  }
+
   const quotaCacheSeconds = configuredNumber(merged.codexQuotaCacheSeconds);
   if (!Number.isInteger(quotaCacheSeconds) || quotaCacheSeconds < 0 || quotaCacheSeconds > 3600) {
     warnings.push(`codexQuotaCacheSeconds "${merged.codexQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.codexQuotaCacheSeconds}.`);
@@ -221,6 +245,36 @@ function loadConfig() {
     merged.unknownHeadroomAssumed = DEFAULT_CONFIG.unknownHeadroomAssumed;
   } else {
     merged.unknownHeadroomAssumed = unknownAssumed;
+  }
+
+  if (!isPlainObject(merged.heartbeat)) {
+    warnings.push('heartbeat must be an object; using the default.');
+    merged.heartbeat = deepMerge({}, DEFAULT_CONFIG.heartbeat);
+  }
+  const stallSeconds = configuredNumber(merged.heartbeat.stallSeconds);
+  if (!Number.isInteger(stallSeconds) || stallSeconds < 1 || stallSeconds > 86400) {
+    warnings.push(`heartbeat.stallSeconds "${merged.heartbeat.stallSeconds}" is not an integer 1-86400; using ${DEFAULT_CONFIG.heartbeat.stallSeconds}.`);
+    merged.heartbeat.stallSeconds = DEFAULT_CONFIG.heartbeat.stallSeconds;
+  } else {
+    merged.heartbeat.stallSeconds = stallSeconds;
+  }
+  if (!isPlainObject(merged.heartbeat.stallSecondsByAgent)) {
+    warnings.push('heartbeat.stallSecondsByAgent must be an object; using the default.');
+    merged.heartbeat.stallSecondsByAgent = { ...DEFAULT_CONFIG.heartbeat.stallSecondsByAgent };
+  } else {
+    for (const [agent, value] of Object.entries(merged.heartbeat.stallSecondsByAgent)) {
+      const seconds = configuredNumber(value);
+      if (!agent || !Number.isInteger(seconds) || seconds < 1 || seconds > 86400) {
+        warnings.push(`heartbeat.stallSecondsByAgent.${agent || '<empty>'} "${value}" is not an integer 1-86400; ignoring it.`);
+        if (Object.hasOwn(DEFAULT_CONFIG.heartbeat.stallSecondsByAgent, agent)) {
+          merged.heartbeat.stallSecondsByAgent[agent] = DEFAULT_CONFIG.heartbeat.stallSecondsByAgent[agent];
+        } else {
+          delete merged.heartbeat.stallSecondsByAgent[agent];
+        }
+      } else {
+        merged.heartbeat.stallSecondsByAgent[agent] = seconds;
+      }
+    }
   }
 
   if (!Array.isArray(merged.disabledGates)) {
@@ -375,6 +429,26 @@ function coderAvailabilityCacheSeconds(cfg) {
   return cfg.coderAvailabilityCacheSeconds;
 }
 
+/** Global stall threshold. A blank ORCH_STALL_SECONDS override is intentionally unset. */
+function stallSeconds(cfg) {
+  const envOverride = process.env.ORCH_STALL_SECONDS;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 1 && n <= 86400) return n;
+  }
+  return cfg.heartbeat.stallSeconds;
+}
+
+/** Whether exhausted work is parked for a detached reset scheduler. */
+function autoResumeAfterReset(cfg) {
+  const envOverride = process.env.ORCH_AUTO_RESUME;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    if (/^(?:1|true|yes|on)$/i.test(envOverride)) return true;
+    if (/^(?:0|false|no|off)$/i.test(envOverride)) return false;
+  }
+  return cfg.autoResumeAfterReset;
+}
+
 /** Directory holding session state (`<sid>.json`, heartbeat files, violations.log). */
 function stateDir() {
   return process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
@@ -480,4 +554,5 @@ module.exports = {
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
+  stallSeconds, autoResumeAfterReset,
 };

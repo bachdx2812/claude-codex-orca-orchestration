@@ -222,13 +222,22 @@ backup precedes their removal. Help and unknown options never enter the install 
   "agents": { "escalation": [], "lookup": ["Explore"] },
   "codexHandoffUsedPercent": 95,
   "kimiHandoffUsedPercent": 95,
+  "handoverWarnMarginPercent": 5,
+  "autoResumeAfterReset": true,
+  "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "coderHeadroomTieBand": 10,
   "unknownHeadroomAssumed": 30,
   "execFallbackWhenCodexUnavailable": "sonnet",
-  "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
+  "heartbeat": {
+    "intervalSeconds": 20,
+    "idleSeconds": 60,
+    "maxSeconds": 3600,
+    "stallSeconds": 900,
+    "stallSecondsByAgent": { "kimi": 600 }
+  },
   "maxParallelCodexWorkers": 3,
   "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
@@ -255,6 +264,14 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `kimiHandoffUsedPercent`: integer 0-100, default 95. Kimi's own, independent threshold:
   Kimi leaves the eligible peer pool once it has used this much of its
   tightest quota window. Overridable for one process with `ORCH_KIMI_HANDOFF_USED`.
+- `handoverWarnMarginPercent`: integer 0-100, default 5. A live worker gets a persisted
+  early-warning episode this many percentage points before its coder's threshold; `0`
+  disables the early warning while retaining threshold/exhaustion handover.
+- `autoResumeAfterReset`: boolean, default `true`. When no handover target exists, park an
+  exhausted supervised worker and launch its detached reset scheduler. `ORCH_AUTO_RESUME`
+  accepts true/false, 1/0, yes/no, or on/off for one process; blank is unset.
+- `autoResumePanel`: boolean, default `true`. Apply the same reset scheduling to the exact
+  panel terminal in `ORCA_TERMINAL_HANDLE` when its screen shows a Claude limit message.
 - `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
   `codex app-server` quota reading or a failed probe is reused from `codex-quota-live.json` in the gate
   state directory; `0` disables cross-process file reuse but not the memo inside one hook
@@ -277,6 +294,12 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `models.kimi`: `{ "alias": null, "id": null }` by default; `id` is shown in banner text
   only — Orca cannot pin a Kimi model on `worker-start`, so the real pin is
   `default_model` in `~/.kimi-code/config.toml`.
+- `heartbeat.stallSeconds`: integer 1-86400, default 900. With no worktree change or new
+  meaningful terminal output for this long, a supervised worker produces an informational
+  stall wake event. `ORCH_STALL_SECONDS` overrides the global value for one process; blank
+  is unset and invalid values fall back to config.
+- `heartbeat.stallSecondsByAgent`: object of per-agent integer thresholds 1-86400. These
+  take precedence over the global value; the default is `{ "kimi": 600 }`.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
   the SessionStart banner.
@@ -322,7 +345,7 @@ and which executable the routing fallback checks; legacy `CODEX_BIN` remains a l
 alias), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
 `ORCH_KIMI_HANDOFF_USED`, `ORCH_KIMI_QUOTA_CACHE_SECONDS`,
 `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`, `ORCH_MAX_PARALLEL_KIMI_WORKERS`,
-`ORCH_CLOSE_DONE_WORKTREES`. Non-config env for tests/ops only: `ORCH_KIMI_BIN` (which
+`ORCH_STALL_SECONDS`, `ORCH_CLOSE_DONE_WORKTREES`. Non-config env for tests/ops only: `ORCH_KIMI_BIN` (which
 `kimi` executable the availability probe checks — authoritative when set, no `which`
 fallback), `ORCH_KIMI_HOME` (default `~/.kimi-code`; where the credentials file is read),
 `ORCH_KIMI_USAGE_URL` (full quota URL; must be `https:` unless the host is loopback). An invalid or missing config value never crashes
@@ -338,7 +361,8 @@ worker start (built from this install's own `process.execPath` and `__dirname`, 
 correct wherever the hooks were installed). The daemon polls Orca and exits the moment
 something needs a decision — a worker changing state, a finished worker still holding a
 terminal, a supervised terminal quiet longer than `heartbeat.idleSeconds`, a Codex session
-that lost its app-server connection, an orphaned terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
+that lost its app-server connection, a supervised worker making no real progress for its
+stall threshold, an orphaned terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
 its exit is the wake-up: the panel does not have to remember to poll, and it costs nothing
 while everything is healthy.
 
@@ -373,6 +397,111 @@ Codex connection-lost/reconnect-failed messages are terminal even when the TUI k
 repainting. The heartbeat reports that terminal as `WORKER STUCK` once per session,
 persisted across daemon restarts; release and re-dispatch it because uncommitted work may
 have been lost. A reported disconnected terminal skips its idle and orphan checks.
+
+Terminal repaint activity alone is not progress. For every supervised worker terminal, the
+heartbeat combines meaningful terminal text with a bounded fingerprint of that worker's
+worktree (`HEAD`, `git status --porcelain`, full `git diff`, and changed/untracked file size
+and mtime). Terminal text comes from a bounded `orca terminal read --terminal <handle> --screen` of
+the rendered screen, only for this session's supervised terminals; a failed read reuses the
+last good screen and only an initial failure falls back to the lossy list preview. A timed-out
+git probe reuses the terminal's last good git sample. Spinner/moon frames,
+`Thinking…` / elapsed `Working (...)` lines, rotating tips, context/token counters, and prompt chrome are
+removed before terminal text is compared; Kimi's completed-tool count is retained as
+progress. Rate-limit, disconnect, and Kimi usage-limit classification remains scoped to the
+live list preview, preventing stale rendered scrollback from retriggering old failures. If
+neither side changes for the applicable
+`heartbeat.stallSeconds` / `heartbeat.stallSecondsByAgent` threshold, it emits:
+
+```text
+WORKER STALLED <dispatch|terminal> (<agent>, no file change or new output for Nm) - nudge it (terminal send "continue ..."), or stop it and re-dispatch the same brief to the other coder
+```
+
+This is informational and never auto-kills the worker. The handle, fingerprint, progress
+time, and reported marker are persisted per session, so an unchanged episode is reported
+once even across daemon restarts; a file or meaningful-output change re-arms it. A worker
+already classified disconnected, rate-limited, or usage-exhausted retains that more
+specific diagnosis and is not also reported stalled.
+An active child-process status (`Waiting for background terminal` or `background terminal
+running`) re-arms progress once and doubles the applicable threshold for that episode; it
+still produces `WORKER STALLED` at 2x when no file or meaningful output changes. Worker rows
+Orca already reports `succeeded`, `failed`, `stopped`, or `completed` are excluded.
+
+A supervised terminal showing an interactive permission, approval, question, or selection
+screen wakes the panel immediately with `WORKER WAITING FOR APPROVAL <dispatch|terminal>
+(<agent>)`; it does not wait for IDLE or `stallSeconds`, and the heartbeat never selects an
+answer. Prompt-shaped evidence includes permission-menu headers, question-shaped
+Allow/Approve requests paired with UI structure, Codex `Would you like to run ...?` / `make
+... edits?` questions with numbered choices or confirm/cancel help, opposing exact
+Allow/Deny options, and `↑↓ navigate · Enter select` (optionally `· Esc cancel`). Ordinary
+prose that merely mentions those words is not a match. Only normalized prompt-block lines
+form the persisted signature, including the normalized question and command, so surrounding
+tips, spinners, timers, and ordinary output do not create new episodes while consecutive
+prompts for different commands remain distinct. It is re-armed when the prompt disappears.
+
+For every live supervised Codex or Kimi worker, the heartbeat reuses the existing cached,
+single-flight quota probe. It warns once at `handoverWarnMarginPercent` below that coder's
+own handoff threshold, then emits a new persisted episode at the threshold or immediately
+on a terminal usage-exhaustion signal:
+
+```text
+WORKER HANDOVER <dispatch|terminal> (<agent> <used>% >= <threshold>%) -> hand over to <other eligible coder, else Sonnet>
+```
+
+Selection is symmetric and excludes the current coder: Kimi -> Codex -> Sonnet fallback;
+Codex -> Kimi -> Sonnet fallback. The per-prompt gate reminder lists persisted workers that
+still need handover. If responsive, tell the worker to stop after committing all WIP as
+`wip: handover` and writing/committing `HANDOVER.md` with done, remaining, next step, and
+verification instructions; wait up to about three minutes. Then `worker-stop` and
+`worker-release` without deleting the worktree/branch. Dispatch the same brief in the same
+worktree/branch, prefixed `Continue a task handed over from <agent>. Read HANDOVER.md and
+git log first; do not redo finished steps.` For Sonnet, point the in-session Agent at that
+worktree.
+
+When the current coder is fully exhausted (100% or a usage-limit signal) and the other
+external coder plus the in-session panel are unavailable, handover is impossible. With
+`autoResumeAfterReset` enabled the heartbeat persists and emits once:
+
+```text
+WORKER PARKED <dispatch|terminal> (<agent> limit, resets <local time>) - will auto-resume
+```
+
+Reset time comes from Kimi `/usages`, Codex app-server `resetsAt`, or a Claude screen hint
+(`resets 5pm`, `resets at 17:00`, `try again in 2h`, or `resets Oct 3, 5pm
+(Asia/Saigon)`). An explicit IANA timezone is honored; otherwise local machine time is used.
+The latest recent limit line remains authoritative until a newer prompt or active-turn line
+appears. Unknown reset times are re-probed every 15 minutes without typing into a terminal
+that still visibly shows the limit. Claude worker terminals use this same screen-based path,
+not only the panel. One detached `orca-resume-scheduler.cjs` process is persisted per parked worker
+(PID and reset time), deduped across heartbeat restarts, and does not depend on the panel
+remaining alive. At reset plus 90 seconds it re-probes; once quota is below the coder's
+handoff threshold it sends `Quota has reset. Continue the task from where you stopped;
+check git status/log (and HANDOVER.md if present) first; do not redo finished steps.` and
+verifies a new terminal turn. A Kimi screen in another permission mode is returned to Never
+Ask first.
+
+When Kimi places a long-idle session menu in front of the delivered resume message, the
+scheduler must recognize the full `has been idle for` / `Compact and continue` / `Enter
+select` shape, verify the current cursor, move to `Compact and continue` if necessary, press
+Enter once, and verify that compaction or the resumed turn starts.
+
+Attempts and the first-attempt time are persisted. A scheduler expires after 768 attempts or
+eight days. A successfully delivered resume is never typed again when turn verification is
+inconclusive. A send-attempt marker is persisted before terminal input, so a scheduler crash
+is also recovered conservatively without retyping. The job becomes `resumed-unverified`, exits, and wakes the panel with `WORKER
+RESUME UNVERIFIED ... inspect the terminal; do not retype`. A fresh Claude limit response to
+the one allowed send is instead re-parked at its new reset. `expired` jobs likewise wake the
+panel for a manual decision. Settled records and abandoned lock directories are cleaned after
+one day. During that retention window, `resumed-unverified` and `expired` block automatic
+re-parking of the same terminal for up to 24 hours so the report-only decision cannot turn
+into an automatic retry. A pending job is not deleted merely because a quota probe recovers before its timer;
+only a real handover or the worker leaving supervision cancels it.
+
+With `autoResumePanel`, the exact `ORCA_TERMINAL_HANDLE` gets the analogous message `Quota
+has reset - continue the orchestration from where you stopped (check worker-list, plans)`.
+Schedulers recheck authorization and exclude unsupervised, released, and finished workers;
+they never type into foreign terminals. In-session Agent
+subagents die with the panel turn and cannot be resumed; the panel re-dispatches them after
+it resumes. Prefer Orca workers for long-running resumable code tasks.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
