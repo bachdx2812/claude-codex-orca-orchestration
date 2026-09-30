@@ -113,6 +113,8 @@ outside `[a-z0-9._:-]`, so a slash or space is never silently truncated) is igno
 notice; nothing changes. Picking a Claude alias for code work exempts that dispatch from
 the review-model/escalation-model scope gates for code specifically — the operator asked
 for it by name, so the gate does not then refuse it for being the "wrong" model doing code.
+Every active override is repeated on each prompt and in the `SessionStart` banner with
+the time it was set and the command that returns routing to automatic quota selection.
 
 **With a `codex` (or `codex:<model>`) override while the Orca-unreachable fallback is
 active**, in-session code still runs on the configured code model, not Codex — the
@@ -561,7 +563,7 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
 
 ```json
 { "session_id": "...", "created": "<ISO-8601>", "bypass": false,
-  "execAgent": null,
+  "bypassSince": null, "execAgent": null, "execAgentSince": null,
   "workers": { "<label>": { "role": "codex-exec", "started": 0,
                              "status": "live|settled", "last_seen": 0,
                              "rate_limited_until": 0,
@@ -577,8 +579,10 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
   "last_heartbeat": 0, "rate_limit_hits": 0 }
 ```
 
-`execAgent` is one of `null` (automatic, by quota), `"code"` (the configured code model),
-`"codex"`, `"codex:<model>"`, or `"claude:<alias>"`.
+`execAgent` is one of `null` (automatic, by quota), `"codex"`, `"codex:<model>"`, or
+`"claude:<alias>"`. Any other persisted value is reset to `null` and reported once. The
+`*Since` fields contain ISO-8601 timestamps only while their corresponding override is
+active.
 
 `group`/`kind`/`agent`/`owns`/`ws` on a worker entry, `reservations`, `agentClaims` and
 `tasks` are the parallel-Codex-worker cap and file-ownership bookkeeping (see "Parallel
@@ -603,10 +607,12 @@ processes racing the same session id can otherwise silently drop each other's wr
 
 - `ORCHESTRATOR_GATE=off` in the environment disables every gate for that session,
   regardless of config.
-- `--no-orchestrate` anywhere in a user prompt disables the gates for the rest of that
-  session. Harness-injected turns (task notifications, cross-session messages, system
-  reminders) never count as the operator's own prompt, so a subagent's report that merely
-  quotes `--no-orchestrate` can never toggle this.
+- `--no-orchestrate` in an operator prompt disables the gates for the session;
+  `--orchestrate` turns them back on. If both appear, the last flag wins. Harness-injected
+  turns (task notifications, cross-session messages, system reminders) and compaction
+  summaries never count as the operator's own prompt, so quoted flags cannot toggle
+  bypass or execution routing. While bypass is active, every prompt and the `SessionStart`
+  banner show when it began and name `--orchestrate` as the recovery command.
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` toggle only
   execution routing, honestly — narrower than a full bypass.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees one or every
@@ -633,7 +639,7 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # all four suites (888 checks)
+npm test                                             # all four suites (913 checks)
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
 node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)

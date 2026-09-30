@@ -83,7 +83,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run     # review the plan; writes nothing
 node install.mjs               # install
-npm test                       # 888 tests, fully hermetic
+npm test                       # 913 tests, fully hermetic
 ```
 
 What it does, each step recorded in `~/.claude/hooks/orchestration/install-manifest.json`
@@ -269,6 +269,7 @@ state up front so this is diagnosed before it becomes a mid-session refusal.
 ORCHESTRATOR_GATE=off <your command>     # disables the gate for one invocation/session
 # or, inside a Claude Code prompt:
 --no-orchestrate
+--orchestrate                            # re-enables gates; last bypass flag in the prompt wins
 --release-claims <toolUseId>             # manually frees one stuck Owns: claim
 --release-claims all                     # manually frees every tracked Owns: claim
 

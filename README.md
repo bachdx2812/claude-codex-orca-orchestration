@@ -31,7 +31,9 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) write
 
 `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto` (session-scoped, last flag
 wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The per-prompt "Model
-routing" line always shows the current coder and why.
+routing" line always shows the current coder and why. Active overrides also show when
+they were set and how to return to automatic quota routing, both per prompt and in the
+`SessionStart` banner.
 
 For Agent/Task descriptions, a recognized first verb governs intent before later nouns do:
 `Review ...` and `Plan ...` route to review, while `Implement ...` and `Generate code/assets/components ...`
@@ -233,7 +235,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 888 tests, hermetic (no live Orca/Codex needed)
+npm test                     # 913 tests, hermetic (no live Orca/Codex needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -333,10 +335,16 @@ exact-match removal (never a blind restore, so edits you made after installing s
 
 - `ORCHESTRATOR_GATE=off` (env var) disables every gate for that session, for CI or
   headless `claude -p`.
-- `--no-orchestrate` anywhere in a prompt disables the gates for the rest of that session.
+- A standalone `--no-orchestrate` flag in an operator prompt disables the gates for that
+  session;
+  `--orchestrate` re-enables them. If both appear, the last flag wins. While disabled,
+  every prompt and the `SessionStart` banner show when bypass began and how to re-enable.
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` (see
   `rules/orchestration-contract.md`) let the operator override coding-model routing
   without a full bypass.
+- Harness-injected notifications and compaction summaries are never interpreted as fresh
+  operator flags, even when they quote an earlier `--no-orchestrate`, `--exec-*`, or
+  `--code-model` prompt.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees a stuck `Owns:`
   claim OR a stuck `max-parallel-agents` registration; `maxParallelCodexWorkers: 0`
   (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env) makes the parallel-Codex-worker cap

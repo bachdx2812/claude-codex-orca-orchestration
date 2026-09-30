@@ -767,7 +767,12 @@ function onSessionStart(p, s, cfg) {
 // reminders) also arrive as UserPromptSubmit. Their text is not the operator's, so
 // it must never toggle a session-wide flag: a subagent report that merely quoted
 // "--no-orchestrate" once switched every gate off.
-const NON_OPERATOR_TURN = /<task-notification>|<cross-session-message|\[SYSTEM NOTIFICATION|<system-reminder>/i;
+const HARNESS_INJECTED_TURN = /<task-notification>|<cross-session-message|\[SYSTEM NOTIFICATION|<system-reminder>/i;
+function isNonOperatorTurn(prompt) {
+  if (HARNESS_INJECTED_TURN.test(prompt) || /^\s*This session is being continued\b/i.test(prompt)) return true;
+  return /(?:^|\n)\s*Summary:(?=\s)/i.test(prompt) &&
+    /\b(previous|prior|earlier)\s+(conversation|session|prompts?)\b/i.test(prompt);
+}
 // A flag counts only as a standalone token, not inside backticks or a longer word.
 const operatorFlag = (prompt, flag) => new RegExp(`(^|\\s)${flag}(?=\\s|$)`, 'i').test(prompt);
 
@@ -812,7 +817,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   // tool call can still be in flight when another operator prompt is submitted, and its
   // eventual PostToolUse needs the reservation to transfer Owns/cap metadata to the worker.
   // Stop remains the safe backstop for unresolved Bash reservations.
-  if (!NON_OPERATOR_TURN.test(raw)) {
+  if (!isNonOperatorTurn(raw)) {
     let purgedAny = false;
     for (const [id, a] of Object.entries(s.agents || {})) {
       if (a && a.background === false) { delete s.agents[id]; purgedAny = true; }
@@ -820,7 +825,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (purgedAny) save(s);
   }
 
-  const prompt = NON_OPERATOR_TURN.test(raw) ? '' : raw;
+  const prompt = isNonOperatorTurn(raw) ? '' : raw;
   const promptLower = prompt.toLowerCase();
   const bypassFlags = ['--no-orchestrate', '--orchestrate']
     .map((flag) => [flag, operatorFlag(prompt, flag) ? promptLower.lastIndexOf(flag) : -1])
