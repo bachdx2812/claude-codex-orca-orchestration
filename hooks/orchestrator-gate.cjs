@@ -233,7 +233,9 @@ function blank(sid) {
     session_id: sid || 'default',
     created: new Date().toISOString(),
     bypass: false,
+    bypassSince: null,
     execAgent: null,        // null (auto by quota) | 'code' | 'codex' | 'codex:<model>' | 'claude:<alias>'
+    execAgentSince: null,
     workers: {},            // label -> { role, started, status, last_seen, rate_limited_until,
                              //            group, kind, agent, owns, ws }
     reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot, newSlot, commandHash } —
@@ -661,6 +663,32 @@ function parallelBudgetLine(cfg, s) {
   return `parallel budget: ${usage.total}/${limitText} (${PAC.cores()} cores x ${Math.round(parallelCoreFraction(cfg) * 100)}%)`;
 }
 
+function activeOverrideLines(cfg, s) {
+  const lines = [];
+  if (s.bypass) {
+    lines.push(`GATES OFF for this session since ${s.bypassSince || s.created} (--no-orchestrate); type --orchestrate to re-enable`);
+  }
+  if (s.execAgent != null) {
+    let target;
+    let flag;
+    if (s.execAgent === 'code') {
+      target = cfg.models.code.alias[0].toUpperCase() + cfg.models.code.alias.slice(1);
+      flag = '--exec-sonnet';
+    } else if (s.execAgent === 'codex') {
+      target = 'Codex';
+      flag = '--exec-codex';
+    } else if (s.execAgent.startsWith('codex:')) {
+      target = `Codex (${s.execAgent.slice(6)})`;
+      flag = `--code-model ${s.execAgent}`;
+    } else {
+      target = s.execAgent.slice(7);
+      flag = `--code-model ${target}`;
+    }
+    lines.push(`code forced to ${target} since ${s.execAgentSince || s.created} (${flag}); --code-model auto to return to quota routing`);
+  }
+  return lines;
+}
+
 function onSessionStart(p, s, cfg) {
   if (!fs.existsSync(stateFile(s.session_id))) save(s);
   const review = cfg.models.review.alias;
@@ -669,9 +697,11 @@ function onSessionStart(p, s, cfg) {
   const code = cfg.models.code.alias;
   const threshold = handoffUsed(cfg);
   const warnings = (cfg.warnings || []).map((w) => `- CONFIG WARNING: ${w}\n`).join('');
+  const overrideWarnings = activeOverrideLines(cfg, s).map((line) => `- ACTIVE OVERRIDE: ${line}\n`).join('');
   process.stdout.write(
     'ORCHESTRATION CONTRACT (enforced by orchestrator-gate.cjs):\n' +
     warnings +
+    overrideWarnings +
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
@@ -763,13 +793,20 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     .sort((a, b) => b[1] - a[1]);
   if (bypassFlags.length) {
     s.bypass = bypassFlags[0][0] === '--no-orchestrate';
+    s.bypassSince = s.bypass ? new Date().toISOString() : null;
     save(s);
     process.stdout.write(s.bypass
       ? 'orchestrator-gate: BYPASSED for this session by explicit user request.\n'
       : 'orchestrator-gate: orchestration gates re-enabled for this session.\n');
-    if (s.bypass) return;
+    if (s.bypass) {
+      process.stdout.write(`${activeOverrideLines(cfg, s).join(' ')}\n`);
+      return;
+    }
   }
-  if (s.bypass) return;
+  if (s.bypass) {
+    process.stdout.write(`${activeOverrideLines(cfg, s).join(' ')}\n`);
+    return;
+  }
 
   // Honest, explicit, session-scoped preference for execution routing. This is NOT the
   // orca-unavailable flag: it never claims Orca is unreachable, and it does not
@@ -793,7 +830,9 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   else if (lastFlag === '--exec-auto') override = null;
   else if (lastFlag === '--code-model') override = parseCodeModel(cfg, cm[2]);
   if (override !== undefined && override !== 'invalid') {
-    s.execAgent = override; save(s);
+    s.execAgent = override;
+    s.execAgentSince = override === null ? null : new Date().toISOString();
+    save(s);
     process.stdout.write(override === null
       ? `orchestrator-gate: coding model back to automatic (Codex first, "${cfg.models.code.alias}" past the Codex handoff %).\n`
       : `orchestrator-gate: coding model set by the operator for this session: ${describeOverride(cfg, override)}. Revert with --code-model auto.\n`);
@@ -841,6 +880,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
 
   const live = liveWorkers(s);
   const parts = [languageSentence(cfg, false) + 'Delegate; do not implement here.'];
+  parts.push(...activeOverrideLines(cfg, s));
   const ex = currentExecRoute(cfg, s);
   const codexModelShown = ex.codexModel || cfg.models.codex.id;
   const roleByAlias = (alias) => Object.values(cfg.models).find((m) => m.alias === alias) || { alias, id: null };

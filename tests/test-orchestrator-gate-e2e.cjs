@@ -614,6 +614,14 @@ expect('--exec-sonnet prompt is accepted',
   const st = readState(SID);
   if (st && st.execAgent === 'code') pass += 1;
   else failures.push(`--exec-sonnet did not persist execAgent='code' in state (got ${JSON.stringify(st && st.execAgent)})`);
+  if (st && !Number.isNaN(Date.parse(st.execAgentSince))) pass += 1;
+  else failures.push(`--exec-sonnet did not persist an ISO execAgentSince timestamp (${JSON.stringify(st && st.execAgentSince)})`);
+  const reminder = spawnGate(promptSubmit(SID, 'status?'), CODEX_WINS).stdout;
+  if (st && reminder.includes(`code forced to Sonnet since ${st.execAgentSince} (--exec-sonnet); --code-model auto to return to quota routing`)) pass += 1;
+  else failures.push(`per-prompt reminder did not expose the active --exec-sonnet override: ${reminder.slice(0, 240)}`);
+  const banner = spawnGate({ session_id: SID, hook_event_name: 'SessionStart' }, CODEX_WINS).stdout;
+  if (st && banner.includes(`code forced to Sonnet since ${st.execAgentSince} (--exec-sonnet); --code-model auto to return to quota routing`)) pass += 1;
+  else failures.push(`SessionStart did not expose the active --exec-sonnet override: ${banner.slice(0, 240)}`);
 }
 expect('exec-intent dispatch on sonnet is allowed once --exec-sonnet is set',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet', prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' }), ALLOW);
@@ -636,8 +644,8 @@ expect('--exec-codex beats a quota that favours the code model',
 expect('--exec-auto prompt is accepted', promptSubmit(SID, 'ok --exec-auto'), ALLOW);
 {
   const st = readState(SID);
-  if (st && st.execAgent == null) pass += 1;
-  else failures.push(`--exec-auto did not clear execAgent (got ${JSON.stringify(st && st.execAgent)})`);
+  if (st && st.execAgent == null && st.execAgentSince == null) pass += 1;
+  else failures.push(`--exec-auto did not clear execAgent and execAgentSince (got ${JSON.stringify(st && { execAgent: st.execAgent, execAgentSince: st.execAgentSince })})`);
 }
 // Automatic routing: Codex first, the code model once Codex has used >= 95%.
 expect('auto: Codex under 95% used -> in-session sonnet code is refused',
@@ -655,11 +663,27 @@ expect('auto: Codex at/over 95% used -> code on another model is refused',
   const bypassDispatch = (tool_input) => dispatch(tool_input, BYPASS_SID);
 
   expect('--no-orchestrate is accepted', promptSubmit(BYPASS_SID, '--no-orchestrate for this session'), ALLOW);
+  {
+    const st = readState(BYPASS_SID);
+    if (st && !Number.isNaN(Date.parse(st.bypassSince))) pass += 1;
+    else failures.push(`--no-orchestrate did not persist an ISO bypassSince timestamp (${JSON.stringify(st && st.bypassSince)})`);
+    const reminder = spawnGate(promptSubmit(BYPASS_SID, 'status?'), CODEX_WINS).stdout;
+    if (st && reminder.includes(`GATES OFF for this session since ${st.bypassSince} (--no-orchestrate); type --orchestrate to re-enable`)) pass += 1;
+    else failures.push(`per-prompt reminder did not expose bypass: ${reminder.slice(0, 240)}`);
+    const banner = spawnGate({ session_id: BYPASS_SID, hook_event_name: 'SessionStart' }, CODEX_WINS).stdout;
+    if (st && banner.includes(`GATES OFF for this session since ${st.bypassSince} (--no-orchestrate); type --orchestrate to re-enable`)) pass += 1;
+    else failures.push(`SessionStart did not expose bypass: ${banner.slice(0, 240)}`);
+  }
   expect('bypass allows the main panel to edit product code', bypassEdit(SRC), ALLOW);
   expect('bypass allows an exec-intent dispatch with no exec-agent flag at all',
     bypassDispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan' }), ALLOW);
 
   expect('--orchestrate is accepted after bypass', promptSubmit(BYPASS_SID, '--orchestrate'), ALLOW);
+  {
+    const st = readState(BYPASS_SID);
+    if (st && st.bypass === false && st.bypassSince == null) pass += 1;
+    else failures.push(`--orchestrate did not clear bypassSince (${JSON.stringify(st && st.bypassSince)})`);
+  }
   expect('--orchestrate re-enables the main-panel write gate', bypassEdit(SRC), DENY);
 
   expect('last bypass flag wins when --orchestrate comes last',
