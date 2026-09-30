@@ -40,7 +40,7 @@ const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { loadConfig, stateDir, closeDoneWorktreesEnabled } = require('./lib/config.cjs');
-const { hasRateLimitError, hasCodexDisconnect } = require('./lib/terminal-signals.cjs');
+const { hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted } = require('./lib/terminal-signals.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -82,6 +82,11 @@ const IDLE_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-idle-reported.js
 // repainting its TUI forever after the session is unrecoverable. Report each affected
 // terminal once for this session, including across heartbeat daemon restarts.
 const DISCONNECT_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-disconnect-reported.json`);
+// Kimi's "usage limit for this billing cycle" 403 is terminal for this billing cycle, not a
+// back-off-and-retry: report each affected terminal once per session (surviving daemon
+// restarts, same mechanism as the disconnect report) so a restart never re-marks Kimi
+// exhausted.
+const USAGE_EXHAUSTED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-usage-exhausted-reported.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -164,6 +169,44 @@ function savePersistedDisconnectReports(set) {
     fs.writeFileSync(tmp, JSON.stringify([...set]));
     fs.renameSync(tmp, DISCONNECT_REPORTED_FILE);
   } catch {}
+}
+
+function loadPersistedUsageExhaustedReports() {
+  try {
+    const handles = JSON.parse(fs.readFileSync(USAGE_EXHAUSTED_REPORTED_FILE, 'utf8'));
+    return new Set(Array.isArray(handles) ? handles.filter((handle) => typeof handle === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function savePersistedUsageExhaustedReports(set) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${USAGE_EXHAUSTED_REPORTED_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...set]));
+    fs.renameSync(tmp, USAGE_EXHAUSTED_REPORTED_FILE);
+  } catch {}
+}
+
+// What to do when a coder's output shows it is exhausted for this billing cycle: record an
+// exhaustion marker the routing code reads to exclude that coder until reset. The module
+// providing it may not exist yet (it lands with the routing lane) — a missing/failing
+// marker write degrades to a no-op; the report event itself is still emitted.
+let onCoderExhausted = defaultOnCoderExhausted;
+function defaultOnCoderExhausted(coder) {
+  try {
+    const now = Date.now();
+    require('./lib/coder-availability.cjs').markCoderExhausted(DIR, coder, {
+      now, until: now + 6 * 60 * 60 * 1000,
+      reason: 'usage limit reached for this billing cycle (worker output)',
+    });
+  } catch {}
+}
+
+/** Test hook: replace the exhaustion-marker side effect. Pass null to restore the default. */
+function setOnCoderExhausted(fn) {
+  onCoderExhausted = typeof fn === 'function' ? fn : defaultOnCoderExhausted;
 }
 
 /** Run an orca command and return parsed JSON, or null when orca cannot answer. */
@@ -726,6 +769,12 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
  */
 function classifyTerminal(t, ctx) {
   if (!ctx.ownHandles || !ctx.ownHandles.has(t.handle)) return { kind: 'ignored' };
+  // Kimi's billing-cycle usage limit is checked before the generic rate-limit backoff: it
+  // is terminal for the billing cycle, not a retry-soon condition. Only ever applied to a
+  // terminal whose tracked worker agent IS kimi (RT-3: a codex worker quoting the sentence,
+  // or prose narrating it, must never mark Kimi exhausted).
+  if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'kimi' &&
+      hasKimiUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'kimi' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
   if (t.orphaned) return { kind: 'orphaned' };
@@ -770,6 +819,7 @@ function main() {
   let prevWorkers = new Map(baseWorkerState);
   const reportedIdle = loadPersistedIdleReports();
   const reportedDisconnect = loadPersistedDisconnectReports();
+  const reportedUsageExhausted = loadPersistedUsageExhaustedReports();
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
@@ -845,22 +895,47 @@ function main() {
     if (ts) {
       // Re-read gate state each tick so a bare terminal created after daemon startup joins
       // this session's set even though it has no worker-list row.
+      const tickState = loadSessionState();
       for (const handle of sessionTerminalHandles(ws || [])) ownTerminalHandles.add(handle);
       for (const key of sessionWorktreeKeys(ws || [], ts, ownTerminalHandles)) ownedWorktreePaths.add(key);
+      // Which coder each supervised terminal runs — the usage-exhausted signal is only ever
+      // attributed to a terminal whose tracked worker agent is kimi (RT-3).
+      const handleAgent = new Map();
+      for (const row of ws || []) {
+        if (row && row.agentTerminalHandle) {
+          const agent = stateWorkerForRow(row, tickState)?.agent;
+          if (agent) handleAgent.set(row.agentTerminalHandle, agent);
+        }
+      }
+      for (const [id, w] of Object.entries(tickState.workers || {})) {
+        if (w && w.agent && w.status === 'live' && (w.kind === 'terminal' || /^term_/.test(id))) {
+          handleAgent.set(id, w.agent);
+        }
+      }
       const ctx = {
         baseHandles: baseTermHandles, ownHandles: ownTerminalHandles,
         retainedHandles: explicitRetainedHandles, started, now, idleSeconds: IDLE_SECONDS,
+        handleAgent,
       };
       for (const t of ts) {
         const verdict = classifyTerminal(t, ctx);
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
-        if (verdict.kind === 'rate_limit') {
+        if (verdict.kind === 'usage_exhausted') {
+          if (reportedUsageExhausted.has(t.handle)) continue;
+          reportedUsageExhausted.add(t.handle);
+          savePersistedUsageExhaustedReports(reportedUsageExhausted);
+          onCoderExhausted(verdict.coder);
+          events.push(
+            `KIMI USAGE LIMIT on ${label}: Kimi is exhausted for this billing cycle - ` +
+            'route new code to Codex (or Sonnet if Codex is also out); release this worker, do not retry it until reset'
+          );
+        } else if (verdict.kind === 'rate_limit') {
           if (reportedRateLimit.has(t.handle)) continue;
           reportedRateLimit.add(t.handle);
           events.push(
             `RATE LIMIT on ${label}: back off, then retry the SAME dispatch with ` +
             '`orca orchestration worker-start --retry-of <dispatchId>`. Do not start a replacement, ' +
-            'and reduce how many Codex workers run in parallel.'
+            'and reduce how many coder workers run in parallel.'
           );
         } else if (verdict.kind === 'connection_lost') {
           if (reportedDisconnect.has(t.handle)) continue;
@@ -904,4 +979,5 @@ module.exports = {
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
+  setOnCoderExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
 };
