@@ -39,8 +39,11 @@
 const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, stateDir, closeDoneWorktreesEnabled } = require('./lib/config.cjs');
+const { loadConfig, stateDir, closeDoneWorktreesEnabled, stallSeconds } = require('./lib/config.cjs');
 const { hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted } = require('./lib/terminal-signals.cjs');
+const {
+  workerProgressFingerprint, observeWorkerProgress, recordsFromJSON,
+} = require('./lib/worker-progress-fingerprint.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -62,6 +65,7 @@ const cfg = loadConfig();
 const IDLE_SECONDS = arg('idle', cfg.heartbeat.idleSeconds);        // quiet terminal => needs a decision
 const INTERVAL_SECONDS = arg('interval', cfg.heartbeat.intervalSeconds);
 const MAX_SECONDS = arg('max', cfg.heartbeat.maxSeconds);           // hard stop so a forgotten daemon dies
+const STALL_SECONDS = stallSeconds(cfg);
 const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
 // A fleet with many worktrees means many per-row git subprocess calls (idle/accepted/clean,
 // each independently bounded ~3s by runGit) inside one `processDoneWorktrees` pass — capped
@@ -87,6 +91,9 @@ const DISCONNECT_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-disconnect
 // restarts, same mechanism as the disconnect report) so a restart never re-marks Kimi
 // exhausted.
 const USAGE_EXHAUSTED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-usage-exhausted-reported.json`);
+// Per-terminal fingerprint, last real progress time and once-per-episode report marker.
+// This survives daemon restarts because emitting any wake event intentionally exits.
+const STALL_PROGRESS_FILE = path.join(DIR, `heartbeat-${SESSION}-stall-progress.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -189,6 +196,20 @@ function savePersistedUsageExhaustedReports(set) {
   } catch {}
 }
 
+function loadPersistedStallProgress() {
+  try { return recordsFromJSON(JSON.parse(fs.readFileSync(STALL_PROGRESS_FILE, 'utf8'))); }
+  catch { return new Map(); }
+}
+
+function savePersistedStallProgress(records) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${STALL_PROGRESS_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...records]));
+    fs.renameSync(tmp, STALL_PROGRESS_FILE);
+  } catch {}
+}
+
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
 // exhaustion marker the routing code reads to exclude that coder until reset. The module
 // providing it may not exist yet (it lands with the routing lane) — a missing/failing
@@ -263,6 +284,7 @@ function workers() {
     workerState: w.workerState,
     dispatchStatus: w.dispatchStatus,
     terminalState: w.terminalState,
+    agent: w.agent || '',
     agentTerminalHandle: w.agentTerminalHandle || '',
     worktreeIds: [
       w.worktreeId,
@@ -277,6 +299,31 @@ function workers() {
       w.worktree && w.worktree.path,
     ].filter((candidate) => typeof candidate === 'string' && candidate.length > 0),
   }));
+}
+
+function terminalWorktreePath(terminal, workerRows) {
+  if (terminal.worktreePath) return terminal.worktreePath;
+  const terminalKeys = [...worktreeKeys(terminal.worktreeId, '')];
+  const terminalPath = terminalKeys.find((key) => path.isAbsolute(key));
+  if (terminalPath) return terminalPath;
+  const worker = (workerRows || []).find((row) => row.agentTerminalHandle === terminal.handle);
+  if (!worker) return '';
+  const candidates = [
+    ...(worker.worktreePaths || []),
+    ...(worker.worktreeIds || []).flatMap((id) => [...worktreeKeys(id, '')]),
+  ];
+  return candidates.find((candidate) => path.isAbsolute(candidate)) || '';
+}
+
+/** Three one-second git probes keep each supervised worker fingerprint bounded near 3s. */
+function runProgressGit(args, cwd) {
+  try {
+    const r = spawnSync(GIT_BIN, args, { cwd, encoding: 'utf8', timeout: 1000 });
+    if (r.error || r.status === null || r.status === undefined) return null;
+    return { status: r.status, stdout: (r.stdout || '').trim() };
+  } catch {
+    return null;
+  }
 }
 
 /** Every stable join key for a worktree id/path. Real Orca ids are `<repoId>::<abs path>`;
@@ -810,6 +857,13 @@ function snapshotWorkers(list) {
   return m;
 }
 
+function formatStallEvent({ dispatchId, handle, agent, stalledSeconds }) {
+  const identity = dispatchId || handle;
+  return `WORKER STALLED ${identity} (${agent}, no file change or new output for ` +
+    `${Math.floor(stalledSeconds / 60)}m) - nudge it (terminal send "continue ..."), ` +
+    'or stop it and re-dispatch the same brief to the other coder';
+}
+
 function main() {
   const started = Date.now();
   beat(started);
@@ -836,6 +890,7 @@ function main() {
   const reportedIdle = loadPersistedIdleReports();
   const reportedDisconnect = loadPersistedDisconnectReports();
   const reportedUsageExhausted = loadPersistedUsageExhaustedReports();
+  const stallProgress = loadPersistedStallProgress();
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
@@ -917,10 +972,12 @@ function main() {
       // Which coder each supervised terminal runs — the usage-exhausted signal is only ever
       // attributed to a terminal whose tracked worker agent is kimi (RT-3).
       const handleAgent = new Map();
+      const handleDispatch = new Map();
       for (const row of ws || []) {
         if (row && row.agentTerminalHandle) {
           const agent = stateWorkerForRow(row, tickState)?.agent || row.agent;
           if (agent) handleAgent.set(row.agentTerminalHandle, agent);
+          if (row.dispatchId) handleDispatch.set(row.agentTerminalHandle, row.dispatchId);
         }
       }
       for (const [id, w] of Object.entries(tickState.workers || {})) {
@@ -969,6 +1026,26 @@ function main() {
           savePersistedIdleReports(reportedIdle);
           events.push(`IDLE ${verdict.quiet}s: ${label} — read it and decide: re-prompt, retry, or release.`);
         }
+
+        // Fatal/quota signals above take precedence and are never mislabeled as stalls.
+        if (!['working', 'idle'].includes(verdict.kind)) continue;
+        const agent = handleAgent.get(t.handle) || 'unknown';
+        const threshold = cfg.heartbeat.stallSecondsByAgent[agent] || STALL_SECONDS;
+        const fingerprint = workerProgressFingerprint({
+          terminalText: t.preview,
+          worktreePath: terminalWorktreePath(t, ws || []),
+          git: runProgressGit,
+        });
+        const progress = observeWorkerProgress(stallProgress, {
+          handle: t.handle, fingerprint, now, stallSeconds: threshold,
+        });
+        if (progress.changed || progress.stalled) savePersistedStallProgress(stallProgress);
+        if (progress.stalled) {
+          events.push(formatStallEvent({
+            dispatchId: handleDispatch.get(t.handle), handle: t.handle, agent,
+            stalledSeconds: progress.stalledSeconds,
+          }));
+        }
       }
     }
 
@@ -993,4 +1070,6 @@ module.exports = {
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
+  terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
+  formatStallEvent,
 };

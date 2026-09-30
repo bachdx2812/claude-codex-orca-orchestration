@@ -54,7 +54,13 @@ const DEFAULT_CONFIG = {
   kimiQuotaCacheSeconds: 60,
   coderAvailabilityCacheSeconds: 600,
   execFallbackWhenCodexUnavailable: 'sonnet',
-  heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
+  heartbeat: {
+    intervalSeconds: 20,
+    idleSeconds: 60,
+    maxSeconds: 3600,
+    stallSeconds: 900,
+    stallSecondsByAgent: { kimi: 600 },
+  },
   maxParallelCodexWorkers: 3, // 0 = unlimited
   maxParallelKimiWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
@@ -195,6 +201,36 @@ function loadConfig() {
     merged.coderAvailabilityCacheSeconds = DEFAULT_CONFIG.coderAvailabilityCacheSeconds;
   } else {
     merged.coderAvailabilityCacheSeconds = availabilityCache;
+  }
+
+  if (!isPlainObject(merged.heartbeat)) {
+    warnings.push('heartbeat must be an object; using the default.');
+    merged.heartbeat = deepMerge({}, DEFAULT_CONFIG.heartbeat);
+  }
+  const stallSeconds = configuredNumber(merged.heartbeat.stallSeconds);
+  if (!Number.isInteger(stallSeconds) || stallSeconds < 1 || stallSeconds > 86400) {
+    warnings.push(`heartbeat.stallSeconds "${merged.heartbeat.stallSeconds}" is not an integer 1-86400; using ${DEFAULT_CONFIG.heartbeat.stallSeconds}.`);
+    merged.heartbeat.stallSeconds = DEFAULT_CONFIG.heartbeat.stallSeconds;
+  } else {
+    merged.heartbeat.stallSeconds = stallSeconds;
+  }
+  if (!isPlainObject(merged.heartbeat.stallSecondsByAgent)) {
+    warnings.push('heartbeat.stallSecondsByAgent must be an object; using the default.');
+    merged.heartbeat.stallSecondsByAgent = { ...DEFAULT_CONFIG.heartbeat.stallSecondsByAgent };
+  } else {
+    for (const [agent, value] of Object.entries(merged.heartbeat.stallSecondsByAgent)) {
+      const seconds = configuredNumber(value);
+      if (!agent || !Number.isInteger(seconds) || seconds < 1 || seconds > 86400) {
+        warnings.push(`heartbeat.stallSecondsByAgent.${agent || '<empty>'} "${value}" is not an integer 1-86400; ignoring it.`);
+        if (Object.hasOwn(DEFAULT_CONFIG.heartbeat.stallSecondsByAgent, agent)) {
+          merged.heartbeat.stallSecondsByAgent[agent] = DEFAULT_CONFIG.heartbeat.stallSecondsByAgent[agent];
+        } else {
+          delete merged.heartbeat.stallSecondsByAgent[agent];
+        }
+      } else {
+        merged.heartbeat.stallSecondsByAgent[agent] = seconds;
+      }
+    }
   }
 
   if (!Array.isArray(merged.disabledGates)) {
@@ -349,6 +385,16 @@ function coderAvailabilityCacheSeconds(cfg) {
   return cfg.coderAvailabilityCacheSeconds;
 }
 
+/** Global stall threshold. A blank ORCH_STALL_SECONDS override is intentionally unset. */
+function stallSeconds(cfg) {
+  const envOverride = process.env.ORCH_STALL_SECONDS;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 1 && n <= 86400) return n;
+  }
+  return cfg.heartbeat.stallSeconds;
+}
+
 /** Directory holding session state (`<sid>.json`, heartbeat files, violations.log). */
 function stateDir() {
   return process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
@@ -454,4 +500,5 @@ module.exports = {
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
+  stallSeconds,
 };
