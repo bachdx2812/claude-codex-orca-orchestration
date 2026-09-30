@@ -91,6 +91,12 @@ async function run() {
     });
     check('codex is unusable on the same prompt that observes logout',
       [map.codex.usable, map.codex.reason], [false, 'not logged in']);
+    const flipBack = availability.coderAvailability({
+      stateDir, cacheSeconds: 600, now: Date.now(), codexAuthState: 'ok',
+      orcaInstalled: true, env: envFor(path.join(root, 'kimi-home'), { ORCH_KIMI_BIN: path.join(root, 'missing-kimi') }),
+    });
+    check('a cache written while logged out is rejected once auth reads ok again',
+      flipBack.codex.usable, true);
     quota.codexQuota(Date.now() + 1, { stateDir, cacheSeconds: 600 });
     check('logged-out failure is cached', fs.readFileSync(calls, 'utf8').trim().split('\n').length, 1);
 
@@ -107,6 +113,21 @@ async function run() {
     const collisionDir = path.join(root, 'collision');
     quota.codexQuota(Date.now(), { stateDir: collisionDir, cacheSeconds: 60 });
     check('child app-server exit 3 is not misclassified as logged out', quota.codexAuthState(collisionDir), 'unknown');
+
+    process.env.ORCH_CODEX_BIN = CODEX_STUB;
+    process.env.STUB_CODEX_MODE = 'timeout';
+    const timeoutDir = path.join(root, 'stub-timeout');
+    const timeoutStarted = Date.now();
+    const timedOut = quota.codexQuota(Date.now(), { stateDir: timeoutDir, cacheSeconds: 60 });
+    check('codex stub timeout mode is quota unknown', timedOut, null);
+    ok('codex stub timeout stays bounded', Date.now() - timeoutStarted < 6000);
+    check('codex stub timeout leaves auth unknown', quota.codexAuthState(timeoutDir), 'unknown');
+
+    process.env.STUB_CODEX_MODE = 'malformed';
+    const malformedDir = path.join(root, 'stub-malformed');
+    check('codex stub malformed mode is quota unknown',
+      quota.codexQuota(Date.now(), { stateDir: malformedDir, cacheSeconds: 60 }), null);
+    check('codex stub malformed leaves auth unknown', quota.codexAuthState(malformedDir), 'unknown');
 
     for (const key of Object.keys(process.env)) if (!(key in old)) delete process.env[key];
     Object.assign(process.env, old);
@@ -196,7 +217,10 @@ async function run() {
     ok('malformed credential errors never leak the token', !`${helper.stdout}${helper.stderr}`.includes(TOKEN));
 
     const leakText = allFiles(root).map((file) => { try { return fs.readFileSync(file, 'utf8'); } catch { return ''; } }).join('\n');
-    ok('state and probe files never persist the fixture token', !allFiles(root).filter((f) => f.includes('/success/') || /status-|bad-json|insecure/.test(f)).some((f) => fs.readFileSync(f).includes(TOKEN)));
+    const outputFiles = allFiles(root).filter((f) => !f.includes(`${path.sep}credentials${path.sep}`));
+    ok('no output or state file persists the bare fixture token', !outputFiles.some((f) => {
+      try { return fs.readFileSync(f).includes(TOKEN); } catch { return false; }
+    }));
     ok('controlled probe output does not surface echoed authorization', !leakText.includes(`Bearer ${TOKEN}`));
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -293,9 +317,24 @@ async function run() {
     check('both at cap stay external and rank by headroom', pick({ live: { codex: 3, kimi: 3 } }).route, 'external');
     check('unknown quota ranks by fewer live workers', pick({ quotas: { codex: null, kimi: null }, live: { codex: 2, kimi: 1 } }).pick, 'kimi');
     check('unknown quota tie prefers Codex', pick({ quotas: { codex: null, kimi: null } }).pick, 'codex');
-    check('fallback false preserves external Codex when none usable', pick({
+    check('fallback false no longer resurrects an unusable Codex', pick({
       availability: { codex: { usable: false, reason: 'not logged in' }, kimi: { usable: false, reason: 'not installed' } }, fallbackEnabled: false,
-    }).order, ['codex']);
+    }).route, 'code');
+    check('alternation prefers the coder that did not run last (codex)', pick({
+      quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 10 } }, lastCoder: 'codex',
+    }).pick, 'kimi');
+    check('alternation prefers the coder that did not run last (kimi)', pick({
+      quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 10 } }, lastCoder: 'kimi',
+    }).pick, 'codex');
+    check('a lastCoder that is not eligible is ignored', pick({
+      quotas: { codex: { usedPercent: 1 }, kimi: { usedPercent: 95 } }, lastCoder: 'kimi',
+    }).pick, 'codex');
+    check('omitted thresholds never compare NaN', pick({
+      quotas: { codex: { usedPercent: 50 }, kimi: { usedPercent: 80 } }, thresholds: {},
+    }).pick, 'codex');
+    check('omitted thresholds still rank by headroom against the default', pick({
+      quotas: { codex: { usedPercent: 96 }, kimi: { usedPercent: 50 } }, thresholds: {},
+    }).pick, 'kimi');
     check('null fallback plus exhausted Codex and missing Kimi routes to code', pick({
       availability: { codex: { usable: true }, kimi: { usable: false, reason: 'not installed' } },
       quotas: { codex: { usedPercent: 95 }, kimi: null }, fallbackEnabled: null,
