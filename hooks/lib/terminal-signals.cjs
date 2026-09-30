@@ -82,6 +82,7 @@ function approvalPromptFingerprint(text) {
   const codexQuestionPattern = /^Would\s+you\s+like\s+to\s+(?:run|make|apply)\b.*\?$/i;
   const approvalQuestionPattern = /^(?:Do\s+you\s+want\s+to\s+(?:allow|approve|run)\b.*|(?:Allow|Approve)\b.*)\?$/i;
   const codexOptionPattern = /^\d+[.)]\s*(?:Yes,\s*proceed|No,\s*and\s+tell)\b.*$/i;
+  const commandPattern = /^\$\s+\S.+$/;
   const hasNavigation = texts.some((line) => navigationPattern.test(line));
   const hasConfirmHint = texts.some((line) => confirmPattern.test(line));
   const hasPermissionMenu = texts.some((line) => permissionPattern.test(line));
@@ -95,6 +96,10 @@ function approvalPromptFingerprint(text) {
     .filter((line) => /^(?:allow|deny|approve|never ask|ask when needed)$/.test(line)));
   const hasOpposingOptions = optionNames.has('allow') && optionNames.has('deny');
   const hasBox = lines.some((line) => /[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]/u.test(line));
+  const questionIndex = texts.findIndex((line) => codexQuestionPattern.test(line));
+  const promptCommand = questionIndex >= 0
+    ? texts.slice(questionIndex + 1).find((line) => commandPattern.test(line))
+    : null;
   const structured = hasNavigation || hasConfirmHint || numberedOptions.length > 0 ||
     hasOpposingOptions || (hasBox && (hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion));
   const prompt = hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion ||
@@ -102,13 +107,13 @@ function approvalPromptFingerprint(text) {
 
   if (!structured || !prompt) return null;
 
-  // Selection arrows and navigation help repaint as the operator moves through the menu.
-  // Excluding them keeps one prompt episode stable while retaining question/command text so
-  // a later, distinct prompt re-arms even when it uses the same Allow/Deny options.
+  // Keep only normalized prompt-block lines. This ignores surrounding repaint noise while
+  // retaining the question and its `$ command`, so a distinct consecutive prompt re-arms.
   const signature = texts
     .filter((line) => permissionPattern.test(line) || codexQuestionPattern.test(line) ||
       approvalQuestionPattern.test(line) || codexOptionPattern.test(line) ||
       navigationPattern.test(line) || confirmPattern.test(line) ||
+      line === promptCommand ||
       /^(?:\d+[.)]\s*)?(?:allow|deny|approve|never ask|ask when needed)$/i.test(line))
     .map((line) => line.toLowerCase())
     .join('\n')

@@ -373,12 +373,15 @@ have been lost. A reported disconnected terminal skips its idle and orphan check
 Terminal repaint activity alone is not progress. For every supervised worker terminal, the
 heartbeat combines meaningful terminal text with a bounded fingerprint of that worker's
 worktree (`HEAD`, `git status --porcelain`, full `git diff`, and changed/untracked file size
-and mtime). Terminal text comes from a bounded `orca terminal read --terminal <handle>` of
+and mtime). Terminal text comes from a bounded `orca terminal read --terminal <handle> --screen` of
 the rendered screen, only for this session's supervised terminals; a failed read reuses the
 last good screen and only an initial failure falls back to the lossy list preview. A timed-out
 git probe reuses the terminal's last good git sample. Spinner/moon frames,
-`Thinking…` / elapsed `Working (...)` lines, rotating tips, counters, and prompt chrome are
-removed before terminal text is compared. If neither side changes for the applicable
+`Thinking…` / elapsed `Working (...)` lines, rotating tips, context/token counters, and prompt chrome are
+removed before terminal text is compared; Kimi's completed-tool count is retained as
+progress. Rate-limit, disconnect, and Kimi usage-limit classification remains scoped to the
+live list preview, preventing stale rendered scrollback from retriggering old failures. If
+neither side changes for the applicable
 `heartbeat.stallSeconds` / `heartbeat.stallSecondsByAgent` threshold, it emits:
 
 ```text
@@ -403,8 +406,9 @@ Allow/Approve requests paired with UI structure, Codex `Would you like to run ..
 ... edits?` questions with numbered choices or confirm/cancel help, opposing exact
 Allow/Deny options, and `↑↓ navigate · Enter select` (optionally `· Esc cancel`). Ordinary
 prose that merely mentions those words is not a match. Only normalized prompt-block lines
-form the persisted signature, so surrounding tips, spinners, timers, and ordinary output do
-not create new episodes. It is re-armed when the prompt disappears.
+form the persisted signature, including the normalized question and command, so surrounding
+tips, spinners, timers, and ordinary output do not create new episodes while consecutive
+prompts for different commands remain distinct. It is re-armed when the prompt disappears.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`

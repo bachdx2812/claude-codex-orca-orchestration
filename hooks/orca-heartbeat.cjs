@@ -314,8 +314,12 @@ function parseTerminalScreen(reply) {
 }
 
 /** Rendered screen text is authoritative; list previews are lossy repaint composites. */
+function terminalReadArgs(handle) {
+  return ['terminal', 'read', '--terminal', handle, '--screen', '--json'];
+}
+
 function terminalScreen(handle) {
-  return parseTerminalScreen(orca(['terminal', 'read', '--terminal', handle, '--json'], 2000));
+  return parseTerminalScreen(orca(terminalReadArgs(handle), 2000));
 }
 
 function resolveTerminalScreen(readText, previousText, listPreview) {
@@ -893,7 +897,9 @@ function classifyTerminal(t, ctx) {
       hasKimiUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'kimi' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
-  const approvalFingerprint = approvalPromptFingerprint(t.preview || '');
+  const approvalFingerprint = approvalPromptFingerprint(
+    ctx.approvalText !== undefined ? ctx.approvalText : (t.preview || '')
+  );
   if (approvalFingerprint) return { kind: 'approval_waiting', fingerprint: approvalFingerprint };
   if (t.orphaned) return { kind: 'orphaned' };
   const supervised = (ctx.retainedHandles && ctx.retainedHandles.has(t.handle)) ||
@@ -1086,7 +1092,7 @@ function main() {
           }
           screenText = resolveTerminalScreen(readText, lastScreenText.get(t.handle), t.preview);
         }
-        const verdict = classifyTerminal({ ...t, preview: screenText }, ctx);
+        const verdict = classifyTerminal(t, { ...ctx, approvalText: screenText });
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
         if (verdict.kind === 'usage_exhausted') {
           const event = reportUsageExhausted({
@@ -1195,5 +1201,5 @@ module.exports = {
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
   shouldTrackWorkerProgress,
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
-  parseTerminalScreen, terminalScreen, resolveTerminalScreen,
+  parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen,
 };

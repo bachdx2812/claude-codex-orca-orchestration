@@ -280,6 +280,33 @@ check('failed rendered read reuses the last good screen',
   heartbeat.resolveTerminalScreen(null, codexScreenA, garbledWaitA), codexScreenA);
 check('first failed rendered read falls back to the list preview',
   heartbeat.resolveTerminalScreen(null, undefined, garbledWaitA), garbledWaitA);
+check('rendered terminal reads request the full screen',
+  heartbeat.terminalReadArgs('term_kimi'),
+  ['terminal', 'read', '--terminal', 'term_kimi', '--screen', '--json']);
+
+const kimiToolScreen172 = [
+  '⠴ Coder Agent Running · K3 · low · 172 tools · Using Bash (35m 24s)',
+  'context: 5% (47.4k/1M)',
+].join('\n');
+const kimiToolScreen173 = [
+  '⠦ Coder Agent Running · K3 · low · 173 tools · Using Bash (35m 25s)',
+  'context: 5% (47.5k/1M)',
+].join('\n');
+check('Kimi tool count survives while its context counter is ignored',
+  [meaningfulTerminalOutput(kimiToolScreen172), meaningfulTerminalOutput(kimiToolScreen173)],
+  ['tools:172', 'tools:173']);
+check('Kimi context counters alone do not change the fingerprint',
+  fingerprint('context: 5% (47.4k/1M)'), fingerprint('context: 5% (47.5k/1M)'));
+const kimiToolRecords = new Map();
+observeWorkerProgress(kimiToolRecords, {
+  handle: 'term_kimi_tools', fingerprint: fingerprint(kimiToolScreen172),
+  now: start, stallSeconds: 600,
+});
+check('increasing Kimi tool count after the threshold is progress, not a stall',
+  observeWorkerProgress(kimiToolRecords, {
+    handle: 'term_kimi_tools', fingerprint: fingerprint(kimiToolScreen173),
+    now: start + 700_000, stallSeconds: 600,
+  }), { stalled: false, changed: true, stalledSeconds: 0 });
 
 // Approval/question prompts wake immediately, while prose mentioning their vocabulary does not.
 const kimiApproval = [
@@ -296,6 +323,7 @@ const kimiApprovalMoved = [
 ].join('\n');
 const codexApproval = [
   'Would you like to run the following command?',
+  '$ git push origin main',
   '› 1. Yes, proceed (y)',
   '  2. No, and tell Codex what to do differently (esc)',
   'Press enter to confirm or esc to cancel',
@@ -304,6 +332,9 @@ check('real Kimi permission menu is detected', typeof approvalPromptFingerprint(
 check('moving the selection does not create a new prompt episode',
   approvalPromptFingerprint(kimiApprovalMoved), approvalPromptFingerprint(kimiApproval));
 check('real Codex command confirmation is detected', typeof approvalPromptFingerprint(codexApproval), 'string');
+check('different Codex commands create different approval episodes',
+  approvalPromptFingerprint(codexApproval) ===
+    approvalPromptFingerprint(codexApproval.replace('$ git push origin main', '$ rm -rf build')), false);
 check('real Codex edit confirmation is detected', typeof approvalPromptFingerprint(
   codexApproval.replace('run the following command', 'make the following edits')), 'string');
 check('captured selection navigation is sufficient UI evidence',
@@ -340,6 +371,19 @@ check('supervised approval screen classifies before idle/stall', heartbeat.class
 check('prose with approval words remains ordinary working output', heartbeat.classifyTerminal({
   handle: 'term_approval', preview: 'Implemented Allow and Deny parsing.', lastOutputAt: start,
 }, approvalCtx).kind, 'working');
+const oldRateLimitScreen = [
+  '  └ HTTP/1.1 429 Too Many Requests',
+  '• Working (45s • esc to interrupt)',
+].join('\n');
+const scopedSignalVerdict = heartbeat.classifyTerminal({
+  handle: 'term_approval', preview: '• Working (45s • esc to interrupt)', lastOutputAt: start,
+}, { ...approvalCtx, approvalText: oldRateLimitScreen });
+check('old rate-limit scrollback does not override the live list preview', scopedSignalVerdict.kind, 'working');
+check('a terminal with old rate-limit scrollback remains eligible for stall tracking',
+  heartbeat.shouldTrackWorkerProgress(scopedSignalVerdict.kind, 'running'), true);
+check('rendered approval UI is still detected when the list preview is working', heartbeat.classifyTerminal({
+  handle: 'term_approval', preview: '• Working (45s • esc to interrupt)', lastOutputAt: start,
+}, { ...approvalCtx, approvalText: kimiApproval }).kind, 'approval_waiting');
 
 const approvalReports = new Map();
 const approvalFingerprint = approvalPromptFingerprint(kimiApproval);
