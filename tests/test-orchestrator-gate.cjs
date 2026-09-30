@@ -904,11 +904,47 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
 // --- gate.cjs: parseCodeModel / describeOverride / currentExecRoute / escapeRegex ----
 
 {
+  const sid = 'invalid-persisted-exec-agent';
+  const file = path.join(STATE_DIR, `${sid}.json`);
+  fs.writeFileSync(file, JSON.stringify({
+    session_id: sid,
+    created: new Date().toISOString(),
+    bypass: false,
+    execAgent: 'code',
+  }));
+  const payload = JSON.stringify({ session_id: sid, hook_event_name: 'SessionStart' });
+  const run = () => spawnSync(process.execPath, [path.join(__dirname, '..', 'hooks', 'orchestrator-gate.cjs')], {
+    input: payload,
+    encoding: 'utf8',
+    env: { ...process.env, ORCA_TERMINAL_HANDLE: 'term_unit_invalid_exec_agent' },
+  });
+  const lockDir = path.join(STATE_DIR, '.lock');
+  fs.mkdirSync(lockDir);
+  const contended = run();
+  const stillInvalid = JSON.parse(fs.readFileSync(file, 'utf8'));
+  check('persisted execAgent repair never writes while the state lock is held', stillInvalid.execAgent, 'code');
+  check('a deferred persisted execAgent repair is not reported before it is saved',
+    /invalid persisted execAgent/.test(contended.stdout), false);
+  fs.rmdirSync(lockDir);
+
+  const first = run();
+  const repaired = JSON.parse(fs.readFileSync(file, 'utf8'));
+  check('invalid persisted execAgent is reset to automatic routing', repaired.execAgent, null);
+  check('invalid persisted execAgent clears its timestamp', repaired.execAgentSince, null);
+  check('invalid persisted execAgent is reported on the repairing hook',
+    /invalid persisted execAgent "code".*automatic quota routing/.test(first.stdout), true);
+  const second = run();
+  check('a repaired persisted execAgent is not reported again',
+    /invalid persisted execAgent/.test(second.stdout), false);
+  fs.unlinkSync(file);
+}
+
+{
   const cfg = config.loadConfig(); // default config: opus/fable/sonnet/haiku/codex
   check('escapeRegex escapes regex metacharacters', gate.escapeRegex('a.b+c'), 'a\\.b\\+c');
 
   check('parseCodeModel: auto clears the override', gate.parseCodeModel(cfg, 'auto'), null);
-  check('parseCodeModel: the code alias maps to "code"', gate.parseCodeModel(cfg, 'sonnet'), 'code');
+  check('parseCodeModel: the code alias maps to claude:<alias>', gate.parseCodeModel(cfg, 'sonnet'), 'claude:sonnet');
   check('parseCodeModel: the review alias maps to claude:<alias>', gate.parseCodeModel(cfg, 'opus'), 'claude:opus');
   check('parseCodeModel: the escalation alias maps to claude:<alias>', gate.parseCodeModel(cfg, 'fable'), 'claude:fable');
   check('parseCodeModel: the lookup alias maps to claude:<alias>', gate.parseCodeModel(cfg, 'haiku'), 'claude:haiku');
@@ -921,11 +957,11 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
 
   check('describeOverride: codex', gate.describeOverride(cfg, 'codex'), 'Codex in an Orca worker');
   check('describeOverride: codex:<model>', gate.describeOverride(cfg, 'codex:gpt-5-custom'), 'Codex (gpt-5-custom) in an Orca worker');
-  check('describeOverride: code alias', gate.describeOverride(cfg, 'code'), 'in-session Agent with model "sonnet"');
+  check('describeOverride: code alias', gate.describeOverride(cfg, 'claude:sonnet'), 'in-session Agent with model "sonnet"');
   check('describeOverride: claude:<alias>', gate.describeOverride(cfg, 'claude:opus'), 'in-session Agent with model "opus"');
 
-  check('currentExecRoute: operator override "code"',
-    gate.currentExecRoute(cfg, { execAgent: 'code' }).route, 'code');
+  check('currentExecRoute: configured code-model override carries its alias',
+    gate.currentExecRoute(cfg, { execAgent: 'claude:sonnet' }).alias, 'sonnet');
   check('currentExecRoute: operator override "codex"',
     gate.currentExecRoute(cfg, { execAgent: 'codex' }).route, 'codex');
   check('currentExecRoute: operator override "codex:<model>" carries the model',

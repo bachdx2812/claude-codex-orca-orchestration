@@ -234,7 +234,7 @@ function blank(sid) {
     created: new Date().toISOString(),
     bypass: false,
     bypassSince: null,
-    execAgent: null,        // null (auto by quota) | 'code' | 'codex' | 'codex:<model>' | 'claude:<alias>'
+    execAgent: null,        // null (auto by quota) | 'codex' | 'codex:<model>' | 'claude:<alias>'
     execAgentSince: null,
     workers: {},            // label -> { role, started, status, last_seen, rate_limited_until,
                              //            group, kind, agent, owns, ws }
@@ -250,9 +250,24 @@ function blank(sid) {
   };
 }
 
+function validPersistedExecAgent(value) {
+  return value === null || value === 'codex' ||
+    (typeof value === 'string' && (/^codex:.+/.test(value) || /^claude:.+/.test(value)));
+}
+
 function load(sid) {
   try {
     const s = JSON.parse(fs.readFileSync(stateFile(sid), 'utf8'));
+    if (!Object.prototype.hasOwnProperty.call(s, 'execAgent')) {
+      s.execAgent = null;
+    } else if (!validPersistedExecAgent(s.execAgent)) {
+      s.execAgent = null;
+    }
+    if (s.execAgent == null && s.execAgentSince != null) {
+      s.execAgentSince = null;
+    }
+    if (!Object.prototype.hasOwnProperty.call(s, 'execAgentSince')) s.execAgentSince = null;
+    if (!Object.prototype.hasOwnProperty.call(s, 'bypassSince')) s.bypassSince = null;
     // Back-fill fields a state file written before this gate's ownership/parallel-limit
     // work existed would not have, so an in-progress session never crashes on upgrade.
     if (!s.reservations) s.reservations = {};
@@ -262,6 +277,28 @@ function load(sid) {
     return s;
   } catch {
     return blank(sid);
+  }
+}
+
+function repairInvalidPersistedExecAgent(sid) {
+  let candidate;
+  try { candidate = JSON.parse(fs.readFileSync(stateFile(sid), 'utf8')); } catch { return; }
+  if (!Object.prototype.hasOwnProperty.call(candidate, 'execAgent') || validPersistedExecAgent(candidate.execAgent)) return;
+
+  const lockDir = path.join(DIR, '.lock');
+  const locked = acquireLock(lockDir, {});
+  if (!locked) return;
+  try {
+    let fresh;
+    try { fresh = JSON.parse(fs.readFileSync(stateFile(sid), 'utf8')); } catch { return; }
+    if (!Object.prototype.hasOwnProperty.call(fresh, 'execAgent') || validPersistedExecAgent(fresh.execAgent)) return;
+    const invalid = fresh.execAgent;
+    fresh.execAgent = null;
+    fresh.execAgentSince = null;
+    writeJsonAtomic(stateFile(sid), fresh);
+    process.stdout.write(`orchestrator-gate: invalid persisted execAgent ${JSON.stringify(invalid)}; using automatic quota routing.\n`);
+  } finally {
+    releaseLock(lockDir);
   }
 }
 
@@ -324,7 +361,7 @@ function parseCodeModel(cfg, v) {
   const x = String(v || '').toLowerCase();
   if (!/^[a-z0-9._:-]+$/.test(x)) return 'invalid'; // e.g. codex:openai/gpt-5 - never truncate silently
   if (x === 'auto') return null;
-  if (x === String(cfg.models.code.alias || '').toLowerCase()) return 'code';
+  if (x === String(cfg.models.code.alias || '').toLowerCase()) return `claude:${cfg.models.code.alias}`;
   if (x === String(cfg.models.review.alias || '').toLowerCase()) return `claude:${cfg.models.review.alias}`;
   if (x === String(cfg.models.escalation.alias || '').toLowerCase()) return `claude:${cfg.models.escalation.alias}`;
   if (x === String(cfg.models.lookup.alias || '').toLowerCase()) return `claude:${cfg.models.lookup.alias}`;
@@ -343,20 +380,18 @@ const { orcaInvocations } = require('./lib/shell-orca-invocations.cjs');
 function describeOverride(cfg, o) {
   if (o === 'codex') return 'Codex in an Orca worker';
   if (o.startsWith('codex:')) return `Codex (${o.slice(6)}) in an Orca worker`;
-  if (o === 'code') return `in-session Agent with model "${cfg.models.code.alias}"`;
   return `in-session Agent with model "${o.slice(7)}"`;
 }
 
 /**
  * Who writes code for this session. An operator override wins:
- *   s.execAgent = 'code' | 'codex' | 'codex:<model>' | 'claude:<alias>'
+ *   s.execAgent = 'codex' | 'codex:<model>' | 'claude:<alias>'
  * (set by --code-model <value>, or the --exec-sonnet / --exec-codex shortcuts);
  * otherwise automatic: Codex first, the configured code model once Codex has used the
  * handoff percentage. Returns { route: 'code' | 'codex' | 'claude', alias?, codexModel?, why }.
  */
 function currentExecRoute(cfg, s) {
   const a = s.execAgent;
-  if (a === 'code') return { route: 'code', alias: cfg.models.code.alias, why: `operator override (${cfg.models.code.alias})` };
   if (a === 'codex') return { route: 'codex', why: 'operator override (codex)' };
   if (typeof a === 'string' && a.startsWith('codex:')) {
     return { route: 'codex', codexModel: a.slice(6), why: `operator override (codex ${a.slice(6)})` };
@@ -671,7 +706,7 @@ function activeOverrideLines(cfg, s) {
   if (s.execAgent != null) {
     let target;
     let flag;
-    if (s.execAgent === 'code') {
+    if (s.execAgent === `claude:${cfg.models.code.alias}`) {
       target = cfg.models.code.alias[0].toUpperCase() + cfg.models.code.alias.slice(1);
       flag = '--exec-sonnet';
     } else if (s.execAgent === 'codex') {
@@ -825,7 +860,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     .map((f) => [f, flagAt(f)]).concat(cm ? [['--code-model', cmAt]] : [])
     .filter(([, i]) => i >= 0).sort((a, b) => b[1] - a[1]).map(([f]) => f)[0];
   let override;
-  if (lastFlag === '--exec-sonnet') override = 'code';
+  if (lastFlag === '--exec-sonnet') override = `claude:${cfg.models.code.alias}`;
   else if (lastFlag === '--exec-codex') override = 'codex';
   else if (lastFlag === '--exec-auto') override = null;
   else if (lastFlag === '--code-model') override = parseCodeModel(cfg, cm[2]);
@@ -1840,6 +1875,7 @@ function onStop(p, s, cfg) {
 function main(p) {
   const cfg = loadConfig();
   if (!activationApplies(cfg)) return;
+  repairInvalidPersistedExecAgent(p.session_id);
   const s = load(p.session_id);
   switch (p.hook_event_name) {
     case 'SessionStart': return onSessionStart(p, s, cfg);

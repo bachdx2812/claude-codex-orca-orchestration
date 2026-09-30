@@ -612,8 +612,8 @@ expect('--exec-sonnet prompt is accepted',
   promptSubmit(SID, 'run this --exec-sonnet please'), ALLOW);
 {
   const st = readState(SID);
-  if (st && st.execAgent === 'code') pass += 1;
-  else failures.push(`--exec-sonnet did not persist execAgent='code' in state (got ${JSON.stringify(st && st.execAgent)})`);
+  if (st && st.execAgent === 'claude:sonnet') pass += 1;
+  else failures.push(`--exec-sonnet did not persist execAgent='claude:sonnet' in state (got ${JSON.stringify(st && st.execAgent)})`);
   if (st && !Number.isNaN(Date.parse(st.execAgentSince))) pass += 1;
   else failures.push(`--exec-sonnet did not persist an ISO execAgentSince timestamp (${JSON.stringify(st && st.execAgentSince)})`);
   const reminder = spawnGate(promptSubmit(SID, 'status?'), CODEX_WINS).stdout;
