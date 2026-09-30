@@ -329,7 +329,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     if (locked === false && hardCapActive) {
       violation = {
         gate: agentCapActive ? 'max-parallel-agents'
-          : (!hasCodexDispatch && hasKimiDispatch
+          : (!hasCodexDispatch && kimiCapActive
               ? 'max-parallel-kimi-workers'
               : 'max-parallel-codex-workers'),
         reason: deps.lockContentionMessage,

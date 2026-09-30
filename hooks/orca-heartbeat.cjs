@@ -919,7 +919,7 @@ function main() {
       const handleAgent = new Map();
       for (const row of ws || []) {
         if (row && row.agentTerminalHandle) {
-          const agent = stateWorkerForRow(row, tickState)?.agent;
+          const agent = stateWorkerForRow(row, tickState)?.agent || row.agent;
           if (agent) handleAgent.set(row.agentTerminalHandle, agent);
         }
       }

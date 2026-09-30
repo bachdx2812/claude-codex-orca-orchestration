@@ -338,6 +338,12 @@ machine-wide `max-parallel-agents` budget derives its limit from; `maxParallelAg
 (default `null`, meaning derive it from `parallelCoreFraction x cores`) overrides that
 derivation outright, `0` meaning unlimited.)
 
+For every numeric env override — `ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`,
+`ORCH_MAX_PARALLEL_CODEX_WORKERS` / `ORCH_MAX_PARALLEL_KIMI_WORKERS`, and the
+`ORCH_*_CACHE_SECONDS` TTLs — an empty or whitespace-only value counts as unset (never
+coerced to `0`), and a `null` or other non-number in this file for a numeric key falls
+back to that key's default with a banner warning.
+
 See `rules/orchestration-contract.md#config` for every field.
 
 ## Uninstall / rollback

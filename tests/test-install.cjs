@@ -11,7 +11,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-install-test-'));
 const binDir = path.join(root, 'bin');
 fs.mkdirSync(binDir);
 try { fs.symlinkSync(process.execPath, path.join(binDir, 'node')); } catch {}
-for (const bin of ['claude', 'orca', 'codex']) {
+for (const bin of ['claude', 'orca', 'codex', 'kimi']) {
   const file = path.join(binDir, bin);
   fs.writeFileSync(file, '#!/bin/sh\necho "stub 1.0"\n');
   fs.chmodSync(file, 0o755);
@@ -19,12 +19,12 @@ for (const bin of ['claude', 'orca', 'codex']) {
 let passed = 0;
 const failures = [];
 
-function run(args, homeName) {
+function run(args, homeName, extraEnv = {}) {
   const home = path.join(root, homeName);
   fs.mkdirSync(home, { recursive: true });
   const result = spawnSync(process.execPath, [INSTALLER, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}` },
+    env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`, ...extraEnv },
   });
   return { ...result, home };
 }
@@ -130,6 +130,41 @@ fs.unlinkSync(path.join(installedForMissing.home, '.claude', 'hooks', 'orchestra
 const missingCheck = run(['--check'], missingHome);
 check('--check prints MISS for a missing installed artifact', /\bMISS\b/.test(missingCheck.stdout), true);
 check('--check exits 1 whenever it prints MISS', missingCheck.status, 1);
+
+// --- coder availability section (stubs only: fake codex/kimi binaries, tmp Kimi homes,
+// an unreachable usage URL; nothing touches real ~/.kimi-code, real codex, or the network)
+const emptyKimiHome = path.join(root, 'kimi-home-empty');
+fs.mkdirSync(emptyKimiHome, { recursive: true });
+const emptyEnv = {
+  ORCH_KIMI_HOME: emptyKimiHome,
+  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+  ORCH_KIMI_HANDOFF_USED: '80',
+};
+const emptyCheck = run(['--check'], 'check-kimi-empty', emptyEnv);
+const emptyOut = `${emptyCheck.stdout}${emptyCheck.stderr}`;
+check('--check exits 0 on a clean machine with no install problems', emptyCheck.status, 0);
+check('--check prints the effective thresholds with env overrides applied',
+  /codexHandoffUsedPercent=95 kimiHandoffUsedPercent=80 maxParallelKimiWorkers=3/.test(emptyOut), true);
+check('--check reports the codex coder line (stub binary, auth unknown, quota unreadable)',
+  /coder codex: usable \[binary [^\]]*stub 1\.0, auth unknown, quota unknown\]/.test(emptyOut), true);
+check('--check reports kimi unusable when no credentials exist',
+  /coder kimi: UNUSABLE \(not signed in\)/.test(emptyOut), true);
+check('--check prints the coder pool summary',
+  /pool: Codex quota unknown, available \(0\/3 live\) or Kimi \(unusable: not signed in\); pick Codex/.test(emptyOut), true);
+
+const credsKimiHome = path.join(root, 'kimi-home-creds');
+fs.mkdirSync(path.join(credsKimiHome, 'credentials'), { recursive: true });
+const FIXTURE_TOKEN = 'fixture-token-9f8e7d6c5b4a-never-print';
+fs.writeFileSync(path.join(credsKimiHome, 'credentials', 'kimi-code.json'),
+  JSON.stringify({ access_token: FIXTURE_TOKEN, expires_at: Date.now() + 3600e3 }));
+const credsCheck = run(['--check'], 'check-kimi-creds', {
+  ORCH_KIMI_HOME: credsKimiHome,
+  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+});
+const credsOut = `${credsCheck.stdout}${credsCheck.stderr}`;
+check('--check reports kimi usable once credentials exist (quota unknown on an unreachable URL)',
+  /coder kimi: usable \[binary [^\]]*stub 1\.0, auth ok, quota unknown\]/.test(credsOut), true);
+check('--check never prints the Kimi access token', credsOut.includes(FIXTURE_TOKEN), false);
 
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`${passed} passed, ${failures.length} failed`);

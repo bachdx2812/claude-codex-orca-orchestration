@@ -235,7 +235,12 @@ terminal on it; disable with `false` or `ORCH_CLOSE_DONE_WORKTREES`
 set to `0`/`false` (`1`/`true` forces it on; anything else, including empty, defers to the
 config). `parallelCoreFraction`/`maxParallelAgents`'s env overrides treat an empty or
 whitespace-only value as unset (never coerced to `0`), and their config-file values accept
-only an actual JSON number (or `null` for `maxParallelAgents`) — never a numeric string. Every code brief that already
+only an actual JSON number (or `null` for `maxParallelAgents`) — never a numeric string.
+The same empty/whitespace-is-unset rule applies to `ORCH_CODEX_HANDOFF_USED` /
+`ORCH_KIMI_HANDOFF_USED`, `ORCH_MAX_PARALLEL_CODEX_WORKERS` /
+`ORCH_MAX_PARALLEL_KIMI_WORKERS`, and the `ORCH_*_CACHE_SECONDS` overrides, and a `null`
+(or any other non-number) in the config file for a numeric key falls back to that key's
+default with a banner warning. Every code brief that already
 needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` dispatch)
 running in a *shared* workspace must also declare `Owns: <repo-relative paths>` or
 `Owns: n/a <reason>` on its own line, unless it is isolated
@@ -280,9 +285,16 @@ can also:
 - declare the Orca fallback: `date -u +%Y-%m-%dT%H:%M:%SZ >
   ~/.claude/orchestrator-gate/orca-unavailable` (expires after 15 minutes on purpose).
 
-`node install.mjs --check` should report Orca and both coders' availability before routing.
-The corresponding installer text is updated separately with the Lane B installer work;
-this lane intentionally does not edit `install.mjs`.
+`node install.mjs --check` reports this directly: its "coder availability" section prints
+the effective `codexHandoffUsedPercent` / `kimiHandoffUsedPercent` /
+`maxParallelKimiWorkers` / `maxParallelCodexWorkers` values (env overrides applied), one
+`coder codex:` / `coder kimi:` line each with usability and reason, the binary path and
+version, the auth state (`ok` / `logged out` / `unknown`), and the live quota when it is
+readable (`unknown` otherwise), and finally a `pool:` line with the pick those states
+produce. Availability is probed fresh and quota caches are written to a throwaway
+directory, so `--check` never mutates the gate's real state; the Kimi access token is
+read only inside the quota helper and is never printed. An unusable or exhausted coder
+never fails `--check` — only missing install artifacts, foreign gates, and Node < 18 do.
 
 ## 7. Escape hatches, uninstall, rollback
 
