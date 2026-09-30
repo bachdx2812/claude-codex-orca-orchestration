@@ -11,10 +11,21 @@ const DURATION = /\b\d+\s*[hms]\b/gi;
 const TOKEN_COUNTER = /[↑↓]?\s*[\d.,]+k?\s*tokens?/gi;
 const ACTIVE_CHILD_MARKER = '__active_child_process__';
 
+function isRepaintGarble(line) {
+  const bullets = (line.match(/[•·]/g) || []).length;
+  const statusFragments = (line.match(/wait|backg|groun|termi|minal/gi) || []).length;
+  const symbolsAndDigits = (line.match(/[•·\d…]/g) || []).length;
+  return bullets >= 3 || statusFragments >= 5 ||
+    (line.length >= 30 && symbolsAndDigits / line.length >= 0.3);
+}
+
 function normalizeTerminalLine(rawLine) {
   const rawWithoutAnsi = String(rawLine || '').replace(ANSI_ESCAPE, '');
   const statusCandidate = rawWithoutAnsi.replace(BOX_CHROME, ' ').replace(LEADING_NOISE, '').trim();
-  const activeChild = /^(?:waiting\s+for\s+background\s+terminal\b|.*\b\d+\s+background\s+terminals?\s+running\b)/i.test(statusCandidate);
+  const compactStatus = statusCandidate.toLowerCase().replace(/[•·\s\d…]/g, '');
+  const cleanActiveChild = /^(?:waiting\s+(?:\/\s*[·•]\s*)?for\s+background\s+(?:terminal|task|agent)s?\b|waiting\s*\/.*\b\d+\s+background\s+tasks?\s+still\s+running\b|.*\b\d+\s+background\s+(?:terminal|task)s?\s+(?:still\s+)?running\b)/i.test(statusCandidate);
+  const garbledActiveChild = isRepaintGarble(statusCandidate) && /backg.*term/i.test(compactStatus);
+  const activeChild = cleanActiveChild || garbledActiveChild;
   let line = rawWithoutAnsi
     .trim()
     .replace(BOX_CHROME, ' ')
@@ -26,6 +37,7 @@ function normalizeTerminalLine(rawLine) {
     .trim();
 
   if (activeChild) return { text: ACTIVE_CHILD_MARKER, activeChild: true };
+  if (isRepaintGarble(statusCandidate)) return { text: '', activeChild: false };
   if (!line || !/[\p{L}\p{N}]/u.test(line)) return { text: '', activeChild: false };
   if (/esc\s+to\s+interrupt/i.test(line) || /thinking(?:\.{3}|…)/i.test(line) ||
       /working\s*\(/i.test(line) || /^\S+(?:\.{3}|…)(?:\s|\(|$)/u.test(line)) {
@@ -124,21 +136,27 @@ function workerProgressFingerprint(options) {
  * episode; an unchanged fingerprint reports once after the configured threshold.
  */
 function observeWorkerProgress(records, {
-  handle, fingerprint, now, stallSeconds, activeChild = false, gitParts,
+  handle, fingerprint, now, stallSeconds, activeChild = false, gitParts, screenText,
 }) {
   const previous = records.get(handle);
   if (!previous || previous.fingerprint !== fingerprint) {
-    records.set(handle, { fingerprint, lastProgressAt: now, reported: false, activeChild, gitParts });
+    records.set(handle, { fingerprint, lastProgressAt: now, reported: false, activeChild, gitParts, screenText });
     return { stalled: false, changed: true, stalledSeconds: 0 };
   }
 
   const stalledSeconds = Math.max(0, Math.floor((now - previous.lastProgressAt) / 1000));
   const effectiveThreshold = activeChild ? stallSeconds * 2 : stallSeconds;
   if (stalledSeconds < effectiveThreshold || previous.reported) {
-    records.set(handle, { ...previous, activeChild, gitParts: gitParts || previous.gitParts });
+    records.set(handle, {
+      ...previous, activeChild, gitParts: gitParts || previous.gitParts,
+      screenText: screenText || previous.screenText,
+    });
     return { stalled: false, changed: false, stalledSeconds };
   }
-  records.set(handle, { ...previous, reported: true, activeChild, gitParts: gitParts || previous.gitParts });
+  records.set(handle, {
+    ...previous, reported: true, activeChild, gitParts: gitParts || previous.gitParts,
+    screenText: screenText || previous.screenText,
+  });
   return { stalled: true, changed: false, stalledSeconds };
 }
 
@@ -151,6 +169,7 @@ function recordsFromJSON(value) {
 
 module.exports = {
   ACTIVE_CHILD_MARKER,
+  isRepaintGarble,
   normalizeTerminalLine,
   terminalOutputSample,
   meaningfulTerminalOutput,

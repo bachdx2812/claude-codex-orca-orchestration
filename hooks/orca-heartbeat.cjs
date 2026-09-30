@@ -303,6 +303,27 @@ function terminals() {
   }));
 }
 
+function parseTerminalScreen(reply) {
+  if (!reply || reply.ok === false) return null;
+  const result = reply.result ?? reply;
+  const terminal = result && result.terminal ? result.terminal : result;
+  if (!terminal) return null;
+  if (Array.isArray(terminal.tail)) return terminal.tail.join('\n');
+  if (typeof terminal.tail === 'string') return terminal.tail;
+  return null;
+}
+
+/** Rendered screen text is authoritative; list previews are lossy repaint composites. */
+function terminalScreen(handle) {
+  return parseTerminalScreen(orca(['terminal', 'read', '--terminal', handle, '--json'], 2000));
+}
+
+function resolveTerminalScreen(readText, previousText, listPreview) {
+  if (readText !== null) return readText;
+  if (typeof previousText === 'string') return previousText;
+  return listPreview || '';
+}
+
 function workers() {
   const d = orca(['orchestration', 'worker-list', '--json']);
   if (!d) return null;
@@ -950,6 +971,9 @@ function main() {
   const reportedDisconnect = loadPersistedDisconnectReports();
   const reportedUsageExhausted = loadPersistedUsageExhaustedReports();
   const stallProgress = loadPersistedStallProgress();
+  const lastScreenText = new Map([...stallProgress]
+    .filter(([, record]) => record && typeof record.screenText === 'string')
+    .map(([handle, record]) => [handle, record.screenText]));
   const reportedApproval = loadPersistedApprovalReports();
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
@@ -1052,7 +1076,17 @@ function main() {
         handleAgent,
       };
       for (const t of ts) {
-        const verdict = classifyTerminal(t, ctx);
+        const workerState = handleWorkerState.get(t.handle);
+        let screenText = t.preview;
+        if (ownTerminalHandles.has(t.handle) && !TERMINAL_WORKER_STATES.has(workerState)) {
+          const readText = terminalScreen(t.handle);
+          beat(started);
+          if (readText !== null) {
+            lastScreenText.set(t.handle, readText);
+          }
+          screenText = resolveTerminalScreen(readText, lastScreenText.get(t.handle), t.preview);
+        }
+        const verdict = classifyTerminal({ ...t, preview: screenText }, ctx);
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
         if (verdict.kind === 'usage_exhausted') {
           const event = reportUsageExhausted({
@@ -1077,7 +1111,7 @@ function main() {
             'its work since the last commit may be lost; release and re-dispatch'
           );
         } else if (verdict.kind === 'approval_waiting') {
-          if (TERMINAL_WORKER_STATES.has(handleWorkerState.get(t.handle))) {
+          if (TERMINAL_WORKER_STATES.has(workerState)) {
             if (reportedApproval.delete(t.handle)) savePersistedApprovalReports(reportedApproval);
             continue;
           }
@@ -1106,8 +1140,8 @@ function main() {
         }
 
         // Fatal/quota signals above take precedence and are never mislabeled as stalls.
-        if (!shouldTrackWorkerProgress(verdict.kind, handleWorkerState.get(t.handle))) {
-          if (!TERMINAL_WORKER_STATES.has(handleWorkerState.get(t.handle))) continue;
+        if (!shouldTrackWorkerProgress(verdict.kind, workerState)) {
+          if (!TERMINAL_WORKER_STATES.has(workerState)) continue;
           if (stallProgress.delete(t.handle)) savePersistedStallProgress(stallProgress);
           continue;
         }
@@ -1115,14 +1149,14 @@ function main() {
         const threshold = stallThresholdForAgent(agent, cfg.heartbeat, STALL_SECONDS);
         const previousProgress = stallProgress.get(t.handle);
         const sample = workerProgressSample({
-          terminalText: t.preview,
+          terminalText: screenText,
           worktreePath: terminalWorktreePath(t, ws || []),
           git: runProgressGit,
           previousGitParts: previousProgress && previousProgress.gitParts,
         });
         const progress = observeWorkerProgress(stallProgress, {
           handle: t.handle, fingerprint: sample.fingerprint, now, stallSeconds: threshold,
-          activeChild: sample.activeChild, gitParts: sample.gitParts,
+          activeChild: sample.activeChild, gitParts: sample.gitParts, screenText,
         });
         beat(started);
         if (progress.changed || progress.stalled) savePersistedStallProgress(stallProgress);
@@ -1161,4 +1195,5 @@ module.exports = {
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
   shouldTrackWorkerProgress,
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
+  parseTerminalScreen, terminalScreen, resolveTerminalScreen,
 };

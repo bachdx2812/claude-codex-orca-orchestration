@@ -110,8 +110,11 @@ reported disconnected, that terminal skips the idle and orphan checks for the sa
 **Progress-based stall detection.** A busy-looking TUI is not necessarily making progress.
 For each supervised worker, the heartbeat fingerprints the worker worktree's `HEAD`,
 `git status --porcelain`, full `git diff`, and changed/untracked file size and mtime together
-with meaningful terminal output. A timed-out git probe reuses that terminal's last good git
-sample, so transient repository slowness is not mistaken for progress.
+with meaningful terminal output from the rendered screen (`orca terminal read --terminal
+<handle>`), not the lossy one-line list preview. Reads are bounded and limited to this
+session's supervised terminals; a failed read reuses the last good screen, falling back to
+the list preview only before any read succeeds. A timed-out git probe likewise reuses that
+terminal's last good git sample, so transient repository slowness is not mistaken for progress.
 Spinner frames, elapsed-time counters, rotating `Tip:` lines, token/cursor counters, and
 prompt box chrome are ignored. If that fingerprint does not change for
 `heartbeat.stallSeconds` (default 900 seconds), or the agent-specific value in
@@ -131,9 +134,13 @@ Interactive worker screens wake the panel immediately instead of waiting for eit
 or the stall threshold. Kimi/Codex permission menus, approval questions, and selection UI
 such as `Select permission mode`, `Allow`/`Deny`, or `↑↓ navigate · Enter select` emit
 `WORKER WAITING FOR APPROVAL <dispatch|terminal> (<agent>)`. The detector requires prompt
-shape rather than isolated keywords, so normal output discussing “allow”, “deny”, or
-“approve” is ignored. Reports persist once per unchanged prompt episode across heartbeat
-restarts and re-arm after the prompt disappears; the heartbeat never answers automatically.
+shape—such as numbered choices, confirm/cancel key help, selection navigation, or a prompt
+box—rather than isolated keywords, so normal output discussing “allow”, “deny”, or “approve”
+is ignored. Codex's `Would you like to run the following command?` / `make the following
+edits?` confirmations are included. Only the normalized prompt block forms the episode
+signature, so rotating tips, timers, and spinners cannot re-fire it. Reports persist once
+per unchanged prompt episode across heartbeat restarts and re-arm after the prompt
+disappears; the heartbeat never answers automatically.
 
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the

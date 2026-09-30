@@ -113,6 +113,44 @@ check('captured noise plus real new output changes the fingerprint',
   fingerprint('• Working (45s • esc to interrupt)\nUpdated hooks/x.cjs') ===
     fingerprint('• Working (1m 23s • esc to interrupt)'), false);
 
+const garbledWaitA = '…ting foing for•g for b for bacor back backgrbackgro…terminal6nalal•••••7•••••8';
+const garbledWaitB = 'r back•r backg backgr•backgrouckgrounkground•round tound te•und termd termi termina•erminalrminal1•inalnalal•l•••2•••••3';
+const garbledSampleA = workerProgressSample({
+  terminalText: garbledWaitA, worktreePath: '/fake/worktree', git: gitStub, stat: statStub,
+});
+const garbledSampleB = workerProgressSample({
+  terminalText: garbledWaitB, worktreePath: '/fake/worktree', git: gitStub, stat: statStub,
+});
+check('captured garbled Codex previews both detect an active child',
+  [garbledSampleA.activeChild, garbledSampleB.activeChild], [true, true]);
+check('captured garbled Codex repaints have a stable fingerprint',
+  garbledSampleA.fingerprint, garbledSampleB.fingerprint);
+
+const codexScreenA = [
+  '• The RTP worker is confirmed active at ~93% CPU, so the long duration is computation rather than a stall.',
+  '• Waiting for background terminal (39m 45s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to…',
+  '  └ .claude/skills/deepstack-release/scripts/check-pr-ci.sh 464 --game v3 --visual',
+  '  └ Tip: Press tab to queue a message when a task is running; otherwise it sends immediately (except !).',
+  '› Ask Codex to do anything',
+].join('\n');
+const codexScreenB = codexScreenA
+  .replace('39m 45s', '39m 46s')
+  .replace('Press tab to queue a message', 'Use /copy to copy the latest response');
+const codexScreenSampleA = workerProgressSample({
+  terminalText: codexScreenA, worktreePath: '/fake/worktree', git: gitStub, stat: statStub,
+});
+const codexScreenSampleB = workerProgressSample({
+  terminalText: codexScreenB, worktreePath: '/fake/worktree', git: gitStub, stat: statStub,
+});
+check('real rendered Codex screens recognize the background-terminal wait',
+  [codexScreenSampleA.activeChild, codexScreenSampleB.activeChild], [true, true]);
+check('two rendered reads of the same Codex wait fingerprint identically',
+  codexScreenSampleA.fingerprint, codexScreenSampleB.fingerprint);
+check('Kimi background-task wait is an active child', workerProgressSample({
+  terminalText: 'Waiting / · 1 background task still running',
+  worktreePath: '/fake/worktree', git: gitStub, stat: statStub,
+}).activeChild, true);
+
 const records = new Map();
 const start = 2_000_000_000_000;
 const first = fingerprint(repaintA);
@@ -204,16 +242,16 @@ check('active-child timers normalize to one stable fingerprint', childA.fingerpr
 check('active-child status is detected', childA.activeChild, true);
 const childRecords = new Map();
 observeWorkerProgress(childRecords, {
-  handle: 'child', fingerprint: childA.fingerprint, now: start, stallSeconds: 600,
-  activeChild: true, gitParts: childA.gitParts,
+  handle: 'child', fingerprint: codexScreenSampleA.fingerprint, now: start, stallSeconds: 600,
+  activeChild: true, gitParts: codexScreenSampleA.gitParts, screenText: codexScreenA,
 });
 check('active child gets the requested grace at the normal threshold', observeWorkerProgress(childRecords, {
-  handle: 'child', fingerprint: childB.fingerprint, now: start + 600_000, stallSeconds: 600,
-  activeChild: true, gitParts: childB.gitParts,
+  handle: 'child', fingerprint: codexScreenSampleB.fingerprint, now: start + 600_000, stallSeconds: 600,
+  activeChild: true, gitParts: codexScreenSampleB.gitParts, screenText: codexScreenB,
 }).stalled, false);
-check('active child stalls at twice the configured threshold', observeWorkerProgress(childRecords, {
-  handle: 'child', fingerprint: childB.fingerprint, now: start + 1_200_000, stallSeconds: 600,
-  activeChild: true, gitParts: childB.gitParts,
+check('hung rendered Codex wait stalls at twice the configured threshold', observeWorkerProgress(childRecords, {
+  handle: 'child', fingerprint: codexScreenSampleB.fingerprint, now: start + 1_200_000, stallSeconds: 600,
+  activeChild: true, gitParts: codexScreenSampleB.gitParts, screenText: codexScreenB,
 }).stalled, true);
 check('stall wake event identifies the dispatch and recommends nudge or cross-coder retry',
   heartbeat.formatStallEvent({ dispatchId: 'ctx_stalled', handle: 'term_stalled', agent: 'kimi', stalledSeconds: 601 }),
@@ -235,6 +273,13 @@ check('done workers are skipped even when their terminals classify idle',
   heartbeat.shouldTrackWorkerProgress('idle', 'succeeded'), false);
 check('running workers remain eligible for progress checks',
   heartbeat.shouldTrackWorkerProgress('working', 'running'), true);
+check('terminal read parser joins the rendered screen tail', heartbeat.parseTerminalScreen({
+  ok: true, result: { terminal: { tail: ['line one', 'line two'] } },
+}), 'line one\nline two');
+check('failed rendered read reuses the last good screen',
+  heartbeat.resolveTerminalScreen(null, codexScreenA, garbledWaitA), codexScreenA);
+check('first failed rendered read falls back to the list preview',
+  heartbeat.resolveTerminalScreen(null, undefined, garbledWaitA), garbledWaitA);
 
 // Approval/question prompts wake immediately, while prose mentioning their vocabulary does not.
 const kimiApproval = [
@@ -250,22 +295,34 @@ const kimiApprovalMoved = [
   '↑↓ navigate · Enter select',
 ].join('\n');
 const codexApproval = [
-  'Do you want to allow Codex to run `npm test`?',
-  '❯ Allow',
-  '  Deny',
-  '↑↓ navigate · Enter select',
+  'Would you like to run the following command?',
+  '› 1. Yes, proceed (y)',
+  '  2. No, and tell Codex what to do differently (esc)',
+  'Press enter to confirm or esc to cancel',
 ].join('\n');
 check('real Kimi permission menu is detected', typeof approvalPromptFingerprint(kimiApproval), 'string');
 check('moving the selection does not create a new prompt episode',
   approvalPromptFingerprint(kimiApprovalMoved), approvalPromptFingerprint(kimiApproval));
-check('real Codex Allow/Deny question is detected', typeof approvalPromptFingerprint(codexApproval), 'string');
+check('real Codex command confirmation is detected', typeof approvalPromptFingerprint(codexApproval), 'string');
+check('real Codex edit confirmation is detected', typeof approvalPromptFingerprint(
+  codexApproval.replace('run the following command', 'make the following edits')), 'string');
 check('captured selection navigation is sufficient UI evidence',
   typeof approvalPromptFingerprint('↑↓ navigate · Enter select'), 'string');
+check('Kimi navigation with Esc cancel is detected',
+  typeof approvalPromptFingerprint('↑↓ navigate · Enter select · Esc cancel'), 'string');
+const kimiApprovalWithNoiseA = `🌒 · Tip: /web: search\n⠦ Thinking…\n${kimiApproval}`;
+const kimiApprovalWithNoiseB = `🌘 · Tip: /clear: reset\n⠏ Thinking…\n${kimiApprovalMoved}`;
+check('approval signature ignores rotating tips, spinners, and selection movement',
+  approvalPromptFingerprint(kimiApprovalWithNoiseA), approvalPromptFingerprint(kimiApprovalWithNoiseB));
+check('approval signature includes only the prompt block, not ordinary surrounding output',
+  approvalPromptFingerprint(`Updated hooks/x.cjs\n${codexApproval}`),
+  approvalPromptFingerprint(`Running a different explanation\n${codexApproval}`));
 for (const prose of [
   'Updated the parser for Allow/Deny/approve prompts.',
   'The Select permission mode test now passes.',
   'The fixture contains ↑↓ navigate · Enter select for coverage.',
   'Normal output can mention allow and deny without asking a question.',
+  'Allow and Deny lists are merged. Is that ok?',
   '```\nAllow\nDeny\n```',
   'const prompt = "Select permission mode";',
 ]) {
