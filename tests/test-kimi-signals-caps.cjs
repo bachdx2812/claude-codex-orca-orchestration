@@ -423,7 +423,7 @@ const THREE_KIMI = {
 }
 
 {
-  const result = runKimiGate({ workers: {}, codexCap: 3, kimiCap: 0, acquireResult: false });
+  const result = runKimiGate({ workers: {}, codexCap: 3, kimiCap: 3, acquireResult: false });
   check('a kimi-only dispatch names the kimi gate when cap-lock acquisition fails',
     result.violations.map((v) => v.gate), ['max-parallel-kimi-workers']);
 }
