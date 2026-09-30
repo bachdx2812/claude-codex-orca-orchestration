@@ -39,13 +39,21 @@
 const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { loadConfig, stateDir, closeDoneWorktreesEnabled, stallSeconds } = require('./lib/config.cjs');
 const {
-  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, approvalPromptFingerprint,
+  loadConfig, stateDir, closeDoneWorktreesEnabled, stallSeconds, handoffUsed, kimiHandoffUsed,
+  codexQuotaCacheSeconds, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds,
+} = require('./lib/config.cjs');
+const {
+  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, hasCodexUsageExhausted,
+  approvalPromptFingerprint,
 } = require('./lib/terminal-signals.cjs');
 const {
   workerProgressSample, observeWorkerProgress, recordsFromJSON,
 } = require('./lib/worker-progress-fingerprint.cjs');
+const QUOTA = require('./lib/exec-route-by-quota.cjs');
+const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
+const CODER_POOL = require('./lib/coder-pool-route.cjs');
+const HANDOVER = require('./lib/worker-quota-handover.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -272,8 +280,59 @@ function reportUsageExhausted({ reported, handle, label, coder }) {
   reported.add(handle);
   savePersistedUsageExhaustedReports(reported);
   onCoderExhausted(coder);
-  return `KIMI USAGE LIMIT on ${label}: Kimi is exhausted for this billing cycle - ` +
-    'route new code to Codex (or Sonnet if Codex is also out); release this worker, do not retry it until reset';
+  const name = coder === 'codex' ? 'Codex' : 'Kimi';
+  const other = coder === 'codex' ? 'Kimi' : 'Codex';
+  return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
+    `route new code to ${other} (or Sonnet if ${other} is also out); release this worker, do not retry it until reset`;
+}
+
+/** Probe only coders with live supervised workers. The existing quota helpers own the
+ * shared cache and single-flight lock, so a fresh gate reading makes this effectively free. */
+function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
+  const result = { codex: null, kimi: null };
+  if (agents.has('codex')) {
+    const reading = (deps.codexQuota || QUOTA.codexQuota)(now, {
+      stateDir: DIR, cacheSeconds: codexQuotaCacheSeconds(cfg),
+    });
+    if (reading && !reading.failed) result.codex = reading;
+  }
+  if (agents.has('kimi')) {
+    const reading = (deps.kimiQuota || QUOTA.kimiQuota)(now, {
+      stateDir: DIR, cacheSeconds: kimiQuotaCacheSeconds(cfg), env: process.env,
+    });
+    if (reading && !reading.failed) result.kimi = reading;
+  }
+  return result;
+}
+
+/** Supplement live-worker readings with fresh cache-only data for destination selection.
+ * This keeps an idle/exhausted alternative out of the recommendation without probing it. */
+function cachedCoderQuotas(now = Date.now(), deps = {}) {
+  const codex = (deps.readCodexCache || QUOTA.readFreshCache)(DIR, codexQuotaCacheSeconds(cfg), now);
+  const kimi = (deps.readKimiCache || QUOTA.readFreshKimiCache)(DIR, kimiQuotaCacheSeconds(cfg), now);
+  return {
+    codex: codex && !codex.failed ? codex : null,
+    kimi: kimi && !kimi.failed ? kimi : null,
+  };
+}
+
+function buildHandoverPool(quotas, now = Date.now(), deps = {}) {
+  const authState = (deps.codexAuthState || QUOTA.codexAuthState)(
+    DIR, now, coderAvailabilityCacheSeconds(cfg) * 1000
+  );
+  const availability = deps.availability || CODER_AVAILABILITY.coderAvailability({
+    stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
+    orcaInstalled: true, env: process.env, codexAuthState: authState,
+  });
+  return (deps.pickCoderPool || CODER_POOL.pickCoderPool)({
+    availability, quotas,
+    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg) },
+    exhaustion: (deps.readCoderExhaustion || CODER_AVAILABILITY.readCoderExhaustion)(DIR, now),
+    live: { codex: 0, kimi: 0 }, caps: { codex: 0, kimi: 0 },
+    // Handover must never recommend an unavailable destination. The legacy null fallback
+    // mode applies only to default new-work routing, not recovery of an in-flight task.
+    fallbackEnabled: true,
+  });
 }
 
 /** Run an orca command and return parsed JSON, or null when orca cannot answer. */
@@ -895,6 +954,8 @@ function classifyTerminal(t, ctx) {
   // or prose narrating it, must never mark Kimi exhausted).
   if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'kimi' &&
       hasKimiUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'kimi' };
+  if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'codex' &&
+      hasCodexUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'codex' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
   const approvalFingerprint = approvalPromptFingerprint(
@@ -981,6 +1042,7 @@ function main() {
     .filter(([, record]) => record && typeof record.screenText === 'string')
     .map(([handle, record]) => [handle, record.screenText]));
   const reportedApproval = loadPersistedApprovalReports();
+  const handoverRecords = HANDOVER.loadRecords(DIR, SESSION);
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
@@ -1081,6 +1143,27 @@ function main() {
         retainedHandles: explicitRetainedHandles, started, now, idleSeconds: IDLE_SECONDS,
         handleAgent,
       };
+      const activeCoderHandles = new Set(ts.filter((terminal) =>
+        ownTerminalHandles.has(terminal.handle) &&
+        !TERMINAL_WORKER_STATES.has(handleWorkerState.get(terminal.handle)) &&
+        ['codex', 'kimi'].includes(handleAgent.get(terminal.handle))
+      ).map((terminal) => terminal.handle));
+      const liveCoderAgents = new Set([...activeCoderHandles].map((handle) => handleAgent.get(handle)));
+      const liveQuotas = probeLiveCoderQuotas(liveCoderAgents, now);
+      beat(started);
+      const cachedQuotas = liveCoderAgents.size ? cachedCoderQuotas(now) : { codex: null, kimi: null };
+      const routingQuotas = {
+        codex: liveQuotas.codex || cachedQuotas.codex,
+        kimi: liveQuotas.kimi || cachedQuotas.kimi,
+      };
+      const handoverPool = liveCoderAgents.size ? buildHandoverPool(routingQuotas, now) : null;
+      let handoverChanged = false;
+      for (const handle of [...handoverRecords.keys()]) {
+        if (!activeCoderHandles.has(handle)) {
+          handoverRecords.delete(handle);
+          handoverChanged = true;
+        }
+      }
       for (const t of ts) {
         const workerState = handleWorkerState.get(t.handle);
         let screenText = t.preview;
@@ -1098,8 +1181,7 @@ function main() {
           const event = reportUsageExhausted({
             reported: reportedUsageExhausted, handle: t.handle, label, coder: verdict.coder,
           });
-          if (!event) continue;
-          events.push(event);
+          if (event) events.push(event);
         } else if (verdict.kind === 'rate_limit') {
           if (reportedRateLimit.has(t.handle)) continue;
           reportedRateLimit.add(t.handle);
@@ -1145,13 +1227,38 @@ function main() {
           savePersistedApprovalReports(reportedApproval);
         }
 
+        const agent = handleAgent.get(t.handle) || 'unknown';
+        if (activeCoderHandles.has(t.handle)) {
+          const quota = liveQuotas[agent];
+          const exhausted = verdict.kind === 'usage_exhausted';
+          // An unknown/failed probe is absence of evidence, not recovery. Preserve an
+          // existing episode until a known below-margin reading or worker completion.
+          if (exhausted || typeof quota?.usedPercent === 'number') {
+            const threshold = agent === 'kimi' ? kimiHandoffUsed(cfg) : handoffUsed(cfg);
+            const target = HANDOVER.pickNextCoder(agent, handoverPool);
+            const handover = HANDOVER.observe(handoverRecords, {
+              handle: t.handle,
+              identity: handleDispatch.get(t.handle) || t.handle,
+              agent,
+              usedPercent: quota?.usedPercent,
+              threshold,
+              warnMargin: cfg.handoverWarnMarginPercent,
+              exhausted,
+              target,
+              worktreePath: terminalWorktreePath(t, ws || []),
+              now,
+            });
+            if (handover.changed) handoverChanged = true;
+            if (handover.event) events.push(handover.event);
+          }
+        }
+
         // Fatal/quota signals above take precedence and are never mislabeled as stalls.
         if (!shouldTrackWorkerProgress(verdict.kind, workerState)) {
           if (!TERMINAL_WORKER_STATES.has(workerState)) continue;
           if (stallProgress.delete(t.handle)) savePersistedStallProgress(stallProgress);
           continue;
         }
-        const agent = handleAgent.get(t.handle) || 'unknown';
         const threshold = stallThresholdForAgent(agent, cfg.heartbeat, STALL_SECONDS);
         const previousProgress = stallProgress.get(t.handle);
         const sample = workerProgressSample({
@@ -1173,6 +1280,7 @@ function main() {
           }));
         }
       }
+      if (handoverChanged) HANDOVER.saveRecords(DIR, SESSION, handoverRecords);
       beat(started);
     }
 
@@ -1202,4 +1310,5 @@ module.exports = {
   shouldTrackWorkerProgress,
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
   parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen,
+  probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
 };

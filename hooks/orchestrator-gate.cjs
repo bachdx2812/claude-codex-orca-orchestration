@@ -44,6 +44,7 @@ const { hasRateLimitError, hasKimiUsageExhausted } = require('./lib/terminal-sig
 const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
 const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const EXEC_QUOTA = require('./lib/exec-route-by-quota.cjs');
+const HANDOVER = require('./lib/worker-quota-handover.cjs');
 
 const DIR = stateDir();
 const LOG = path.join(DIR, 'violations.log');
@@ -1036,6 +1037,8 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   }
   parts.push(`Model routing: plan/red-team/review -> model ${modelLabel(cfg.models.review)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);
+  const handoverReminder = HANDOVER.reminder(DIR, s.session_id);
+  if (handoverReminder) parts.push(handoverReminder);
   if (live.length) {
     const baseline = s.last_heartbeat || Math.min(...live.map(([, w]) => w.started || Date.now()));
     const stale = Math.round((Date.now() - baseline) / 1000);

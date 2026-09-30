@@ -145,6 +145,22 @@ signature, so rotating tips, timers, and spinners cannot re-fire it. Reports per
 per unchanged prompt episode across heartbeat restarts and re-arm after the prompt
 disappears; the heartbeat never answers automatically.
 
+**Mid-task quota handover.** While a supervised Codex or Kimi worker is live, the heartbeat
+reuses that coder's cached single-flight quota probe. At
+`handoverWarnMarginPercent` (default 5) below the coder's own handoff threshold it emits a
+once-per-episode warning; at the threshold, or on a terminal usage-exhaustion signal, it
+emits `WORKER HANDOVER <dispatch|terminal> (<agent> <used>% >= <threshold>%)`. Kimi hands
+over to eligible Codex, and Codex hands over to eligible Kimi; either direction falls back
+to Sonnet when the other external coder is unavailable or exhausted. The gate repeats
+persisted pending handovers in each prompt reminder.
+
+If the old worker still responds, send it: `Stop now: commit all work-in-progress as wip:
+handover and write HANDOVER.md (done / remaining / next step / how to verify), commit it,
+then stop.` Wait up to about three minutes, then stop and release it without deleting its
+worktree or branch. Dispatch the same brief to the selected coder in that same worktree and
+branch, prefixed: `Continue a task handed over from <agent>. Read HANDOVER.md and git log
+first; do not redo finished steps.` For Sonnet, point the in-session Agent at that worktree.
+
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
 worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree
@@ -346,6 +362,7 @@ The file is plain JSON — no comments — parsed as-is:
 {
   "codexHandoffUsedPercent": 90,
   "kimiHandoffUsedPercent": 95,
+  "handoverWarnMarginPercent": 5,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
@@ -361,6 +378,8 @@ The file is plain JSON — no comments — parsed as-is:
 
 (`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95;
 `kimiHandoffUsedPercent` is Kimi's own, separate threshold (default 95) — both are
+used for new routing and live-worker handover. `handoverWarnMarginPercent` warns that many
+percentage points before either threshold (default 5; set 0 to disable the early warning).
 tunable via this file or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`);
 `kimiQuotaCacheSeconds` and `coderAvailabilityCacheSeconds` (default 600, the per-machine
 "is this coder installed and signed in?" probe TTL) mirror the Codex cache key;

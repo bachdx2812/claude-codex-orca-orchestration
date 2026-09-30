@@ -326,6 +326,13 @@ function kimiQuota(now = Date.now(), options = {}) {
   });
 }
 
+/** Cache-only Kimi read for handover destination selection. Never starts a network probe. */
+function readFreshKimiCache(stateDir, cacheSeconds, now = Date.now()) {
+  return liveCache().readFresh({
+    stateDir, cacheFile: KIMI_LIVE_CACHE_FILE, cacheSeconds, now, validate: cachedKimiResult,
+  });
+}
+
 function liveQuotaResult(now = Date.now()) {
   const codexBin = process.env.ORCH_CODEX_BIN || process.env.CODEX_BIN || 'codex';
   const probe = spawnSync(process.execPath, [LIVE_PROBE, codexBin], {
@@ -478,5 +485,6 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
 
 module.exports = {
   pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
-  parseLiveQuota, parseKimiUsages, liveQuota, codexQuota, kimiQuota, codexAuthState, readFreshCache, formatAge,
+  parseLiveQuota, parseKimiUsages, liveQuota, codexQuota, kimiQuota, codexAuthState,
+  readFreshCache, readFreshKimiCache, formatAge,
 };

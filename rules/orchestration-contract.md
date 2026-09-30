@@ -214,6 +214,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   "agents": { "escalation": [], "lookup": ["Explore"] },
   "codexHandoffUsedPercent": 95,
   "kimiHandoffUsedPercent": 95,
+  "handoverWarnMarginPercent": 5,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
@@ -251,6 +252,9 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `kimiHandoffUsedPercent`: integer 0-100, default 95. Kimi's own, independent threshold:
   Kimi leaves the eligible peer pool once it has used this much of its
   tightest quota window. Overridable for one process with `ORCH_KIMI_HANDOFF_USED`.
+- `handoverWarnMarginPercent`: integer 0-100, default 5. A live worker gets a persisted
+  early-warning episode this many percentage points before its coder's threshold; `0`
+  disables the early warning while retaining threshold/exhaustion handover.
 - `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
   `codex app-server` quota reading or a failed probe is reused from `codex-quota-live.json` in the gate
   state directory; `0` disables cross-process file reuse but not the memo inside one hook
@@ -409,6 +413,25 @@ prose that merely mentions those words is not a match. Only normalized prompt-bl
 form the persisted signature, including the normalized question and command, so surrounding
 tips, spinners, timers, and ordinary output do not create new episodes while consecutive
 prompts for different commands remain distinct. It is re-armed when the prompt disappears.
+
+For every live supervised Codex or Kimi worker, the heartbeat reuses the existing cached,
+single-flight quota probe. It warns once at `handoverWarnMarginPercent` below that coder's
+own handoff threshold, then emits a new persisted episode at the threshold or immediately
+on a terminal usage-exhaustion signal:
+
+```text
+WORKER HANDOVER <dispatch|terminal> (<agent> <used>% >= <threshold>%) -> hand over to <other eligible coder, else Sonnet>
+```
+
+Selection is symmetric and excludes the current coder: Kimi -> Codex -> Sonnet fallback;
+Codex -> Kimi -> Sonnet fallback. The per-prompt gate reminder lists persisted workers that
+still need handover. If responsive, tell the worker to stop after committing all WIP as
+`wip: handover` and writing/committing `HANDOVER.md` with done, remaining, next step, and
+verification instructions; wait up to about three minutes. Then `worker-stop` and
+`worker-release` without deleting the worktree/branch. Dispatch the same brief in the same
+worktree/branch, prefixed `Continue a task handed over from <agent>. Read HANDOVER.md and
+git log first; do not redo finished steps.` For Sonnet, point the in-session Agent at that
+worktree.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`

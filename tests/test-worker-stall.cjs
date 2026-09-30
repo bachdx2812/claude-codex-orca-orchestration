@@ -14,7 +14,10 @@ fs.writeFileSync(configFile, '{}');
 
 const config = require('../hooks/lib/config.cjs');
 const heartbeat = require('../hooks/orca-heartbeat.cjs');
-const { approvalPromptFingerprint } = require('../hooks/lib/terminal-signals.cjs');
+const {
+  approvalPromptFingerprint, hasCodexUsageExhausted,
+} = require('../hooks/lib/terminal-signals.cjs');
+const handover = require('../hooks/lib/worker-quota-handover.cjs');
 const {
   meaningfulTerminalOutput,
   workerProgressSample,
@@ -50,6 +53,7 @@ function withEnv(name, value, fn) {
   const defaults = config.loadConfig();
   check('default stall threshold is 15 minutes', defaults.heartbeat.stallSeconds, 900);
   check('Kimi default override is 10 minutes', defaults.heartbeat.stallSecondsByAgent, { kimi: 600 });
+  check('default handover warning margin is 5 percent', defaults.handoverWarnMarginPercent, 5);
   check('ORCH_STALL_SECONDS overrides the global threshold',
     withEnv('ORCH_STALL_SECONDS', '45', () => config.stallSeconds(defaults)), 45);
   check('blank ORCH_STALL_SECONDS is unset',
@@ -65,10 +69,17 @@ function withEnv(name, value, fn) {
   check('invalid thresholds produce warnings',
     invalid.warnings.filter((warning) => warning.includes('stallSeconds')).length, 3);
 
+  const invalidMargin = withConfig({ handoverWarnMarginPercent: 101 }, () => config.loadConfig());
+  check('invalid handover warning margin falls back', invalidMargin.handoverWarnMarginPercent, 5);
+  check('invalid handover warning margin warns',
+    invalidMargin.warnings.some((warning) => warning.includes('handoverWarnMarginPercent')), true);
+
   const valid = withConfig({ heartbeat: { stallSeconds: 120, stallSecondsByAgent: { kimi: 30, codex: 90 } } },
     () => config.loadConfig());
   check('valid thresholds are retained',
     [valid.heartbeat.stallSeconds, valid.heartbeat.stallSecondsByAgent], [120, { kimi: 30, codex: 90 }]);
+  check('a valid zero handover warning margin is retained',
+    withConfig({ handoverWarnMarginPercent: 0 }, () => config.loadConfig()).handoverWarnMarginPercent, 0);
 }
 
 // Repaint-only changes collapse to the same meaningful output.
@@ -404,6 +415,136 @@ check('clearing the disappeared prompt re-arms the same future prompt', heartbea
   reported: approvalAfterRestart, handle: 'term_approval', fingerprint: approvalFingerprint,
   identity: 'ctx_approval', agent: 'kimi',
 }), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
+
+// Live quota handover is symmetric, cached-probe friendly, and persisted per episode.
+let codexProbeCalls = 0;
+let kimiProbeCalls = 0;
+const stubQuotas = heartbeat.probeLiveCoderQuotas(new Set(['kimi']), start, {
+  codexQuota: () => { codexProbeCalls += 1; return { usedPercent: 20 }; },
+  kimiQuota: () => { kimiProbeCalls += 1; return { usedPercent: 91, source: 'stub' }; },
+});
+check('quota probing only calls coders with live supervised workers',
+  [codexProbeCalls, kimiProbeCalls, stubQuotas.codex, stubQuotas.kimi.usedPercent],
+  [0, 1, null, 91]);
+check('failed stub quota probes stay unknown', heartbeat.probeLiveCoderQuotas(new Set(['codex']), start, {
+  codexQuota: () => ({ failed: true }),
+}).codex, null);
+check('destination selection can read both quota caches without live probes',
+  heartbeat.cachedCoderQuotas(start, {
+    readCodexCache: () => ({ usedPercent: 30, source: 'cache' }),
+    readKimiCache: () => ({ usedPercent: 97, source: 'cache' }),
+  }), {
+    codex: { usedPercent: 30, source: 'cache' },
+    kimi: { usedPercent: 97, source: 'cache' },
+  });
+
+const bothEligiblePool = {
+  order: ['codex', 'kimi'],
+  coders: { codex: { state: 'eligible' }, kimi: { state: 'eligible' } },
+};
+check('Kimi handover selects Codex while excluding Kimi',
+  handover.pickNextCoder('kimi', bothEligiblePool), 'codex');
+check('Codex handover selects Kimi while excluding Codex',
+  handover.pickNextCoder('codex', bothEligiblePool), 'kimi');
+check('Kimi handover falls back to Sonnet when Codex is unavailable', handover.pickNextCoder('kimi', {
+  order: [], coders: { codex: { state: 'exhausted' }, kimi: { state: 'eligible' } },
+}), 'sonnet');
+check('Codex handover falls back to Sonnet when Kimi is unavailable', handover.pickNextCoder('codex', {
+  order: [], coders: { codex: { state: 'eligible' }, kimi: { state: 'unusable' } },
+}), 'sonnet');
+const cachedExhaustionPool = heartbeat.buildHandoverPool({
+  codex: { usedPercent: 30 }, kimi: { usedPercent: 97 },
+}, start, {
+  codexAuthState: () => 'ok',
+  availability: {
+    codex: { usable: true }, kimi: { usable: true },
+  },
+  readCoderExhaustion: () => ({}),
+});
+check('a cached exhausted alternative is excluded from the handover target',
+  handover.pickNextCoder('codex', cachedExhaustionPool), 'sonnet');
+const unavailableCodexPool = heartbeat.buildHandoverPool({ codex: null, kimi: { usedPercent: 95 } }, start, {
+  codexAuthState: () => 'unknown',
+  availability: {
+    codex: { usable: false, reason: 'not installed' }, kimi: { usable: true },
+  },
+  readCoderExhaustion: () => ({}),
+});
+check('handover never uses legacy routing semantics to select an unavailable Codex',
+  handover.pickNextCoder('kimi', unavailableCodexPool), 'sonnet');
+
+const handoverRecords = new Map();
+check('below the warning margin emits no handover event', handover.observe(handoverRecords, {
+  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 89,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex', now: start,
+}).event, null);
+const warningEvent = handover.observe(handoverRecords, {
+  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 90,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex', now: start + 1,
+}).event;
+check('crossing the warning margin emits a warning once',
+  /^WORKER HANDOVER WARNING ctx_kimi_quota \(kimi 90% >= 90% warning; handover at 95%\)/.test(warningEvent), true);
+check('the same warning episode does not emit twice', handover.observe(handoverRecords, {
+  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 91,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex', now: start + 2,
+}).event, null);
+check('a destination change updates the same episode without another wake event', handover.observe(handoverRecords, {
+  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 92,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet', now: start + 2,
+}).event, null);
+const kimiHandoverEvent = handover.observe(handoverRecords, {
+  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 95,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex',
+  worktreePath: '/work/kimi-task', now: start + 3,
+}).event;
+check('Kimi threshold crossing hands over to Codex with the required recipe',
+  /^WORKER HANDOVER ctx_kimi_quota \(kimi 95% >= 95%\) -> hand over to Codex\./.test(kimiHandoverEvent) &&
+    kimiHandoverEvent.includes('HANDOVER.md') && kimiHandoverEvent.includes('SAME worktree/branch'), true);
+handover.saveRecords(stateDir, 'worker-stall-test', handoverRecords);
+const handoverAfterRestart = handover.loadRecords(stateDir, 'worker-stall-test');
+check('handover episode persists across heartbeat restart', handover.observe(handoverAfterRestart, {
+  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 96,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex',
+  worktreePath: '/work/kimi-task', now: start + 4,
+}).event, null);
+check('gate reminder lists persisted workers needing handover',
+  handover.reminder(stateDir, 'worker-stall-test').includes('ctx_kimi_quota (kimi 95%, handover -> Codex)'), true);
+
+const codexHandoverEvent = handover.observe(new Map(), {
+  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 97,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'kimi', now: start,
+}).event;
+check('Codex threshold crossing symmetrically hands over to Kimi',
+  /^WORKER HANDOVER ctx_codex_quota \(codex 97% >= 95%\) -> hand over to Kimi\./.test(codexHandoverEvent), true);
+
+const kimiExhaustedCtx = { ...approvalCtx, handleAgent: new Map([['term_approval', 'kimi']]) };
+const kimiExhaustedVerdict = heartbeat.classifyTerminal({
+  handle: 'term_approval', preview: '■ 403 You\'ve reached your usage limit for this billing cycle', lastOutputAt: start,
+}, kimiExhaustedCtx);
+check('Kimi 403 billing-cycle output is a handover exhaustion trigger',
+  [kimiExhaustedVerdict.kind, kimiExhaustedVerdict.coder], ['usage_exhausted', 'kimi']);
+check('Kimi exhaustion emits handover even without a quota probe reading',
+  /^WORKER HANDOVER ctx_kimi_403 \(kimi 100% >= 95%\)/.test(handover.observe(new Map(), {
+    handle: 'term_kimi_403', identity: 'ctx_kimi_403', agent: 'kimi', usedPercent: undefined,
+    threshold: 95, warnMargin: 5, exhausted: true, target: 'codex', now: start,
+  }).event), true);
+
+const codexUsageLine = '■ You\'ve hit your usage limit. Try again later.';
+check('Codex usage-limit output is distinguished from a transient generic 429',
+  [hasCodexUsageExhausted(codexUsageLine), hasCodexUsageExhausted('HTTP/1.1 429 Too Many Requests')],
+  [true, false]);
+for (const diagnostic of [
+  'error: Codex usage limit parser failed',
+  '⚠ Codex usage limit request timed out',
+]) {
+  check(`Codex diagnostic prose is not exhaustion: ${diagnostic}`,
+    hasCodexUsageExhausted(diagnostic), false);
+}
+const codexExhaustedVerdict = heartbeat.classifyTerminal({
+  handle: 'term_approval', preview: codexUsageLine, lastOutputAt: start,
+}, { ...approvalCtx, handleAgent: new Map([['term_approval', 'codex']]) });
+check('Codex usage-limit output symmetrically triggers handover',
+  [codexExhaustedVerdict.kind, codexExhaustedVerdict.coder], ['usage_exhausted', 'codex']);
 
 if (failures.length) {
   console.error(`${failures.length} failure(s), ${pass} passed`);

@@ -49,6 +49,7 @@ const DEFAULT_CONFIG = {
     lookup: ['Explore'],
   },
   codexHandoffUsedPercent: 95,
+  handoverWarnMarginPercent: 5,
   codexQuotaCacheSeconds: 60,
   kimiHandoffUsedPercent: 95,
   kimiQuotaCacheSeconds: 60,
@@ -169,6 +170,14 @@ function loadConfig() {
     merged.codexHandoffUsedPercent = DEFAULT_CONFIG.codexHandoffUsedPercent;
   } else {
     merged.codexHandoffUsedPercent = threshold;
+  }
+
+  const handoverWarnMargin = configuredNumber(merged.handoverWarnMarginPercent);
+  if (!Number.isInteger(handoverWarnMargin) || handoverWarnMargin < 0 || handoverWarnMargin > 100) {
+    warnings.push(`handoverWarnMarginPercent "${merged.handoverWarnMarginPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.handoverWarnMarginPercent}.`);
+    merged.handoverWarnMarginPercent = DEFAULT_CONFIG.handoverWarnMarginPercent;
+  } else {
+    merged.handoverWarnMarginPercent = handoverWarnMargin;
   }
 
   const quotaCacheSeconds = configuredNumber(merged.codexQuotaCacheSeconds);

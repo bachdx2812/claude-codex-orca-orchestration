@@ -51,6 +51,19 @@ function hasKimiUsageExhausted(text) {
   return false;
 }
 
+/** Codex's terminal usage-limit screen is a handover signal, unlike a transient generic
+ * 429. Keep the matcher error-shaped so prose and source excerpts remain inert. */
+function hasCodexUsageExhausted(text) {
+  let inFence = false;
+  for (const raw of terminalLines(text)) {
+    const line = raw.trimEnd();
+    if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence || isSourceExcerpt(line)) continue;
+    if (/^\s*(?:■|⚠|error:)?\s*you(?:'|’)?ve\s+hit\s+your\s+usage\s+limit\b/i.test(line)) return true;
+  }
+  return false;
+}
+
 function hasCodexDisconnect(text) {
   let inFence = false;
   for (const raw of terminalLines(text)) {
@@ -122,5 +135,6 @@ function approvalPromptFingerprint(text) {
 }
 
 module.exports = {
-  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, approvalPromptFingerprint,
+  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, hasCodexUsageExhausted,
+  approvalPromptFingerprint,
 };
