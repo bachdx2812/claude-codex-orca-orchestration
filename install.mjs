@@ -43,7 +43,8 @@ const HOOK_FILES = [
   'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/codex-quota-probe.cjs', 'lib/shell-orca-invocations.cjs',
   'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
-  'lib/terminal-signals.cjs',
+  'lib/terminal-signals.cjs', 'lib/live-probe-cache.cjs', 'lib/kimi-quota-probe.cjs',
+  'lib/coder-availability.cjs', 'lib/coder-pool-route.cjs',
 ];
 const EVENTS = {
   SessionStart: '*',
@@ -686,6 +687,80 @@ function versionOf(bin, args = ['--version']) {
   catch { return null; }
 }
 
+function hookLibBase() {
+  const needed = ['lib/coder-availability.cjs', 'lib/coder-pool-route.cjs',
+    'lib/exec-route-by-quota.cjs', 'lib/config.cjs'];
+  for (const base of [HOOKS_DIR, path.join(REPO_ROOT, 'hooks')]) {
+    if (needed.every((rel) => fs.existsSync(path.join(base, rel)))) return base;
+  }
+  return null;
+}
+
+/** Report each coder's availability on this machine, the effective thresholds/caps, and
+ *  the pool pick they produce. Probes run fresh with caches written only to a throwaway
+ *  state dir, so `--check` never mutates the operator's real gate state, and the Kimi
+ *  token is only ever read inside the spawned quota helper - never printed here. */
+function checkCoders(hasOrca) {
+  log('\n--- coder availability ---');
+  const base = hookLibBase();
+  if (!base) {
+    warn('could not find the coder-routing libraries (not installed yet?) - skipping coder availability.');
+    return;
+  }
+  const availLib = require(path.join(base, 'lib/coder-availability.cjs'));
+  const poolLib = require(path.join(base, 'lib/coder-pool-route.cjs'));
+  const quotaLib = require(path.join(base, 'lib/exec-route-by-quota.cjs'));
+  const cfgLib = require(path.join(base, 'lib/config.cjs'));
+  let probeStateDir = null;
+  try {
+    const cfg = cfgLib.loadConfig();
+    const now = Date.now();
+    const stateDir = cfgLib.stateDir();
+    const thresholds = { codex: cfgLib.handoffUsed(cfg), kimi: cfgLib.kimiHandoffUsed(cfg) };
+    const caps = { codex: cfgLib.maxParallelCodexWorkers(cfg), kimi: cfgLib.maxParallelKimiWorkers(cfg) };
+    log(`thresholds: codexHandoffUsedPercent=${thresholds.codex} kimiHandoffUsedPercent=${thresholds.kimi} ` +
+      `maxParallelKimiWorkers=${caps.kimi} maxParallelCodexWorkers=${caps.codex}`);
+    const authState = quotaLib.codexAuthState(stateDir, now, cfgLib.coderAvailabilityCacheSeconds(cfg) * 1000);
+    const availability = availLib.coderAvailability({
+      fresh: true, env: process.env, orcaInstalled: !!hasOrca, codexAuthState: authState, now,
+    });
+    probeStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-check-'));
+    const quotas = { codex: null, kimi: null };
+    if (availability.codex && availability.codex.usable) {
+      const q = quotaLib.codexQuota(now, { stateDir: probeStateDir, cacheSeconds: 0 });
+      quotas.codex = q && !q.failed ? q : null;
+    }
+    if (availability.kimi && availability.kimi.usable) {
+      const q = quotaLib.kimiQuota(now, { stateDir: probeStateDir, cacheSeconds: 0, env: process.env });
+      quotas.kimi = q && !q.failed ? q : null;
+    }
+    for (const coder of ['codex', 'kimi']) {
+      const a = availability[coder] || { usable: false, reason: 'unknown', auth: 'unknown', binPath: null };
+      const q = quotas[coder];
+      const quotaText = q && typeof q.usedPercent === 'number' ? `${Math.round(100 - q.usedPercent)}% left` : 'unknown';
+      const binText = a.binPath ? `${a.binPath} ${versionOf(a.binPath) || 'present'}`.trim() : 'none';
+      const authText = a.auth === 'logged-out' ? 'logged out' : a.auth;
+      log(`coder ${coder}: ${a.usable ? 'usable' : `UNUSABLE (${a.reason})`} ` +
+        `[binary ${binText}, auth ${authText}, quota ${quotaText}]`);
+    }
+    const pool = poolLib.pickCoderPool({
+      availability, quotas, thresholds,
+      exhaustion: availLib.readCoderExhaustion(stateDir, now),
+      live: { codex: 0, kimi: 0 }, caps,
+      fallbackEnabled: cfg.execFallbackWhenCodexUnavailable === null ? null : true,
+    });
+    log(`pool: ${pool.summary}`);
+    if (pool.route === 'code') {
+      warn(`no coder usable -> code routes to ${cfg.models?.code?.alias || 'the configured code model'} in-session. ` +
+        'Fix a coder (install/sign in) or accept the in-session model.');
+    }
+  } catch (err) {
+    warn(`could not evaluate coder availability: ${err.message}`);
+  } finally {
+    if (probeStateDir) try { fs.rmSync(probeStateDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
 function check() {
   checkPlatform();
   let checkFailed = false;
@@ -706,8 +781,10 @@ function check() {
   if (!hasOrca || !hasCodex) {
     warn('Without both Orca and a usable Codex quota reading, automatic routing keeps defaulting to Codex. ' +
       'Use --exec-sonnet (or --code-model <your code alias>) to route code in-session instead, ' +
-      'or see "No Orca / no Codex" in rules/orchestration-contract.md.');
+      'or see "Coder availability (no Orca / no Codex / no Kimi)" in rules/orchestration-contract.md.');
   }
+
+  checkCoders(hasOrca);
 
   log('\n--- install status ---');
   const manifest = readJSONSafe(MANIFEST_FILE, null);
