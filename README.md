@@ -179,7 +179,9 @@ be confirmed—or a scheduler dies after persisting its pre-send marker—the he
 `WORKER RESUME UNVERIFIED ... do not retype` for manual
 inspection. If Claude responds to that send with a fresh limit banner, that is a new quota
 episode and is parked at the newly parsed reset instead. Expired schedulers are also reported,
-and reported/finished scheduler records are removed after one day.
+and reported/finished scheduler records are removed after one day. Until that cleanup,
+`resumed-unverified` and `expired` deliberately block automatic re-parking of the same
+terminal for up to 24 hours; inspect and resolve the reported terminal manually.
 
 `autoResumeAfterReset` defaults to `true`; `ORCH_AUTO_RESUME=false` disables scheduling for
 one process (blank is unset). `autoResumePanel` also defaults to `true`: when the exact panel

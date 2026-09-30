@@ -414,8 +414,11 @@ function resolveTerminalScreen(readText, previousText, listPreview) {
 }
 
 function workers() {
-  const d = orca(['orchestration', 'worker-list', '--json']);
-  if (!d) return null;
+  return parseWorkerRows(orca(['orchestration', 'worker-list', '--json']));
+}
+
+function parseWorkerRows(d) {
+  if (!d || d.ok === false) return null;
   const r = d.result ?? d;
   const list = Array.isArray(r) ? r : r.workers || [];
   return list.map((w) => ({
@@ -1030,6 +1033,13 @@ function shouldTrackWorkerProgress(verdictKind, workerState) {
   return ['working', 'idle'].includes(verdictKind) && !TERMINAL_WORKER_STATES.has(workerState);
 }
 
+/** Absence-based cleanup is safe only after Orca supplied an authoritative worker list. */
+function clearMissingPendingJobsForTick(workerRows, stateDir, session, activeHandles,
+  clear = RESUME.clearMissingPendingJobs) {
+  if (!Array.isArray(workerRows)) return 0;
+  return clear(stateDir, session, activeHandles);
+}
+
 function formatStallEvent({ dispatchId, handle, agent, stalledSeconds }) {
   const identity = dispatchId || handle;
   return `WORKER STALLED ${identity} (${agent}, no file change or new output for ` +
@@ -1218,7 +1228,7 @@ function main() {
       if (panelHandle && ts.some((terminal) => terminal.handle === panelHandle)) {
         authorizedResumeHandles.add(panelHandle);
       }
-      RESUME.clearMissingPendingJobs(DIR, SESSION, authorizedResumeHandles);
+      clearMissingPendingJobsForTick(ws, DIR, SESSION, authorizedResumeHandles);
       const liveCoderAgents = new Set([...activeCoderHandles].map((handle) => handleAgent.get(handle)));
       const liveQuotas = probeLiveCoderQuotas(liveCoderAgents, now);
       beat(started);
@@ -1423,8 +1433,10 @@ module.exports = {
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
   shouldTrackWorkerProgress,
+  clearMissingPendingJobsForTick,
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
   parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen,
+  parseWorkerRows,
   probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
   pidAlive, spawnResumeScheduler,
 };

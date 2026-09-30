@@ -469,7 +469,9 @@ is also recovered conservatively without retyping. The job becomes `resumed-unve
 RESUME UNVERIFIED ... inspect the terminal; do not retype`. A fresh Claude limit response to
 the one allowed send is instead re-parked at its new reset. `expired` jobs likewise wake the
 panel for a manual decision. Settled records and abandoned lock directories are cleaned after
-one day. A pending job is not deleted merely because a quota probe recovers before its timer;
+one day. During that retention window, `resumed-unverified` and `expired` block automatic
+re-parking of the same terminal for up to 24 hours so the report-only decision cannot turn
+into an automatic retry. A pending job is not deleted merely because a quota probe recovers before its timer;
 only a real handover or the worker leaving supervision cancels it.
 
 With `autoResumePanel`, the exact `ORCA_TERMINAL_HANDLE` gets the analogous message `Quota

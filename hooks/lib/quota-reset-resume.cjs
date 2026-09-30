@@ -114,7 +114,7 @@ function durationMs(text) {
 }
 
 function timeZoneFromText(text) {
-  const match = String(text).match(/\(([A-Za-z_]+\/[A-Za-z0-9_+.-]+)\)/);
+  const match = String(text).match(/\(([A-Za-z_]+(?:\/[A-Za-z0-9_+.-]+)?)\)/);
   if (!match) return '';
   try {
     new Intl.DateTimeFormat('en-US', { timeZone: match[1] }).format(0);

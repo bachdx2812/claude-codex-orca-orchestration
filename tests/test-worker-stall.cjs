@@ -628,6 +628,9 @@ check('Claude relative reset text is parsed',
 check('Claude month/day reset honors an explicit IANA timezone',
   resume.parseClaudeResetAt('■ Usage limit reached · resets Oct 3, 5pm (Asia/Saigon)', resetNow),
   Date.parse('2026-10-03T10:00:00.000Z'));
+check('Claude reset accepts the slashless UTC timezone identifier',
+  resume.parseClaudeResetAt('■ Usage limit reached · resets 5pm (UTC)', resetNow),
+  Date.parse('2026-10-01T17:00:00.000Z'));
 check('ordinary reset discussion is not a Claude limit screen',
   resume.hasClaudeLimitMessage('Updated reset parsing tests for 5pm.'), false);
 check('prose quoting limit and reset wording is not a Claude limit screen',
@@ -738,6 +741,21 @@ check('a quota recovery does not clear a scheduler-owned pending job', [
 check('a worker leaving the supervised set clears its pending job', [
   resume.clearMissingPendingJobs(stateDir, 'pending-test', new Set()),
   resume.readJob(pendingFile),
+], [1, null]);
+const uncertainFile = resume.jobFile(stateDir, 'uncertain-worker-list', 'term_uncertain');
+resume.writeJob(uncertainFile, {
+  version: 1, session: 'uncertain-worker-list', handle: 'term_uncertain', identity: 'ctx_uncertain',
+  agent: 'codex', status: 'scheduled', token: 'uncertain', pid: 12, parkedAt: resetNow,
+});
+check('one failed worker-list tick leaves a parked job intact', [
+  heartbeat.clearMissingPendingJobsForTick(null, stateDir, 'uncertain-worker-list', new Set()),
+  resume.readJob(uncertainFile).status,
+], [0, 'scheduled']);
+check('an explicit worker-list ok:false reply remains unknown rather than empty',
+  heartbeat.parseWorkerRows({ ok: false, error: 'timeout' }), null);
+check('an authoritative empty worker-list tick may clear the missing parked job', [
+  heartbeat.clearMissingPendingJobsForTick([], stateDir, 'uncertain-worker-list', new Set()),
+  resume.readJob(uncertainFile),
 ], [1, null]);
 check('foreign terminals are never parked or scheduled', resume.park({
   stateDir, session: 'park-test', handle: 'term_foreign', identity: 'ctx_foreign', agent: 'codex',
