@@ -261,6 +261,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   // Lane B may not pass this dep yet (config.cjs is the single source of truth for it).
   const maxKimiWorkers = deps.maxParallelKimiWorkers || require('./config.cjs').maxParallelKimiWorkers;
   const kimiCap = maxKimiWorkers(cfg);
+  const hasKimiDispatch = invs.some((inv) => inv.sub === 'orchestration worker-start' &&
+    (flagValue(inv.args, '--agent') || '').toLowerCase() === 'kimi');
+  const hasCodexDispatch = invs.some((inv) => inv.sub === 'orchestration worker-start' &&
+    (flagValue(inv.args, '--agent') || 'codex').toLowerCase() === 'codex');
   const ttl = ownershipClaimTtlMinutes(cfg);
   const agentCapActive = !gateDisabled(cfg, 'max-parallel-agents') &&
     Number.isFinite(deps.agentParallelLimit(cfg));
@@ -269,9 +273,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     // The Kimi cap only justifies the long cap lock timeout when this command actually
     // contains a Kimi dispatch — otherwise every Codex/Claude worker-start would pay the
     // ~10.5s stale-lock wait for a cap that can never apply to it.
-    invs.some((inv) => inv.sub === 'orchestration worker-start' &&
-      (flagValue(inv.args, '--agent') || '').toLowerCase() === 'kimi');
+    hasKimiDispatch;
   const hardCapActive = agentCapActive || codexCapActive || kimiCapActive;
+  const acquireStateLock = deps.acquireLock || acquireLock;
+  const releaseStateLock = deps.releaseLock || releaseLock;
   let violation = null;
   // True once a mid-loop Orca reconcile (`applyOrcaReconciliation`) has actually changed
   // something real — a worker Orca confirmed released, or marked cap-exempt. That change
@@ -293,7 +298,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   // Ownership bookkeeping is best-effort under contention, so it keeps file-lock's short
   // default. Only an enabled, finite resource cap needs the long timeout that can outlive a
   // stale lock. This keeps an unlimited worker-start from waiting ~10.5s for no cap at all.
-  let locked = acquireLock(lockDir, hardCapActive ? deps.capLockOpts : {});
+  let locked = acquireStateLock(lockDir, hardCapActive ? deps.capLockOpts : {});
   if (locked === null) return;
   try {
     // CRITICAL: reload state fresh from disk now that the lock is held. `s` as passed in
@@ -324,7 +329,9 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     if (locked === false && hardCapActive) {
       violation = {
         gate: agentCapActive ? 'max-parallel-agents'
-          : (codexCapActive ? 'max-parallel-codex-workers' : 'max-parallel-kimi-workers'),
+          : (!hasCodexDispatch && hasKimiDispatch
+              ? 'max-parallel-kimi-workers'
+              : 'max-parallel-codex-workers'),
         reason: deps.lockContentionMessage,
       };
     }
@@ -468,9 +475,9 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
               // workers cap below already uses. A worker this session's own bookkeeping
               // still shows live, but that Orca has already confirmed released or done,
               // would otherwise refuse a dispatch that could actually proceed right now.
-              if (locked) { releaseLock(lockDir); locked = false; }
+              if (locked) { releaseStateLock(lockDir); locked = false; }
               const rows = fetchOrcaWorkerRows(ORCA_BIN);
-              locked = acquireLock(lockDir, deps.capLockOpts);
+              locked = acquireStateLock(lockDir, deps.capLockOpts);
               if (locked === null) return;
               if (locked === false) {
                 violation = { gate: 'max-parallel-agents', reason: deps.lockContentionMessage };
@@ -503,9 +510,9 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             // whatever changed during the unlocked window (including this same command's own
             // earlier localReservations, re-applied here since the reload wiped them) is
             // never lost.
-            if (locked) { releaseLock(lockDir); locked = false; }
+            if (locked) { releaseStateLock(lockDir); locked = false; }
             const rows = fetchOrcaWorkerRows(ORCA_BIN);
-            locked = acquireLock(lockDir, deps.capLockOpts);
+            locked = acquireStateLock(lockDir, deps.capLockOpts);
             if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
@@ -528,9 +535,9 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
         if (kimiSlot && kimiCap > 0 && !gateDisabled(cfg, 'max-parallel-kimi-workers')) {
           let live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
           if (live >= kimiCap) {
-            if (locked) { releaseLock(lockDir); locked = false; }
+            if (locked) { releaseStateLock(lockDir); locked = false; }
             const rows = fetchOrcaWorkerRows(ORCA_BIN);
-            locked = acquireLock(lockDir, deps.capLockOpts);
+            locked = acquireStateLock(lockDir, deps.capLockOpts);
             if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
@@ -571,7 +578,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
       save(s);
     }
   } finally {
-    if (locked) releaseLock(lockDir);
+    if (locked) releaseStateLock(lockDir);
   }
 
   if (violation) d(violation.gate, violation.reason);

@@ -38,6 +38,7 @@ function check(name, actual, expected) {
 
 const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-kimi-config-'));
 const cfgFile = path.join(cfgDir, 'orchestration.config.json');
+const gateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-kimi-gate-'));
 function withConfig(obj, fn) {
   fs.writeFileSync(cfgFile, JSON.stringify(obj));
   const prev = process.env.ORCH_CONFIG_PATH;
@@ -322,7 +323,109 @@ check('without agent info the sentence is only a generic rate limit',
     POG.liveCodexGroupIds(s), POG.liveGroupIds(s, 'codex'));
 }
 
+function gateState(workers) {
+  return {
+    session_id: 'kimi-cap-test', workers, reservations: {}, tasks: {}, agents: {},
+  };
+}
+
+function runKimiGate({ workers, rows = [], agent = 'kimi', codexCap = 3, kimiCap = 3, acquireResult = true }) {
+  const stub = path.join(gateDir, `orca-${Math.random().toString(36).slice(2)}.cjs`);
+  fs.writeFileSync(stub, '#!/usr/bin/env node\n' +
+    `process.stdout.write(${JSON.stringify(JSON.stringify({ result: { workers: rows } }))});\n`);
+  fs.chmodSync(stub, 0o755);
+  let stored = gateState(workers);
+  const violations = [];
+  const lockOptions = [];
+  const clone = (value) => JSON.parse(JSON.stringify(value));
+  const deps = {
+    hasFlag: (args, flag) => args.includes(flag),
+    flagValue: (args, flag) => {
+      const i = args.indexOf(flag);
+      return i >= 0 ? args[i + 1] || null : null;
+    },
+    briefText: () => ({ text: 'implement cap test', unreadable: [] }),
+    EXEC_INTENT: /implement/i,
+    DIR: gateDir,
+    ORCA_BIN: stub,
+    maxParallelCodexWorkers: () => codexCap,
+    maxParallelKimiWorkers: () => kimiCap,
+    ownershipClaimTtlMinutes: () => 120,
+    save: (next) => { stored = clone(next); },
+    load: () => clone(stored),
+    gateDisabled: () => false,
+    agentParallelLimit: () => Infinity,
+    machineWideLiveUnits: () => ({ total: 0, entries: [] }),
+    formatParallelAgentsRefusal: () => 'unexpected agent-cap refusal',
+    cores: () => 8,
+    parallelCoreFraction: () => 0.8,
+    maxParallelAgents: () => null,
+    lockContentionMessage: 'lock busy',
+    capLockOpts: { timeoutMs: 10500 },
+    acquireLock: (_dir, options) => { lockOptions.push(options); return acquireResult; },
+    releaseLock: () => {},
+  };
+  POG.handleOrcaDispatchGates({
+    p: { cwd: process.cwd(), tool_use_id: `tool-${Math.random()}` },
+    s: clone(stored), cfg: {},
+    cmd: `orca orchestration worker-start --agent ${agent} --worktree new-child --spec "implement cap test"`,
+    d: (gate, reason) => violations.push({ gate, reason }), deps,
+  });
+  return { stored, violations, lockOptions };
+}
+
+const THREE_KIMI = {
+  ctx_k1: { status: 'live', agent: 'kimi', group: 'ctx_k1', started: Date.now() },
+  ctx_k2: { status: 'live', agent: 'kimi', group: 'ctx_k2', started: Date.now() },
+  ctx_k3: { status: 'live', agent: 'kimi', group: 'ctx_k3', started: Date.now() },
+};
+
+{
+  const rows = Object.keys(THREE_KIMI).map((dispatchId) => ({ dispatchId, dispatchStatus: 'running' }));
+  const result = runKimiGate({ workers: THREE_KIMI, rows });
+  check('a fourth kimi worker is refused at the default cap of three',
+    result.violations.map((v) => v.gate), ['max-parallel-kimi-workers']);
+}
+
+{
+  const rows = [
+    { dispatchId: 'ctx_k1', dispatchStatus: 'running' },
+    { dispatchId: 'ctx_k2', dispatchStatus: 'running' },
+    { dispatchId: 'ctx_k3', dispatchStatus: 'succeeded', terminalState: 'released' },
+  ];
+  const result = runKimiGate({ workers: THREE_KIMI, rows });
+  check('reconciling a released kimi worker frees a cap slot', result.violations, []);
+  check('the admitted kimi dispatch reserves the freed slot',
+    Object.values(result.stored.reservations).some((r) => r.agent === 'kimi' && r.kimiSlot), true);
+}
+
+{
+  const codexWorkers = {
+    ctx_c1: { status: 'live', agent: 'codex', group: 'ctx_c1', started: Date.now() },
+    ctx_c2: { status: 'live', agent: 'codex', group: 'ctx_c2', started: Date.now() },
+    ctx_c3: { status: 'live', agent: 'codex', group: 'ctx_c3', started: Date.now() },
+  };
+  const result = runKimiGate({ workers: codexWorkers });
+  check('three live codex workers do not block a kimi dispatch', result.violations, []);
+}
+
+{
+  const result = runKimiGate({ workers: {}, agent: 'codex', codexCap: 0, kimiCap: 3 });
+  check('a codex-only dispatch with disabled codex and agent caps uses the short lock options',
+    result.lockOptions[0], {});
+}
+
+{
+  const result = runKimiGate({ workers: {}, codexCap: 3, kimiCap: 0, acquireResult: false });
+  check('a kimi-only dispatch names the kimi gate when cap-lock acquisition fails',
+    result.violations.map((v) => v.gate), ['max-parallel-kimi-workers']);
+}
+
 // --- summary -------------------------------------------------------------------
+
+fs.rmSync(gateDir, { recursive: true, force: true });
+fs.rmSync(cfgDir, { recursive: true, force: true });
+fs.rmSync(STATE_DIR, { recursive: true, force: true });
 
 if (failures.length) {
   console.error(`${pass} passed, ${failures.length} failed`);
