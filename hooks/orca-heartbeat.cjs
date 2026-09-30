@@ -45,7 +45,7 @@ const {
   autoResumeAfterReset,
 } = require('./lib/config.cjs');
 const {
-  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, hasCodexUsageExhausted,
+  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
   approvalPromptFingerprint,
 } = require('./lib/terminal-signals.cjs');
 const {
@@ -257,12 +257,18 @@ function reportApprovalWaiting({ reported, handle, fingerprint, identity, agent 
 // providing it may not exist yet (it lands with the routing lane) — a missing/failing
 // marker write degrades to a no-op; the report event itself is still emitted.
 let onCoderExhausted = defaultOnCoderExhausted;
-function defaultOnCoderExhausted(coder) {
+function defaultOnCoderExhausted(coder, info = {}) {
   try {
     const now = Date.now();
+    const hours = Number.isFinite(info.windowHours) ? info.windowHours : null;
+    // A windowed limit lasts until that window's reported reset (else one window length);
+    // the billing-cycle form keeps the long default.
+    const windowReset = hours ? QUOTA.kimiWindowResetMs(DIR, hours * 60, now) : null;
+    const until = hours ? (windowReset || now + hours * 60 * 60 * 1000) : now + 6 * 60 * 60 * 1000;
     require('./lib/coder-availability.cjs').markCoderExhausted(DIR, coder, {
-      now, until: now + 6 * 60 * 60 * 1000,
-      reason: 'usage limit reached for this billing cycle (worker output)',
+      now, until,
+      reason: hours ? `${hours}-hour usage limit reached (worker output)`
+        : 'usage limit reached for this billing cycle (worker output)',
     });
   } catch {}
 }
@@ -279,11 +285,11 @@ function setOnCoderExhausted(fn) {
  * already reported. Pure apart from that one persisted set, so tests can drive it
  * directly with a synthetic handle.
  */
-function reportUsageExhausted({ reported, handle, label, coder }) {
+function reportUsageExhausted({ reported, handle, label, coder, windowHours }) {
   if (reported.has(handle)) return null;
   reported.add(handle);
   savePersistedUsageExhaustedReports(reported);
-  onCoderExhausted(coder);
+  onCoderExhausted(coder, { windowHours: Number.isFinite(windowHours) ? windowHours : null });
   const name = coder === 'codex' ? 'Codex' : 'Kimi';
   const other = coder === 'codex' ? 'Kimi' : 'Codex';
   return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
@@ -1256,11 +1262,19 @@ function main() {
           }
           screenText = resolveTerminalScreen(readText, lastScreenText.get(t.handle), t.preview);
         }
-        const verdict = classifyTerminal(t, { ...ctx, approvalText: screenText });
+        let verdict = classifyTerminal(t, { ...ctx, approvalText: screenText });
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
+        // Kimi exhaustion is a machine-wide fact: a Kimi terminal showing the limit marks the
+        // coder exhausted even when it is not a tracked worker of this session.
+        const terminalAgent = handleAgent.get(t.handle);
+        if (verdict.kind !== 'usage_exhausted' && (!terminalAgent || terminalAgent === 'kimi') &&
+            hasKimiUsageExhausted(t.preview || '')) {
+          verdict = { kind: 'usage_exhausted', coder: 'kimi' };
+        }
         if (verdict.kind === 'usage_exhausted') {
           const event = reportUsageExhausted({
             reported: reportedUsageExhausted, handle: t.handle, label, coder: verdict.coder,
+            windowHours: verdict.coder === 'kimi' ? kimiUsageLimitHours(t.preview || '') : null,
           });
           if (event) events.push(event);
         } else if (verdict.kind === 'rate_limit') {

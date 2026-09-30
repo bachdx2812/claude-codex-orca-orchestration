@@ -31,9 +31,15 @@ function hasRateLimitError(text) {
   return false;
 }
 
-const KIMI_USAGE_LIMIT_SENTENCE = /^you(?:'|’)?ve\s+reached\s+your\s+usage\s+limit\s+for\s+this\s+billing\s+cycle/i;
+const KIMI_USAGE_LIMIT_SENTENCE = /^you(?:'|’)?ve\s+reached\s+your\s+(?:usage\s+limit\s+for\s+this\s+billing\s+cycle|\d+-hour\s+usage\s+limit)/i;
 const KIMI_IGNORED_LINE_PREFIX = /^\s*(?:["'`>]|\/\/|#|[-*](?:\s|$))/;
 const KIMI_ERROR_PREFIX = /^\s*\+?\s*(?:[■⚠✗]\s*|error\b[:\s]+|(?:HTTP\s*)?403\b[:\s]+)(?:(?:ERROR\b|(?:HTTP\s*)?403\b)[:\s-]*)*/i;
+
+/** The window length in hours when the sentence is the "N-hour usage limit" form, else null. */
+function kimiUsageLimitHours(text) {
+  const match = String(text || '').match(/reached\s+your\s+(\d+)-hour\s+usage\s+limit/i);
+  return match ? Number(match[1]) : null;
+}
 
 /** True only when Kimi's billing-cycle usage-limit sentence appears on an error-shaped
  * line — deliberately NOT a strong marker: the sentence alone, in plain prose (a worker
@@ -135,6 +141,6 @@ function approvalPromptFingerprint(text) {
 }
 
 module.exports = {
-  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, hasCodexUsageExhausted,
+  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
   approvalPromptFingerprint,
 };

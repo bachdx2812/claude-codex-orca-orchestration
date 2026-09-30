@@ -240,40 +240,62 @@ function resetSeconds(value) {
   return Number.isFinite(parsed) ? parsed / 1000 : 0;
 }
 
-function kimiWindow(limit, remaining, resetTime, now, usedRatio) {
+/** Kimi returns counts as numbers or numeric strings; anything else is unusable. */
+function kimiNumber(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+/**
+ * One quota window from a limit block. An exhausted window carries `used` and no
+ * `remaining`, so `used` wins; otherwise usage derives from `remaining`. The ratio-only
+ * form is the last resort because it can stay 0 while the real window is full.
+ */
+function kimiWindow(block, now, durationMinutes, usedRatio) {
+  const limit = kimiNumber(block && block.limit);
+  const used = kimiNumber(block && block.used);
+  const remaining = kimiNumber(block && block.remaining);
+  const ratio = kimiNumber(usedRatio);
   let usedPercent = null;
-  if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0 &&
-      typeof remaining === 'number' && Number.isFinite(remaining)) {
-    usedPercent = Math.max(0, Math.min(100, ((limit - remaining) / limit) * 100));
-  } else if (typeof usedRatio === 'number' && Number.isFinite(usedRatio) && usedRatio >= 0) {
-    usedPercent = Math.max(0, Math.min(100, usedRatio <= 1 ? usedRatio * 100 : usedRatio));
+  if (limit !== null && limit > 0 && used !== null) {
+    usedPercent = (used * 100) / limit;
+  } else if (limit !== null && limit > 0 && remaining !== null) {
+    usedPercent = ((limit - remaining) * 100) / limit;
+  } else if (ratio !== null && ratio >= 0) {
+    usedPercent = ratio <= 1 ? ratio * 100 : ratio;
   }
   if (usedPercent === null) return null;
-  const resetsAt = resetSeconds(resetTime);
-  return resetsAt && resetsAt * 1000 <= now ? { usedPercent: 0, resetsAt: 0 } : { usedPercent, resetsAt };
+  usedPercent = Math.max(0, Math.min(100, usedPercent));
+  const resetsAt = resetSeconds(block && (block.resetTime || block.reset_time));
+  const duration = kimiNumber(durationMinutes);
+  const extra = duration !== null && duration > 0 ? { durationMinutes: duration } : {};
+  return resetsAt && resetsAt * 1000 <= now
+    ? { usedPercent: 0, resetsAt: 0, ...extra }
+    : { usedPercent, resetsAt, ...extra };
 }
 
 /** Every usable window of a Kimi /usages response (unreduced). */
 function kimiQuotaWindows(body, now = Date.now()) {
   if (!body || typeof body !== 'object') return [];
   const windows = [];
-  const usage = body.usage;
-  if (usage && typeof usage === 'object') {
-    windows.push(kimiWindow(usage.limit, usage.remaining, usage.resetTime || usage.reset_time, now));
-  }
+  if (body.usage && typeof body.usage === 'object') windows.push(kimiWindow(body.usage, now));
   if (Array.isArray(body.limits)) {
     for (const item of body.limits) {
       const detail = item && item.detail;
       if (detail && typeof detail === 'object') {
-        windows.push(kimiWindow(detail.limit, detail.remaining, detail.resetTime || detail.reset_time, now));
+        windows.push(kimiWindow(detail, now, item.window && item.window.duration));
       }
     }
   }
+  const counted = windows.filter(Boolean);
+  if (counted.length) return counted;
   if (body.usages && typeof body.usages === 'object') {
     for (const item of Object.values(body.usages)) {
-      if (item && typeof item === 'object') {
-        windows.push(kimiWindow(null, null, item.reset_time || item.resetTime, now, item.used_ratio));
-      }
+      if (item && typeof item === 'object') windows.push(kimiWindow(item, now, undefined, item.used_ratio));
     }
   }
   return windows.filter(Boolean);
@@ -283,6 +305,20 @@ function kimiQuotaWindows(body, now = Date.now()) {
 function parseKimiUsages(body, now = Date.now()) {
   const valid = kimiQuotaWindows(body, now);
   return valid.length ? valid.reduce((a, b) => b.usedPercent > a.usedPercent ? b : a) : null;
+}
+
+/**
+ * When the Kimi window of the given length next resets, from the last cached /usages
+ * reading (epoch ms), or null when no such future reset is known. Cache-only: never probes.
+ */
+function kimiWindowResetMs(stateDir, durationMinutes, now = Date.now()) {
+  try {
+    const entry = JSON.parse(fs.readFileSync(path.join(stateDir, KIMI_LIVE_CACHE_FILE), 'utf8'));
+    const resets = (Array.isArray(entry.windows) ? entry.windows : [])
+      .filter((w) => w && w.durationMinutes === durationMinutes && typeof w.resetsAt === 'number' && w.resetsAt * 1000 > now)
+      .map((w) => w.resetsAt * 1000);
+    return resets.length ? Math.max(...resets) : null;
+  } catch { return null; }
 }
 
 function kimiProbeEnv(env = process.env) {
@@ -588,7 +624,7 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
 
 module.exports = {
   pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
-  parseLiveQuota, parseKimiUsages, liveQuotaWindows, kimiQuotaWindows,
+  parseLiveQuota, parseKimiUsages, kimiWindowResetMs, liveQuotaWindows, kimiQuotaWindows,
   liveQuota, codexQuota, kimiQuota, codexAuthState,
   readFreshCache, readFreshKimiCache, formatAge,
   persistLastKnownQuota, estimatedQuota, ESTIMATE_RESETLESS_WINDOW_MAX_AGE_MS,

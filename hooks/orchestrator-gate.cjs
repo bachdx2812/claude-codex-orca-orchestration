@@ -40,7 +40,7 @@ const HBL = require('./lib/heartbeat-liveness.cjs');
 const OWN = require('./lib/ownership.cjs');
 const OC = require('./lib/ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
-const { hasRateLimitError, hasKimiUsageExhausted } = require('./lib/terminal-signals.cjs');
+const { hasRateLimitError, hasKimiUsageExhausted, kimiUsageLimitHours } = require('./lib/terminal-signals.cjs');
 const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
 const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const EXEC_QUOTA = require('./lib/exec-route-by-quota.cjs');
@@ -2047,8 +2047,14 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
     const targetsKimiOnly = trackedReadWorkers.length > 0 &&
       trackedReadWorkers.length === readTargets.length && trackedReadWorkers.every(([, worker]) => worker.agent === 'kimi');
     if (readsWorkerOutput && targetsKimiOnly && hasKimiUsageExhausted(signalText)) {
+      const markNow = Date.now();
+      const windowHours = kimiUsageLimitHours(signalText);
       CODER_AVAILABILITY.markCoderExhausted(DIR, 'kimi', {
-        now: Date.now(), reason: 'usage limit reached for this billing cycle',
+        now: markNow,
+        ...(windowHours ? {
+          until: EXEC_QUOTA.kimiWindowResetMs(DIR, windowHours * 60, markNow) || markNow + windowHours * 3600 * 1000,
+        } : {}),
+        reason: windowHours ? `${windowHours}-hour usage limit reached` : 'usage limit reached for this billing cycle',
       });
       const until = Date.now() + RATE_LIMIT_BACKOFF_SECONDS * 1000;
       for (const [key, worker] of Object.entries(s.workers)) {
