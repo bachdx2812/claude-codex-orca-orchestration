@@ -608,7 +608,7 @@ expect('fable escalation naming opus (xhigh) is allowed',
 {
   const RS = `${SID}-rv`;
   const out = spawnGate(promptSubmit(RS, 'status?'), SONNET_WINS).stdout;
-  if (/code -> Sonnet: Codex quota 97% used .*Kimi not installed/.test(out) && !/undefined/.test(out)) pass += 1;
+  if (/code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[Codex quota 97% used .*Kimi not installed/.test(out) && !/undefined/.test(out)) pass += 1;
   else failures.push(`auto route to the code model must name model "sonnet", never "undefined": ${out.slice(0, 200)}`);
   const bare = spawnGate(promptSubmit(RS, 'please --code-model'), CODEX_WINS).stdout;
   if (/needs a value/.test(bare)) pass += 1; else failures.push('a bare --code-model must print a notice');
@@ -678,6 +678,45 @@ expect('--exec-sonnet still requires model sonnet',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan' }), DENY);
 expect('plan/review routing to Opus is unaffected by --exec-sonnet',
   dispatch({ subagent_type: 'planner', description: 'plan the refactor', model: 'sonnet' }), DENY);
+
+// Fix 7: the code model's dispatch shape (effort + agent subagent_type) is config-driven and
+// surfaced in the banner, the per-prompt reminder and the mismatch refusal advice.
+{
+  const F7SID = `${SID}-fix7`;
+  rmState(F7SID);
+  const banner = spawnGate({ session_id: F7SID, hook_event_name: 'SessionStart' }, SONNET_WINS).stdout;
+  if (/sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet/.test(banner)) pass += 1;
+  else failures.push(`SessionStart banner must name the code dispatch shape (effort + agentType): ${banner.slice(0, 400)}`);
+  const reminder = spawnGate(promptSubmit(F7SID, 'status?'), SONNET_WINS).stdout;
+  if (/sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet/.test(reminder)) pass += 1;
+  else failures.push(`per-prompt reminder must name the code dispatch shape: ${reminder.slice(0, 400)}`);
+  const mismatch = invoke(dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'haiku',
+    prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (test).' }, F7SID), SONNET_WINS);
+  if (mismatch.code === DENY && /subagent_type sonnet-coder \+ model "sonnet" \(effort medium\)/.test(mismatch.err)) pass += 1;
+  else failures.push(`execution-model-mismatch advice must name subagent_type + effort (exit ${mismatch.code}): ${mismatch.err.slice(0, 300)}`);
+  // models.code.effort / agentType are configurable; an invalid effort warns and defaults.
+  const f7Cfg = {
+    models: {
+      review: { alias: 'opus', id: 'claude-opus-5-5' },
+      escalation: { alias: 'fable', id: 'claude-fable-5-1' },
+      code: { alias: 'sonnet', id: 'claude-sonnet-5-5', effort: 'high', agentType: 'my-coder' },
+      lookup: { alias: 'haiku', id: null },
+      codex: { alias: null, id: 'gpt-5.6-sol' },
+    },
+  };
+  const f7Env = quotaEnv('fix7-custom', 10, 97, f7Cfg);
+  const f7Banner = spawnGate({ session_id: `${F7SID}-custom`, hook_event_name: 'SessionStart' }, f7Env).stdout;
+  if (/sonnet \(claude-sonnet-5-5\), effort high: Agent subagent_type my-coder \+ model sonnet; Orca Claude worker: --model claude-sonnet-5-5 --effort high/.test(f7Banner)) pass += 1;
+  else failures.push(`a configured effort/agentType/id must shape the dispatch text: ${f7Banner.slice(0, 400)}`);
+  const f7BadEnv = quotaEnv('fix7-bad-effort', 10, 97, {
+    models: { ...f7Cfg.models, code: { alias: 'sonnet', id: null, effort: 'bogus', agentType: '' } },
+  });
+  const f7Bad = spawnGate({ session_id: `${F7SID}-bad`, hook_event_name: 'SessionStart' }, f7BadEnv).stdout;
+  if (/models\.code\.effort "bogus"/.test(f7Bad) && /models\.code\.agentType must be a non-empty string/.test(f7Bad) &&
+      /sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet/.test(f7Bad)) pass += 1;
+  else failures.push(`an invalid effort/agentType must warn and fall back to the defaults: ${f7Bad.slice(0, 500)}`);
+  rmState(F7SID);
+}
 
 expect('--exec-codex prompt reverts the preference',
   promptSubmit(SID, 'back to --exec-codex'), ALLOW);

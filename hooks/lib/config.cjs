@@ -39,7 +39,7 @@ const DEFAULT_CONFIG = {
   models: {
     review: { alias: 'opus', id: 'claude-opus-5-5' },
     escalation: { alias: 'fable', id: 'claude-fable-5-1' },
-    code: { alias: 'sonnet', id: null },
+    code: { alias: 'sonnet', id: null, effort: 'medium', agentType: 'sonnet-coder' },
     lookup: { alias: 'haiku', id: null },
     codex: { alias: null, id: 'gpt-5.6-sol' },
     kimi: { alias: null, id: null },
@@ -81,6 +81,7 @@ const DEFAULT_CONFIG = {
 };
 
 const ACTIVATION_VALUES = new Set(['orca-only', 'always', 'off']);
+const EFFORT_VALUES = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
 function deepMerge(base, override) {
   if (typeof override !== 'object' || override === null || Array.isArray(override)) {
@@ -161,6 +162,17 @@ function loadConfig() {
         v[field] = DEFAULT_CONFIG.models[role][field];
       }
     }
+  }
+
+  // models.code's dispatch shape (Fix 7): the effort and agent subagent_type the in-session
+  // code route is dispatched with.
+  if (!EFFORT_VALUES.has(merged.models.code.effort)) {
+    warnings.push(`models.code.effort "${merged.models.code.effort}" is not one of low|medium|high|xhigh|max; using "${DEFAULT_CONFIG.models.code.effort}".`);
+    merged.models.code.effort = DEFAULT_CONFIG.models.code.effort;
+  }
+  if (typeof merged.models.code.agentType !== 'string' || !merged.models.code.agentType.trim()) {
+    warnings.push(`models.code.agentType must be a non-empty string; using "${DEFAULT_CONFIG.models.code.agentType}".`);
+    merged.models.code.agentType = DEFAULT_CONFIG.models.code.agentType;
   }
 
   if (!ACTIVATION_VALUES.has(merged.activation)) {

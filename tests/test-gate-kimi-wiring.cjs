@@ -129,7 +129,7 @@ function state(stateDir, sid) {
   const f = fixture('none', { codex: false, kimi: false });
   const out = prompt(f.env, 'none-session').stdout;
   ok('neither usable routes to Sonnet with both reasons',
-    /code -> Sonnet: Codex not installed, Kimi not installed/.test(out));
+    /code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[Codex not installed, Kimi not installed\]/.test(out));
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 

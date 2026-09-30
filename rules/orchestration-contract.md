@@ -214,7 +214,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   "models": {
     "review": { "alias": "opus", "id": "claude-opus-5-5" },
     "escalation": { "alias": "fable", "id": "claude-fable-5-1" },
-    "code": { "alias": "sonnet", "id": null },
+    "code": { "alias": "sonnet", "id": null, "effort": "medium", "agentType": "sonnet-coder" },
     "lookup": { "alias": "haiku", "id": null },
     "codex": { "alias": null, "id": "gpt-5.6-sol" },
     "kimi": { "alias": null, "id": null }
@@ -253,6 +253,13 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `models.<role>.alias`: the Claude Code model alias the gate matches against and
   instructs dispatches to use. `models.<role>.id`: the exact model ID, used only in banner
   text and in `orca ... --model <id>` examples — the gate itself matches on alias.
+  `models.code` also carries `effort` (one of `low|medium|high|xhigh|max`, default
+  `medium`) and `agentType` (default `sonnet-coder`): the effort and subagent_type the
+  in-session code route is dispatched with — reminder and refusal advice say e.g.
+  "sonnet (claude-sonnet-5-5), effort medium: Agent subagent_type sonnet-coder + model
+  sonnet" and, for an Orca Claude worker, `--model claude-sonnet-5-5 --effort medium`. The
+  matching agent definition ships as `agents/sonnet-coder.md` (installed only when absent;
+  a user-edited file is never overwritten).
 - `agents.escalation` / `agents.lookup`: agent names (by `subagent_type`) that count as
   that role even without a matching `model`. Both default to a minimal, non-operator-
   specific set (`agents.lookup` ships with `["Explore"]`; `agents.escalation` ships

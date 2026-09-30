@@ -81,6 +81,20 @@ function modelLabel(role) {
 }
 
 /**
+ * How to dispatch in-session code on the configured code model (Fix 7), e.g.
+ * `sonnet (claude-sonnet-5-5), effort medium: Agent subagent_type sonnet-coder + model sonnet`
+ * — plus, when an exact model id is configured, the Orca Claude-worker equivalent
+ * (`--model <id> --effort <effort>`). Everything derives from `models.code`.
+ */
+function codeModelDispatchText(cfg) {
+  const code = cfg.models.code;
+  const effort = code.effort || 'medium';
+  const name = code.id ? `${code.alias} (${code.id})` : `${code.alias}`;
+  const base = `${name}, effort ${effort}: Agent subagent_type ${code.agentType || code.alias} + model ${code.alias}`;
+  return code.id ? `${base}; Orca Claude worker: --model ${code.id} --effort ${effort}` : base;
+}
+
+/**
  * `orcaInvocations()` args are shell words, not a parsed flag table: `--spec=x.md` is one
  * word, not `--spec` followed by `x.md`. `args.includes('--spec')` therefore misses the
  * `=` form entirely - the same gap applies to `--model=`, `--terminal=`, `--agent=codex`.
@@ -883,7 +897,7 @@ function onSessionStart(p, s, cfg) {
     '    Codex -> Orca worker: orca orchestration task-create ... && worker-start --agent codex --model ...\n' +
     '    Kimi  -> Orca worker: orca orchestration task-create ... && worker-start --agent kimi (no --model)\n' +
     '             then worker-list | worker-read | worker-release\n' +
-    `    ${code[0].toUpperCase()}${code.slice(1)} -> in-session Agent with model "${code}".\n` +
+    `    ${code[0].toUpperCase()}${code.slice(1)} -> ${codeModelDispatchText(cfg)}.\n` +
     `  Operator-only override from the main panel: --code-model <${review}|${code}|${lookup}|${escalation}|codex|codex:<model>|kimi|kimi:<model>|auto>\n` +
     '  (session-scoped, last flag wins; --exec-sonnet / --exec-codex / --exec-kimi are shortcuts, --exec-auto = --code-model auto).\n' +
     '  If Orca itself is unreachable: `touch ~/.claude/orchestrator-gate/orca-unavailable` (15 min) permits in-session code\n' +
@@ -1066,12 +1080,14 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   } else if (ex.route === 'external' && ex.pick === 'kimi') {
     codeRoute = `Kimi in an Orca worker (worker-start --agent kimi, no --model)${ex.kimiModel ? ` (${ex.kimiModel} via default_model; Orca cannot pin it)` : ''}`;
   } else if (ex.route === 'claude') {
-    codeRoute = `in-session subagent (Agent model ${modelLabel(roleByAlias(ex.alias))})`;
+    codeRoute = ex.alias === cfg.models.code.alias
+      ? `in-session: ${codeModelDispatchText(cfg)}`
+      : `in-session subagent (Agent model ${modelLabel(roleByAlias(ex.alias))})`;
   } else {
     const reasons = ex.coders
       ? ['codex', 'kimi'].map((coder) => `${coder === 'codex' ? 'Codex' : 'Kimi'} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ')
       : ex.why;
-    codeRoute = `${String(cfg.models.code.alias).replace(/^./, (c) => c.toUpperCase())}: ${reasons}`;
+    codeRoute = `${codeModelDispatchText(cfg)} [${reasons}]`;
   }
   if (ex.route === 'external' && ex.order?.length > 1 && ex.coders) {
     const coderText = (coder) => {
@@ -1366,8 +1382,11 @@ function onPreToolUse(p, s, cfg) {
           'The operator (only) can pick the coding model with --code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>.');
       }
       if (!model.toLowerCase().includes(String(wantAlias || '').toLowerCase())) {
+        const redispatch = wantAlias === cfg.models.code.alias
+          ? `Re-dispatch as Agent subagent_type ${cfg.models.code.agentType || wantAlias} + model "${wantAlias}" (effort ${cfg.models.code.effort || 'medium'}).`
+          : `Re-dispatch with model: "${wantAlias}".`;
         d('execution-model-mismatch',
-          `In-session code work must run on model "${wantAlias}" [${ex.why}]. Re-dispatch with model: "${wantAlias}". ` +
+          `In-session code work must run on model "${wantAlias}" [${ex.why}]. ${redispatch} ` +
           `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
       }
       if (!VERIFY_COMMAND.test(`${input.description || ''}\n${input.prompt || ''}`)) {

@@ -166,6 +166,49 @@ check('--check reports kimi usable once credentials exist (quota unknown on an u
   /coder kimi: usable \[binary [^\]]*stub 1\.0, auth ok, quota unknown\]/.test(credsOut), true);
 check('--check never prints the Kimi access token', credsOut.includes(FIXTURE_TOKEN), false);
 
+// --- shipped agent definitions (agents/sonnet-coder.md): created only when absent, ------
+// --- never overwritten, removed on uninstall only when still the shipped original -------
+const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonnet-coder.md'), 'utf8');
+{
+  const fresh = run([], 'agents-fresh');
+  const dest = path.join(fresh.home, '.claude', 'agents', 'sonnet-coder.md');
+  check('install ships agents/sonnet-coder.md', fs.existsSync(dest), true);
+  check('the shipped agent definition matches the repo original',
+    fs.existsSync(dest) && fs.readFileSync(dest, 'utf8'), SHIPPED_AGENT);
+
+  // A user edit is never overwritten by a re-install, and never removed by uninstall.
+  fs.writeFileSync(dest, 'user-edited agent definition\n');
+  const again = run([], 'agents-fresh');
+  check('re-install never overwrites a user-edited agent definition',
+    fs.readFileSync(dest, 'utf8'), 'user-edited agent definition\n');
+  const uninstEdited = run(['--uninstall'], 'agents-fresh');
+  check('uninstall exits successfully with an edited agent present', uninstEdited.status, 0);
+  check('uninstall leaves a user-edited agent definition in place', fs.existsSync(dest), true);
+  check('uninstall warns about the edited agent definition',
+    /WARNING:.*sonnet-coder\.md was edited since install/i.test(`${uninstEdited.stdout}${uninstEdited.stderr}`), true);
+
+  // An untouched, installer-created agent definition IS removed on uninstall.
+  const clean = run([], 'agents-clean');
+  const cleanDest = path.join(clean.home, '.claude', 'agents', 'sonnet-coder.md');
+  check('clean install ships the agent definition', fs.existsSync(cleanDest), true);
+  const uninstClean = run(['--uninstall'], 'agents-clean');
+  check('clean uninstall exits successfully', uninstClean.status, 0);
+  check('uninstall removes an unmodified installer-created agent definition', fs.existsSync(cleanDest), false);
+
+  // A pre-existing (not installer-created) agent definition is left alone by both.
+  const pre = run([], 'agents-preexisting');
+  const preDestDir = path.join(pre.home, '.claude', 'agents');
+  fs.mkdirSync(preDestDir, { recursive: true });
+  fs.writeFileSync(path.join(preDestDir, 'sonnet-coder.md'), 'my own agent\n');
+  const pre2 = run([], 'agents-preexisting');
+  check('install leaves a pre-existing agent definition untouched',
+    fs.readFileSync(path.join(preDestDir, 'sonnet-coder.md'), 'utf8'), 'my own agent\n');
+  const uninstPre = run(['--uninstall'], 'agents-preexisting');
+  check('uninstall of a pre-existing agent definition exits successfully', uninstPre.status, 0);
+  check('uninstall leaves a pre-existing agent definition in place',
+    fs.existsSync(path.join(preDestDir, 'sonnet-coder.md')), true);
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`${passed} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  FAIL ${failure}`);

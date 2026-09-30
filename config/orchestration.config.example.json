@@ -4,7 +4,7 @@
   "models": {
     "review": { "alias": "opus", "id": "claude-opus-5-5" },
     "escalation": { "alias": "fable", "id": "claude-fable-5-1" },
-    "code": { "alias": "sonnet", "id": null },
+    "code": { "alias": "sonnet", "id": null, "effort": "medium", "agentType": "sonnet-coder" },
     "lookup": { "alias": "haiku", "id": null },
     "codex": { "alias": null, "id": "gpt-5.6-sol" },
     "kimi": { "alias": null, "id": null }

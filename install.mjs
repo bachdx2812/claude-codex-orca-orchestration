@@ -35,7 +35,13 @@ const RULES_FILE = path.join(CLAUDE_DIR, 'rules', 'orchestration-contract.md');
 const CONFIG_FILE = path.join(CLAUDE_DIR, 'orchestration.config.json');
 const SETTINGS_FILE = path.join(CLAUDE_DIR, 'settings.json');
 const CLAUDE_MD_FILE = path.join(CLAUDE_DIR, 'CLAUDE.md');
+const AGENTS_DIR = path.join(CLAUDE_DIR, 'agents');
 const MANIFEST_FILE = path.join(HOOKS_DIR, 'install-manifest.json');
+
+// Agent definitions the installer ships. They are ONLY ever created, never overwritten:
+// an existing file may be user-edited, and uninstall removes only a file this installer
+// created whose content still matches the shipped original.
+const AGENT_FILES = ['sonnet-coder.md'];
 
 const GATE_SCRIPT = 'orchestrator-gate.cjs';
 const HOOK_FILES = [
@@ -243,6 +249,39 @@ function uninstallRulesFile(manifest) {
     return;
   }
   removeFile(RULES_FILE);
+}
+
+// --- install: agent definitions ------------------------------------------------
+
+function installAgents(prevManifest) {
+  const results = {};
+  for (const rel of AGENT_FILES) {
+    const dest = path.join(AGENTS_DIR, rel);
+    if (fs.existsSync(dest)) {
+      // Never overwrite: an existing agent definition may be user-edited.
+      const owned = prevManifest ? !!prevManifest.agents?.[rel]?.createdNew : false;
+      results[rel] = { path: dest, createdNew: owned, alreadyPresent: true };
+      continue;
+    }
+    copyFile(path.join(REPO_ROOT, 'agents', rel), dest);
+    results[rel] = { path: dest, createdNew: true };
+  }
+  return results;
+}
+
+function uninstallAgents(manifest) {
+  for (const rel of AGENT_FILES) {
+    const record = manifest.agents?.[rel];
+    if (!record || !record.createdNew) continue; // never delete a file we did not create
+    const dest = path.join(AGENTS_DIR, rel);
+    const current = fs.existsSync(dest) ? fs.readFileSync(dest, 'utf8') : null;
+    const src = (() => { try { return fs.readFileSync(path.join(REPO_ROOT, 'agents', rel), 'utf8'); } catch { return null; } })();
+    if (current !== null && src !== null && current !== src) {
+      warn(`${dest} was edited since install; leaving it in place.`);
+      continue;
+    }
+    removeFile(dest);
+  }
 }
 
 // --- install: config seed -----------------------------------------------------
@@ -640,6 +679,7 @@ function install() {
   const configFile = installConfig(prevManifest);
   const settings = installSettings({ pinModels: !NO_PIN }, prevManifest);
   const claudeMd = installClaudeMd(prevManifest);
+  const agents = installAgents(prevManifest);
 
   const manifest = {
     version: 1,
@@ -651,6 +691,7 @@ function install() {
     configFile,
     settings,
     claudeMd,
+    agents,
   };
   writeJSON(MANIFEST_FILE, manifest);
 
@@ -669,6 +710,7 @@ function uninstall(purge) {
   }
   uninstallSettings(manifest);
   uninstallClaudeMd(manifest);
+  uninstallAgents(manifest);
   uninstallRulesFile(manifest);
   uninstallConfig(manifest, purge);
   uninstallHookFiles(manifest);
