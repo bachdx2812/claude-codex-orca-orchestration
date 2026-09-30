@@ -1013,6 +1013,8 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     codeRoute = `Codex in an Orca worker${codexModelShown ? ` (worker-start --agent codex --model ${codexModelShown})` : ''}`;
   } else if (ex.route === 'external' && ex.pick === 'kimi') {
     codeRoute = `Kimi in an Orca worker (worker-start --agent kimi, no --model)${ex.kimiModel ? ` (${ex.kimiModel} via default_model; Orca cannot pin it)` : ''}`;
+  } else if (ex.route === 'claude') {
+    codeRoute = `in-session subagent (Agent model ${modelLabel(roleByAlias(ex.alias))})`;
   } else {
     const reasons = ex.coders
       ? ['codex', 'kimi'].map((coder) => `${coder === 'codex' ? 'Codex' : 'Kimi'} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ')
@@ -1488,10 +1490,14 @@ function readinessTimeoutAdvice(replyText) {
  * Returns true when anything in `s` changed.
  */
 function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
-  const dispatchInvs = orcaInvocations(cmd).filter((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
+  const allInvs = orcaInvocations(cmd).filter((inv) => !hasFlag(inv.args, '--help'));
+  const dispatchEntries = allInvs.map((inv, commandIndex) => ({ inv, commandIndex }))
+    .filter(({ inv }) => DISPATCH_SUBS.has(inv.sub));
+  const dispatchInvs = dispatchEntries.map(({ inv }) => inv);
   if (!dispatchInvs.length) return false;
   const toolUseId = p.tool_use_id || p.toolUseId || null;
   const rawReplies = WG.splitJsonReplies(out);
+  const jsonStartsOutput = /^[\s\r\n]*\{/.test(String(out || ''));
   // A count mismatch (e.g. one invocation's reply got swallowed by a log-line prefix that
   // defeated the line-start discriminator, or a stray object was miscounted as a reply) means
   // positional zipping (`replies[idx]` <-> `dispatchInvs[idx]`) cannot be trusted AT ALL — it
@@ -1500,8 +1506,16 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
   // command is treated as id-less: each falls through to its own "no ids found" handling
   // (a pending placeholder on the success path, an untouched reservation on the failure path),
   // which is always safe even when wrong, unlike a confident-but-incorrect attribution.
-  const mismatched = rawReplies.length !== dispatchInvs.length;
-  const replies = mismatched ? null : rawReplies;
+  const fullCommandMapping = rawReplies.length === allInvs.length;
+  // When another Orca invocation also ran, a surviving JSON object can belong to that
+  // command after a formatter consumed worker-start's own reply. In the safe dispatch-only
+  // case, worker-start --json is the first emitted value; any leading free text makes the
+  // attribution ambiguous and leaves a pending reservation instead of stealing another id.
+  const dispatchOnlyMapping = rawReplies.length === dispatchInvs.length &&
+    (allInvs.length === dispatchInvs.length || jsonStartsOutput);
+  const mismatched = !fullCommandMapping && !dispatchOnlyMapping;
+  const replies = mismatched ? null : dispatchEntries.map(({ commandIndex }, idx) =>
+    fullCommandMapping ? rawReplies[commandIndex] : rawReplies[idx]);
   const replyAt = (idx) => mismatched ? null : replies[idx] || null;
   let dirty = false;
 
@@ -1818,8 +1832,15 @@ function onPostToolUseLocked(p, s, cfg) {
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
     // Only worker/terminal output counts; the panel's own quota inspection ("rate_limits" JSON) does not.
     const readsWorkerOutput = /\borca\b/.test(cmd) && /(worker-read|terminal (read|show))\b/.test(cmd);
-    const signalText = workerOutputSignalText(out).replace(/"rate_limits"/g, '');
     const readTargets = orcaInvocations(cmd).map((inv) => WG.outputTarget(inv, flagValue)).filter(Boolean);
+    const parsedReadReplies = WG.splitJsonReplies(out);
+    const readJsonStartsOutput = /^[\s\r\n]*\{/.test(String(out || ''));
+    const parsedOutputIsAttributable = parsedReadReplies.length === readTargets.length &&
+      (shellSegments(cmd).length === readTargets.length || readJsonStartsOutput);
+    const scopedReadOutput = parsedOutputIsAttributable
+      ? parsedReadReplies.map((reply) => workerOutputSignalText(JSON.stringify(reply))).join('\n')
+      : (readTargets.length === 1 && shellSegments(cmd).length === 1 ? workerOutputSignalText(out) : '');
+    const signalText = scopedReadOutput.replace(/"rate_limits"/g, '');
     const trackedReadWorkers = readTargets.map((target) => [target, s.workers[target]]).filter(([, worker]) => worker);
     const kimiGroups = new Set(trackedReadWorkers
       .filter(([, worker]) => worker.agent === 'kimi')

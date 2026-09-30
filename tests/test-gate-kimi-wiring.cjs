@@ -118,6 +118,9 @@ function state(stateDir, sid) {
   ok('kimi model preference is described without a model pin', /default_model; Orca cannot pin it/.test(reminder));
   prompt(f.env, 'override-session', '--exec-kimi');
   check('--exec-kimi persists kimi', state(f.stateDir, 'override-session').execAgent, 'kimi');
+  prompt(f.env, 'override-session', '--code-model opus');
+  ok('Claude model overrides name the selected model in reminders',
+    /code -> in-session subagent \(Agent model "opus"/.test(prompt(f.env, 'override-session').stdout));
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 
@@ -160,6 +163,21 @@ function state(stateDir, sid) {
     `{"ok":true,"result":{"dispatchId":"ctx_worker_start_only"}}\nformatted workers: ${noise}`);
   const ids = Object.keys(state(f.stateDir, sid).workers);
   check('worker registration uses only the worker-start JSON reply', ids, ['ctx_worker_start_only']);
+  const showSid = 'reply-show-session';
+  const showCommand = 'orca orchestration worker-start --agent codex --json && orca orchestration worker-show --dispatch ctx_worker_start_show --json';
+  preBash(f.env, showSid, 'toolu_reply_show', showCommand);
+  postBash(f.env, showSid, 'toolu_reply_show', showCommand,
+    '{"ok":true,"result":{"dispatchId":"ctx_worker_start_show"}}\n{"ok":true,"result":{"dispatchId":"ctx_worker_show_echo","preview":"healthy"}}');
+  check('a chained worker-show JSON reply does not displace the worker-start reply',
+    Object.keys(state(f.stateDir, showSid).workers), ['ctx_worker_start_show']);
+  const formattedSid = 'reply-formatted-session';
+  const formattedCommand = 'orca orchestration worker-start --agent kimi --json | formatter && orca orchestration worker-show --dispatch ctx_other --json';
+  preBash(f.env, formattedSid, 'toolu_reply_formatted', formattedCommand);
+  postBash(f.env, formattedSid, 'toolu_reply_formatted', formattedCommand,
+    'Started ctx_own\n{"ok":true,"result":{"dispatchId":"ctx_other","preview":"healthy"}}');
+  const formattedWorkers = Object.keys(state(f.stateDir, formattedSid).workers);
+  ok('a surviving worker-show reply cannot be stolen as the formatted worker-start reply',
+    formattedWorkers.length === 1 && formattedWorkers[0].startsWith('pending-'));
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 
@@ -183,6 +201,16 @@ function state(stateDir, sid) {
   ok('tracked Kimi output writes an exhaustion marker',
     JSON.parse(fs.readFileSync(path.join(f.stateDir, 'coder-exhausted.json'), 'utf8')).kimi);
   fs.unlinkSync(path.join(f.stateDir, 'coder-exhausted.json'));
+  postBash(f.env, sid, 'toolu_read_noise',
+    'orca orchestration worker-read --dispatch ctx_kimi_signal --json && cat docs/provider-error.log',
+    `{"ok":true,"result":{"preview":"healthy"}}\n${signal}`);
+  check('non-Orca prose chained after a healthy Kimi JSON reply cannot mark exhaustion',
+    fs.existsSync(path.join(f.stateDir, 'coder-exhausted.json')), false);
+  postBash(f.env, sid, 'toolu_read_json_noise',
+    'orca orchestration worker-read --dispatch ctx_kimi_signal && cat docs/provider-error.json',
+    `healthy plaintext worker output\n{"ok":true,"result":{"preview":"${signal}"}}`);
+  check('unrelated chained JSON cannot masquerade as the Kimi worker-read reply',
+    fs.existsSync(path.join(f.stateDir, 'coder-exhausted.json')), false);
   const codexStart = 'orca orchestration worker-start --agent codex --json';
   preBash(f.env, sid, 'toolu_codex_signal', codexStart);
   postBash(f.env, sid, 'toolu_codex_signal', codexStart, '{"ok":true,"dispatchId":"ctx_codex_signal"}');
