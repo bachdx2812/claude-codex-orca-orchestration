@@ -173,6 +173,10 @@ the same parking path as the panel. Reset hints also accept month/day and an exp
 timezone, for example `resets Oct 3, 5pm (Asia/Saigon)`. Only live, supervised, non-released
 terminal handles from this session are eligible.
 
+If Kimi presents its long-idle session menu after the resume message, the scheduler verifies
+the menu cursor, moves it to `Compact and continue` when necessary, presses Enter once, and
+then verifies that compaction or the resumed turn started.
+
 The scheduler persists its attempt count and first-attempt time and stops after 768 attempts
 or eight days. It never retypes a resume after a successful terminal send: if no new turn can
 be confirmed—or a scheduler dies after persisting its pre-send marker—the heartbeat reports

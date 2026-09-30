@@ -78,6 +78,7 @@ function verifyStarted(handle, before) {
   for (let attempt = 0; attempt < 5; attempt++) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
     screen = terminalScreen(handle);
+    if (RESUME.hasKimiIdleSessionMenu(screen)) return { started: false, screen };
     if (RESUME.turnStarted(screen, before)) return { started: true, screen };
   }
   return { started: false, screen };

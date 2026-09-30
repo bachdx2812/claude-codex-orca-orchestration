@@ -898,6 +898,97 @@ check('a delivered Kimi permission interaction is marked delivered instead of bl
     verifyStarted: () => true, wait: () => {},
   }).delivered, true);
 
+const kimiIdleMenuDefault = [
+  'This session has been idle for 2h 2m and is ~200k tokens.',
+  '❯ Compact and continue',
+  '  Start a new session',
+  '  Continue as-is',
+  "  Don't ask me again",
+  '↑↓ navigate · Enter select',
+].join('\n');
+const kimiIdleMenuWithHistory = `• Working (4000s • esc to interrupt)\n${kimiIdleMenuDefault}`;
+check('visible Kimi idle menu overrides historical active-turn text in the viewport',
+  resume.turnStarted(kimiIdleMenuWithHistory, 'Ready'), false);
+const kimiIdleDefaultSends = [];
+let kimiIdleDefaultVerify = 0;
+check('Kimi idle-session prompt selects the captured default Compact and continue option',
+  resume.attemptResume({
+    ...resumeJob, handle: 'term_kimi_idle_default', agent: 'kimi', threshold: 95,
+  }, {
+    now: resetNow + 1000 + resume.RESET_GRACE_MS,
+    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }), readScreen: () => 'Ready',
+    send: (...args) => { kimiIdleDefaultSends.push(args); return true; },
+    verifyStarted: () => ++kimiIdleDefaultVerify === 1
+      ? { started: false, screen: kimiIdleMenuDefault }
+      : { started: true, screen: 'Compacting conversation context…' },
+  }).resumed, true);
+check('default idle-session cursor needs only one Enter after the resume message',
+  kimiIdleDefaultSends.map((entry) => [entry[1], entry[2]]), [
+    [resume.WORKER_RESUME_MESSAGE, true], ['', true],
+  ]);
+const kimiHistoricalSends = [];
+let kimiHistoricalVerify = 0;
+check('historical Working text cannot bypass idle-menu selection', resume.attemptResume({
+  ...resumeJob, handle: 'term_kimi_idle_history', agent: 'kimi', threshold: 95,
+}, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }), readScreen: () => 'Ready',
+  send: (...args) => { kimiHistoricalSends.push(args); return true; },
+  verifyStarted: () => ++kimiHistoricalVerify === 1
+    ? { started: resume.turnStarted(kimiIdleMenuWithHistory, 'Ready'), screen: kimiIdleMenuWithHistory }
+    : { started: true, screen: 'Compacting conversation context…' },
+}).resumed, true);
+check('historical Working text still leads to one Compact selection Enter',
+  kimiHistoricalSends.map((entry) => [entry[1], entry[2]]), [
+    [resume.WORKER_RESUME_MESSAGE, true], ['', true],
+  ]);
+const kimiIdleMenuMoved = kimiIdleMenuDefault
+  .replace('❯ Compact and continue', '  Compact and continue')
+  .replace('  Continue as-is', '❯ Continue as-is');
+const kimiIdleMenuTarget = kimiIdleMenuDefault;
+const kimiIdleMovedSends = [];
+let kimiIdleMovedVerify = 0;
+check('Kimi idle-session prompt moves to Compact and continue and verifies the cursor before Enter',
+  resume.attemptResume({
+    ...resumeJob, handle: 'term_kimi_idle_moved', agent: 'kimi', threshold: 95,
+  }, {
+    now: resetNow + 1000 + resume.RESET_GRACE_MS,
+    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
+    readScreen: () => kimiIdleMenuTarget, wait: () => {},
+    send: (...args) => { kimiIdleMovedSends.push(args); return true; },
+    verifyStarted: () => ++kimiIdleMovedVerify === 1
+      ? { started: false, screen: kimiIdleMenuMoved }
+      : { started: true, screen: '• Working (1s • esc to interrupt)' },
+  }).resumed, true);
+check('moved idle-session cursor sends two Downs without Enter, then one Enter',
+  kimiIdleMovedSends.map((entry) => [entry[1], entry[2]]), [
+    [resume.WORKER_RESUME_MESSAGE, true], ['\u001b[B\u001b[B', false], ['', true],
+  ]);
+const kimiIdleUnverifiedSends = [];
+check('Kimi idle-session prompt never presses Enter when the moved cursor cannot be verified',
+  resume.attemptResume({
+    ...resumeJob, handle: 'term_kimi_idle_unverified', agent: 'kimi', threshold: 95,
+  }, {
+    now: resetNow + 1000 + resume.RESET_GRACE_MS,
+    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
+    readScreen: () => kimiIdleMenuMoved, wait: () => {},
+    send: (...args) => { kimiIdleUnverifiedSends.push(args); return true; },
+    verifyStarted: () => ({ started: false, screen: kimiIdleMenuMoved }),
+  }).reason, 'idle-menu-unverified');
+check('unverified idle-session cursor receives no selection Enter',
+  kimiIdleUnverifiedSends.some((entry) => entry[1] === '' && entry[2] === true), false);
+check('retained historical activity without new evidence cannot verify post-menu resumption',
+  resume.turnStarted('• Working (4001s • esc to interrupt)',
+    '• Working (4000s • esc to interrupt)\n' + kimiIdleMenuDefault), false);
+check('spinner and timer repaint on historical activity is not new turn evidence',
+  resume.turnStarted('⠋ Working (4001s • esc to interrupt)',
+    '• Working (4000s • esc to interrupt)'), false);
+check('captured Kimi spinner and inline Tip repaint is not new turn evidence',
+  resume.turnStarted('⠏ Thinking… · Tip: /web searches the internet',
+    '⠦ Thinking… · Tip: /clear starts fresh'), false);
+check('normal output merely mentioning idle compaction words is not treated as the menu',
+  resume.hasKimiIdleSessionMenu('The session has been idle for a while; compact later.'), false);
+
 const panelSends = [];
 check('panel self-resume uses its orchestration-specific message', resume.attemptResume({
   handle: 'term_panel', identity: 'term_panel', agent: 'claude', panel: true,

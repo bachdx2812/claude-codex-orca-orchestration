@@ -365,9 +365,44 @@ function kimiPermissionMoves(screen) {
   return (target - selected + options.length) % options.length;
 }
 
+function hasKimiIdleSessionMenu(screen) {
+  const text = String(screen || '');
+  return /\bhas been idle for\b/i.test(text) &&
+    /\bCompact and continue\b/i.test(text) &&
+    /(?:↑↓|up\/down).*navigate\s*[·•-]\s*Enter select/i.test(text);
+}
+
+function kimiIdleCompactMoves(screen) {
+  if (!hasKimiIdleSessionMenu(screen)) return null;
+  const options = String(screen || '').split(/\r?\n/)
+    .map((line) => ({ selected: /[❯›>]/u.test(line), text: line.replace(/^[\s❯›>\d.)-]+/u, '').trim() }))
+    .filter((line) => /^(?:Compact and continue|Start a new session|Continue as-is|Don't ask me again)$/i.test(line.text));
+  const selected = options.findIndex((line) => line.selected);
+  const target = options.findIndex((line) => /^Compact and continue$/i.test(line.text));
+  if (selected < 0 || target < 0) return null;
+  return (target - selected + options.length) % options.length;
+}
+
+function activeTurnEvidence(text) {
+  return String(text || '').split(/\r?\n/)
+    .filter((line) => /(?:Thinking(?:\.{3}|…)|Working\s*\(|Coder Agent Running|esc\s+to\s+interrupt|background\s+(?:terminal|task).*running|Compact(?:ing|ion)\b)/i.test(line))
+    .map((line) => line.trim()
+      .replace(/^[^A-Za-z0-9]+/u, '')
+      .replace(/\s*[·•]\s*Tip:.*$/i, '')
+      .replace(/\b\d+\s*(?:d|h|m|s)\b/gi, '#time')
+      .replace(/\b\d+(?:\.\d+)?\s*[kKmM]?\s*tokens?\b/g, '#tokens'));
+}
+
 function turnStarted(after, before) {
-  return String(after || '') !== String(before || '') &&
-    /(?:Thinking(?:\.{3}|…)|Working\s*\(|Coder Agent Running|esc\s+to\s+interrupt|background\s+(?:terminal|task).*running)/i.test(String(after || ''));
+  if (String(after || '') === String(before || '') || hasKimiIdleSessionMenu(after)) return false;
+  const previous = new Map();
+  for (const line of activeTurnEvidence(before)) previous.set(line, (previous.get(line) || 0) + 1);
+  for (const line of activeTurnEvidence(after)) {
+    const count = previous.get(line) || 0;
+    if (count === 0) return true;
+    previous.set(line, count - 1);
+  }
+  return false;
 }
 
 function pollScreen(deps, handle, predicate, attempts = 5) {
@@ -440,9 +475,33 @@ function attemptResume(job, deps = {}) {
     ? deps.verifyStarted(job.handle, before) : true;
   const verified = typeof verification === 'object' ? verification.started : verification;
   if (verified) return { resumed: true, reason: 'started', message, delivered };
-  const after = typeof verification === 'object' && typeof verification.screen === 'string'
+  let after = typeof verification === 'object' && typeof verification.screen === 'string'
     ? verification.screen
     : (typeof deps.readScreen === 'function' ? deps.readScreen(job.handle) : '');
+  if (job.agent === 'kimi' && hasKimiIdleSessionMenu(after) && typeof deps.send === 'function') {
+    const moves = kimiIdleCompactMoves(after);
+    if (moves === null) return { resumed: false, reason: 'idle-menu-unverified', delivered };
+    if (moves > 0) {
+      if (deps.send(job.handle, '\u001b[B'.repeat(moves), false) === false) {
+        return { resumed: false, reason: 'idle-menu-selection-failed', delivered };
+      }
+      delivered = true;
+      after = pollScreen(deps, job.handle, (screen) => kimiIdleCompactMoves(screen) === 0);
+      if (kimiIdleCompactMoves(after) !== 0) {
+        return { resumed: false, reason: 'idle-menu-unverified', delivered };
+      }
+    }
+    if (deps.send(job.handle, '', true) === false) {
+      return { resumed: false, reason: 'idle-menu-selection-failed', delivered };
+    }
+    delivered = true;
+    const compactVerification = typeof deps.verifyStarted === 'function'
+      ? deps.verifyStarted(job.handle, after) : false;
+    const compactStarted = typeof compactVerification === 'object'
+      ? compactVerification.started : compactVerification;
+    if (compactStarted) return { resumed: true, reason: 'started', message, delivered };
+    return { resumed: false, reason: 'resumed-unverified', message, delivered };
+  }
   const limit = job.agent === 'claude' ? claudeLimitInfo(after, now)
     : { limited: false, occurrences: 0 };
   const newLimitResponse = limit.limited &&
@@ -532,6 +591,6 @@ module.exports = {
   clearJob, clearSettledJob, withOwnedJob, isPendingJob, isSettledJob,
   shouldPark, availableHandoverTarget, nextAttemptAt, beginAttempt,
   recordDelivery, recoverDeliveredJob, applyAttemptResult, park,
-  kimiNeedsNeverAsk, kimiPermissionMoves,
+  kimiNeedsNeverAsk, kimiPermissionMoves, hasKimiIdleSessionMenu, kimiIdleCompactMoves,
   turnStarted, attemptResume, resumeJobEvents, sweepJobs, clearMissingPendingJobs,
 };

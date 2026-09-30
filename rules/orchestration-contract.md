@@ -462,6 +462,11 @@ check git status/log (and HANDOVER.md if present) first; do not redo finished st
 verifies a new terminal turn. A Kimi screen in another permission mode is returned to Never
 Ask first.
 
+When Kimi places a long-idle session menu in front of the delivered resume message, the
+scheduler must recognize the full `has been idle for` / `Compact and continue` / `Enter
+select` shape, verify the current cursor, move to `Compact and continue` if necessary, press
+Enter once, and verify that compaction or the resumed turn starts.
+
 Attempts and the first-attempt time are persisted. A scheduler expires after 768 attempts or
 eight days. A successfully delivered resume is never typed again when turn verification is
 inconclusive. A send-attempt marker is persisted before terminal input, so a scheduler crash
