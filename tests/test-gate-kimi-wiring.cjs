@@ -45,7 +45,7 @@ function fixture(name, options = {}) {
     },
     codexHandoffUsedPercent: 95, kimiHandoffUsedPercent: 95,
     codexQuotaCacheSeconds: 60, kimiQuotaCacheSeconds: 60, coderAvailabilityCacheSeconds: 600,
-    maxParallelCodexWorkers: 0, maxParallelKimiWorkers: 0, maxParallelAgents: 0,
+    maxParallelCodexWorkers: options.codexCap ?? 0, maxParallelKimiWorkers: options.kimiCap ?? 0, maxParallelAgents: 0,
     execFallbackWhenCodexUnavailable: 'sonnet', disabledGates: [],
   }));
   const env = {
@@ -102,6 +102,29 @@ function state(stateDir, sid) {
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 
+{
+  const f = fixture('per-session-cap', { codexUsed: 5, kimiUsed: 10, codexCap: 3, kimiCap: 3 });
+  // Other sessions alone fill BOTH machine-wide counts past the per-session caps.
+  for (const [sid, agent, n] of [['busy-codex', 'codex', 4], ['busy-kimi', 'kimi', 4]]) {
+    const workers = {};
+    for (let i = 0; i < n; i++) workers[`ctx_${sid}_${i}`] = { status: 'live', agent, group: `ctx_${sid}_${i}` };
+    fs.writeFileSync(path.join(f.stateDir, `${sid}.json`), JSON.stringify({ session_id: sid, workers }));
+  }
+  const out = prompt(f.env, 'fresh-session').stdout;
+  ok('machine-wide at cap but this session free still routes to an external coder',
+    /next -> (Codex|Kimi)/.test(out) && !/all at cap, wait/.test(out));
+  // The same session at its OWN cap for every coder does wait.
+  const ownWorkers = {};
+  for (let i = 0; i < 3; i++) {
+    ownWorkers[`ctx_own_codex_${i}`] = { status: 'live', agent: 'codex', group: `ctx_own_codex_${i}` };
+    ownWorkers[`ctx_own_kimi_${i}`] = { status: 'live', agent: 'kimi', group: `ctx_own_kimi_${i}` };
+  }
+  fs.writeFileSync(path.join(f.stateDir, 'full-session.json'),
+    JSON.stringify({ session_id: 'full-session', workers: ownWorkers }));
+  ok('this session at its own cap for every coder waits',
+    /all at cap, wait/.test(prompt(f.env, 'full-session').stdout));
+  fs.rmSync(f.root, { recursive: true, force: true });
+}
 {
   const f = fixture('none', { codex: false, kimi: false });
   const out = prompt(f.env, 'none-session').stdout;

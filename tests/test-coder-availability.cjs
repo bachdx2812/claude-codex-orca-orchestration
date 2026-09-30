@@ -350,6 +350,17 @@ async function run() {
     const bothAtCap = pick({ live: { codex: 3, kimi: 3 } });
     check('both at cap stay external and rank by headroom', bothAtCap.route, 'external');
     ok('both at cap tells the operator to wait', /all at cap, wait/.test(bothAtCap.why));
+    const machineAtCapSessionFree = pick({ live: { codex: 4, kimi: 4 }, sessionLive: { codex: 0, kimi: 0 } });
+    check('machine-wide at cap but session free still picks a coder', machineAtCapSessionFree.route, 'external');
+    ok('machine-wide at cap but session free never says wait', !/all at cap, wait/.test(machineAtCapSessionFree.why));
+    const sessionAtCapMachineOver = pick({ live: { codex: 5, kimi: 5 }, sessionLive: { codex: 3, kimi: 3 } });
+    ok('this session at its own cap for every coder says wait', /all at cap, wait/.test(sessionAtCapMachineOver.why));
+    check('free per-session slot outranks fewer machine-wide live', pick({
+      live: { codex: 3, kimi: 9 }, sessionLive: { codex: 3, kimi: 1 },
+    }).pick, 'kimi');
+    check('machine-wide live still orders among sessions with free slots', pick({
+      live: { codex: 3, kimi: 0 }, sessionLive: { codex: 1, kimi: 0 },
+    }).pick, 'kimi');
     check('unknown quota ranks by fewer live workers', pick({ quotas: { codex: null, kimi: null }, live: { codex: 2, kimi: 1 } }).pick, 'kimi');
     check('unknown quota tie prefers Codex', pick({ quotas: { codex: null, kimi: null } }).pick, 'codex');
     check('fallback false no longer resurrects an unusable Codex', pick({

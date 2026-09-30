@@ -18,6 +18,12 @@
  * headroom below each coder's OWN resolved threshold (only when both quotas are known)
  * -> alternate away from `options.lastCoder` (validated; ignored when not eligible)
  * -> Codex first.
+ *
+ * `options.live` is MACHINE-wide live counts (the load-balancing ordering key);
+ * `options.sessionLive` is THIS session's live counts, the basis of the free-slot key:
+ * the caps in `options.caps` are per-session (maxParallel*Workers), so a slot is free
+ * when this session's own count is below its own cap, regardless of what other
+ * sessions are running. `sessionLive` defaults to `live` when omitted.
  */
 
 const CODERS = ['codex', 'kimi'];
@@ -49,7 +55,7 @@ function formatCoderState(coderName, coder) {
 }
 
 function liveText(coder) {
-  return coder.cap === 0 ? `${coder.live} live` : `${coder.live}/${coder.cap} live`;
+  return coder.cap === 0 ? `${coder.sessionLive} live` : `${coder.sessionLive}/${coder.cap} live`;
 }
 
 function pickCoderPool(options = {}) {
@@ -58,6 +64,7 @@ function pickCoderPool(options = {}) {
   const thresholds = options.thresholds || {};
   const exhaustion = options.exhaustion || {};
   const live = options.live || {};
+  const sessionLive = options.sessionLive || live;
   const caps = options.caps || {};
   const lastCoder = CODERS.includes(options.lastCoder) ? options.lastCoder : null;
   const coders = {};
@@ -72,6 +79,7 @@ function pickCoderPool(options = {}) {
       ? legacyCodexUsable(available, options.fallbackEnabled)
       : available.usable === true;
     const liveCount = Number.isInteger(live[coder]) && live[coder] >= 0 ? live[coder] : 0;
+    const sessionLiveCount = Number.isInteger(sessionLive[coder]) && sessionLive[coder] >= 0 ? sessionLive[coder] : 0;
     const cap = Number.isInteger(caps[coder]) && caps[coder] >= 0 ? caps[coder] : 0;
     const leftPct = knownQuota(quota) ? Math.max(0, 100 - quota.usedPercent) : null;
     let state = 'eligible';
@@ -86,11 +94,11 @@ function pickCoderPool(options = {}) {
       state = 'exhausted';
       reason = exhaustion[coder].reason || 'quota exhaustion marker active';
     }
-    coders[coder] = { state, leftPct, headroom: headroomFor(coder), live: liveCount, cap, reason };
+    coders[coder] = { state, leftPct, headroom: headroomFor(coder), live: liveCount, sessionLive: sessionLiveCount, cap, reason };
   }
 
   const order = CODERS.filter((coder) => coders[coder].state === 'eligible');
-  const freeSlot = (coder) => coders[coder].cap === 0 || coders[coder].live < coders[coder].cap;
+  const freeSlot = (coder) => coders[coder].cap === 0 || coders[coder].sessionLive < coders[coder].cap;
   order.sort((a, b) => {
     const aFree = freeSlot(a); const bFree = freeSlot(b);
     if (aFree !== bFree) return aFree ? -1 : 1;

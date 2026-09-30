@@ -420,6 +420,13 @@ function machineWideCoderLive(s, now = Date.now()) {
   return result;
 }
 
+function sessionCoderLive(s) {
+  return {
+    codex: WG.countLiveGroups(s.workers, 'codex'),
+    kimi: WG.countLiveGroups(s.workers, 'kimi'),
+  };
+}
+
 function coderPoolRoute(cfg, s, now = Date.now()) {
   const availabilityTtlMs = coderAvailabilityCacheSeconds(cfg) * 1000;
   let authState = EXEC_QUOTA.codexAuthState(DIR, now, availabilityTtlMs);
@@ -457,6 +464,7 @@ function coderPoolRoute(cfg, s, now = Date.now()) {
     thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg) },
     exhaustion: CODER_AVAILABILITY.readCoderExhaustion(DIR, now),
     live: machineWideCoderLive(s, now),
+    sessionLive: sessionCoderLive(s),
     caps: { codex: maxParallelCodexWorkers(cfg), kimi: maxParallelKimiWorkers(cfg) },
     lastCoder: readLastCoder(),
     fallbackEnabled: cfg.execFallbackWhenCodexUnavailable === 'sonnet' ? true : null,
