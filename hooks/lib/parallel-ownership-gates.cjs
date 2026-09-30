@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * parallel-ownership-gates.cjs — Gate A (`max-parallel-codex-workers`) and Gate B
+ * parallel-ownership-gates.cjs — the per-coder parallel caps (`max-parallel-codex-workers`,
+ * `max-parallel-kimi-workers`) and Gate B
  * (`code-brief-needs-owns` / `ownership-overlap`) for every real `orchestration
  * worker-start` / `orchestration task-create` invocation in one Bash command line.
  *
@@ -51,29 +52,36 @@ function resolveWorkerStartAgent(inv, s, flagValue) {
   return 'codex';
 }
 
-/** Distinct live Codex group ids, for naming them in the parallel-limit refusal. A
+/** Distinct live group ids for `agent`, for naming them in the parallel-limit refusal. A
  * cap-exempt group (done per Orca, still holding its terminal) is named with a suffix so
  * the operator knows RELEASING it — not waiting on it — is what frees capacity; it is never
  * counted toward the cap number itself (see countLiveGroups). Every still-unresolved
  * reservation (a dispatch admitted at PreToolUse whose PostToolUse hasn't yet turned it into
  * a real registered worker or dropped it) is named individually, not folded into one generic
  * placeholder, so the operator can see exactly which reservation is holding capacity and when
- * it will self-expire if nothing ever resolves it. */
-function liveCodexGroupIds(s) {
+ * it will self-expire if nothing ever resolves it. A legacy reservation that predates the
+ * generalised `agent`/`newSlot` fields still counts for 'codex' via its `codexSlot`. */
+function liveGroupIds(s, agent) {
   const groups = new Map(); // group -> capExempt
   for (const [key, w] of Object.entries(s.workers)) {
-    if (w.status === 'live' && w.agent === 'codex') {
+    if (w.status === 'live' && w.agent === agent) {
       const g = WG.groupOf(w, key);
       if (!groups.has(g) || w.capExempt) groups.set(g, !!w.capExempt);
     }
   }
   const names = [...groups.entries()].map(([g, exempt]) => (exempt ? `${g} (done, release it)` : g));
   for (const [id, r] of Object.entries(s.reservations || {})) {
-    if (!r || !r.codexSlot || OC.reservationExpired(r)) continue;
+    if (!r || OC.reservationExpired(r)) continue;
+    const holdsSlot = (r.newSlot && r.agent === agent) || (agent === 'codex' && r.codexSlot);
+    if (!holdsSlot) continue;
     const remainingMinutes = Math.max(0, Math.round((OC.RESERVATION_TTL_MS - (Date.now() - r.ts)) / 60000));
     names.push(`pending reservation ${id} (expires in ${remainingMinutes}m)`);
   }
   return names;
+}
+
+function liveCodexGroupIds(s) {
+  return liveGroupIds(s, 'codex');
 }
 
 /**
@@ -186,6 +194,8 @@ function reconcileCodexGroupsWithOrca(s, orcaBin) {
  *            maxParallelCodexWorkers, ownershipClaimTtlMinutes, capLockOpts, save }` —
  * all lifted
  * straight from orchestrator-gate.cjs, which still owns `d()` (the actual refusal/exit).
+ * `maxParallelKimiWorkers` may also be passed; when absent it falls back to config.cjs's
+ * own accessor so the Kimi cap still works before the gate wires the dep through.
  */
 /**
  * This invocation's OWN spec text, scoped as tightly as the shell scanner allows — never
@@ -248,11 +258,15 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   const baseId = toolUseId || `sid-${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const commandHash = createHash('sha256').update(cmd).digest('hex');
   const cap = maxParallelCodexWorkers(cfg);
+  // Lane B may not pass this dep yet (config.cjs is the single source of truth for it).
+  const maxKimiWorkers = deps.maxParallelKimiWorkers || require('./config.cjs').maxParallelKimiWorkers;
+  const kimiCap = maxKimiWorkers(cfg);
   const ttl = ownershipClaimTtlMinutes(cfg);
   const agentCapActive = !gateDisabled(cfg, 'max-parallel-agents') &&
     Number.isFinite(deps.agentParallelLimit(cfg));
   const codexCapActive = cap > 0 && !gateDisabled(cfg, 'max-parallel-codex-workers');
-  const hardCapActive = agentCapActive || codexCapActive;
+  const kimiCapActive = kimiCap > 0 && !gateDisabled(cfg, 'max-parallel-kimi-workers');
+  const hardCapActive = agentCapActive || codexCapActive || kimiCapActive;
   let violation = null;
   // True once a mid-loop Orca reconcile (`applyOrcaReconciliation`) has actually changed
   // something real — a worker Orca confirmed released, or marked cap-exempt. That change
@@ -304,7 +318,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     // timeout a second time against the same live holder.
     if (locked === false && hardCapActive) {
       violation = {
-        gate: agentCapActive ? 'max-parallel-agents' : 'max-parallel-codex-workers',
+        gate: agentCapActive ? 'max-parallel-agents'
+          : (codexCapActive ? 'max-parallel-codex-workers' : 'max-parallel-kimi-workers'),
         reason: deps.lockContentionMessage,
       };
     }
@@ -413,19 +428,20 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
         }
       }
 
-      // --- parallel-Codex-worker cap: worker-start only, and only a genuinely new dispatch ---
+      // --- parallel-coder-worker caps: worker-start only, and only a genuinely new dispatch ---
       let codexSlot = false;
+      let kimiSlot = false;
       let agent = null;
       // `newSlot`: this worker-start invocation is neither a task-create (never launches a
       // terminal by itself) nor a replacement of an already-tracked live group
       // (`--terminal <h>` / `--retry-of <id>`) — i.e. it is really about to consume one more
       // unit of the MACHINE-wide max-parallel-agents budget, whatever agent it targets.
-      // `codexSlot` (the older, Codex-only field) is exactly this same condition narrowed to
-      // `agent === 'codex'`.
+      // `codexSlot`/`kimiSlot` are this same condition narrowed to the per-coder caps.
       const newSlot = !isTaskCreate && !replacesGroup;
       if (!isTaskCreate) {
         agent = resolveWorkerStartAgent(inv, s, flagValue);
         codexSlot = newSlot && agent === 'codex';
+        kimiSlot = newSlot && agent === 'kimi';
 
         // Machine-wide max-parallel-agents budget: checked for EVERY agent's worker-start,
         // on top of (never instead of) the Codex-only cap below. Uses the in-memory `s` for
@@ -500,10 +516,35 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             break;
           }
         }
+
+        // Kimi cap: the same reconcile-then-recount path as the Codex cap above — the Orca
+        // fetch happens outside the lock, its rows are applied to a fresh post-reacquire
+        // load() under the lock, and only the recount decides.
+        if (kimiSlot && kimiCap > 0 && !gateDisabled(cfg, 'max-parallel-kimi-workers')) {
+          let live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
+          if (live >= kimiCap) {
+            if (locked) { releaseLock(lockDir); locked = false; }
+            const rows = fetchOrcaWorkerRows(ORCA_BIN);
+            locked = acquireLock(lockDir, deps.capLockOpts);
+            if (locked === null) return;
+            s = load(sessionId);
+            Object.assign(s.reservations, localReservations);
+            if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;
+            live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
+          }
+          if (live >= kimiCap) {
+            violation = { gate: 'max-parallel-kimi-workers', reason:
+              `${live}/${kimiCap} Kimi workers already live: ${liveGroupIds(s, 'kimi').join(', ') || '(reserved)'}.\n` +
+              'Wait for one to finish and release it (worker-read, then\n' +
+              'worker-release --dispatch <id>), or reuse a finished worker\'s terminal with --terminal <handle>. Raise the\n' +
+              'limit only with maxParallelKimiWorkers / ORCH_MAX_PARALLEL_KIMI_WORKERS.' };
+            break;
+          }
+        }
       }
 
       const reservation = {
-        ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, newSlot,
+        ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, kimiSlot, newSlot,
         commandHash,
       };
       localReservations[`${baseId}#${idx}`] = reservation;
@@ -532,6 +573,6 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 }
 
 module.exports = {
-  OWNS_BRIEF_HELP, resolveWorkerStartAgent, liveCodexGroupIds, reconcileCodexGroupsWithOrca,
+  OWNS_BRIEF_HELP, resolveWorkerStartAgent, liveGroupIds, liveCodexGroupIds, reconcileCodexGroupsWithOrca,
   fetchOrcaWorkerRows, applyOrcaReconciliation, handleOrcaDispatchGates, resolveSpecText,
 };
