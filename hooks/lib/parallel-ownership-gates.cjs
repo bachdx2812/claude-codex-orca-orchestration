@@ -65,6 +65,7 @@ function liveGroupIds(s, agent) {
   const groups = new Map(); // group -> capExempt
   for (const [key, w] of Object.entries(s.workers)) {
     if (w.status === 'live' && w.agent === agent) {
+      if (WG.pendingPlaceholderExpired(key, w)) continue;
       const g = WG.groupOf(w, key);
       if (!groups.has(g) || w.capExempt) groups.set(g, !!w.capExempt);
     }
@@ -155,12 +156,15 @@ function applyOrcaReconciliation(s, rows) {
     if (w.status !== 'live') continue;
     // A "pending-<ts>" key is a placeholder registered when a worker-start's own reply
     // carried no id at all (see orchestrator-gate.cjs) — Orca was NEVER given this key as an
-    // id, so it can never appear in `rows` under any status. Its only correct resolution is
-    // a later worker-list/worker-read poll adopting a real id for it; the 10-minute
-    // "Orca never mentioned it" rule below must not apply to it; a still-genuinely-running
-    // worker would otherwise be settled out from under itself just because this particular
-    // reconcile pass, by construction, could never have found it.
-    if (key.startsWith('pending-')) continue;
+    // id, so it can never appear in `rows` under any status. Its correct resolution is
+    // adoption of a real id (see reconcilePendingPlaceholders); until then it is exempt
+    // from the "Orca never mentioned it" rule below — but ONLY up to its TTL: past 10
+    // minutes it must settle here too, so a placeholder can never hold an Owns: claim or a
+    // cap slot forever just because no adoption ever matched it.
+    if (key.startsWith('pending-')) {
+      if (WG.pendingPlaceholderExpired(key, w)) { w.status = 'settled'; changed = true; }
+      continue;
+    }
     if (releasedIds.has(key)) { w.status = 'settled'; changed = true; continue; }
     if (doneButHeldIds.has(key)) { if (!w.capExempt) { w.capExempt = true; changed = true; } continue; }
     if (!liveIds.has(key) && (w.started || 0) < tenMinAgo) { w.status = 'settled'; changed = true; }
@@ -168,6 +172,83 @@ function applyOrcaReconciliation(s, rows) {
   return changed;
 }
 
+/**
+ * Reconcile live "pending-*" placeholders against already-fetched Orca worker rows.
+ *
+ * A placeholder is a worker-start the gate knows ran (ok reply or successful Bash) but whose
+ * real dispatch id was never parsed (e.g. the caller piped the reply through a formatter).
+ * For each placeholder, the candidate rows are those not already tracked under any of their
+ * own ids; a candidate must be COMPATIBLE on every field both sides actually carry: agent
+ * (`row.agent` / `row.projection.agent` vs the placeholder's resolved agent), worktree
+ * (`row.worktreeId` vs the placeholder's recorded `worktreeIds`), and start time (any of
+ * `startedAt`/`createdAt`/`started`, epoch ms or ISO, within ±5 minutes of the placeholder).
+ * A placeholder with exactly one compatible, still-unclaimed candidate adopts that row's real
+ * ids (dispatchId/taskId/agentTerminalHandle) and is deleted; a placeholder no candidate
+ * matches settles once it is older than its TTL, freeing its Owns: claim and cap slot.
+ *
+ * Mutates `s.workers` in place; must be called with the state lock held against a freshly
+ * reloaded state, exactly like `applyOrcaReconciliation`. Returns
+ * `{ changed, adopted, settled }` (adopted/settled are the affected placeholder keys) so the
+ * caller can persist and print a one-line notice per outcome.
+ */
+function reconcilePendingPlaceholders(s, rows, now = Date.now()) {
+  const result = { changed: false, adopted: [], settled: [] };
+  const pendings = Object.entries(s.workers || {})
+    .filter(([k, w]) => k.startsWith('pending-') && w.status === 'live');
+  if (!pendings.length) return result;
+
+  const trackedIds = new Set(Object.keys(s.workers));
+  const rowStartMs = (row) => {
+    const raw = row.startedAt ?? row.createdAt ?? row.started;
+    if (raw == null) return null;
+    const ms = typeof raw === 'number' ? raw : Date.parse(raw);
+    return Number.isFinite(ms) ? ms : null;
+  };
+  const compatible = (row, ph) => {
+    const agent = row.agent || (row.projection && row.projection.agent) || null;
+    if (agent && ph.agent && String(agent).toLowerCase() !== String(ph.agent).toLowerCase()) return false;
+    if (row.worktreeId && Array.isArray(ph.worktreeIds) && ph.worktreeIds.length &&
+        !ph.worktreeIds.includes(row.worktreeId)) return false;
+    const start = rowStartMs(row);
+    if (start !== null && Number.isFinite(ph.started) && Math.abs(start - ph.started) > 5 * 60 * 1000) return false;
+    return true;
+  };
+  const rowIds = (row) => [row.dispatchId, row.taskId, row.agentTerminalHandle]
+    .filter((id) => typeof id === 'string' && /^(?:ctx|task|term)_[A-Za-z0-9_-]+$/.test(id));
+
+  // Candidates: rows with at least one usable id, none of which is already tracked.
+  const candidates = (rows || []).filter((row) => {
+    const ids = rowIds(row);
+    return ids.length > 0 && ids.every((id) => !trackedIds.has(id));
+  });
+  const usedRows = new Set();
+
+  for (const [pendingKey, ph] of pendings) {
+    const matches = candidates.filter((row) => !usedRows.has(row) && compatible(row, ph));
+    if (matches.length === 1) {
+      const row = matches[0];
+      usedRows.add(row);
+      const ids = rowIds(row);
+      const group = ids.find((id) => /^ctx_/.test(id)) || ids[0];
+      for (const id of ids) {
+        s.workers[id] = {
+          ...ph, role: `${ph.agent || 'worker'}-exec`,
+          started: rowStartMs(row) ?? ph.started,
+          status: 'live', last_seen: now, unverified: false, group,
+          kind: WG.kindOf(id),
+        };
+      }
+      delete s.workers[pendingKey];
+      result.changed = true;
+      result.adopted.push(`${pendingKey} -> ${group}`);
+    } else if (WG.pendingPlaceholderExpired(pendingKey, ph, now)) {
+      ph.status = 'settled';
+      result.changed = true;
+      result.settled.push(pendingKey);
+    }
+  }
+  return result;
+}
 /**
  * Convenience wrapper composing fetch+apply against the SAME state object, for callers (and
  * existing tests) that don't need the unlocked-fetch/locked-apply split `handleOrcaDispatchGates`
@@ -586,5 +667,5 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
 module.exports = {
   OWNS_BRIEF_HELP, resolveWorkerStartAgent, liveGroupIds, liveCodexGroupIds, reconcileCodexGroupsWithOrca,
-  fetchOrcaWorkerRows, applyOrcaReconciliation, handleOrcaDispatchGates, resolveSpecText,
+  fetchOrcaWorkerRows, applyOrcaReconciliation, reconcilePendingPlaceholders, handleOrcaDispatchGates, resolveSpecText,
 };

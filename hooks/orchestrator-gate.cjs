@@ -761,6 +761,47 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
   });
 }
 
+/**
+ * Reconcile live "pending-*" placeholders (a worker-start whose reply carried no parseable
+ * id) at most once per minute, on any gate event, so a placeholder cannot hold an Owns:
+ * claim and a cap slot until a lucky manual poll. The Orca fetch runs OUTSIDE the lock (up
+ * to 5s); only the apply mutates state, against a freshly reloaded copy under the lock —
+ * the same split the cap reconciles use. The attempt is stamped even when Orca cannot
+ * answer, so an unreachable Orca never makes every hook event pay for a 5s timeout; the
+ * placeholder TTL (worker-groups.cjs) remains the backstop in that case.
+ */
+const PENDING_RECONCILE_INTERVAL_MS = 60 * 1000;
+function maybeReconcilePendingPlaceholders(sessionId) {
+  const snapshot = load(sessionId);
+  const hasPending = Object.entries(snapshot.workers || {})
+    .some(([k, w]) => k.startsWith('pending-') && w.status === 'live');
+  if (!hasPending) return;
+  const now = Date.now();
+  if (now - (snapshot.last_pending_reconcile || 0) < PENDING_RECONCILE_INTERVAL_MS) return;
+  const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+  const lockDir = path.join(DIR, '.lock');
+  const locked = acquireLock(lockDir, {});
+  if (!locked) return;
+  try {
+    const fresh = load(sessionId);
+    fresh.last_pending_reconcile = now;
+    if (rows !== null) {
+      const res = PARALLEL_OWNERSHIP.reconcilePendingPlaceholders(fresh, rows, now);
+      for (const line of res.adopted) {
+        process.stdout.write(`orchestrator-gate: resolved placeholder ${line} against orca worker-list.\n`);
+      }
+      for (const key of res.settled) {
+        process.stdout.write(
+          `orchestrator-gate: placeholder ${key} never matched a real dispatch within ` +
+          `${Math.round(WG.PENDING_PLACEHOLDER_TTL_MS / 60000)}m; settled, releasing its Owns: claim and cap slot.\n`);
+      }
+    }
+    save(fresh);
+  } finally {
+    releaseLock(lockDir);
+  }
+}
+
 /** "Reply to the operator in <language>." — omitted entirely when replyLanguage is null. */
 function languageSentence(cfg, forBanner) {
   if (!cfg.replyLanguage) return forBanner ? '' : '';
@@ -868,6 +909,7 @@ function isNonOperatorTurn(prompt) {
 const operatorFlag = (prompt, flag) => new RegExp(`(^|\\s)${flag}(?=\\s|$)`, 'i').test(prompt);
 
 function onUserPromptSubmit(p, s, cfg) {
+  maybeReconcilePendingPlaceholders(p.session_id);
   // CRITICAL: reload fresh under the lock, same reasoning as onPostToolUse — this handler
   // both reads and mutates (bypass, code-model override, --release-claims, task-notification
   // release) and must never operate on a stale pre-lock snapshot.
@@ -1135,6 +1177,7 @@ function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
 function onPreToolUse(p, s, cfg) {
   if (s.bypass) return;
   if (!isMainPanel(p)) return; // subagents do the real work; never gate them (Orca workers: see deny())
+  maybeReconcilePendingPlaceholders(p.session_id);
   const tool = p.tool_name;
   const input = p.tool_input || {};
   const d = (gate, reason) => { if (!gateDisabled(cfg, gate)) deny(s, gate, reason); };
@@ -1497,7 +1540,29 @@ function readinessTimeoutAdvice(replyText) {
  *
  * Returns true when anything in `s` changed.
  */
+/**
+ * Parse fallback for a piped/redirected dispatch: when the invocation's own JSON reply is
+ * unparseable, a `"dispatchId": "ctx_..."` line is often still present in the raw output
+ * (e.g. `worker-start --json | grep dispatchId`). Accept it ONLY when this command holds a
+ * single dispatch invocation AND the whole output contains exactly one distinct dispatchId —
+ * anything else (a second invocation's segment, a chained worker-list's many ids) stays a
+ * pending placeholder, never a guessed registration. Optional single taskId / terminal
+ * handle are picked up the same way. Returns a Set of ids, possibly empty.
+ */
+function singleDispatchIdsFromRawOutput(out) {
+  const ids = new Set();
+  const dispatchIds = new Set([...String(out || '').matchAll(/"dispatchId"\s*:\s*"(ctx_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  if (dispatchIds.size !== 1) return ids;
+  ids.add([...dispatchIds][0]);
+  const taskIds = new Set([...String(out).matchAll(/"taskId"\s*:\s*"(task_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  if (taskIds.size === 1) ids.add([...taskIds][0]);
+  const handles = new Set([...String(out).matchAll(/"(?:agentTerminalHandle|terminalHandle|handle)"\s*:\s*"(term_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  if (handles.size === 1) ids.add([...handles][0]);
+  return ids;
+}
+
 function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
+
   const allInvs = orcaInvocations(cmd).filter((inv) => !hasFlag(inv.args, '--help'));
   const dispatchEntries = allInvs.map((inv, commandIndex) => ({ inv, commandIndex }))
     .filter(({ inv }) => DISPATCH_SUBS.has(inv.sub));
@@ -1578,6 +1643,15 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
     }
 
     const ids = reply ? WG.idsFromReply(reply) : new Set();
+    // Parse fallback only for a PIPED single dispatch whose reply left NO parseable JSON
+    // anywhere in the output: the pipe's downstream fragments (a grep/tail/formatter line)
+    // still derive from this invocation's own reply. A surviving dispatch-shaped JSON object
+    // could belong to a chained worker-show/list and must never be claimed; a captured
+    // (`$( )`/backtick) or redirected reply never reaches the tool's stdout at all.
+    if (!ids.size && assumeDispatched && dispatchInvs.length === 1 && rawReplies.length === 0 &&
+        inv.stdoutPiped && !inv.stdoutCaptured && !inv.stdoutRedirected) {
+      for (const id of singleDispatchIdsFromRawOutput(out)) ids.add(id);
+    }
     if (!ids.size) {
       if (!assumeDispatched) return; // unknown outcome on a failure event: keep the reservation.
       const pendingId = `pending-${Date.now()}-${idx}`;
@@ -1812,9 +1886,24 @@ function onPostToolUseLocked(p, s, cfg) {
       if (s.workers[target]) {
         if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
       } else {
-        process.stdout.write(
-          `orchestrator-gate: ${inv.sub} named "${target}", which this session is not tracking as a live worker; ` +
-          'nothing was settled. Check `orca orchestration worker-list`.\n');
+        // The id may belong to a worker this session only tracks as a "pending-*"
+        // placeholder (its start reply never yielded the real id). With exactly one live
+        // placeholder there is nothing to confuse it with — settle it so its Owns: claim
+        // and cap slot go away with the release the operator clearly intends. More than
+        // one live placeholder makes the target ambiguous: settle nothing.
+        const livePendings = Object.entries(s.workers)
+          .filter(([k, w]) => k.startsWith('pending-') && w.status === 'live');
+        if (livePendings.length === 1) {
+          livePendings[0][1].status = 'settled';
+          dirty = true;
+          process.stdout.write(
+            `orchestrator-gate: ${inv.sub} named untracked "${target}"; settled the one live placeholder ` +
+            `${livePendings[0][0]} it could only have referred to.\n`);
+        } else {
+          process.stdout.write(
+            `orchestrator-gate: ${inv.sub} named "${target}", which this session is not tracking as a live worker; ` +
+            'nothing was settled. Check `orca orchestration worker-list`.\n');
+        }
       }
     }
 
@@ -1967,6 +2056,11 @@ function onStop(p, s, cfg) {
       }
       for (const [id, a] of Object.entries(fresh.agents || {})) {
         if (a && a.background === false) { delete fresh.agents[id]; purgedAny = true; }
+      }
+      // A "pending-*" placeholder past its TTL no longer counts toward caps or ownership
+      // (worker-groups.cjs) and must not keep the panel from stopping either.
+      for (const [key, w] of Object.entries(fresh.workers || {})) {
+        if (w.status === 'live' && WG.pendingPlaceholderExpired(key, w)) { w.status = 'settled'; purgedAny = true; }
       }
       if (purgedAny) { save(fresh); s = fresh; }
     } finally {

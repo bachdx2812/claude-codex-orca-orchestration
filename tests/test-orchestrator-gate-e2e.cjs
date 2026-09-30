@@ -1799,10 +1799,11 @@ rmState(`${SID}-hard-off`);
   rmState(G3iSID);
 }
 
-// Round 2, item 6: a "pending-<ts>" placeholder (a worker-start reply that carried no id at
-// all — Orca was never given this key as an id) must survive the at-cap reconcile's "not
-// mentioned by Orca and older than 10 minutes" rule. Only a later worker-list/worker-read
-// poll may resolve it; this blanket timeout must never apply to it.
+// Round 2, item 6 (revised by the pending-placeholder-leak fix): a "pending-<ts>" placeholder
+// older than its 10-minute TTL must NOT hold a cap slot or survive a reconcile — it is
+// settled, freeing the slot, exactly so a leaked placeholder cannot block later dispatches
+// for hours. A YOUNG placeholder (under the TTL) still counts: Orca may simply not have
+// listed a genuinely just-started worker yet.
 {
   const CAP6b = quotaEnv('round2-item6-pending', 10, 30, { maxParallelCodexWorkers: 1 });
   const G6bSID = `${SID}-round2-item6`;
@@ -1817,13 +1818,32 @@ rmState(`${SID}-hard-off`);
   }));
   const r6b = invoke(mainBash('orca orchestration worker-start --agent codex --task round2item6', { sid: G6bSID }),
     { ...CAP6b, STUB_WORKERS_JSON: '[]' });
-  if (r6b.code === DENY && /max-parallel-codex-workers/.test(r6b.err)) pass += 1;
-  else failures.push(`round2 item6: a pending-* placeholder must NOT be settled by the 10-minute ` +
-    `"Orca never mentioned it" reconcile rule (exit ${r6b.code}, err ${r6b.err.slice(0, 200)})`);
+  if (r6b.code === ALLOW) pass += 1;
+  else failures.push(`round2 item6: an expired pending-* placeholder must not hold a cap slot (exit ${r6b.code}, err ${r6b.err.slice(0, 200)})`);
   {
     const st = readState(G6bSID);
-    if (st.workers[pendingKey] && st.workers[pendingKey].status === 'live') pass += 1;
-    else failures.push(`round2 item6: the pending-* entry must still be live after the reconcile pass (${JSON.stringify(st.workers)})`);
+    if (st.workers[pendingKey] && st.workers[pendingKey].status === 'settled') pass += 1;
+    else failures.push(`round2 item6: the expired pending-* entry must be settled by the gate-event reconcile (${JSON.stringify(st.workers)})`);
+  }
+  rmState(G6bSID);
+  // Contrast: a placeholder only 2 minutes old still holds its slot — Orca may not have
+  // listed the genuinely just-started worker yet.
+  const youngTs = Date.now() - 2 * 60 * 1000;
+  const youngKey = `pending-${youngTs}`;
+  fs.writeFileSync(path.join(STATE_DIR, `${G6bSID}.json`), JSON.stringify({
+    session_id: G6bSID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { [youngKey]: { role: 'codex-exec', started: youngTs, status: 'live', last_seen: youngTs,
+      rate_limited_until: 0, unverified: true, group: youngKey, kind: 'worker', agent: 'codex', owns: null, ws: null } },
+    reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  const r6c = invoke(mainBash('orca orchestration worker-start --agent codex --task round2item6young', { sid: G6bSID }),
+    { ...CAP6b, STUB_WORKERS_JSON: '[]' });
+  if (r6c.code === DENY && /max-parallel-codex-workers/.test(r6c.err)) pass += 1;
+  else failures.push(`round2 item6: a young pending-* placeholder must still hold its cap slot (exit ${r6c.code}, err ${r6c.err.slice(0, 200)})`);
+  {
+    const st = readState(G6bSID);
+    if (st.workers[youngKey] && st.workers[youngKey].status === 'live') pass += 1;
+    else failures.push(`round2 item6: the young pending-* entry must still be live (${JSON.stringify(st.workers)})`);
   }
   rmState(G6bSID);
 }
@@ -3251,6 +3271,143 @@ async function heartbeatH1RealGitTests() {
   });
   checkBool('H1 (real git): a worktree with a real commit genuinely merged into origin/main is reported done-but-open',
     outMerged.includes(`pre-existing done-but-open worktree(s) at startup: merged (${mergedPath})`), true);
+}
+
+// --- pending-placeholder leak fixes (2026-10-01) -----------------------------
+// 1. A piped worker-start whose JSON reply is unparseable still registers the real id when
+//    the output carries exactly one "dispatchId" line; 2. a live pending placeholder is
+//    adopted by the once-a-minute gate-event reconcile against orca worker-list; 3. an
+//    unmatched placeholder older than 10 min settles and frees its Owns: claim; 4. a
+//    release naming an untracked id settles the one live placeholder it can only mean.
+{
+  const P_SID = `${SID}-pending-leak`;
+
+  // Fix 1: piped worker-start, single dispatchId in the piped output -> real id registered.
+  rmState(P_SID);
+  invoke(postBash('orca orchestration worker-start --agent codex --task pl1 --json | grep dispatchId',
+    '  "dispatchId": "ctx_piped_1",', { sid: P_SID }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {} };
+    const pendings = Object.keys(st.workers).filter((k) => k.startsWith('pending-'));
+    if (st.workers.ctx_piped_1 && st.workers.ctx_piped_1.status === 'live' && !pendings.length) pass += 1;
+    else failures.push(`piped worker-start with exactly one dispatchId line must register the real id, not a placeholder (${JSON.stringify(st.workers)})`);
+  }
+  // Wave-0 regression guard: more than one distinct dispatchId in the output is ambiguous —
+  // never guess; keep the placeholder, register nothing real.
+  rmState(P_SID);
+  invoke(postBash('orca orchestration worker-start --agent codex --task pl2 --json | node -e "process.stdin.pipe(process.stdout)"',
+    '"dispatchId": "ctx_w0_a"\n"dispatchId": "ctx_w0_b"', { sid: P_SID }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {} };
+    const pendings = Object.keys(st.workers).filter((k) => k.startsWith('pending-'));
+    if (!st.workers.ctx_w0_a && !st.workers.ctx_w0_b && pendings.length === 1) pass += 1;
+    else failures.push(`ambiguous multi-dispatchId piped output must stay a placeholder, never a guessed registration (${JSON.stringify(st.workers)})`);
+  }
+
+  // Fix 2: a live pending placeholder is adopted by the gate-event reconcile when orca's
+  // worker-list has exactly one compatible row (agent + worktree + start time all match).
+  rmState(P_SID);
+  const adoptStarted = Date.now();
+  fs.writeFileSync(path.join(STATE_DIR, `${P_SID}.json`), JSON.stringify({
+    session_id: P_SID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { [`pending-${adoptStarted}-0`]: { role: 'codex-exec', started: adoptStarted, status: 'live',
+      last_seen: adoptStarted, rate_limited_until: 0, unverified: true, group: `pending-${adoptStarted}-0`,
+      kind: 'worker', agent: 'codex', owns: null, ws: null, worktreeIds: ['wt_adopt'] } },
+    reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  invoke(mainEdit('/work/.claude/hooks/x.cjs', P_SID),
+    { ...CODEX_WINS, STUB_WORKERS_JSON: JSON.stringify([
+      { dispatchId: 'ctx_adopted_1', taskId: 'task_adopted_1', agentTerminalHandle: 'term_adopted_1',
+        agent: 'codex', worktreeId: 'wt_adopt', startedAt: adoptStarted,
+        terminalState: 'active', workerState: 'running' },
+    ]) });
+  {
+    const st = readState(P_SID) || { workers: {} };
+    const pendings = Object.keys(st.workers).filter((k) => k.startsWith('pending-'));
+    if (st.workers.ctx_adopted_1 && st.workers.ctx_adopted_1.status === 'live' &&
+        st.workers.ctx_adopted_1.unverified === false && !pendings.length) pass += 1;
+    else failures.push(`the gate-event reconcile must adopt the matching worker-list row in place of the placeholder (${JSON.stringify(st.workers)})`);
+  }
+  // A worker-list row for a DIFFERENT agent must never be adopted by a codex placeholder.
+  rmState(P_SID);
+  const mmStarted = Date.now();
+  fs.writeFileSync(path.join(STATE_DIR, `${P_SID}.json`), JSON.stringify({
+    session_id: P_SID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { [`pending-${mmStarted}-0`]: { role: 'codex-exec', started: mmStarted, status: 'live',
+      last_seen: mmStarted, rate_limited_until: 0, unverified: true, group: `pending-${mmStarted}-0`,
+      kind: 'worker', agent: 'codex', owns: null, ws: null } },
+    reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  invoke(mainEdit('/work/.claude/hooks/x.cjs', P_SID),
+    { ...CODEX_WINS, STUB_WORKERS_JSON: JSON.stringify([
+      { dispatchId: 'ctx_other_agent', agent: 'kimi', startedAt: mmStarted,
+        terminalState: 'active', workerState: 'running' },
+    ]) });
+  {
+    const st = readState(P_SID) || { workers: {} };
+    if (!st.workers.ctx_other_agent && st.workers[`pending-${mmStarted}-0`] &&
+        st.workers[`pending-${mmStarted}-0`].status === 'live') pass += 1;
+    else failures.push(`a placeholder must never adopt a row for a different agent (${JSON.stringify(st.workers)})`);
+  }
+
+  // Fix 3: an unmatched placeholder older than 10 min settles on the gate-event reconcile,
+  // freeing its Owns: claim so an overlapping dispatch is admitted again.
+  const OWN_LIB = require('../hooks/lib/ownership.cjs');
+  const leakWs = OWN_LIB.workspaceKey({ repoRootDir: OWN_LIB.repoRoot(FAKE_REPO), worktreeValue: null, isolated: false });
+  rmState(P_SID);
+  const staleStarted = Date.now() - 11 * 60 * 1000;
+  fs.writeFileSync(path.join(STATE_DIR, `${P_SID}.json`), JSON.stringify({
+    session_id: P_SID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { [`pending-${staleStarted}-0`]: { role: 'codex-exec', started: staleStarted, status: 'live',
+      last_seen: staleStarted, rate_limited_until: 0, unverified: true, group: `pending-${staleStarted}-0`,
+      kind: 'worker', agent: 'codex', owns: ['src/ttl/**'], ws: leakWs } },
+    reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  const ttlSpec = 'Implement the ttl fix. Verify: npm test\nOwns: src/ttl/**';
+  const rTtl = invoke(mainBash(`orca orchestration worker-start --agent codex --spec "${ttlSpec}" --json`,
+    { sid: P_SID, cwd: FAKE_REPO }), { ...CODEX_WINS, STUB_WORKERS_JSON: '[]' });
+  {
+    const st = readState(P_SID) || { workers: {} };
+    if (rTtl.code === ALLOW && st.workers[`pending-${staleStarted}-0`] &&
+        st.workers[`pending-${staleStarted}-0`].status === 'settled') pass += 1;
+    else failures.push(`an expired placeholder must settle and free its Owns: claim for the overlapping dispatch (exit ${rTtl.code}, workers ${JSON.stringify(st.workers)})`);
+  }
+
+  // Fix 4: releasing an id this session never tracked settles the ONE live placeholder it
+  // can only refer to; with two live placeholders the target is ambiguous and nothing moves.
+  rmState(P_SID);
+  const relStarted = Date.now();
+  fs.writeFileSync(path.join(STATE_DIR, `${P_SID}.json`), JSON.stringify({
+    session_id: P_SID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: { [`pending-${relStarted}-0`]: { role: 'codex-exec', started: relStarted, status: 'live',
+      last_seen: relStarted, rate_limited_until: 0, unverified: true, group: `pending-${relStarted}-0`,
+      kind: 'worker', agent: 'codex', owns: null, ws: null } },
+    reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_never_tracked --json', '{"ok":true}', { sid: P_SID }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {} };
+    if (st.workers[`pending-${relStarted}-0`] && st.workers[`pending-${relStarted}-0`].status === 'settled') pass += 1;
+    else failures.push(`releasing an untracked id must settle the single live placeholder it can only mean (${JSON.stringify(st.workers)})`);
+  }
+  rmState(P_SID);
+  fs.writeFileSync(path.join(STATE_DIR, `${P_SID}.json`), JSON.stringify({
+    session_id: P_SID, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers: {
+      'pending-a-0': { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+        rate_limited_until: 0, unverified: true, group: 'pending-a-0', kind: 'worker', agent: 'codex', owns: null, ws: null },
+      'pending-b-1': { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(),
+        rate_limited_until: 0, unverified: true, group: 'pending-b-1', kind: 'worker', agent: 'codex', owns: null, ws: null },
+    },
+    reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_never_tracked --json', '{"ok":true}', { sid: P_SID }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {} };
+    if (st.workers['pending-a-0'].status === 'live' && st.workers['pending-b-1'].status === 'live') pass += 1;
+    else failures.push(`releasing an untracked id with two live placeholders must settle nothing (${JSON.stringify(st.workers)})`);
+  }
+  rmState(P_SID);
 }
 
 heartbeatWorktreeTests()

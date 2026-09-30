@@ -225,6 +225,22 @@ function kindOf(id) {
   return /^term_/.test(String(id)) ? 'terminal' : 'worker';
 }
 
+// A "pending-<ts>-<idx>" placeholder (a worker-start whose reply carried no parseable id)
+// may hold cap slots and Owns: claims for at most this long. Past it, every counting path
+// must ignore it even when no reconcile ever ran (Orca down), and reconcile paths settle it.
+const PENDING_PLACEHOLDER_TTL_MS = 10 * 60 * 1000;
+
+function isPendingPlaceholderKey(key) {
+  return String(key).startsWith('pending-');
+}
+
+function pendingPlaceholderExpired(key, entry, now = Date.now()) {
+  if (!isPendingPlaceholderKey(key)) return false;
+  // No recorded start time means the placeholder cannot be aged — never treat it as expired.
+  if (!entry || !Number.isFinite(entry.started)) return false;
+  return now - entry.started > PENDING_PLACEHOLDER_TTL_MS;
+}
+
 /**
  * The canonical group id for a set of ids surfaced by one worker-start reply: prefer the
  * dispatch id, then the task id, then the terminal handle — whichever is present first,
@@ -251,6 +267,7 @@ function countLiveGroups(workers, agent = 'codex') {
     if (w.status !== 'live') continue;
     if (w.agent !== agent) continue;
     if (w.capExempt) continue;
+    if (pendingPlaceholderExpired(key, w)) continue;
     groups.add(groupOf(w, key));
   }
   return groups.size;
@@ -337,6 +354,7 @@ function outputTarget(inv, flagValue) {
 module.exports = {
   idsFromOutput, idsFromReply, fieldValuesFromReply,
   splitJsonReplies, splitConcatenatedJson, isDispatchReply, kindOf,
+  PENDING_PLACEHOLDER_TTL_MS, isPendingPlaceholderKey, pendingPlaceholderExpired,
   canonicalGroup, groupOf, countLiveGroups, liveGroupByTerminal, groupById, settleGroup,
   RELEASE_SUBS, releaseTarget, RETAIN_SUB, retainTarget, outputTarget,
 };

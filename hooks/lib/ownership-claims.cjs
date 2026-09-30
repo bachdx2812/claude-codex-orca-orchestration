@@ -17,7 +17,7 @@
 
 'use strict';
 
-const { groupOf } = require('./worker-groups.cjs');
+const { groupOf, pendingPlaceholderExpired } = require('./worker-groups.cjs');
 const { anyOverlap } = require('./ownership.cjs');
 
 // A Bash-dispatch reservation (parallel-limit capacity or ownership claim, or both) is
@@ -45,6 +45,9 @@ function liveClaims(s, ttlMinutes, excludeGroup) {
   const claims = [];
   for (const [key, w] of Object.entries(s.workers || {})) {
     if (w.status !== 'live' || !w.owns || !w.owns.length) continue;
+    // An unresolved "pending-*" placeholder older than its TTL must never keep an Owns:
+    // claim alive, even when no reconcile has run to settle it yet (Orca down).
+    if (pendingPlaceholderExpired(key, w)) continue;
     const group = groupOf(w, key);
     if (excludeGroup && group === excludeGroup) continue;
     claims.push({ id: group, owns: w.owns, ws: w.ws, source: 'worker', ts: w.started });
