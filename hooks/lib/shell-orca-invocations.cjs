@@ -26,7 +26,10 @@
  * command-substitution recursion is capped at a fixed depth as a safety
  * valve against adversarial nesting.
  *
- * Exports `orcaInvocations(cmd)` -> Array<{ sub: string, args: string[] }>,
+ * Exports `orcaInvocations(cmd)` -> Array<{
+ *   sub: string, args: string[], stdoutPiped: boolean,
+ *   stdoutRedirected: boolean, stdoutCaptured: boolean
+ * }>,
  * one entry per real orca invocation, in the order the shell would run them.
  * `sub` is 'orchestration worker-start' | 'orchestration task-create' |
  * 'terminal create' | the first one or two words after `orca` otherwise.
@@ -47,7 +50,7 @@ const ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
 // A run of characters that need no special handling. Linear: one character
 // class (negated), one quantifier, sticky so it only matches at `lastIndex`.
-const WORD_RUN = /[^'"\\$`(){}\n;&|\s]+/y;
+const WORD_RUN = /[^'"\\$`(){}\n;&|>\s]+/y;
 
 // A bare heredoc delimiter word.
 const HEREDOC_WORD = /[A-Za-z0-9_]+/y;
@@ -81,7 +84,7 @@ function deriveSub(rest) {
  * simple command's word list, then register it as an orca invocation when
  * the remaining first word's basename is `orca`.
  */
-function processSimpleCommand(ctx, words) {
+function processSimpleCommand(ctx, words, output = {}) {
   if (!words.length) return;
   let i = 0;
   for (;;) {
@@ -123,7 +126,53 @@ function processSimpleCommand(ctx, words) {
   if (i >= words.length) return;
   if (basename(words[i]) !== 'orca') return;
   const rest = words.slice(i + 1);
-  ctx.invocations.push({ sub: deriveSub(rest), args: rest });
+  ctx.invocations.push({
+    sub: deriveSub(rest),
+    args: rest,
+    stdoutPiped: output.stdoutPiped === true,
+    stdoutRedirected: output.stdoutRedirected === true,
+    stdoutCaptured: output.stdoutCaptured === true,
+  });
+}
+
+/** Output operators applied to a completed `( ... )` or `{ ...; }` group. */
+function groupOutputSemantics(s, start, end) {
+  let i = start;
+  let stdoutRedirected = false;
+  const whitespace = () => { while (i < end && (s[i] === ' ' || s[i] === '\t' || s[i] === '\r')) i += 1; };
+  const skipTarget = () => {
+    whitespace();
+    if (s[i] === '&') {
+      i += 1;
+      while (i < end && (/[0-9]/.test(s[i]) || s[i] === '-')) i += 1;
+      return;
+    }
+    if (s[i] === '"' || s[i] === "'") {
+      const quote = s[i++];
+      while (i < end && s[i] !== quote) i += s[i] === '\\' ? 2 : 1;
+      if (s[i] === quote) i += 1;
+      return;
+    }
+    while (i < end && !/[\s;&|]/.test(s[i])) i += 1;
+  };
+  whitespace();
+  for (;;) {
+    if (s[i] === '|' && s[i + 1] !== '|') return { stdoutPiped: true, stdoutRedirected };
+    if (s[i] === '&' && s[i + 1] === '>') {
+      stdoutRedirected = true;
+      i += s[i + 2] === '>' ? 3 : 2;
+      skipTarget(); whitespace();
+      continue;
+    }
+    let j = i;
+    while (j < end && /[0-9]/.test(s[j])) j += 1;
+    const fd = j > i ? s.slice(i, j) : null;
+    if (s[j] !== '>') break;
+    if (fd === null || fd === '1') stdoutRedirected = true;
+    i = j + (s[j + 1] === '>' ? 2 : 1);
+    skipTarget(); whitespace();
+  }
+  return { stdoutPiped: false, stdoutRedirected };
 }
 
 /** Skip heredoc bodies queued for the line that just ended, verbatim. */
@@ -170,13 +219,13 @@ function scanDoubleQuoted(ctx, start, end, onText) {
     }
     if (c === '$' && s[i + 1] === '(') {
       flush(i);
-      i = scanRegion(ctx, i + 2, end, 'paren');
+      i = scanRegion(ctx, i + 2, end, 'paren', { stdoutCaptured: true });
       segStart = i;
       continue;
     }
     if (c === '`') {
       flush(i);
-      i = scanRegion(ctx, i + 1, end, 'backtick');
+      i = scanRegion(ctx, i + 1, end, 'backtick', { stdoutCaptured: true });
       segStart = i;
       continue;
     }
@@ -221,7 +270,7 @@ function skipRegionShallow(ctx, start, end, mode) {
  * Returns the index just past this region's close (or `end` for 'top', or on
  * an unterminated 'paren'/'backtick').
  */
-function scanRegion(ctx, start, end, mode) {
+function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
   if (mode !== 'top') {
     ctx.depth += 1;
     if (ctx.depth > MAX_DEPTH) { ctx.depth -= 1; return skipRegionShallow(ctx, start, end, mode); }
@@ -231,7 +280,10 @@ function scanRegion(ctx, start, end, mode) {
   let words = [];
   let curWord = '';
   let wordOpen = false;
+  let stdoutRedirected = false;
   let pendingHeredocs = [];
+  const groupStarts = [];
+  const braceGroupStarts = [];
   let depth = mode === 'paren' ? 1 : 0;
 
   const flushWord = () => {
@@ -241,8 +293,16 @@ function scanRegion(ctx, start, end, mode) {
     wordOpen = false;
     if (words.length === 1 && KEYWORDS.has(words[0])) words.length = 0;
   };
-  const flushCommand = () => {
-    if (words.length) { processSimpleCommand(ctx, words); words = []; }
+  const flushCommand = ({ stdoutPiped = false } = {}) => {
+    if (words.length) {
+      processSimpleCommand(ctx, words, {
+        stdoutPiped: stdoutPiped || inheritedOutput.stdoutPiped === true,
+        stdoutRedirected: stdoutRedirected || inheritedOutput.stdoutRedirected === true,
+        stdoutCaptured: inheritedOutput.stdoutCaptured === true,
+      });
+      words = [];
+    }
+    stdoutRedirected = false;
   };
 
   while (i < end) {
@@ -272,14 +332,14 @@ function scanRegion(ctx, start, end, mode) {
 
     if (c === '$' && s[i + 1] === '(') {
       wordOpen = true;
-      i = scanRegion(ctx, i + 2, end, 'paren');
+      i = scanRegion(ctx, i + 2, end, 'paren', { stdoutCaptured: true });
       continue;
     }
 
     if (c === '`') {
       if (mode === 'backtick') { flushWord(); flushCommand(); if (mode !== 'top') ctx.depth -= 1; return i + 1; }
       wordOpen = true;
-      i = scanRegion(ctx, i + 1, end, 'backtick');
+      i = scanRegion(ctx, i + 1, end, 'backtick', { stdoutCaptured: true });
       continue;
     }
 
@@ -304,14 +364,53 @@ function scanRegion(ctx, start, end, mode) {
       continue;
     }
 
+    // Process substitutions execute their body in a separate asynchronous shell with
+    // a FIFO standing in for its output/input. Captured hook output cannot be zipped
+    // positionally back to that nested invocation, so mark it indirect just like `$()`.
+    if ((c === '<' || c === '>') && s[i + 1] === '(') {
+      wordOpen = true;
+      curWord += `${c}(...)`;
+      i = scanRegion(ctx, i + 2, end, 'paren', { stdoutCaptured: true });
+      continue;
+    }
+
+    // A caller that needs to attribute captured output to this exact command cannot
+    // trust a reply once stdout is transformed by a pipeline or sent somewhere else.
+    // Keep redirection targets in the word stream for backward-compatible argument
+    // parsing, but record the provenance loss on the invocation itself.
+    if (c === '>' || (c === '&' && s[i + 1] === '>')) {
+      // In `2>file`, only stderr moved; bare `>file`, `1>file`, and `&>file`
+      // all move stdout. Shell fd prefixes are unquoted decimal words immediately
+      // adjacent to the operator, so inspect the open word before flushing it.
+      const fd = c === '>' && wordOpen && /^\d+$/.test(curWord) ? curWord : null;
+      flushWord();
+      if (c === '&' || fd === null || fd === '1') stdoutRedirected = true;
+      if (c === '&') i += s[i + 2] === '>' ? 3 : 2;
+      else i += s[i + 1] === '>' ? 2 : 1;
+      if (c === '>' && s[i] === '&') {
+        i += 1;
+        while (i < end && (/[0-9]/.test(s[i]) || s[i] === '-')) i += 1;
+      }
+      continue;
+    }
+
     if (c === '(') {
       flushWord(); flushCommand();
+      groupStarts.push(ctx.invocations.length);
       if (mode === 'paren') depth += 1;
       i += 1;
       continue;
     }
     if (c === ')') {
       flushWord(); flushCommand();
+      const groupStart = groupStarts.pop();
+      if (groupStart != null) {
+        const output = groupOutputSemantics(s, i + 1, end);
+        for (let j = groupStart; j < ctx.invocations.length; j += 1) {
+          if (output.stdoutPiped) ctx.invocations[j].stdoutPiped = true;
+          if (output.stdoutRedirected) ctx.invocations[j].stdoutRedirected = true;
+        }
+      }
       i += 1;
       if (mode === 'paren') {
         depth -= 1;
@@ -319,7 +418,25 @@ function scanRegion(ctx, start, end, mode) {
       }
       continue;
     }
-    if (c === '{' || c === '}') { flushWord(); flushCommand(); i += 1; continue; }
+    if (c === '{') {
+      flushWord(); flushCommand();
+      braceGroupStarts.push(ctx.invocations.length);
+      i += 1;
+      continue;
+    }
+    if (c === '}') {
+      flushWord(); flushCommand();
+      const groupStart = braceGroupStarts.pop();
+      if (groupStart != null) {
+        const output = groupOutputSemantics(s, i + 1, end);
+        for (let j = groupStart; j < ctx.invocations.length; j += 1) {
+          if (output.stdoutPiped) ctx.invocations[j].stdoutPiped = true;
+          if (output.stdoutRedirected) ctx.invocations[j].stdoutRedirected = true;
+        }
+      }
+      i += 1;
+      continue;
+    }
 
     if (c === '\n') {
       flushWord(); flushCommand();
@@ -330,7 +447,7 @@ function scanRegion(ctx, start, end, mode) {
     if (c === ';') { flushWord(); flushCommand(); i += 1; continue; }
     if (c === '&' && s[i + 1] === '&') { flushWord(); flushCommand(); i += 2; continue; }
     if (c === '|' && s[i + 1] === '|') { flushWord(); flushCommand(); i += 2; continue; }
-    if (c === '|') { flushWord(); flushCommand(); i += 1; continue; }
+    if (c === '|') { flushWord(); flushCommand({ stdoutPiped: true }); i += 1; continue; }
     if (c === '&') { flushWord(); flushCommand(); i += 1; continue; }
     if (c === ' ' || c === '\t' || c === '\r') { flushWord(); i += 1; continue; }
 

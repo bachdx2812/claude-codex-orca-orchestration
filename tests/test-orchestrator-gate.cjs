@@ -197,6 +197,13 @@ check('--spec in a different orca invocation does not count for this one',
   orcaInvocations('orca orchestration task-create --help ; orca orchestration worker-start --spec s')
     .map((inv) => [inv.sub, inv.args.includes('--spec'), inv.args.includes('--help')]),
   [['orchestration task-create', false, true], ['orchestration worker-start', true, false]]);
+check('scanner records piped and redirected stdout provenance per invocation',
+  orcaInvocations('orca orchestration worker-start --json | jq empty; orca orchestration worker-read --json > /dev/null; orca doctor &> report.log; orca status 2>/dev/null; (orca worker-list) 2>&1 | jq empty; { orca task-list; } > report.json; reply=$(orca worker-show --json); jq empty <(orca inbox --json)')
+    .map((inv) => [inv.sub, inv.stdoutPiped, inv.stdoutRedirected, inv.stdoutCaptured]),
+  [['orchestration worker-start', true, false, false], ['orchestration worker-read', false, true, false],
+    ['doctor report.log', false, true, false], ['status 2', false, false, false],
+    ['worker-list', true, false, false], ['task-list', false, true, false],
+    ['worker-show --json', false, false, true], ['inbox --json', false, false, true]]);
 
 // Timing: none of these may pay a backtracking-regex-shaped cost.
 {

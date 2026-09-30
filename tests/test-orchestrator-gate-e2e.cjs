@@ -520,11 +520,17 @@ expect('fable escalation naming opus (xhigh) is allowed',
   };
   for (const c of ['/opt/local/bin/orca orchestration worker-start --task t --agent codex',
                    'ORCA_X=1 orca orchestration worker-start --task t --agent codex',
-                   'id=$(orca orchestration worker-start --task t --agent codex)',
-                   'id=`orca orchestration worker-start --task t --agent codex`',
                    'sudo orca orchestration worker-start --task t --agent codex',
                    'if true; then orca orchestration worker-start --task t --agent codex; fi']) {
     if (registered(c)) pass += 1; else failures.push(`real worker start not registered: ${c}`);
+  }
+  for (const c of ['id=$(orca orchestration worker-start --task t --agent codex)',
+                   'id=`orca orchestration worker-start --task t --agent codex`']) {
+    rmState(RS);
+    invoke(post(c), CODEX_WINS);
+    const workers = ((readState(RS) || {}).workers || {});
+    if (!workers.ctx_rv_1 && Object.keys(workers).some((id) => id.startsWith('pending-'))) pass += 1;
+    else failures.push(`captured worker-start output must not claim the tool stdout reply: ${c}`);
   }
   if (!registered('echo "orca orchestration worker-start" | cat')) pass += 1;
   else failures.push('an echo of worker-start registered a phantom worker');

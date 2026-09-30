@@ -178,6 +178,54 @@ function state(stateDir, sid) {
   const formattedWorkers = Object.keys(state(f.stateDir, formattedSid).workers);
   ok('a surviving worker-show reply cannot be stolen as the formatted worker-start reply',
     formattedWorkers.length === 1 && formattedWorkers[0].startsWith('pending-'));
+  const pipedSid = 'reply-piped-session';
+  const pipedCommand = 'orca orchestration worker-start --agent kimi --json | jq empty && orca orchestration worker-show --dispatch ctx_other --json';
+  preBash(f.env, pipedSid, 'toolu_reply_piped', pipedCommand);
+  postBash(f.env, pipedSid, 'toolu_reply_piped', pipedCommand,
+    '{"ok":true,"result":{"dispatchId":"ctx_other","preview":"healthy"}}');
+  const pipedWorkers = Object.keys(state(f.stateDir, pipedSid).workers);
+  ok('a piped worker-start cannot claim a later worker-show reply',
+    pipedWorkers.length === 1 && pipedWorkers[0].startsWith('pending-'));
+  const stderrSid = 'reply-stderr-session';
+  const stderrCommand = 'orca orchestration worker-start --agent kimi --json 2>/dev/null';
+  preBash(f.env, stderrSid, 'toolu_reply_stderr', stderrCommand);
+  postBash(f.env, stderrSid, 'toolu_reply_stderr', stderrCommand,
+    '{"ok":true,"result":{"dispatchId":"ctx_stderr_own"}}');
+  check('stderr-only redirection preserves worker-start stdout attribution',
+    Object.keys(state(f.stateDir, stderrSid).workers), ['ctx_stderr_own']);
+  const groupedSid = 'reply-grouped-session';
+  const groupedCommand = '(orca orchestration worker-start --agent kimi --json) | jq empty && orca orchestration worker-show --dispatch ctx_group_other --json';
+  preBash(f.env, groupedSid, 'toolu_reply_grouped', groupedCommand);
+  postBash(f.env, groupedSid, 'toolu_reply_grouped', groupedCommand,
+    '{"ok":true,"result":{"dispatchId":"ctx_group_other","preview":"healthy"}}');
+  const groupedWorkers = Object.keys(state(f.stateDir, groupedSid).workers);
+  ok('a grouped and piped worker-start cannot claim a later worker-show reply',
+    groupedWorkers.length === 1 && groupedWorkers[0].startsWith('pending-'));
+  const braceSid = 'reply-brace-session';
+  const braceCommand = '{ orca orchestration worker-start --agent kimi --json; } | jq empty && orca orchestration worker-show --dispatch ctx_brace_other --json';
+  preBash(f.env, braceSid, 'toolu_reply_brace', braceCommand);
+  postBash(f.env, braceSid, 'toolu_reply_brace', braceCommand,
+    '{"ok":true,"result":{"dispatchId":"ctx_brace_other","preview":"healthy"}}');
+  const braceWorkers = Object.keys(state(f.stateDir, braceSid).workers);
+  ok('a brace-grouped and piped worker-start cannot claim a later worker-show reply',
+    braceWorkers.length === 1 && braceWorkers[0].startsWith('pending-'));
+  for (const [caseName, wrappedStart] of [
+    ['parenthesized redirect', '(orca orchestration worker-start --agent kimi --json) > /dev/null'],
+    ['brace redirect', '{ orca orchestration worker-start --agent kimi --json; } > /dev/null'],
+    ['group stderr then pipe', '(orca orchestration worker-start --agent kimi --json) 2>/dev/null | jq empty'],
+    ['group fd duplication then pipe', '(orca orchestration worker-start --agent kimi --json) 2>&1 | jq empty'],
+    ['command substitution', 'reply=$(orca orchestration worker-start --agent kimi --json)'],
+    ['process substitution', 'jq empty <(orca orchestration worker-start --agent kimi --json)'],
+  ]) {
+    const caseSid = `reply-${caseName.replace(/\s+/g, '-')}-session`;
+    const caseCommand = `${wrappedStart} && orca orchestration worker-show --dispatch ctx_indirect_other --json`;
+    preBash(f.env, caseSid, `toolu_${caseSid}`, caseCommand);
+    postBash(f.env, caseSid, `toolu_${caseSid}`, caseCommand,
+      '{"ok":true,"result":{"dispatchId":"ctx_indirect_other","preview":"healthy"}}');
+    const caseWorkers = Object.keys(state(f.stateDir, caseSid).workers);
+    ok(`${caseName} cannot claim a later worker-show reply`,
+      caseWorkers.length === 1 && caseWorkers[0].startsWith('pending-'));
+  }
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 
@@ -210,6 +258,16 @@ function state(stateDir, sid) {
     'orca orchestration worker-read --dispatch ctx_kimi_signal && cat docs/provider-error.json',
     `healthy plaintext worker output\n{"ok":true,"result":{"preview":"${signal}"}}`);
   check('unrelated chained JSON cannot masquerade as the Kimi worker-read reply',
+    fs.existsSync(path.join(f.stateDir, 'coder-exhausted.json')), false);
+  postBash(f.env, sid, 'toolu_read_redirected',
+    'orca orchestration worker-read --dispatch ctx_kimi_signal --json > /dev/null && cat docs/provider-error.json',
+    `{"ok":true,"result":{"preview":"${signal}"}}`);
+  check('redirected Kimi worker output cannot attribute a later JSON document',
+    fs.existsSync(path.join(f.stateDir, 'coder-exhausted.json')), false);
+  postBash(f.env, sid, 'toolu_read_group_redirected',
+    '(orca orchestration worker-read --dispatch ctx_kimi_signal --json) > /dev/null && cat docs/provider-error.json',
+    `{"ok":true,"result":{"preview":"${signal}"}}`);
+  check('group-redirected Kimi output cannot attribute a later JSON document',
     fs.existsSync(path.join(f.stateDir, 'coder-exhausted.json')), false);
   const codexStart = 'orca orchestration worker-start --agent codex --json';
   preBash(f.env, sid, 'toolu_codex_signal', codexStart);

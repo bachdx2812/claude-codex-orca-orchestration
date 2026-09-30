@@ -1511,11 +1511,15 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
   // command after a formatter consumed worker-start's own reply. In the safe dispatch-only
   // case, worker-start --json is the first emitted value; any leading free text makes the
   // attribution ambiguous and leaves a pending reservation instead of stealing another id.
-  const dispatchOnlyMapping = rawReplies.length === dispatchInvs.length &&
+  const allDispatchOutputDirect = dispatchInvs.every((inv) =>
+    !inv.stdoutPiped && !inv.stdoutRedirected && !inv.stdoutCaptured);
+  const dispatchOnlyMapping = allDispatchOutputDirect && rawReplies.length === dispatchInvs.length &&
     (allInvs.length === dispatchInvs.length || jsonStartsOutput);
   const mismatched = !fullCommandMapping && !dispatchOnlyMapping;
-  const replies = mismatched ? null : dispatchEntries.map(({ commandIndex }, idx) =>
-    fullCommandMapping ? rawReplies[commandIndex] : rawReplies[idx]);
+  const replies = mismatched ? null : dispatchEntries.map(({ inv, commandIndex }, idx) =>
+    (inv.stdoutPiped || inv.stdoutRedirected || inv.stdoutCaptured)
+      ? null
+      : (fullCommandMapping ? rawReplies[commandIndex] : rawReplies[idx]));
   const replyAt = (idx) => mismatched ? null : replies[idx] || null;
   let dirty = false;
 
@@ -1832,14 +1836,21 @@ function onPostToolUseLocked(p, s, cfg) {
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
     // Only worker/terminal output counts; the panel's own quota inspection ("rate_limits" JSON) does not.
     const readsWorkerOutput = /\borca\b/.test(cmd) && /(worker-read|terminal (read|show))\b/.test(cmd);
-    const readTargets = orcaInvocations(cmd).map((inv) => WG.outputTarget(inv, flagValue)).filter(Boolean);
+    const readEntries = orcaInvocations(cmd)
+      .map((inv) => ({ inv, target: WG.outputTarget(inv, flagValue) }))
+      .filter(({ target }) => Boolean(target));
+    const readTargets = readEntries.map(({ target }) => target);
+    const readOutputDirect = readEntries.every(({ inv }) =>
+      !inv.stdoutPiped && !inv.stdoutRedirected && !inv.stdoutCaptured);
     const parsedReadReplies = WG.splitJsonReplies(out);
     const readJsonStartsOutput = /^[\s\r\n]*\{/.test(String(out || ''));
-    const parsedOutputIsAttributable = parsedReadReplies.length === readTargets.length &&
+    const parsedOutputIsAttributable = readOutputDirect && parsedReadReplies.length === readTargets.length &&
       (shellSegments(cmd).length === readTargets.length || readJsonStartsOutput);
     const scopedReadOutput = parsedOutputIsAttributable
       ? parsedReadReplies.map((reply) => workerOutputSignalText(JSON.stringify(reply))).join('\n')
-      : (readTargets.length === 1 && shellSegments(cmd).length === 1 ? workerOutputSignalText(out) : '');
+      : (readOutputDirect && readTargets.length === 1 && shellSegments(cmd).length === 1
+          ? workerOutputSignalText(out)
+          : '');
     const signalText = scopedReadOutput.replace(/"rate_limits"/g, '');
     const trackedReadWorkers = readTargets.map((target) => [target, s.workers[target]]).filter(([, worker]) => worker);
     const kimiGroups = new Set(trackedReadWorkers
