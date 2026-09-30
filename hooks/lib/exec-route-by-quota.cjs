@@ -406,19 +406,28 @@ function codexQuota(now = Date.now(), options = {}) {
   return readSessionQuota(now);
 }
 
-/** Read the last cached Codex auth state without spawning the app-server probe. */
-function codexAuthState(stateDir, now = Date.now()) {
+/** Read the last cached Codex auth state without spawning the app-server probe.
+ *  Entries older than `maxAgeMs` (when given) report 'unknown', so a logged-out
+ *  reading expires and the next quota call re-probes instead of excluding Codex
+ *  forever. */
+function codexAuthState(stateDir, now = Date.now(), maxAgeMs) {
   const file = cachePath(stateDir);
   try {
     const stat = fs.statSync(file);
     const memo = authStateCache.get(file);
-    if (memo && memo.mtimeMs === stat.mtimeMs && memo.size === stat.size) return memo.state;
-    const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const state = entry && entry.authState === 'logged-out' ? 'logged-out'
+    let entry;
+    if (memo && memo.mtimeMs === stat.mtimeMs && memo.size === stat.size) entry = memo.entry;
+    else {
+      entry = JSON.parse(fs.readFileSync(file, 'utf8'));
+      authStateCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, entry });
+    }
+    if (typeof maxAgeMs === 'number' && Number.isFinite(maxAgeMs)) {
+      const fetchedAt = entry && typeof entry.fetchedAt === 'number' ? entry.fetchedAt : NaN;
+      if (!Number.isFinite(fetchedAt) || now - fetchedAt > maxAgeMs) return 'unknown';
+    }
+    return entry && entry.authState === 'logged-out' ? 'logged-out'
       : entry && entry.authState === 'ok' ? 'ok'
         : 'unknown';
-    authStateCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, state });
-    return state;
   } catch {
     return 'unknown';
   }
@@ -447,7 +456,8 @@ function pickExecRoute(claudeLeft, codexLeft, handoffUsedPct = 95) {
 /** Current routing verdict with the numbers that produced it. */
 function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
   const claudeQuota = readClaudeQuota(now);
-  const quota = codexQuota(now, options);
+  const result = codexQuota(now, options);
+  const quota = result && !result.failed ? result : null;
   const claudeLeft = claudeQuota ? claudeQuota.remaining : null;
   const codexLeft = quota ? Math.max(0, 100 - quota.usedPercent) : null;
   const fmt = (v) => (v === null ? 'unknown' : `${Math.round(v)}% left`);
