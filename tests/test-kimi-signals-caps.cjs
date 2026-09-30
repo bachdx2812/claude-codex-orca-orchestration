@@ -280,6 +280,11 @@ check('without agent info the sentence is only a generic rate limit',
   check('the event says to release and not retry',
     event.includes('release this worker, do not retry it until reset'), true);
   check('the exhaustion hook fired once for kimi', calls, ['kimi']);
+  check('the reported handle is persisted for a daemon restart',
+    heartbeat.loadPersistedUsageExhaustedReports().has('term_k1'), true);
+  const afterRestart = heartbeat.loadPersistedUsageExhaustedReports();
+  check('a restarted daemon does not report the persisted handle again',
+    heartbeat.reportUsageExhausted({ reported: afterRestart, handle: 'term_k1', label: 'term_k1 (Kimi worker)', coder: 'kimi' }), null);
   check('the same handle is not reported twice',
     heartbeat.reportUsageExhausted({ reported, handle: 'term_k1', label: 'term_k1 (Kimi worker)', coder: 'kimi' }), null);
   check('the exhaustion hook still fired only once', calls.length, 1);
