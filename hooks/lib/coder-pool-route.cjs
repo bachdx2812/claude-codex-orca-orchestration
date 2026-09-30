@@ -1,5 +1,23 @@
 'use strict';
 
+/**
+ * coder-pool-route.cjs — ranks the external coders (Codex, Kimi) and picks who takes
+ * the next code dispatch.
+ *
+ * Config -> option mapping (`execFallbackWhenCodexUnavailable` -> `options.fallbackEnabled`):
+ *   - config `null` => `fallbackEnabled: null`: Codex-only legacy behaviour per RT-4 —
+ *     a Codex that is merely not installed (or Orca not installed) still routes to Codex,
+ *     exactly like the pre-pool routing did.
+ *   - config set (e.g. `"sonnet"`, the default) => `fallbackEnabled: true`: an unusable
+ *     coder is excluded from the pool. An unusable Kimi is ALWAYS excluded, regardless
+ *     of this option.
+ *   - nothing usable => `route: 'code'`: the in-session code model (default alias sonnet).
+ *
+ * Tie-breaking among eligible coders: free concurrency capacity beats quota headroom,
+ * then larger threshold headroom, then fewer live workers, then alternation away from
+ * `options.lastCoder` (ignored when it is not eligible), then Codex first.
+ */
+
 const CODERS = ['codex', 'kimi'];
 
 function label(coder) { return coder === 'codex' ? 'Codex' : 'Kimi'; }
@@ -10,7 +28,6 @@ function knownQuota(quota) {
 
 function legacyCodexUsable(availability, fallbackEnabled) {
   if (availability.usable) return true;
-  if (fallbackEnabled === false) return true;
   return fallbackEnabled === null && (availability.reason === 'not installed' || availability.reason === 'orca not installed');
 }
 
@@ -40,12 +57,14 @@ function pickCoderPool(options = {}) {
   const exhaustion = options.exhaustion || {};
   const live = options.live || {};
   const caps = options.caps || {};
+  const lastCoder = options.lastCoder;
   const coders = {};
+  const thresholdFor = (coder) => typeof thresholds[coder] === 'number' ? thresholds[coder] : 95;
 
   for (const coder of CODERS) {
     const available = availability[coder] || { usable: false, reason: 'not installed' };
     const quota = quotas[coder] || null;
-    const threshold = typeof thresholds[coder] === 'number' ? thresholds[coder] : 95;
+    const threshold = thresholdFor(coder);
     const usable = coder === 'codex'
       ? legacyCodexUsable(available, options.fallbackEnabled)
       : available.usable === true;
@@ -74,13 +93,12 @@ function pickCoderPool(options = {}) {
     const bFree = bc.cap === 0 || bc.live < bc.cap;
     if (aFree !== bFree) return aFree ? -1 : 1;
     if (knownQuota(quotas[a]) && knownQuota(quotas[b])) {
-      const ah = thresholds[a] - quotas[a].usedPercent;
-      const bh = thresholds[b] - quotas[b].usedPercent;
+      const ah = thresholdFor(a) - quotas[a].usedPercent;
+      const bh = thresholdFor(b) - quotas[b].usedPercent;
       if (ah !== bh) return bh - ah;
-    } else if (ac.live !== bc.live) {
-      return ac.live - bc.live;
     }
     if (ac.live !== bc.live) return ac.live - bc.live;
+    if (lastCoder === a || lastCoder === b) return lastCoder === a ? 1 : -1;
     return a === 'codex' ? -1 : 1;
   });
 
