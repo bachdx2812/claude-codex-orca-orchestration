@@ -110,6 +110,12 @@ function isPlainObject(v) {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+function configuredNumber(value) {
+  if (value === null || typeof value === 'boolean' ||
+      (typeof value === 'string' && value.trim() === '')) return NaN;
+  return Number(value);
+}
+
 /**
  * Validated view of the merged config. Invalid values degrade to the default for that
  * field and collect a human-readable warning; they never throw and never take down the
@@ -151,7 +157,7 @@ function loadConfig() {
     merged.activation = 'orca-only';
   }
 
-  const threshold = Number(merged.codexHandoffUsedPercent);
+  const threshold = configuredNumber(merged.codexHandoffUsedPercent);
   if (!Number.isInteger(threshold) || threshold < 0 || threshold > 100) {
     warnings.push(`codexHandoffUsedPercent "${merged.codexHandoffUsedPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.codexHandoffUsedPercent}.`);
     merged.codexHandoffUsedPercent = DEFAULT_CONFIG.codexHandoffUsedPercent;
@@ -159,7 +165,7 @@ function loadConfig() {
     merged.codexHandoffUsedPercent = threshold;
   }
 
-  const quotaCacheSeconds = Number(merged.codexQuotaCacheSeconds);
+  const quotaCacheSeconds = configuredNumber(merged.codexQuotaCacheSeconds);
   if (!Number.isInteger(quotaCacheSeconds) || quotaCacheSeconds < 0 || quotaCacheSeconds > 3600) {
     warnings.push(`codexQuotaCacheSeconds "${merged.codexQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.codexQuotaCacheSeconds}.`);
     merged.codexQuotaCacheSeconds = DEFAULT_CONFIG.codexQuotaCacheSeconds;
@@ -167,7 +173,7 @@ function loadConfig() {
     merged.codexQuotaCacheSeconds = quotaCacheSeconds;
   }
 
-  const kimiThreshold = Number(merged.kimiHandoffUsedPercent);
+  const kimiThreshold = configuredNumber(merged.kimiHandoffUsedPercent);
   if (!Number.isInteger(kimiThreshold) || kimiThreshold < 0 || kimiThreshold > 100) {
     warnings.push(`kimiHandoffUsedPercent "${merged.kimiHandoffUsedPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.kimiHandoffUsedPercent}.`);
     merged.kimiHandoffUsedPercent = DEFAULT_CONFIG.kimiHandoffUsedPercent;
@@ -175,7 +181,7 @@ function loadConfig() {
     merged.kimiHandoffUsedPercent = kimiThreshold;
   }
 
-  const kimiQuotaCache = Number(merged.kimiQuotaCacheSeconds);
+  const kimiQuotaCache = configuredNumber(merged.kimiQuotaCacheSeconds);
   if (!Number.isInteger(kimiQuotaCache) || kimiQuotaCache < 0 || kimiQuotaCache > 3600) {
     warnings.push(`kimiQuotaCacheSeconds "${merged.kimiQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.kimiQuotaCacheSeconds}.`);
     merged.kimiQuotaCacheSeconds = DEFAULT_CONFIG.kimiQuotaCacheSeconds;
@@ -183,7 +189,7 @@ function loadConfig() {
     merged.kimiQuotaCacheSeconds = kimiQuotaCache;
   }
 
-  const availabilityCache = Number(merged.coderAvailabilityCacheSeconds);
+  const availabilityCache = configuredNumber(merged.coderAvailabilityCacheSeconds);
   if (!Number.isInteger(availabilityCache) || availabilityCache < 0 || availabilityCache > 86400) {
     warnings.push(`coderAvailabilityCacheSeconds "${merged.coderAvailabilityCacheSeconds}" is not an integer 0-86400; using ${DEFAULT_CONFIG.coderAvailabilityCacheSeconds}.`);
     merged.coderAvailabilityCacheSeconds = DEFAULT_CONFIG.coderAvailabilityCacheSeconds;
@@ -204,7 +210,7 @@ function loadConfig() {
     merged.execFallbackWhenCodexUnavailable = 'sonnet';
   }
 
-  const maxParallel = Number(merged.maxParallelCodexWorkers);
+  const maxParallel = configuredNumber(merged.maxParallelCodexWorkers);
   if (!Number.isInteger(maxParallel) || maxParallel < 0 || maxParallel > 32) {
     warnings.push(`maxParallelCodexWorkers "${merged.maxParallelCodexWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelCodexWorkers}.`);
     merged.maxParallelCodexWorkers = DEFAULT_CONFIG.maxParallelCodexWorkers;
@@ -212,7 +218,7 @@ function loadConfig() {
     merged.maxParallelCodexWorkers = maxParallel;
   }
 
-  const maxKimiParallel = Number(merged.maxParallelKimiWorkers);
+  const maxKimiParallel = configuredNumber(merged.maxParallelKimiWorkers);
   if (!Number.isInteger(maxKimiParallel) || maxKimiParallel < 0 || maxKimiParallel > 32) {
     warnings.push(`maxParallelKimiWorkers "${merged.maxParallelKimiWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelKimiWorkers}.`);
     merged.maxParallelKimiWorkers = DEFAULT_CONFIG.maxParallelKimiWorkers;
@@ -279,7 +285,7 @@ function gateDisabled(cfg, gate) {
  */
 function handoffUsed(cfg) {
   const envOverride = process.env.ORCH_CODEX_HANDOFF_USED;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isInteger(n) && n >= 0 && n <= 100) return n;
   }
@@ -308,7 +314,7 @@ function codexQuotaCacheSeconds(cfg) {
  */
 function kimiHandoffUsed(cfg) {
   const envOverride = process.env.ORCH_KIMI_HANDOFF_USED;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isInteger(n) && n >= 0 && n <= 100) return n;
   }
@@ -356,7 +362,7 @@ function stateDir() {
  */
 function maxParallelCodexWorkers(cfg) {
   const envOverride = process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isInteger(n) && n >= 0 && n <= 32) return n;
   }
@@ -370,7 +376,7 @@ function maxParallelCodexWorkers(cfg) {
  */
 function maxParallelKimiWorkers(cfg) {
   const envOverride = process.env.ORCH_MAX_PARALLEL_KIMI_WORKERS;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isInteger(n) && n >= 0 && n <= 32) return n;
   }

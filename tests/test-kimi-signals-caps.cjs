@@ -101,6 +101,22 @@ for (const [key, bad, dflt] of [
     cfg.warnings.some((w) => w.includes(key)), true);
 }
 
+for (const bad of [null, true]) {
+  for (const [key, dflt] of [
+    ['codexHandoffUsedPercent', 95],
+    ['kimiHandoffUsedPercent', 95],
+    ['codexQuotaCacheSeconds', 60],
+    ['kimiQuotaCacheSeconds', 60],
+    ['coderAvailabilityCacheSeconds', 600],
+    ['maxParallelCodexWorkers', 3],
+    ['maxParallelKimiWorkers', 3],
+  ]) {
+    const cfg = withConfig({ [key]: bad }, () => config.loadConfig());
+    check(`${key} ${bad} falls back to default instead of numeric coercion`, cfg[key], dflt);
+    check(`${key} ${bad} produces a banner warning`, cfg.warnings.some((w) => w.includes(key)), true);
+  }
+}
+
 {
   const good = withConfig({
     kimiHandoffUsedPercent: 80, kimiQuotaCacheSeconds: 0,
@@ -135,6 +151,19 @@ for (const [key, bad, dflt] of [
   withEnv('ORCH_KIMI_HANDOFF_USED', 'bad', () => {
     check('an invalid kimi handoff override falls back to config', config.kimiHandoffUsed(defaults), 95);
   });
+  for (const [name, read, expected] of [
+    ['ORCH_CODEX_HANDOFF_USED', config.handoffUsed, 95],
+    ['ORCH_KIMI_HANDOFF_USED', config.kimiHandoffUsed, 95],
+    ['ORCH_CODEX_QUOTA_CACHE_SECONDS', config.codexQuotaCacheSeconds, 60],
+    ['ORCH_KIMI_QUOTA_CACHE_SECONDS', config.kimiQuotaCacheSeconds, 60],
+    ['ORCH_CODER_AVAILABILITY_CACHE_SECONDS', config.coderAvailabilityCacheSeconds, 600],
+    ['ORCH_MAX_PARALLEL_CODEX_WORKERS', config.maxParallelCodexWorkers, 3],
+    ['ORCH_MAX_PARALLEL_KIMI_WORKERS', config.maxParallelKimiWorkers, 3],
+  ]) {
+    withEnv(name, '   ', () => {
+      check(`${name} whitespace counts as unset`, read(defaults), expected);
+    });
+  }
   withEnv('ORCH_KIMI_QUOTA_CACHE_SECONDS', '5', () => {
     check('ORCH_KIMI_QUOTA_CACHE_SECONDS overrides the config value', config.kimiQuotaCacheSeconds(defaults), 5);
   });
