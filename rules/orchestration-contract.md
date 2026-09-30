@@ -372,7 +372,8 @@ have been lost. A reported disconnected terminal skips its idle and orphan check
 
 Terminal repaint activity alone is not progress. For every supervised worker terminal, the
 heartbeat combines meaningful terminal text with a bounded fingerprint of that worker's
-worktree (`HEAD`, `git status --porcelain`, and `git diff --stat`). Spinner/moon frames,
+worktree (`HEAD`, `git status --porcelain`, full `git diff`, and changed/untracked file size
+and mtime). A timed-out git probe reuses the terminal's last good git sample. Spinner/moon frames,
 `Thinking…` / elapsed `Working (...)` lines, rotating tips, counters, and prompt chrome are
 removed before terminal text is compared. If neither side changes for the applicable
 `heartbeat.stallSeconds` / `heartbeat.stallSecondsByAgent` threshold, it emits:
@@ -386,6 +387,19 @@ time, and reported marker are persisted per session, so an unchanged episode is 
 once even across daemon restarts; a file or meaningful-output change re-arms it. A worker
 already classified disconnected, rate-limited, or usage-exhausted retains that more
 specific diagnosis and is not also reported stalled.
+An active child-process status (`Waiting for background terminal` or `background terminal
+running`) re-arms progress once and doubles the applicable threshold for that episode; it
+still produces `WORKER STALLED` at 2x when no file or meaningful output changes. Worker rows
+Orca already reports `succeeded`, `failed`, `stopped`, or `completed` are excluded.
+
+A supervised terminal showing an interactive permission, approval, question, or selection
+screen wakes the panel immediately with `WORKER WAITING FOR APPROVAL <dispatch|terminal>
+(<agent>)`; it does not wait for IDLE or `stallSeconds`, and the heartbeat never selects an
+answer. Prompt-shaped evidence includes permission-menu headers, question-shaped
+Allow/Approve requests, opposing exact Allow/Deny options, and the exact `↑↓ navigate ·
+Enter select` UI hint. Ordinary prose that merely mentions those words is not a match.
+The prompt signature is persisted once per episode across daemon restarts and is re-armed
+when the prompt disappears.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`

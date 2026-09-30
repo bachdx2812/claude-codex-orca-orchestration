@@ -109,7 +109,9 @@ reported disconnected, that terminal skips the idle and orphan checks for the sa
 
 **Progress-based stall detection.** A busy-looking TUI is not necessarily making progress.
 For each supervised worker, the heartbeat fingerprints the worker worktree's `HEAD`,
-`git status --porcelain`, and `git diff --stat` together with meaningful terminal output.
+`git status --porcelain`, full `git diff`, and changed/untracked file size and mtime together
+with meaningful terminal output. A timed-out git probe reuses that terminal's last good git
+sample, so transient repository slowness is not mistaken for progress.
 Spinner frames, elapsed-time counters, rotating `Tip:` lines, token/cursor counters, and
 prompt box chrome are ignored. If that fingerprint does not change for
 `heartbeat.stallSeconds` (default 900 seconds), or the agent-specific value in
@@ -120,6 +122,18 @@ persisted once per unchanged episode across daemon restarts and is re-armed by a
 meaningful-output change. Disconnected, rate-limited, and usage-exhausted workers keep their
 more specific diagnosis instead of also being labeled stalled. Set `ORCH_STALL_SECONDS` to
 override the global threshold for one process; blank or invalid values fall back to config.
+An active `Waiting for background terminal` / `background terminal running` status gets a
+grace period of twice the applicable stall threshold; if neither the child status nor any
+other progress changes by then, the same informational stall event fires. Workers Orca
+already reports succeeded, failed, stopped, or completed are excluded.
+
+Interactive worker screens wake the panel immediately instead of waiting for either IDLE
+or the stall threshold. Kimi/Codex permission menus, approval questions, and selection UI
+such as `Select permission mode`, `Allow`/`Deny`, or `↑↓ navigate · Enter select` emit
+`WORKER WAITING FOR APPROVAL <dispatch|terminal> (<agent>)`. The detector requires prompt
+shape rather than isolated keywords, so normal output discussing “allow”, “deny”, or
+“approve” is ignored. Reports persist once per unchanged prompt episode across heartbeat
+restarts and re-arm after the prompt disappears; the heartbeat never answers automatically.
 
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the

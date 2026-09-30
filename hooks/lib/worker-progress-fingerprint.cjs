@@ -1,74 +1,144 @@
 'use strict';
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const ANSI_ESCAPE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
-const SPINNER_PREFIX = /^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⏳⌛⣾⣽⣻⢿⡿⣟⣯⣷🌑🌒🌓🌔🌕🌖🌗🌘|/\\\-]+\s*/u;
+const LEADING_NOISE = /^\s*[•·✢✳✦✧✶✻◯❯›>⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⏳⌛⣾⣽⣻⢿⡿⣟⣯⣷🌑🌒🌓🌔🌕🌖🌗🌘|/\\\-]+\s*/u;
+const BOX_CHROME = /[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]/gu;
+const DURATION = /\b\d+\s*[hms]\b/gi;
+const TOKEN_COUNTER = /[↑↓]?\s*[\d.,]+k?\s*tokens?/gi;
+const ACTIVE_CHILD_MARKER = '__active_child_process__';
 
-function meaningfulTerminalOutput(text) {
-  return String(text || '')
+function normalizeTerminalLine(rawLine) {
+  const rawWithoutAnsi = String(rawLine || '').replace(ANSI_ESCAPE, '');
+  const statusCandidate = rawWithoutAnsi.replace(BOX_CHROME, ' ').replace(LEADING_NOISE, '').trim();
+  const activeChild = /^(?:waiting\s+for\s+background\s+terminal\b|.*\b\d+\s+background\s+terminals?\s+running\b)/i.test(statusCandidate);
+  let line = rawWithoutAnsi
+    .trim()
+    .replace(BOX_CHROME, ' ')
+    .replace(LEADING_NOISE, '')
+    .replace(/\s*(?:[·•]\s*)?tip\s*:.*$/i, '')
+    .replace(DURATION, '')
+    .replace(TOKEN_COUNTER, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (activeChild) return { text: ACTIVE_CHILD_MARKER, activeChild: true };
+  if (!line || !/[\p{L}\p{N}]/u.test(line)) return { text: '', activeChild: false };
+  if (/esc\s+to\s+interrupt/i.test(line) || /thinking(?:\.{3}|…)/i.test(line) ||
+      /working\s*\(/i.test(line) || /^\S+(?:\.{3}|…)(?:\s|\(|$)/u.test(line)) {
+    return { text: '', activeChild: false };
+  }
+  if (/^(?:elapsed|time)\s*:?\s*(?:\d+(?::\d+){1,2})?\s*$/i.test(line)) {
+    return { text: '', activeChild: false };
+  }
+  return { text: line, activeChild: false };
+}
+
+function terminalOutputSample(text) {
+  const normalized = String(text || '')
     .replace(ANSI_ESCAPE, '')
     .replace(/\r/g, '\n')
     .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => {
-      if (!line) return false;
-      const withoutChrome = line
-        .replace(/^[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]+\s*/u, '')
-        .replace(/\s*[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]+$/u, '')
-        .trim();
-      const withoutSpinner = withoutChrome.replace(SPINNER_PREFIX, '').trim();
-      if (!withoutSpinner) return false;
-      if (/^thinking(?:\.{1,3}|…)?(?:\s+\d+[hms](?:\s+\d+[ms])*)?\s*$/i.test(withoutSpinner)) return false;
-      if (/^working(?:\.{1,3}|…)?\s*\(\s*\d+m(?:\s*\d+s)?[^)]*\)\s*$/i.test(withoutSpinner)) return false;
-      if (/^(?:elapsed|time)\s*:?\s*\d+(?::\d+){1,2}\s*$/i.test(withoutSpinner)) return false;
-      if (/^(?:└\s*)?tip\s*:/i.test(withoutSpinner)) return false;
-      if (/^[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]+$/u.test(withoutSpinner)) return false;
-      if (/^(?:[↑↓]\s*)?(?:cursor|tokens?|context)?\s*:?\s*[\d,.]+k?(?:\s*\/\s*[\d,.]+k?|%|\s+tokens?)?\s*$/i.test(withoutSpinner)) return false;
-      if (/^[›>❯]\s*$/.test(withoutSpinner)) return false;
-      return true;
-    })
-    .join('\n');
+    .map(normalizeTerminalLine);
+  return {
+    text: normalized.map((line) => line.text).filter(Boolean).join('\n'),
+    activeChild: normalized.some((line) => line.activeChild),
+  };
+}
+
+function meaningfulTerminalOutput(text) {
+  return terminalOutputSample(text).text;
 }
 
 function digest(parts) {
   return crypto.createHash('sha256').update(parts.join('\0')).digest('hex');
 }
 
-/** Build a stable progress fingerprint. `git` is injected so tests never spawn git. */
-function workerProgressFingerprint({ terminalText, worktreePath, git }) {
-  const parts = [`output:${meaningfulTerminalOutput(terminalText)}`];
+function gitValue({ key, args, worktreePath, git, previousGitParts }) {
+  const result = git(args, worktreePath);
+  if (result && result.status === 0) return { value: result.stdout || '', available: true };
+  if (previousGitParts && typeof previousGitParts[key] === 'string') {
+    return { value: previousGitParts[key], available: false };
+  }
+  return { value: '<unavailable>', available: false };
+}
+
+function changedPathMetadata(worktreePath, pathsText, stat) {
+  const root = path.resolve(worktreePath);
+  return String(pathsText || '')
+    .split(/[\0\n]/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .sort()
+    .map((entry) => {
+      const absolute = path.resolve(root, entry);
+      if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) return `${entry}:<outside>`;
+      try {
+        const value = stat(absolute);
+        return `${entry}:${value.size}:${value.mtimeMs}`;
+      } catch {
+        return `${entry}:<missing>`;
+      }
+    })
+    .join('\n');
+}
+
+/** Build a stable progress sample. Git/stat functions are injected so tests stay hermetic. */
+function workerProgressSample({
+  terminalText, worktreePath, git, stat = fs.statSync, previousGitParts = null,
+}) {
+  const output = terminalOutputSample(terminalText);
+  const parts = [`output:${output.text}`];
+  const gitParts = {};
   if (worktreePath && typeof git === 'function') {
-    for (const args of [
-      ['status', '--porcelain'],
-      ['rev-parse', 'HEAD'],
-      ['diff', '--stat'],
+    for (const [key, args] of [
+      ['status', ['status', '--porcelain']],
+      ['head', ['rev-parse', 'HEAD']],
+      ['diff', ['diff']],
+      ['changedPaths', ['ls-files', '-z', '-o', '-m', '--exclude-standard']],
     ]) {
-      const result = git(args, worktreePath);
-      parts.push(result && result.status === 0 ? `${args[0]}:${result.stdout || ''}` : `${args[0]}:<unavailable>`);
+      const sampled = gitValue({ key, args, worktreePath, git, previousGitParts });
+      gitParts[key] = sampled.value;
+      parts.push(`${key}:${sampled.value}`);
     }
+    const changedPathsAvailable = gitParts.changedPaths !== '<unavailable>';
+    gitParts.pathMetadata = changedPathsAvailable
+      ? changedPathMetadata(worktreePath, gitParts.changedPaths, stat)
+      : (previousGitParts && previousGitParts.pathMetadata) || '<unavailable>';
+    parts.push(`pathMetadata:${gitParts.pathMetadata}`);
   } else {
     parts.push('worktree:<unavailable>');
   }
-  return digest(parts);
+  return { fingerprint: digest(parts), gitParts, activeChild: output.activeChild };
+}
+
+function workerProgressFingerprint(options) {
+  return workerProgressSample(options).fingerprint;
 }
 
 /**
  * Update one terminal's persisted progress clock. A changed fingerprint re-arms the
  * episode; an unchanged fingerprint reports once after the configured threshold.
  */
-function observeWorkerProgress(records, { handle, fingerprint, now, stallSeconds }) {
+function observeWorkerProgress(records, {
+  handle, fingerprint, now, stallSeconds, activeChild = false, gitParts,
+}) {
   const previous = records.get(handle);
   if (!previous || previous.fingerprint !== fingerprint) {
-    records.set(handle, { fingerprint, lastProgressAt: now, reported: false });
+    records.set(handle, { fingerprint, lastProgressAt: now, reported: false, activeChild, gitParts });
     return { stalled: false, changed: true, stalledSeconds: 0 };
   }
 
   const stalledSeconds = Math.max(0, Math.floor((now - previous.lastProgressAt) / 1000));
-  if (stalledSeconds < stallSeconds || previous.reported) {
+  const effectiveThreshold = activeChild ? stallSeconds * 2 : stallSeconds;
+  if (stalledSeconds < effectiveThreshold || previous.reported) {
+    records.set(handle, { ...previous, activeChild, gitParts: gitParts || previous.gitParts });
     return { stalled: false, changed: false, stalledSeconds };
   }
-  records.set(handle, { ...previous, reported: true });
+  records.set(handle, { ...previous, reported: true, activeChild, gitParts: gitParts || previous.gitParts });
   return { stalled: true, changed: false, stalledSeconds };
 }
 
@@ -80,7 +150,11 @@ function recordsFromJSON(value) {
 }
 
 module.exports = {
+  ACTIVE_CHILD_MARKER,
+  normalizeTerminalLine,
+  terminalOutputSample,
   meaningfulTerminalOutput,
+  workerProgressSample,
   workerProgressFingerprint,
   observeWorkerProgress,
   recordsFromJSON,

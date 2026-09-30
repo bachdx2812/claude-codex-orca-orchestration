@@ -61,4 +61,43 @@ function hasCodexDisconnect(text) {
   return false;
 }
 
-module.exports = { hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted };
+/**
+ * Return a repaint-stable signature for an interactive approval/question/selection prompt,
+ * or null for ordinary output that merely discusses those words.
+ */
+function approvalPromptFingerprint(text) {
+  let inFence = false;
+  const lines = terminalLines(text).flatMap((raw) => {
+    const line = raw.trim();
+    if (/^(?:```|~~~)/.test(line)) { inFence = !inFence; return []; }
+    return inFence || isSourceExcerpt(line) ? [] : [line];
+  }).filter(Boolean);
+  const hasNavigation = lines.some((line) =>
+    /^[↑↓]+\s*navigate\s*[·•|]\s*Enter\s+select\s*$/i.test(line));
+  const hasPermissionMenu = lines.some((line) => /^Select\s+permission\s+mode\s*$/i.test(line));
+  const hasApprovalQuestion = lines.some((line) =>
+    /^(?:Would\s+you\s+like\s+to\s+(?:allow|approve|run)|Do\s+you\s+want\s+to\s+(?:allow|approve|run)|(?:Allow|Approve)\b.*\?)$/i.test(line));
+  const optionNames = new Set(lines.map((line) => line
+    .replace(/^[❯›>•·✓✔✗✘\s]+/u, '')
+    .replace(/^\d+[.)]\s*/, '')
+    .trim()
+    .toLowerCase())
+    .filter((line) => /^(?:allow|deny|approve|never ask|ask when needed)$/.test(line)));
+  const hasOpposingOptions = optionNames.has('allow') && optionNames.has('deny');
+
+  if (!hasNavigation && !hasPermissionMenu && !hasApprovalQuestion && !hasOpposingOptions) return null;
+
+  // Selection arrows and navigation help repaint as the operator moves through the menu.
+  // Excluding them keeps one prompt episode stable while retaining question/command text so
+  // a later, distinct prompt re-arms even when it uses the same Allow/Deny options.
+  const signature = lines
+    .filter((line) => !/^[↑↓]+\s*navigate\s*[·•|]\s*Enter\s+select\s*$/i.test(line))
+    .map((line) => line.replace(/^[❯›>•·✓✔✗✘\s]+/u, '').replace(/^\d+[.)]\s*/, '').trim())
+    .join('\n')
+    .toLowerCase();
+  return signature || 'selection-prompt';
+}
+
+module.exports = {
+  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, approvalPromptFingerprint,
+};

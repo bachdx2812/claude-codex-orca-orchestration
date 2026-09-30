@@ -40,9 +40,11 @@ const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { loadConfig, stateDir, closeDoneWorktreesEnabled, stallSeconds } = require('./lib/config.cjs');
-const { hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted } = require('./lib/terminal-signals.cjs');
 const {
-  workerProgressFingerprint, observeWorkerProgress, recordsFromJSON,
+  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, approvalPromptFingerprint,
+} = require('./lib/terminal-signals.cjs');
+const {
+  workerProgressSample, observeWorkerProgress, recordsFromJSON,
 } = require('./lib/worker-progress-fingerprint.cjs');
 
 const DIR = stateDir();
@@ -94,6 +96,7 @@ const USAGE_EXHAUSTED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-usage
 // Per-terminal fingerprint, last real progress time and once-per-episode report marker.
 // This survives daemon restarts because emitting any wake event intentionally exits.
 const STALL_PROGRESS_FILE = path.join(DIR, `heartbeat-${SESSION}-stall-progress.json`);
+const APPROVAL_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-approval-reported.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -210,6 +213,33 @@ function savePersistedStallProgress(records) {
   } catch {}
 }
 
+function loadPersistedApprovalReports() {
+  try {
+    const pairs = JSON.parse(fs.readFileSync(APPROVAL_REPORTED_FILE, 'utf8'));
+    return new Map(Array.isArray(pairs) ? pairs.filter((pair) =>
+      Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' &&
+      typeof pair[1] === 'string') : []);
+  } catch {
+    return new Map();
+  }
+}
+
+function savePersistedApprovalReports(reported) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${APPROVAL_REPORTED_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...reported]));
+    fs.renameSync(tmp, APPROVAL_REPORTED_FILE);
+  } catch {}
+}
+
+function reportApprovalWaiting({ reported, handle, fingerprint, identity, agent }) {
+  if (reported.get(handle) === fingerprint) return null;
+  reported.set(handle, fingerprint);
+  savePersistedApprovalReports(reported);
+  return `WORKER WAITING FOR APPROVAL ${identity || handle} (${agent || 'unknown'})`;
+}
+
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
 // exhaustion marker the routing code reads to exclude that coder until reset. The module
 // providing it may not exist yet (it lands with the routing lane) — a missing/failing
@@ -315,12 +345,14 @@ function terminalWorktreePath(terminal, workerRows) {
   return candidates.find((candidate) => path.isAbsolute(candidate)) || '';
 }
 
-/** Three one-second git probes keep each supervised worker fingerprint bounded near 3s. */
+/** Four bounded probes keep one supervised worker's git fingerprint near 3s total. */
 function runProgressGit(args, cwd) {
   try {
-    const r = spawnSync(GIT_BIN, args, { cwd, encoding: 'utf8', timeout: 1000 });
+    const r = spawnSync(GIT_BIN, args, {
+      cwd, encoding: 'utf8', timeout: 750, maxBuffer: 8 * 1024 * 1024,
+    });
     if (r.error || r.status === null || r.status === undefined) return null;
-    return { status: r.status, stdout: (r.stdout || '').trim() };
+    return { status: r.status, stdout: r.stdout || '' };
   } catch {
     return null;
   }
@@ -840,6 +872,8 @@ function classifyTerminal(t, ctx) {
       hasKimiUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'kimi' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
+  const approvalFingerprint = approvalPromptFingerprint(t.preview || '');
+  if (approvalFingerprint) return { kind: 'approval_waiting', fingerprint: approvalFingerprint };
   if (t.orphaned) return { kind: 'orphaned' };
   const supervised = (ctx.retainedHandles && ctx.retainedHandles.has(t.handle)) ||
     !ctx.baseHandles.has(t.handle) || t.lastOutputAt > ctx.started;
@@ -855,6 +889,31 @@ function snapshotWorkers(list) {
     m.set(w.dispatchId, `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`);
   }
   return m;
+}
+
+const TERMINAL_WORKER_STATES = new Set(['succeeded', 'failed', 'stopped', 'completed']);
+
+function terminalWorkerStates(workerRows) {
+  const states = new Map();
+  for (const row of workerRows || []) {
+    if (row && row.agentTerminalHandle && row.workerState) {
+      const previous = states.get(row.agentTerminalHandle);
+      if (!TERMINAL_WORKER_STATES.has(previous) || TERMINAL_WORKER_STATES.has(row.workerState)) {
+        states.set(row.agentTerminalHandle, row.workerState);
+      }
+    }
+  }
+  return states;
+}
+
+function stallThresholdForAgent(agent, heartbeatConfig, globalThreshold) {
+  return Object.hasOwn(heartbeatConfig.stallSecondsByAgent, agent)
+    ? heartbeatConfig.stallSecondsByAgent[agent]
+    : globalThreshold;
+}
+
+function shouldTrackWorkerProgress(verdictKind, workerState) {
+  return ['working', 'idle'].includes(verdictKind) && !TERMINAL_WORKER_STATES.has(workerState);
 }
 
 function formatStallEvent({ dispatchId, handle, agent, stalledSeconds }) {
@@ -891,6 +950,7 @@ function main() {
   const reportedDisconnect = loadPersistedDisconnectReports();
   const reportedUsageExhausted = loadPersistedUsageExhaustedReports();
   const stallProgress = loadPersistedStallProgress();
+  const reportedApproval = loadPersistedApprovalReports();
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
@@ -973,6 +1033,7 @@ function main() {
       // attributed to a terminal whose tracked worker agent is kimi (RT-3).
       const handleAgent = new Map();
       const handleDispatch = new Map();
+      const handleWorkerState = terminalWorkerStates(ws || []);
       for (const row of ws || []) {
         if (row && row.agentTerminalHandle) {
           const agent = stateWorkerForRow(row, tickState)?.agent || row.agent;
@@ -1015,6 +1076,19 @@ function main() {
             `WORKER STUCK on ${label}: Codex session lost its app-server connection - ` +
             'its work since the last commit may be lost; release and re-dispatch'
           );
+        } else if (verdict.kind === 'approval_waiting') {
+          if (TERMINAL_WORKER_STATES.has(handleWorkerState.get(t.handle))) {
+            if (reportedApproval.delete(t.handle)) savePersistedApprovalReports(reportedApproval);
+            continue;
+          }
+          const event = reportApprovalWaiting({
+            reported: reportedApproval,
+            handle: t.handle,
+            fingerprint: verdict.fingerprint,
+            identity: handleDispatch.get(t.handle) || t.handle,
+            agent: handleAgent.get(t.handle) || 'unknown',
+          });
+          if (event) events.push(event);
         } else if (verdict.kind === 'orphaned') {
           // Orphans already present at startup are backlog, not this run's event: reporting
           // them would make every restarted daemon exit on its first tick, breaking the loop.
@@ -1027,18 +1101,30 @@ function main() {
           events.push(`IDLE ${verdict.quiet}s: ${label} — read it and decide: re-prompt, retry, or release.`);
         }
 
+        if (verdict.kind !== 'approval_waiting' && reportedApproval.delete(t.handle)) {
+          savePersistedApprovalReports(reportedApproval);
+        }
+
         // Fatal/quota signals above take precedence and are never mislabeled as stalls.
-        if (!['working', 'idle'].includes(verdict.kind)) continue;
+        if (!shouldTrackWorkerProgress(verdict.kind, handleWorkerState.get(t.handle))) {
+          if (!TERMINAL_WORKER_STATES.has(handleWorkerState.get(t.handle))) continue;
+          if (stallProgress.delete(t.handle)) savePersistedStallProgress(stallProgress);
+          continue;
+        }
         const agent = handleAgent.get(t.handle) || 'unknown';
-        const threshold = cfg.heartbeat.stallSecondsByAgent[agent] || STALL_SECONDS;
-        const fingerprint = workerProgressFingerprint({
+        const threshold = stallThresholdForAgent(agent, cfg.heartbeat, STALL_SECONDS);
+        const previousProgress = stallProgress.get(t.handle);
+        const sample = workerProgressSample({
           terminalText: t.preview,
           worktreePath: terminalWorktreePath(t, ws || []),
           git: runProgressGit,
+          previousGitParts: previousProgress && previousProgress.gitParts,
         });
         const progress = observeWorkerProgress(stallProgress, {
-          handle: t.handle, fingerprint, now, stallSeconds: threshold,
+          handle: t.handle, fingerprint: sample.fingerprint, now, stallSeconds: threshold,
+          activeChild: sample.activeChild, gitParts: sample.gitParts,
         });
+        beat(started);
         if (progress.changed || progress.stalled) savePersistedStallProgress(stallProgress);
         if (progress.stalled) {
           events.push(formatStallEvent({
@@ -1047,6 +1133,7 @@ function main() {
           }));
         }
       }
+      beat(started);
     }
 
     if (events.length) { flushAndExit(events, now); return; }
@@ -1071,5 +1158,7 @@ module.exports = {
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
-  formatStallEvent,
+  formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
+  shouldTrackWorkerProgress,
+  loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
 };
