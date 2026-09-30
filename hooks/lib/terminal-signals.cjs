@@ -31,7 +31,7 @@ function hasRateLimitError(text) {
 
 const KIMI_USAGE_LIMIT_SENTENCE = /^you(?:'|’)?ve\s+reached\s+your\s+usage\s+limit\s+for\s+this\s+billing\s+cycle/i;
 const KIMI_IGNORED_LINE_PREFIX = /^\s*(?:["'`>]|\/\/|#|[-*](?:\s|$))/;
-const KIMI_ERROR_PREFIX = /^\s*\+?\s*(?:[■⚠✗]\s*(?:(?:ERROR\b|(?:HTTP\s*)?403\b)[:\s-]*)*|error\b[:\s]+|(?:HTTP\s*)?403\b[:\s]+)/i;
+const KIMI_ERROR_PREFIX = /^\s*\+?\s*(?:[■⚠✗]\s*|error\b[:\s]+|(?:HTTP\s*)?403\b[:\s]+)(?:(?:ERROR\b|(?:HTTP\s*)?403\b)[:\s-]*)*/i;
 
 /** True only when Kimi's billing-cycle usage-limit sentence appears on an error-shaped
  * line — deliberately NOT a strong marker: the sentence alone, in plain prose (a worker

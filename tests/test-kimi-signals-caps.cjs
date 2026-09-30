@@ -238,6 +238,8 @@ for (const marker of ['`', '> ', '// ', '# ', '- ', '* ']) {
 }
 check('a direct HTTP 403 prefix counts', hasKimiUsageExhausted(
   "HTTP 403: You've reached your usage limit for this billing cycle."), true);
+check('a direct ERROR 403 prefix counts', hasKimiUsageExhausted(
+  "ERROR 403 You've reached your usage limit for this billing cycle."), true);
 
 // --- heartbeat classification (agent-scoped, RT-3) -----------------------------
 
