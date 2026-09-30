@@ -36,6 +36,10 @@ const DEFAULT_CACHE_SECONDS = 60;
 const LIVE_CACHE_FILE = 'codex-quota-live.json';
 const LIVE_PROBE_LOCK = '.codex-quota-probe.lock';
 const LIVE_PROBE = path.join(__dirname, 'codex-quota-probe.cjs');
+const KIMI_LIVE_TIMEOUT_MS = 3500;
+const KIMI_LIVE_CACHE_FILE = 'kimi-quota-live.json';
+const KIMI_LIVE_PROBE_LOCK = '.kimi-quota-probe.lock';
+const KIMI_LIVE_PROBE = path.join(__dirname, 'kimi-quota-probe.cjs');
 const authStateCache = new Map();
 
 function codexSessionsDir() {
@@ -215,6 +219,113 @@ function parseLiveQuota(result, now = Date.now()) {
   ));
 }
 
+function resetSeconds(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? value / 1000 : value;
+  if (typeof value !== 'string') return 0;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && value.trim() !== '') return numeric > 1e12 ? numeric / 1000 : numeric;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed / 1000 : 0;
+}
+
+function kimiWindow(limit, remaining, resetTime, now, usedRatio) {
+  let usedPercent = null;
+  if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0 &&
+      typeof remaining === 'number' && Number.isFinite(remaining)) {
+    usedPercent = Math.max(0, Math.min(100, ((limit - remaining) / limit) * 100));
+  } else if (typeof usedRatio === 'number' && Number.isFinite(usedRatio) && usedRatio >= 0) {
+    usedPercent = Math.max(0, Math.min(100, usedRatio <= 1 ? usedRatio * 100 : usedRatio));
+  }
+  if (usedPercent === null) return null;
+  const resetsAt = resetSeconds(resetTime);
+  return resetsAt && resetsAt * 1000 <= now ? { usedPercent: 0, resetsAt: 0 } : { usedPercent, resetsAt };
+}
+
+/** Convert Kimi's /usages response to the tightest usable quota window. */
+function parseKimiUsages(body, now = Date.now()) {
+  if (!body || typeof body !== 'object') return null;
+  const windows = [];
+  const usage = body.usage;
+  if (usage && typeof usage === 'object') {
+    windows.push(kimiWindow(usage.limit, usage.remaining, usage.resetTime || usage.reset_time, now));
+  }
+  if (Array.isArray(body.limits)) {
+    for (const item of body.limits) {
+      const detail = item && item.detail;
+      if (detail && typeof detail === 'object') {
+        windows.push(kimiWindow(detail.limit, detail.remaining, detail.resetTime || detail.reset_time, now));
+      }
+    }
+  }
+  if (body.usages && typeof body.usages === 'object') {
+    for (const item of Object.values(body.usages)) {
+      if (item && typeof item === 'object') {
+        windows.push(kimiWindow(null, null, item.reset_time || item.resetTime, now, item.used_ratio));
+      }
+    }
+  }
+  const valid = windows.filter(Boolean);
+  return valid.length ? valid.reduce((a, b) => b.usedPercent > a.usedPercent ? b : a) : null;
+}
+
+function kimiProbeEnv(env = process.env) {
+  const out = {};
+  for (const key of ['ORCH_KIMI_HOME', 'ORCH_KIMI_USAGE_URL', 'KIMI_CODE_BASE_URL', 'HOME']) {
+    if (Object.prototype.hasOwnProperty.call(env, key)) out[key] = String(env[key]);
+  }
+  return out;
+}
+
+function kimiLiveResult(now, env) {
+  const probe = spawnSync(process.execPath, [KIMI_LIVE_PROBE], {
+    encoding: 'utf8',
+    timeout: KIMI_LIVE_TIMEOUT_MS,
+    maxBuffer: 3 * 1024 * 1024,
+    env: kimiProbeEnv(env),
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const stdout = String(probe.stdout || '').trim();
+  if (probe.error || !stdout) return { failed: true, kind: 'timeout' };
+  try {
+    const reply = JSON.parse(stdout);
+    if (probe.status !== 0 || reply.ok !== true) {
+      return { failed: true, kind: typeof reply.kind === 'string' ? reply.kind : 'http' };
+    }
+    const quota = parseKimiUsages(reply.body, now);
+    return quota || { failed: true, kind: 'parse' };
+  } catch {
+    return { failed: true, kind: 'parse' };
+  }
+}
+
+function cachedKimiResult(entry, now) {
+  if (!entry || typeof entry.fetchedAt !== 'number' || !Number.isFinite(entry.fetchedAt)) return null;
+  if (entry.failed === true) return {
+    failed: true, fetchedAt: entry.fetchedAt,
+    ...(typeof entry.kind === 'string' ? { kind: entry.kind } : {}),
+  };
+  if (typeof entry.usedPercent !== 'number' || !Number.isFinite(entry.usedPercent) ||
+      entry.usedPercent < 0 || entry.usedPercent > 100 ||
+      typeof entry.resetsAt !== 'number' || !Number.isFinite(entry.resetsAt) || entry.resetsAt < 0 ||
+      (entry.resetsAt && entry.resetsAt * 1000 <= now)) return null;
+  return { usedPercent: entry.usedPercent, resetsAt: entry.resetsAt, fetchedAt: entry.fetchedAt, source: 'live' };
+}
+
+function kimiQuota(now = Date.now(), options = {}) {
+  const stateDir = options.stateDir || process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
+  const cacheSeconds = options.cacheSeconds === undefined ? DEFAULT_CACHE_SECONDS : options.cacheSeconds;
+  return liveCache().cachedLiveProbe({
+    stateDir,
+    cacheFile: KIMI_LIVE_CACHE_FILE,
+    lockName: KIMI_LIVE_PROBE_LOCK,
+    cacheSeconds,
+    now,
+    probe: () => kimiLiveResult(now, options.env || process.env),
+    validate: cachedKimiResult,
+    probeTimeoutMs: KIMI_LIVE_TIMEOUT_MS,
+  });
+}
+
 function liveQuotaResult(now = Date.now()) {
   const codexBin = process.env.ORCH_CODEX_BIN || process.env.CODEX_BIN || 'codex';
   const probe = spawnSync(process.execPath, [LIVE_PROBE, codexBin], {
@@ -304,7 +415,7 @@ function codexAuthState(stateDir, now = Date.now()) {
     if (memo && memo.mtimeMs === stat.mtimeMs && memo.size === stat.size) return memo.state;
     const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
     const state = entry && entry.authState === 'logged-out' ? 'logged-out'
-      : entry && entry.failed !== true && cachedQuotaResult(entry, now) ? 'ok'
+      : entry && entry.authState === 'ok' ? 'ok'
         : 'unknown';
     authStateCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, state });
     return state;
@@ -357,5 +468,5 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
 
 module.exports = {
   pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
-  parseLiveQuota, liveQuota, codexQuota, codexAuthState, readFreshCache, formatAge,
+  parseLiveQuota, parseKimiUsages, liveQuota, codexQuota, kimiQuota, codexAuthState, readFreshCache, formatAge,
 };

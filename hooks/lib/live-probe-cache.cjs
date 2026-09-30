@@ -118,6 +118,7 @@ function cachedLiveProbe({
   const fallback = readProcessFallback(args);
   if (fallback) return fallback;
 
+  try { fs.mkdirSync(stateDir, { recursive: true }); } catch {}
   const lockDir = path.join(stateDir, lockName);
   const lock = acquireLock(lockDir, { timeoutMs: 300, retryMs: 25, staleMs: probeTimeoutMs + 1000 });
   if (lock === false) {
