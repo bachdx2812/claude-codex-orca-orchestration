@@ -14,8 +14,8 @@
     "lookup": ["Explore"]
   },
   "codexHandoffUsedPercent": 95,
-  "codexQuotaCacheSeconds": 60,
   "kimiHandoffUsedPercent": 95,
+  "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "execFallbackWhenCodexUnavailable": "sonnet",

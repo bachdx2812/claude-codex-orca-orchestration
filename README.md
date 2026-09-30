@@ -2,9 +2,10 @@
 
 Installable [Claude Code](https://claude.com/claude-code) hooks that turn a described
 orchestration workflow into a mechanically enforced one: a main panel that only
-dispatches and supervises, planning/review/verification pinned to one model, code routed
-to Codex in an [Orca](https://orca.dev) worker (or an in-session model once Codex quota
-runs low), every code brief required to name how it will be verified, and a supervision
+dispatches and supervises, planning/review/verification pinned to one model, code spread
+across Codex and Kimi peers in [Orca](https://orca.dev) workers (or an in-session model
+once neither coder is eligible), every code brief required to name how it will be
+verified, and a supervision
 loop that will not let the session end with an Orca worker still live and unwatched.
 
 Repo: <https://github.com/bachdx2812/claude-codex-orca-orchestration>
@@ -24,11 +25,16 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kim
 | Main panel (orchestrator) | Takes the request, delegates, supervises workers, reports; never writes code | Session default model | — | `activation` |
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Reviewer / verifier | Code review, verification | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
-| Coder (default) | Implement / fix / refactor | Codex `gpt-5.6-sol` | Orca worker: `orca orchestration worker-start --agent codex --model gpt-5.6-sol` (brief must name a verify command) | `models.codex` |
-| Coder (parallel) | Same work, in parallel with Codex on disjoint `Owns:` | Kimi (`default_model` in `~/.kimi-code/config.toml`) | Orca worker: `orca orchestration worker-start --agent kimi` — no `--model` (Orca cannot pin one for Kimi); brief must name a verify command | `models.kimi`, `maxParallelKimiWorkers` |
+| Coder pool (peers) | Every task class previously handled by Codex: code, builds, refactors, tests, bulk conversions, and fix loops | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) | Spread across eligible Orca workers. Pick fewer live workers, then more headroom below that coder's own threshold, then the coder other than `lastCoder`, then Codex as the final tie-break. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`. | `models.codex`, `models.kimi`, per-coder caps and thresholds |
 | Coder (handoff) | Same work once every usable coder has used >= its handoff threshold of its live-read quota (Codex: `codexHandoffUsedPercent`, default 95, override `ORCH_CODEX_HANDOFF_USED`; Kimi: `kimiHandoffUsedPercent`, default 95, override `ORCH_KIMI_HANDOFF_USED`) or is unusable on this machine | Sonnet | `Agent` with `model: "sonnet"` (brief must name a verify command) | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `models.code`, `execFallbackWhenCodexUnavailable` |
 | Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
 | Escalation | Only after Opus 5.5 failed even at higher effort; the dispatch must say both | Fable 5.1 (`claude-fable-5-1`) | `Agent` with `model: "fable"` + "escalation: opus failed ... at high effort ..." | `models.escalation` |
+
+An eligible coder is usable on this machine (installed, signed in, and launchable), below
+its own handoff threshold, and has a free cap slot. Unusable coders are excluded; if both
+coders are exhausted or unusable, code goes to Sonnet. Each threshold defaults to 95 and
+is independently configurable in `~/.claude/orchestration.config.json` or with
+`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`.
 
 ### Override from the main panel
 
@@ -301,8 +307,8 @@ The file is plain JSON — no comments — parsed as-is:
 ```json
 {
   "codexHandoffUsedPercent": 90,
-  "codexQuotaCacheSeconds": 60,
   "kimiHandoffUsedPercent": 95,
+  "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "replyLanguage": "Vietnamese",

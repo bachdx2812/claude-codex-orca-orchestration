@@ -16,18 +16,23 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kim
 |---|---|---|---|
 | Main panel | session default; never writes code | — | `activation` |
 | Planner / red-team / reviewer / verifier | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
-| Coder (default) | Codex `gpt-5.6-sol` | Orca worker (`worker-start --agent codex --model gpt-5.6-sol`) | `models.codex` |
-| Coder (parallel) | Kimi (`default_model` in `~/.kimi-code/config.toml`) | Orca worker (`worker-start --agent kimi`, no `--model`) | `models.kimi`, `maxParallelKimiWorkers` |
+| Coder pool (peers) | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) for code, builds, refactors, tests, bulk conversions, and fix loops | Spread across eligible Orca workers: fewer live workers, then more threshold headroom, then not `lastCoder`, then Codex as the final tie-break. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`. | `models.codex`, `models.kimi`, per-coder caps and thresholds |
 | Coder (handoff) | Sonnet, once every usable coder is at/past its handoff threshold (Codex `codexHandoffUsedPercent` / Kimi `kimiHandoffUsedPercent`, both default 95) of its live-read quota or is unusable; overrides `ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED` | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `models.code` |
 | Lookups | Haiku (advised, not enforced) | `Agent` with `model: "haiku"` | `models.lookup` |
 | Escalation | Fable 5.1 (`claude-fable-5-1`), only after Opus 5.5 failed at high effort | `Agent` with `model: "fable"` | `models.escalation` |
+
+Eligibility means installed, signed in, launchable, below the coder's own threshold, and
+within its cap. An unusable coder is excluded; both unusable or exhausted means Sonnet.
+The independent Codex/Kimi thresholds default to 95 and are configurable in
+`~/.claude/orchestration.config.json` or through `ORCH_CODEX_HANDOFF_USED` /
+`ORCH_KIMI_HANDOFF_USED`.
 
 Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|kimi|kimi:<model>|auto`. Full
 detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
 
 **Subagents and parallel work.** In-session subagents (`Agent` tool) return their result
 directly and are never tracked by these hooks for supervision purposes — no heartbeat
-needed. Orca workers (Codex) run in their own terminal/worktree and must be supervised by
+needed. Orca workers (Codex or Kimi) run in their own terminal/worktree and must be supervised by
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
 terminal, a lost Codex app-server connection, an orphan, a rate limit, or one of this session's worktrees whose PR already
 merged/closed with no live terminal left on it; `Stop` refuses to end the session with one live and
@@ -76,7 +81,7 @@ orca --version                       # or: orca orchestration --help
 ```
 
 None of these are hard requirements to *install* — `node install.mjs --check` reports
-which are missing and what that implies (see "No Orca / no Codex" below). Node >= 18 is
+which are missing and what that implies (see "No Orca / unusable coder pool" below). Node >= 18 is
 the one hard requirement; the installer refuses to run without it.
 
 ## 2. Install
@@ -190,8 +195,8 @@ The file is plain JSON — no comments — parsed as-is:
 ```json
 {
   "codexHandoffUsedPercent": 90,
-  "codexQuotaCacheSeconds": 60,
   "kimiHandoffUsedPercent": 95,
+  "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "replyLanguage": "Vietnamese",
@@ -262,20 +267,22 @@ in-session code still runs on the configured code model** — the fallback exist
 Orca cannot be reached at all, so it cannot honor "use Codex" either, regardless of the
 standing override.
 
-## 6. No Orca / no Codex
+## 6. No Orca / unusable coder pool
 
-If `orca` is not on `PATH`, or Codex quota is unknown after the live app-server probe and
-session-log fallback, automatic routing keeps defaulting to Codex (an unknown Codex quota
-is not evidence Codex is unusable) — which will then refuse in-session code dispatches
-until you either:
+Automatic routing excludes any coder that is not usable on this machine: `orca` or its
+binary is missing, authentication is absent, or Orca cannot launch it. A failed quota read
+alone does not make an otherwise usable coder unavailable. If only one coder is eligible,
+all code goes to it; if neither Codex nor Kimi is eligible, code falls back to Sonnet. You
+can also:
 
 - pass `--exec-sonnet` (or `--code-model <your configured code alias>`) — an honest,
   session-scoped preference that never claims Orca is down, or
 - declare the Orca fallback: `date -u +%Y-%m-%dT%H:%M:%SZ >
   ~/.claude/orchestrator-gate/orca-unavailable` (expires after 15 minutes on purpose).
 
-`node install.mjs --check` reports both binaries' presence and codex's apparent login
-state up front so this is diagnosed before it becomes a mid-session refusal.
+`node install.mjs --check` should report Orca and both coders' availability before routing.
+The corresponding installer text is updated separately with the Lane B installer work;
+this lane intentionally does not edit `install.mjs`.
 
 ## 7. Escape hatches, uninstall, rollback
 

@@ -27,8 +27,13 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    configured in-session code
    model (`models.code.alias`, default `sonnet`) only once every usable coder has exhausted
    its quota — Codex at `codexHandoffUsedPercent` (default 95), Kimi at the separate
-   `kimiHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. The operator
-   can pick the coding model directly with `--code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>`,
+   `kimiHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. Routing
+   spreads every Codex task class — code, builds, refactors, tests, bulk conversions, and
+   fix loops — across both peers. Among eligible coders, pick fewer live workers, then more
+   headroom below the coder's own threshold, then the coder other than `lastCoder`, and
+   finally Codex as the last tie-break. A coder that is not installed, signed in, or
+   launchable on this machine is excluded; both coders exhausted or unusable means Sonnet.
+   The operator can pick the coding model directly with `--code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>`,
    or use the `--exec-sonnet` / `--exec-codex` / `--exec-kimi` / `--exec-auto` shortcuts.
    A `worker-start --agent kimi` is dispatched WITHOUT `--model` (Kimi uses
    `default_model` from `~/.kimi-code/config.toml`).
@@ -130,19 +135,18 @@ either, regardless of what the operator's standing override says.
 
 ## Coder availability (no Orca / no Codex / no Kimi)
 
-Codex is the deliberately-preferred default, so **only a missing binary triggers the
-execution fallback — never merely an unknown quota reading.** Automatic routing first
-uses a fresh state-dir live cache (including cached failures), then queries `codex app-server`
+Codex and Kimi are peers. Automatic routing first establishes which coders are usable,
+then applies the load-balancing order in rule 3; Codex is chosen first only at the final
+tie-break. A quota-unknown reading does not by itself make a usable coder ineligible.
+Codex quota discovery first uses a fresh state-dir live cache (including cached failures), then queries `codex app-server`
 JSON-RPC `account/rateLimits/read` (5-second parent timeout, 4.5-second helper deadline,
 no model call), then scans local Codex session logs no older than six hours. A helper that
 must stop its app-server child escalates from SIGTERM to SIGKILL. If all three sources are
-unavailable, the reading is unknown; that is not
-evidence Codex is unusable, and routing still prefers it. If `orca` or `codex` itself is
-not on `PATH`,
-though, Codex genuinely cannot be dispatched to at all, and with
-`execFallbackWhenCodexUnavailable` at `"sonnet"` (the default) automatic routing falls
-back to the configured code model instead. Set `execFallbackWhenCodexUnavailable` to
-`null` to disable this and always prefer Codex regardless of either binary's presence.
+unavailable, the reading is unknown rather than evidence that Codex is unusable. If only
+one coder is eligible, all code goes to it; if neither coder is eligible,
+`execFallbackWhenCodexUnavailable: "sonnet"` (the default) routes to the configured code
+model. Setting the legacy-named option to `null` disables that automatic in-session
+fallback; it does not make an unusable coder eligible.
 
 Each coder's **availability** (binary present? signed in?) is probed per machine and cached
 in `coder-availability.json` in the gate state directory for `coderAvailabilityCacheSeconds`
@@ -208,8 +212,8 @@ backup precedes their removal. Help and unknown options never enter the install 
   },
   "agents": { "escalation": [], "lookup": ["Explore"] },
   "codexHandoffUsedPercent": 95,
-  "codexQuotaCacheSeconds": 60,
   "kimiHandoffUsedPercent": 95,
+  "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "execFallbackWhenCodexUnavailable": "sonnet",
@@ -234,11 +238,11 @@ backup precedes their removal. Help and unknown options never enter the install 
   specific set (`agents.lookup` ships with `["Explore"]`; `agents.escalation` ships
   empty) — add your own team's advisory-agent names here rather than expecting the gate
   to guess them.
-- `codexHandoffUsedPercent`: integer 0-100. Sonnet-or-whatever-your-code-model-is takes
-  over once Codex has used this much of its tightest quota window. Overridable for one
+- `codexHandoffUsedPercent`: integer 0-100, default 95. Codex leaves the eligible peer
+  pool once it has used this much of its tightest quota window. Overridable for one
   process with `ORCH_CODEX_HANDOFF_USED`.
-- `kimiHandoffUsedPercent`: integer 0-100, default 95. Kimi's own handoff threshold —
-  separate from the Codex one: Kimi counts as exhausted once it has used this much of its
+- `kimiHandoffUsedPercent`: integer 0-100, default 95. Kimi's own, independent threshold:
+  Kimi leaves the eligible peer pool once it has used this much of its
   tightest quota window. Overridable for one process with `ORCH_KIMI_HANDOFF_USED`.
 - `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
   `codex app-server` quota reading or a failed probe is reused from `codex-quota-live.json` in the gate
