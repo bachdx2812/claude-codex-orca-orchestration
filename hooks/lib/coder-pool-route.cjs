@@ -18,9 +18,11 @@
  * free per-session concurrency slot (a ranking key, not a filter) -> MORE HEADROOM below
  * each coder's OWN resolved threshold -> within a tie band (`options.tieBand`, default 10
  * headroom points) fewer live workers machine-wide -> the coder other than
- * `options.lastCoder` -> Codex first. A coder whose quota is UNKNOWN ranks as if its
- * headroom were `options.unknownAssumed` (default 30) points: below any coder with known
- * headroom >= that value, above one with less. Headroom is known as often as possible —
+ * `options.lastCoder` -> Codex first. The tie band applies ONLY between two coders with
+ * KNOWN headroom: a quota-unknown coder never ties — it ranks below any coder with known
+ * headroom >= `options.unknownAssumed` (default 30) and above one with known headroom
+ * below that, by operator ruling on the Fix-6 spec nuance. Headroom is known as often as
+ * possible —
  * quota readings may carry `estimated: true` (a reset-aware estimate of the last
  * successful live read, see exec-route-by-quota.cjs) and then count as known, surfaced
  * via `coders[coder].estimated` / `quotaFetchedAt` for the reminder text.
@@ -79,12 +81,9 @@ function pickCoderPool(options = {}) {
   const coders = {};
   const thresholdFor = (coder) => typeof thresholds[coder] === 'number' ? thresholds[coder] : 95;
   const headroomFor = (coder) => knownQuota(quotas[coder]) ? thresholdFor(coder) - quotas[coder].usedPercent : null;
-  // The ranking headroom: known when a (possibly estimated) reading exists, the configured
-  // assumed value when unknown — unknown ranks below known >= assumed and above known < assumed.
-  const rankHeadroomFor = (coder) => {
-    const h = headroomFor(coder);
-    return h === null ? unknownAssumed : h;
-  };
+  // The known headroom, or null when the quota is unknown. Unknown-vs-known NEVER ties
+  // (operator ruling, N4): the tie band applies only between two known headrooms.
+  const rankHeadroomFor = (coder) => headroomFor(coder);
 
   for (const coder of CODERS) {
     const available = availability[coder] || { usable: false, reason: 'not installed' };
@@ -120,7 +119,15 @@ function pickCoderPool(options = {}) {
     const aFree = freeSlot(a); const bFree = freeSlot(b);
     if (aFree !== bFree) return aFree ? -1 : 1;
     const ah = rankHeadroomFor(a); const bh = rankHeadroomFor(b);
-    if (Math.abs(ah - bh) > tieBand) return bh - ah;
+    if (ah !== null && bh !== null) {
+      if (Math.abs(ah - bh) > tieBand) return bh - ah;
+      // within the tie band: fall through to fewer live workers
+    } else if (ah !== null || bh !== null) {
+      // Unknown vs known never ties: known >= unknownAssumed ranks above unknown.
+      const known = ah !== null ? ah : bh;
+      if (known >= unknownAssumed) return ah !== null ? -1 : 1;
+      return ah !== null ? 1 : -1;
+    }
     if (coders[a].live !== coders[b].live) return coders[a].live - coders[b].live;
     if (lastCoder === a) return 1;
     if (lastCoder === b) return -1;
@@ -142,10 +149,13 @@ function pickCoderPool(options = {}) {
   } else if (order.length > 1) {
     const other = order[1];
     const pickH = rankHeadroomFor(pick); const otherH = rankHeadroomFor(other);
+    const headroomDecided = (pickH !== null && otherH !== null)
+      ? Math.abs(pickH - otherH) > tieBand
+      : (pickH !== null || otherH !== null); // unknown vs known never ties (N4)
+    const fmtH = (h) => h === null ? `unknown (~${unknownAssumed})` : `${Math.round(h)}`;
     if (freeSlot(pick) !== freeSlot(other)) pickReason = 'free capacity';
-    else if (Math.abs(pickH - otherH) > tieBand) {
-      pickReason = `more quota left: ${Math.round(pickH)} vs ${Math.round(otherH)}`;
-    } else if (coders[pick].live !== coders[other].live) pickReason = 'fewer live';
+    else if (headroomDecided) pickReason = `more quota left: ${fmtH(pickH)} vs ${fmtH(otherH)}`;
+    else if (coders[pick].live !== coders[other].live) pickReason = 'fewer live';
     else if (lastCoder === other) pickReason = 'alternation';
     else pickReason = 'codex first';
   }

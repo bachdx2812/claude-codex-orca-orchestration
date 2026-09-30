@@ -3363,6 +3363,45 @@ async function heartbeatH1RealGitTests() {
     if (st.workers.ctx_bare_1 && st.workers.ctx_bare_1.status === 'live' && !pendings.length) pass += 1;
     else failures.push(`a piped worker-start whose formatter prints a bare dispatch id must register it (${JSON.stringify(st.workers)})`);
   }
+  // N2: an "ok": false reply piped through jq is still honoured as a failure — nothing is
+  // registered, the reservation is dropped; a readiness-timeout failure still registers
+  // its retainable dispatch.
+  rmState(P_SID);
+  const n2cmd = 'orca orchestration worker-start --agent codex --task pln2 --json | jq .';
+  invoke(mainBash(n2cmd, { sid: P_SID, tool_use_id: 'toolu_n2_piped' }), CODEX_WINS);
+  invoke(postBash(n2cmd, '{"ok":false,"error":"dispatch refused"}', { sid: P_SID, tool_use_id: 'toolu_n2_piped' }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {}, reservations: {} };
+    if (!Object.keys(st.workers).length && !Object.keys(st.reservations).length) pass += 1;
+    else failures.push(`a piped "ok": false reply must register nothing and drop the reservation (${JSON.stringify({ workers: st.workers, reservations: st.reservations })})`);
+  }
+  rmState(P_SID);
+  invoke(postBash(n2cmd,
+    '{"ok":false,"result":{"stage":"agent_readiness","lastError":"timeout","dispatchId":"ctx_rt_piped","agentTerminalHandle":"term_rt_piped"}}',
+    { sid: P_SID }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {} };
+    if (st.workers.ctx_rt_piped && st.workers.ctx_rt_piped.readinessTimeout === true) pass += 1;
+    else failures.push(`a piped readiness-timeout reply must register its retainable dispatch (${JSON.stringify(st.workers)})`);
+  }
+  // N3: an id already named in the command line (--retry-of) is an input, never the result.
+  rmState(P_SID);
+  invoke(postBash('orca orchestration worker-start --agent codex --retry-of ctx_OLD42 | tail -2',
+    '"retryOf":"ctx_OLD42"', { sid: P_SID }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {} };
+    const pendings = Object.keys(st.workers).filter((k) => k.startsWith('pending-'));
+    if (!st.workers.ctx_OLD42 && pendings.length === 1) pass += 1;
+    else failures.push(`the --retry-of id from the command line must never be registered as the new dispatch (${JSON.stringify(st.workers)})`);
+  }
+  rmState(P_SID);
+  invoke(postBash('orca orchestration worker-start --agent codex --retry-of ctx_OLD42 | tail -2',
+    'ctx_OLD42\nctx_NEW42', { sid: P_SID }), CODEX_WINS);
+  {
+    const st = readState(P_SID) || { workers: {} };
+    if (st.workers.ctx_NEW42 && st.workers.ctx_NEW42.status === 'live' && !st.workers.ctx_OLD42) pass += 1;
+    else failures.push(`with the command-line id excluded, the one remaining output id is the dispatch (${JSON.stringify(st.workers)})`);
+  }
 
   // Fix 2: a live pending placeholder is adopted by the gate-event reconcile when orca's
   // worker-list has exactly one compatible row, judged on the REAL row shape: agent at

@@ -381,6 +381,16 @@ async function run() {
     check('the assumed unknown value is configurable', pick({
       quotas: { codex: null, kimi: { usedPercent: 60 } }, unknownAssumed: 50,
     }).pick, 'codex');
+    // N4 ruling: unknown NEVER ties with known — the tie band applies only between two
+    // known headrooms. Known 35 vs assumed 30 decides directly, even against fewer live.
+    check('unknown never ties with known within the band (known >= assumed wins despite more live)', pick({
+      quotas: { codex: null, kimi: { usedPercent: 60 } },
+      live: { codex: 0, kimi: 5 }, sessionLive: { codex: 0, kimi: 0 },
+    }).pick, 'kimi');
+    check('known below the assumed value ranks under unknown even with more live', pick({
+      quotas: { codex: null, kimi: { usedPercent: 70 } },
+      live: { codex: 5, kimi: 0 }, sessionLive: { codex: 0, kimi: 0 },
+    }).pick, 'codex');
     check('the per-session cap still outranks more headroom', pick({
       sessionLive: { codex: 3, kimi: 0 }, live: { codex: 3, kimi: 0 },
       quotas: { codex: { usedPercent: 0 }, kimi: { usedPercent: 90 } },
@@ -489,6 +499,52 @@ async function run() {
     ok('a successful live Kimi read is returned live, not estimated', live && !live.estimated && !live.failed);
     check('the successful read replaces the persisted last-known',
       quota.estimatedQuota(liveStateDir, 'kimi', Date.now()).usedPercent, live.usedPercent);
+    if (old.ORCH_CODEX_BIN === undefined) delete process.env.ORCH_CODEX_BIN; else process.env.ORCH_CODEX_BIN = old.ORCH_CODEX_BIN;
+    if (old.CODEX_SESSIONS_DIR === undefined) delete process.env.CODEX_SESSIONS_DIR; else process.env.CODEX_SESSIONS_DIR = old.CODEX_SESSIONS_DIR;
+
+    // B1: a session-log reading keeps per-window reset times, so the estimate ages out
+    // instead of pinning the coder as exhausted forever.
+    const sessions = path.join(root, 'sessions-b1');
+    fs.mkdirSync(path.join(sessions, '2026', '09', '29'), { recursive: true });
+    const b1State = path.join(root, 'state-b1'); fs.mkdirSync(b1State, { recursive: true });
+    const t0 = Date.now();
+    fs.writeFileSync(path.join(sessions, '2026', '09', '29', 's.jsonl'),
+      JSON.stringify({ timestamp: new Date(t0).toISOString(), payload: { rate_limits: {
+        primary: { used_percent: 97, resets_at: Math.floor(t0 / 1000) + 3600 } } } }) + '\n');
+    process.env.ORCH_CODEX_BIN = path.join(root, 'missing-codex');
+    process.env.CODEX_SESSIONS_DIR = sessions;
+    const b1First = quota.codexQuota(t0, { stateDir: b1State, cacheSeconds: 60 });
+    check('a session-log reading is used while fresh', [b1First.usedPercent, b1First.source], [97, 'session log']);
+    check('the persisted last-known keeps the window reset time',
+      quota.estimatedQuota(b1State, 'codex', t0 + 30 * 60000).usedPercent, 97);
+    // Session log rotated away, live probe still failing, and the window has since reset:
+    fs.rmSync(sessions, { recursive: true, force: true }); fs.mkdirSync(sessions);
+    const b1Later = quota.codexQuota(t0 + 2 * 3600e3, { stateDir: b1State, cacheSeconds: 60 });
+    check('a 97% session-log reading no longer exhausts Codex after the window reset',
+      [b1Later.usedPercent, b1Later.estimated], [0, true]);
+    check('the post-reset estimate makes the coder eligible, not exhausted',
+      pool.pickCoderPool({
+        availability: { codex: { usable: true }, kimi: { usable: true } },
+        quotas: { codex: b1Later, kimi: { usedPercent: 10 } }, thresholds: { codex: 95, kimi: 95 },
+        exhaustion: {}, live: { codex: 0, kimi: 0 }, caps: { codex: 3, kimi: 3 }, fallbackEnabled: true,
+      }).coders.codex.state, 'eligible');
+    // A window with NO reset time is dropped once the reading is older than 5h.
+    const t1 = Date.now();
+    quota.persistLastKnownQuota(b1State, 'kimi', { usedPercent: 97, resetsAt: 0 }, t1);
+    check('a resetless window is still trusted within the bound',
+      quota.estimatedQuota(b1State, 'kimi', t1 + 3600e3).usedPercent, 97);
+    check('a resetless window older than the bound drops to unknown',
+      quota.estimatedQuota(b1State, 'kimi', t1 + 6 * 3600e3), null);
+
+    // N1: readAt is the reading's own fetchedAt, and a cache-hit shape never rewrites it.
+    const n1State = path.join(root, 'state-n1'); fs.mkdirSync(n1State, { recursive: true });
+    const fetchedAt = Date.now() - 1800e3;
+    quota.persistLastKnownQuota(n1State, 'codex', { usedPercent: 50, resetsAt: 0, fetchedAt });
+    const n1File = path.join(n1State, 'codex-quota-last-known.json');
+    const n1Before = fs.readFileSync(n1File, 'utf8');
+    check('readAt is the reading own fetchedAt, not the call time', JSON.parse(n1Before).readAt, fetchedAt);
+    quota.persistLastKnownQuota(n1State, 'codex', { usedPercent: 99, resetsAt: 0, fetchedAt });
+    check('the same reading (a cache hit) is never rewritten', fs.readFileSync(n1File, 'utf8'), n1Before);
     if (old.ORCH_CODEX_BIN === undefined) delete process.env.ORCH_CODEX_BIN; else process.env.ORCH_CODEX_BIN = old.ORCH_CODEX_BIN;
     if (old.CODEX_SESSIONS_DIR === undefined) delete process.env.CODEX_SESSIONS_DIR; else process.env.CODEX_SESSIONS_DIR = old.CODEX_SESSIONS_DIR;
     fs.rmSync(root, { recursive: true, force: true });

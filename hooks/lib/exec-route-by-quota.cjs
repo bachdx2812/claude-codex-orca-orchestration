@@ -167,17 +167,23 @@ function readSessionQuota(now = Date.now()) {
       }
       if (now - observedAt > CODEX_SESSION_STALE_MS) continue;
       const rl = event.rateLimits;
+      // Keep each window's own reset time for the persisted last-known reading: without
+      // it the reset-aware estimate could never age a stale session-log reading out (B1).
       const windows = [rl.primary, rl.secondary]
         .filter(Boolean)
-        .map((w) => windowUsed(w.used_percent, w.resets_at ? w.resets_at * 1000 : 0, now, false))
+        .filter((w) => typeof w.used_percent === 'number' && Number.isFinite(w.used_percent))
+        .map((w) => ({ usedPercent: w.used_percent, resetsAt: w.resets_at || 0 }));
+      const used = windows
+        .map((w) => windowUsed(w.usedPercent, w.resetsAt ? w.resetsAt * 1000 : 0, now, false))
         .filter((v) => v !== null);
-      if (windows.length) {
+      if (used.length) {
         return {
-          usedPercent: Math.max(...windows),
+          usedPercent: Math.max(...used),
           resetsAt: 0,
           fetchedAt: observedAt,
           source: 'session log',
           ageMs: Math.max(0, now - observedAt),
+          windows,
         };
       }
     }
@@ -330,6 +336,10 @@ function cachedKimiResult(entry, now) {
 // a window whose reset time has passed counts as 0% used, every other window keeps its last
 // reading, and the tightest window wins. Unknown only when a coder was never read at all.
 const LAST_KNOWN_FILE = { codex: 'codex-quota-last-known.json', kimi: 'kimi-quota-last-known.json' };
+// A persisted window with NO reset time is only trusted for this long; past it the window
+// is dropped (a reading that old says nothing about current usage), and if no windows are
+// left the estimate is unknown rather than pinning a coder as exhausted forever (B1).
+const ESTIMATE_RESETLESS_WINDOW_MAX_AGE_MS = 5 * 60 * 60 * 1000;
 
 function validKnownWindow(w) {
   return w && typeof w.usedPercent === 'number' && Number.isFinite(w.usedPercent) &&
@@ -337,7 +347,9 @@ function validKnownWindow(w) {
     (w.resetsAt === undefined || (typeof w.resetsAt === 'number' && Number.isFinite(w.resetsAt) && w.resetsAt >= 0));
 }
 
-/** Persist a successful reading (`quota.windows` when present, else its tightest window). */
+/** Persist a successful reading (`quota.windows` when present, else its tightest window).
+ *  `readAt` is the reading's own `fetchedAt` (never the cache-hit time), and the file is
+ *  not rewritten when it already records that same reading (N1). */
 function persistLastKnownQuota(stateDir, coder, quota, now = Date.now()) {
   const file = LAST_KNOWN_FILE[coder];
   if (!file || !stateDir || !quota) return;
@@ -347,11 +359,14 @@ function persistLastKnownQuota(stateDir, coder, quota, now = Date.now()) {
   const windows = raw.filter(validKnownWindow)
     .map((w) => ({ usedPercent: w.usedPercent, resetsAt: w.resetsAt || 0 }));
   if (!windows.length) return;
+  const readAt = typeof quota.fetchedAt === 'number' && Number.isFinite(quota.fetchedAt) ? quota.fetchedAt : now;
   try {
     fs.mkdirSync(stateDir, { recursive: true });
     const target = path.join(stateDir, file);
+    const existing = (() => { try { return JSON.parse(fs.readFileSync(target, 'utf8')); } catch { return null; } })();
+    if (existing && existing.readAt === readAt) return; // same reading already recorded
     const temp = `${target}.${process.pid}.tmp`;
-    fs.writeFileSync(temp, JSON.stringify({ windows, readAt: now }), { mode: 0o600 });
+    fs.writeFileSync(temp, JSON.stringify({ windows, readAt }), { mode: 0o600 });
     fs.renameSync(temp, target);
   } catch {}
 }
@@ -369,7 +384,13 @@ function estimatedQuota(stateDir, coder, now = Date.now()) {
   if (!entry || !Array.isArray(entry.windows) ||
       typeof entry.readAt !== 'number' || !Number.isFinite(entry.readAt)) return null;
   const used = entry.windows.filter(validKnownWindow)
-    .map((w) => (w.resetsAt && w.resetsAt * 1000 <= now ? 0 : w.usedPercent));
+    .map((w) => {
+      if (w.resetsAt && w.resetsAt * 1000 <= now) return 0;
+      // A window with no reset time is dropped once the reading is too old to trust (B1).
+      if (!w.resetsAt && now - entry.readAt > ESTIMATE_RESETLESS_WINDOW_MAX_AGE_MS) return null;
+      return w.usedPercent;
+    })
+    .filter((v) => v !== null);
   if (!used.length) return null;
   return { usedPercent: Math.max(...used), resetsAt: 0, fetchedAt: entry.readAt, estimated: true, source: 'estimate' };
 }
@@ -570,5 +591,5 @@ module.exports = {
   parseLiveQuota, parseKimiUsages, liveQuotaWindows, kimiQuotaWindows,
   liveQuota, codexQuota, kimiQuota, codexAuthState,
   readFreshCache, readFreshKimiCache, formatAge,
-  persistLastKnownQuota, estimatedQuota,
+  persistLastKnownQuota, estimatedQuota, ESTIMATE_RESETLESS_WINDOW_MAX_AGE_MS,
 };

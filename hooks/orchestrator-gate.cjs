@@ -1583,19 +1583,23 @@ function readinessTimeoutAdvice(replyText) {
  * ids) stays a pending placeholder, never a guessed registration. Optional single taskId /
  * terminal handle are picked up the same way. Returns a Set of ids, possibly empty.
  */
-function singleDispatchIdsFromRawOutput(out) {
+function singleDispatchIdsFromRawOutput(out, cmd) {
   const ids = new Set();
   const text = String(out || '');
-  let dispatchIds = new Set([...text.matchAll(/"dispatchId"\s*:\s*"(ctx_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  // Ids already named in the command line (--retry-of ctx_OLD, --dispatch ctx_X, ...) are
+  // inputs to the dispatch, never its result — they must never be picked up from output.
+  const inCommand = new Set([...String(cmd || '').matchAll(/\b((?:ctx|task|term)_[A-Za-z0-9_-]+)\b/g)].map((m) => m[1]));
+  const fresh = (set) => new Set([...set].filter((id) => !inCommand.has(id)));
+  let dispatchIds = fresh([...text.matchAll(/"dispatchId"\s*:\s*"(ctx_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
   if (dispatchIds.size !== 1) {
     // A raw-mode formatter (`jq -r ...`) prints the id bare, with no field name around it.
-    dispatchIds = new Set([...text.matchAll(/\b(ctx_[A-Za-z0-9_-]+)\b/g)].map((m) => m[1]));
+    dispatchIds = fresh([...text.matchAll(/\b(ctx_[A-Za-z0-9_-]+)\b/g)].map((m) => m[1]));
   }
   if (dispatchIds.size !== 1) return ids;
   ids.add([...dispatchIds][0]);
-  const taskIds = new Set([...text.matchAll(/"taskId"\s*:\s*"(task_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  const taskIds = fresh([...text.matchAll(/"taskId"\s*:\s*"(task_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
   if (taskIds.size === 1) ids.add([...taskIds][0]);
-  const handles = new Set([...text.matchAll(/"(?:agentTerminalHandle|terminalHandle|handle)"\s*:\s*"(term_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  const handles = fresh([...text.matchAll(/"(?:agentTerminalHandle|terminalHandle|handle)"\s*:\s*"(term_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
   if (handles.size === 1) ids.add([...handles][0]);
   return ids;
 }
@@ -1638,7 +1642,16 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
   dispatchInvs.forEach((inv, idx) => {
     const resId = toolUseId ? `${toolUseId}#${idx}` : null;
     const reservation = resId ? s.reservations[resId] : null;
-    const reply = replyAt(idx);
+    // A piped single dispatch (the whole command is this one invocation) whose formatter
+    // re-emitted the reply as JSON (| jq ., | tee): the one surviving reply is this
+    // invocation's own for EVERY purpose — the "ok": false / readiness-timeout handling
+    // below included, not only id extraction (N2). A captured (`$( )`/backtick) or
+    // redirected reply never reaches the tool's stdout at all, and with any other orca
+    // invocation in the command a surviving object could belong to its segment.
+    const pipedSoleDispatch = assumeDispatched && dispatchInvs.length === 1 && allInvs.length === 1 &&
+      inv.stdoutPiped && !inv.stdoutCaptured && !inv.stdoutRedirected;
+    const reply = replyAt(idx) ||
+      (pipedSoleDispatch && rawReplies.length === 1 ? rawReplies[0] : null);
     const replyText = reply ? JSON.stringify(reply) : '';
 
     if (inv.sub === 'orchestration task-create') {
@@ -1682,19 +1695,12 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
     }
 
     const ids = reply ? WG.idsFromReply(reply) : new Set();
-    // Parse fallback only for a PIPED single dispatch (the whole command is this one
-    // invocation): a captured (`$( )`/backtick) or redirected reply never reaches the tool's
-    // stdout at all, and with any other orca invocation in the command a surviving id could
-    // belong to its segment. Three shapes are accepted, all unambiguous by construction:
-    // the formatter re-emitted the reply as JSON (| jq ., | tee) -> the single surviving
-    // reply's own ids; no JSON survived -> exactly one dispatchId line / bare ctx_ token.
-    if (!ids.size && assumeDispatched && dispatchInvs.length === 1 && allInvs.length === 1 &&
-        inv.stdoutPiped && !inv.stdoutCaptured && !inv.stdoutRedirected) {
-      if (rawReplies.length === 1) {
-        for (const id of WG.idsFromReply(rawReplies[0])) ids.add(id);
-      } else if (rawReplies.length === 0) {
-        for (const id of singleDispatchIdsFromRawOutput(out)) ids.add(id);
-      }
+    // Parse fallback only for the same PIPED single dispatch when NO JSON survived: the
+    // pipe's downstream fragments (a grep/tail line, or a bare ctx_ from `jq -r`) still
+    // derive from this invocation's own reply — but never an id that already appears in
+    // the command line itself (e.g. --retry-of / --dispatch args, N3).
+    if (!ids.size && pipedSoleDispatch && rawReplies.length === 0) {
+      for (const id of singleDispatchIdsFromRawOutput(out, cmd)) ids.add(id);
     }
     if (!ids.size) {
       if (!assumeDispatched) return; // unknown outcome on a failure event: keep the reservation.
