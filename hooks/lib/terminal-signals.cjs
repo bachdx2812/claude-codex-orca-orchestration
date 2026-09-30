@@ -29,6 +29,26 @@ function hasRateLimitError(text) {
   return false;
 }
 
+const KIMI_USAGE_LIMIT_SENTENCE = /^you(?:'|’)?ve\s+reached\s+your\s+usage\s+limit\s+for\s+this\s+billing\s+cycle/i;
+const KIMI_IGNORED_LINE_PREFIX = /^\s*(?:["'`>]|\/\/|#|[-*](?:\s|$))/;
+const KIMI_ERROR_PREFIX = /^\s*\+?\s*(?:[■⚠✗]\s*|error\b[:\s]+|(?:HTTP\s*)?403\b[:\s]+)(?:(?:ERROR\b|(?:HTTP\s*)?403\b)[:\s-]*)*/i;
+
+/** True only when Kimi's billing-cycle usage-limit sentence appears on an error-shaped
+ * line — deliberately NOT a strong marker: the sentence alone, in plain prose (a worker
+ * narrating or quoting the very text it handles), must never count. Callers additionally
+ * scope this to terminals/workers known to be running Kimi. */
+function hasKimiUsageExhausted(text) {
+  let inFence = false;
+  for (const raw of terminalLines(text)) {
+    const line = raw.trimEnd();
+    if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence || /^\s*(?:└\s*)?Tip:/i.test(line) || KIMI_IGNORED_LINE_PREFIX.test(line) || isSourceExcerpt(line)) continue;
+    const prefix = line.match(KIMI_ERROR_PREFIX);
+    if (prefix && KIMI_USAGE_LIMIT_SENTENCE.test(line.slice(prefix[0].length))) return true;
+  }
+  return false;
+}
+
 function hasCodexDisconnect(text) {
   let inFence = false;
   for (const raw of terminalLines(text)) {
@@ -41,4 +61,4 @@ function hasCodexDisconnect(text) {
   return false;
 }
 
-module.exports = { hasRateLimitError, hasCodexDisconnect };
+module.exports = { hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted };

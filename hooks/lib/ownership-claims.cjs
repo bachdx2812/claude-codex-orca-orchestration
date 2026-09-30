@@ -79,17 +79,25 @@ function ageString(ts) {
   return `${Math.round(secs / 60)}m`;
 }
 
-/** Live (unexpired) Bash-dispatch reservations that hold parallel-Codex-worker capacity. */
-function countPendingCodexReservations(s) {
+/** Live (unexpired) Bash-dispatch reservations that hold parallel-worker capacity for
+ * `agent`. New reservations carry `agent` + `newSlot`; a legacy reservation written before
+ * the generalised fields existed only has `codexSlot`, which still counts for 'codex'. */
+function countPendingReservations(s, agent) {
   let n = 0;
   for (const r of Object.values(s.reservations || {})) {
     if (reservationExpired(r)) continue;
-    if (r.codexSlot) n += 1;
+    if (r.newSlot && r.agent === agent) n += 1;
+    else if (agent === 'codex' && r.codexSlot) n += 1;
   }
   return n;
 }
 
+/** Live (unexpired) Bash-dispatch reservations that hold parallel-Codex-worker capacity. */
+function countPendingCodexReservations(s) {
+  return countPendingReservations(s, 'codex');
+}
+
 module.exports = {
   RESERVATION_TTL_MS, reservationExpired, claimExpired, liveClaims, findOverlap, ageString,
-  countPendingCodexReservations,
+  countPendingReservations, countPendingCodexReservations,
 };

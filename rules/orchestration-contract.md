@@ -23,11 +23,20 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    `model: "<review alias>"`). The configured escalation model
    (`models.escalation.alias`, default `fable`) is reserved for work the review model
    could not do, even at higher effort — a dispatch to it must say so.
-3. **Code goes to Codex in an Orca worker first**, and to the configured in-session code
-   model (`models.code.alias`, default `sonnet`) once Codex has used
-   `codexHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. The operator
-   can pick the coding model directly with `--code-model <alias|codex|codex:<model>|auto>`,
-   or use the `--exec-sonnet` / `--exec-codex` / `--exec-auto` shortcuts.
+3. **Code goes to an external coder (Codex or Kimi) in an Orca worker first**, and to the
+   configured in-session code
+   model (`models.code.alias`, default `sonnet`) only once every usable coder has exhausted
+   its quota — Codex at `codexHandoffUsedPercent` (default 95), Kimi at the separate
+   `kimiHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. Routing
+   spreads every Codex task class — code, builds, refactors, tests, bulk conversions, and
+   fix loops — across both peers. Among eligible coders, pick fewer live workers, then more
+   headroom below the coder's own threshold, then the coder other than `lastCoder`, and
+   finally Codex as the last tie-break. A coder that is not installed, signed in, or
+   launchable on this machine is excluded; both coders exhausted or unusable means Sonnet.
+   The operator can pick the coding model directly with `--code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>`,
+   or use the `--exec-sonnet` / `--exec-codex` / `--exec-kimi` / `--exec-auto` shortcuts.
+   A `worker-start --agent kimi` is dispatched WITHOUT `--model` (Kimi uses
+   `default_model` from `~/.kimi-code/config.toml`).
 4. **Light lookups** (find/locate code, read logs or test output, explore) are advised
    toward the configured lookup model (`models.lookup.alias`, default `haiku`) — this is
    advisory only and never blocks.
@@ -39,8 +48,9 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
 7. **Codex rate-limits under parallel load.** On a rate-limit signal the correct response
    is to back off and retry the *same* dispatch (`worker-start --retry-of <id>`), never to
    re-dispatch immediately or start a replacement.
-8. **No more than `maxParallelCodexWorkers` (default 3) live Codex workers at once.** A
-   `worker-start` that would exceed it is refused; wait for one to finish and release it,
+8. **No more than `maxParallelCodexWorkers` (default 3) live Codex workers at once** — and
+   no more than `maxParallelKimiWorkers` (default 3) live Kimi workers at once. A
+   `worker-start` that would exceed its coder's cap is refused; wait for one to finish and release it,
    reuse its terminal (`--terminal <handle>`), or retry it (`--retry-of <id>`) — neither
    replaces an existing group, so neither counts as a new dispatch against the cap.
 9. **A code brief in a shared workspace declares the files it will touch.** `Owns: <paths>`
@@ -105,6 +115,8 @@ The operator (only) can pick who writes code for the rest of the session:
 --code-model fable         # the configured escalation model, for code work specifically
 --code-model codex         # Codex in an Orca worker, no pinned model (same as --exec-codex)
 --code-model codex:gpt-5-custom   # Codex in an Orca worker, pinned to this model
+--code-model kimi          # Kimi in an Orca worker (same as --exec-kimi); no --model — Kimi uses default_model from ~/.kimi-code/config.toml
+--code-model kimi:<model>  # Kimi, recorded model preference shown in reminders (Orca cannot pin it)
 --code-model auto          # back to automatic routing (same as --exec-auto)
 ```
 
@@ -121,21 +133,39 @@ active**, in-session code still runs on the configured code model, not Codex —
 fallback exists precisely because Orca cannot be reached, so it cannot honor "use Codex"
 either, regardless of what the operator's standing override says.
 
-## No Orca / no Codex
+## Coder availability (no Orca / no Codex / no Kimi)
 
-Codex is the deliberately-preferred default, so **only a missing binary triggers the
-execution fallback — never merely an unknown quota reading.** Automatic routing first
-uses a fresh state-dir live cache (including cached failures), then queries `codex app-server`
+Codex and Kimi are peers. Automatic routing first establishes which coders are usable,
+then applies the load-balancing order in rule 3; Codex is chosen first only at the final
+tie-break. A quota-unknown reading does not by itself make a usable coder ineligible.
+Codex quota discovery first uses a fresh state-dir live cache (including cached failures), then queries `codex app-server`
 JSON-RPC `account/rateLimits/read` (5-second parent timeout, 4.5-second helper deadline,
 no model call), then scans local Codex session logs no older than six hours. A helper that
 must stop its app-server child escalates from SIGTERM to SIGKILL. If all three sources are
-unavailable, the reading is unknown; that is not
-evidence Codex is unusable, and routing still prefers it. If `orca` or `codex` itself is
-not on `PATH`,
-though, Codex genuinely cannot be dispatched to at all, and with
-`execFallbackWhenCodexUnavailable` at `"sonnet"` (the default) automatic routing falls
-back to the configured code model instead. Set `execFallbackWhenCodexUnavailable` to
-`null` to disable this and always prefer Codex regardless of either binary's presence.
+unavailable, the reading is unknown rather than evidence that Codex is unusable. If only
+one coder is eligible, all code goes to it; if neither coder is eligible,
+`execFallbackWhenCodexUnavailable: "sonnet"` (the default) routes to the configured code
+model. Setting the legacy-named option to `null` disables that automatic in-session
+fallback; it does not make an unusable coder eligible.
+
+Each coder's **availability** (binary present? signed in?) is probed per machine and cached
+in `coder-availability.json` in the gate state directory for `coderAvailabilityCacheSeconds`
+(default 600; `ORCH_CODER_AVAILABILITY_CACHE_SECONDS` overrides for one process). Availability
+is distinct from quota: **unusable** (excluded from routing) means the binary is missing,
+Codex is logged out, Kimi's credentials file (`~/.kimi-code/credentials/kimi-code.json`) is
+missing/unparseable/has no token, or `orca` itself is missing (which excludes both). A
+**quota-unknown** reading (read failed, timeout, HTTP 401/403, expired token) still counts
+as usable — Kimi's CLI refreshes its own short-lived token, so the gate never refreshes it.
+Kimi's live quota comes from `GET ${KIMI_CODE_BASE_URL:-https://api.kimi.com/coding/v1}/usages`
+with the access token sent only as an `Authorization` header inside the spawned probe helper —
+**the token is never written to stdout, stderr, state, or any log** — cached in
+`kimi-quota-live.json` for `kimiQuotaCacheSeconds` (default 60;
+`ORCH_KIMI_QUOTA_CACHE_SECONDS` overrides). A worker whose output shows Kimi's billing-cycle
+403 ("You've reached your usage limit for this billing cycle", error-shaped lines only, and
+only for terminals whose tracked agent is `kimi`) is recorded in `coder-exhausted.json` with
+an `until` time (the reported reset, else 6 hours); that coder is excluded from routing
+until the marker expires or a fresh quota reading shows it below its threshold. No state
+file ever contains a token.
 
 The gate checks `orca`/`codex` reachability itself (an absolute `ORCA_BIN`/`ORCH_CODEX_BIN`
 path is checked with a file-exists test; the bare default name via `which`/`where`) — no
@@ -177,14 +207,19 @@ backup precedes their removal. Help and unknown options never enter the install 
     "escalation": { "alias": "fable", "id": "claude-fable-5-1" },
     "code": { "alias": "sonnet", "id": null },
     "lookup": { "alias": "haiku", "id": null },
-    "codex": { "alias": null, "id": "gpt-5.6-sol" }
+    "codex": { "alias": null, "id": "gpt-5.6-sol" },
+    "kimi": { "alias": null, "id": null }
   },
   "agents": { "escalation": [], "lookup": ["Explore"] },
   "codexHandoffUsedPercent": 95,
+  "kimiHandoffUsedPercent": 95,
   "codexQuotaCacheSeconds": 60,
+  "kimiQuotaCacheSeconds": 60,
+  "coderAvailabilityCacheSeconds": 600,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,
+  "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
   "closeDoneWorktrees": true,
@@ -203,14 +238,27 @@ backup precedes their removal. Help and unknown options never enter the install 
   specific set (`agents.lookup` ships with `["Explore"]`; `agents.escalation` ships
   empty) — add your own team's advisory-agent names here rather than expecting the gate
   to guess them.
-- `codexHandoffUsedPercent`: integer 0-100. Sonnet-or-whatever-your-code-model-is takes
-  over once Codex has used this much of its tightest quota window. Overridable for one
+- `codexHandoffUsedPercent`: integer 0-100, default 95. Codex leaves the eligible peer
+  pool once it has used this much of its tightest quota window. Overridable for one
   process with `ORCH_CODEX_HANDOFF_USED`.
+- `kimiHandoffUsedPercent`: integer 0-100, default 95. Kimi's own, independent threshold:
+  Kimi leaves the eligible peer pool once it has used this much of its
+  tightest quota window. Overridable for one process with `ORCH_KIMI_HANDOFF_USED`.
 - `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
   `codex app-server` quota reading or a failed probe is reused from `codex-quota-live.json` in the gate
   state directory; `0` disables cross-process file reuse but not the memo inside one hook
   process. Overridable for one process with
   `ORCH_CODEX_QUOTA_CACHE_SECONDS`.
+- `kimiQuotaCacheSeconds`: integer 0-3600, default 60. Same as `codexQuotaCacheSeconds`,
+  for the Kimi `/usages` reading cached in `kimi-quota-live.json`. Overridable for one
+  process with `ORCH_KIMI_QUOTA_CACHE_SECONDS`.
+- `coderAvailabilityCacheSeconds`: integer 0-86400, default 600. How long a per-machine
+  coder availability probe (binary present? signed in?) is reused from
+  `coder-availability.json`. Overridable for one process with
+  `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`.
+- `models.kimi`: `{ "alias": null, "id": null }` by default; `id` is shown in banner text
+  only — Orca cannot pin a Kimi model on `worker-start`, so the real pin is
+  `default_model` in `~/.kimi-code/config.toml`.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
   the SessionStart banner.
@@ -221,6 +269,9 @@ backup precedes their removal. Help and unknown options never enter the install 
   `--retry-of <id>` that replaces an existing tracked group is not a new dispatch and does
   not count, and a non-Codex agent is never counted at all. Overridable for one process
   with `ORCH_MAX_PARALLEL_CODEX_WORKERS`.
+- `maxParallelKimiWorkers`: integer 0-32, default 3. The same per-session group cap for
+  Kimi-agent worker-starts; `0` is unlimited. Overridable for one process with
+  `ORCH_MAX_PARALLEL_KIMI_WORKERS`.
 - `ownershipClaimTtlMinutes`: integer 1-10080, default 120. How long a background
   in-session Agent's `Owns:` claim survives without an explicit release before it
   auto-expires. Overridable for one process with `ORCH_CLAIM_TTL_MINUTES`.
@@ -251,7 +302,12 @@ state, the violations log and heartbeat liveness files live — default
 for tests), `ORCH_CODEX_BIN` (which `codex` executable the live quota probe invokes —
 and which executable the routing fallback checks; legacy `CODEX_BIN` remains a lower-priority
 alias), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
-`ORCH_CLOSE_DONE_WORKTREES`. An invalid or missing config value never crashes
+`ORCH_KIMI_HANDOFF_USED`, `ORCH_KIMI_QUOTA_CACHE_SECONDS`,
+`ORCH_CODER_AVAILABILITY_CACHE_SECONDS`, `ORCH_MAX_PARALLEL_KIMI_WORKERS`,
+`ORCH_CLOSE_DONE_WORKTREES`. Non-config env for tests/ops only: `ORCH_KIMI_BIN` (which
+`kimi` executable the availability probe checks — authoritative when set, no `which`
+fallback), `ORCH_KIMI_HOME` (default `~/.kimi-code`; where the credentials file is read),
+`ORCH_KIMI_USAGE_URL` (full quota URL; must be `https:` unless the host is loopback). An invalid or missing config value never crashes
 the gate; it falls back to the default for that field alone and reports the fallback as a
 warning in the SessionStart banner. Config is re-read on every hook invocation (each is
 its own Node process), so an edit takes effect on the very next tool call — no restart
@@ -557,6 +613,15 @@ orca orchestration worker-start --retry-of <dispatchId> ...
 Re-dispatching immediately deepens the limit; starting a *replacement* worker doubles the
 load that caused it.
 
+Kimi has one stronger, terminal signal: an error-shaped line (never plain prose, and only
+on a terminal whose tracked agent is `kimi`) reading "You've reached your usage limit for
+this billing cycle" marks Kimi **exhausted for the billing cycle** — the heartbeat reports
+it once per terminal per session (persisted, so a daemon restart does not re-report or
+re-mark) and records an exhaustion marker (`coder-exhausted.json`, until the reported reset
+or 6 hours). Routing then excludes Kimi until the marker expires or a fresh quota reading
+shows it back below `kimiHandoffUsedPercent`. Do not retry that worker; route new code to
+Codex (or the in-session code model if Codex is also out).
+
 ## State
 
 Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
@@ -572,7 +637,7 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
                              "capExempt": false } },
   "reservations": { "<toolUseId>#<idx>": { "ts": 0, "agent": "codex",
                                             "owns": ["src/api/**"], "ws": "<repoRoot>|current",
-                                            "codexSlot": true } },
+                                            "codexSlot": true, "kimiSlot": false, "newSlot": true } },
   "agentClaims": { "<toolUseId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current", "ts": 0,
                                      "background": false } },
   "tasks": { "<taskId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current" } },
@@ -594,7 +659,14 @@ tool call may still be in flight; `Stop`, explicit release, reply consumption, a
 the safe cleanup paths. An `agentClaims` entry is removed at release, whichever of the paths
 above fires first. A worker Orca reports done but still holding its terminal is marked
 `capExempt: true` — it no longer counts toward `maxParallelCodexWorkers`, but stays `live`
-so the Stop gate still catches it as an unreleased resource. An `agentClaims` entry from a
+so the Stop gate still catches it as an unreleased resource. A reservation's `codexSlot` /
+`kimiSlot` flags record which per-coder cap (`maxParallelCodexWorkers` /
+`maxParallelKimiWorkers`) it holds capacity against; `newSlot` is set for any agent's
+genuinely new dispatch and counts toward the machine-wide `max-parallel-agents` budget.
+Cross-session, machine-wide files in the same state directory: `codex-quota-live.json`,
+`kimi-quota-live.json` (cached live quota readings, never a token),
+`coder-availability.json` (cached per-coder usable/unusable probe), `coder-exhausted.json`
+(billing-cycle exhaustion markers per coder, each with `at`/`until`/`reason`). An `agentClaims` entry from a
 `run_in_background: true` dispatch is marked `background: true` and is deliberately NOT
 released at its own launch `PostToolUse` (that event fires as soon as the dispatch is
 sent, long before the background work finishes) — only a matching
@@ -624,6 +696,8 @@ processes racing the same session id can otherwise silently drop each other's wr
   freed the same way a stuck `agentClaims` entry can.
 - `maxParallelCodexWorkers: 0` (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env, one
   process) makes the parallel-Codex-worker cap unlimited.
+- `maxParallelKimiWorkers: 0` (config) or `ORCH_MAX_PARALLEL_KIMI_WORKERS=0` (env, one
+  process) makes the parallel-Kimi-worker cap unlimited.
 - `maxParallelAgents: 0` (config) or `ORCH_MAX_PARALLEL_AGENTS=0` (env, one process) makes
   the machine-wide `max-parallel-agents` budget unlimited.
 

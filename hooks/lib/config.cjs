@@ -27,6 +27,7 @@ const GATE_NAMES = [
   'workers-unwatched',
   'workers-unreconciled',
   'max-parallel-codex-workers',
+  'max-parallel-kimi-workers',
   'code-brief-needs-owns',
   'ownership-overlap',
   'max-parallel-agents',
@@ -41,6 +42,7 @@ const DEFAULT_CONFIG = {
     code: { alias: 'sonnet', id: null },
     lookup: { alias: 'haiku', id: null },
     codex: { alias: null, id: 'gpt-5.6-sol' },
+    kimi: { alias: null, id: null },
   },
   agents: {
     escalation: [], // agent names that always count as the escalation role, alias match only
@@ -48,9 +50,13 @@ const DEFAULT_CONFIG = {
   },
   codexHandoffUsedPercent: 95,
   codexQuotaCacheSeconds: 60,
+  kimiHandoffUsedPercent: 95,
+  kimiQuotaCacheSeconds: 60,
+  coderAvailabilityCacheSeconds: 600,
   execFallbackWhenCodexUnavailable: 'sonnet',
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
   maxParallelCodexWorkers: 3, // 0 = unlimited
+  maxParallelKimiWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
   closeDoneWorktrees: true, // heartbeat: remind on a merged/closed-PR worktree with no live terminal
@@ -104,6 +110,12 @@ function isPlainObject(v) {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
+function configuredNumber(value) {
+  if (value === null || typeof value === 'boolean' ||
+      (typeof value === 'string' && value.trim() === '')) return NaN;
+  return Number(value);
+}
+
 /**
  * Validated view of the merged config. Invalid values degrade to the default for that
  * field and collect a human-readable warning; they never throw and never take down the
@@ -145,7 +157,7 @@ function loadConfig() {
     merged.activation = 'orca-only';
   }
 
-  const threshold = Number(merged.codexHandoffUsedPercent);
+  const threshold = configuredNumber(merged.codexHandoffUsedPercent);
   if (!Number.isInteger(threshold) || threshold < 0 || threshold > 100) {
     warnings.push(`codexHandoffUsedPercent "${merged.codexHandoffUsedPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.codexHandoffUsedPercent}.`);
     merged.codexHandoffUsedPercent = DEFAULT_CONFIG.codexHandoffUsedPercent;
@@ -153,12 +165,36 @@ function loadConfig() {
     merged.codexHandoffUsedPercent = threshold;
   }
 
-  const quotaCacheSeconds = Number(merged.codexQuotaCacheSeconds);
+  const quotaCacheSeconds = configuredNumber(merged.codexQuotaCacheSeconds);
   if (!Number.isInteger(quotaCacheSeconds) || quotaCacheSeconds < 0 || quotaCacheSeconds > 3600) {
     warnings.push(`codexQuotaCacheSeconds "${merged.codexQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.codexQuotaCacheSeconds}.`);
     merged.codexQuotaCacheSeconds = DEFAULT_CONFIG.codexQuotaCacheSeconds;
   } else {
     merged.codexQuotaCacheSeconds = quotaCacheSeconds;
+  }
+
+  const kimiThreshold = configuredNumber(merged.kimiHandoffUsedPercent);
+  if (!Number.isInteger(kimiThreshold) || kimiThreshold < 0 || kimiThreshold > 100) {
+    warnings.push(`kimiHandoffUsedPercent "${merged.kimiHandoffUsedPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.kimiHandoffUsedPercent}.`);
+    merged.kimiHandoffUsedPercent = DEFAULT_CONFIG.kimiHandoffUsedPercent;
+  } else {
+    merged.kimiHandoffUsedPercent = kimiThreshold;
+  }
+
+  const kimiQuotaCache = configuredNumber(merged.kimiQuotaCacheSeconds);
+  if (!Number.isInteger(kimiQuotaCache) || kimiQuotaCache < 0 || kimiQuotaCache > 3600) {
+    warnings.push(`kimiQuotaCacheSeconds "${merged.kimiQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.kimiQuotaCacheSeconds}.`);
+    merged.kimiQuotaCacheSeconds = DEFAULT_CONFIG.kimiQuotaCacheSeconds;
+  } else {
+    merged.kimiQuotaCacheSeconds = kimiQuotaCache;
+  }
+
+  const availabilityCache = configuredNumber(merged.coderAvailabilityCacheSeconds);
+  if (!Number.isInteger(availabilityCache) || availabilityCache < 0 || availabilityCache > 86400) {
+    warnings.push(`coderAvailabilityCacheSeconds "${merged.coderAvailabilityCacheSeconds}" is not an integer 0-86400; using ${DEFAULT_CONFIG.coderAvailabilityCacheSeconds}.`);
+    merged.coderAvailabilityCacheSeconds = DEFAULT_CONFIG.coderAvailabilityCacheSeconds;
+  } else {
+    merged.coderAvailabilityCacheSeconds = availabilityCache;
   }
 
   if (!Array.isArray(merged.disabledGates)) {
@@ -174,12 +210,20 @@ function loadConfig() {
     merged.execFallbackWhenCodexUnavailable = 'sonnet';
   }
 
-  const maxParallel = Number(merged.maxParallelCodexWorkers);
+  const maxParallel = configuredNumber(merged.maxParallelCodexWorkers);
   if (!Number.isInteger(maxParallel) || maxParallel < 0 || maxParallel > 32) {
     warnings.push(`maxParallelCodexWorkers "${merged.maxParallelCodexWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelCodexWorkers}.`);
     merged.maxParallelCodexWorkers = DEFAULT_CONFIG.maxParallelCodexWorkers;
   } else {
     merged.maxParallelCodexWorkers = maxParallel;
+  }
+
+  const maxKimiParallel = configuredNumber(merged.maxParallelKimiWorkers);
+  if (!Number.isInteger(maxKimiParallel) || maxKimiParallel < 0 || maxKimiParallel > 32) {
+    warnings.push(`maxParallelKimiWorkers "${merged.maxParallelKimiWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelKimiWorkers}.`);
+    merged.maxParallelKimiWorkers = DEFAULT_CONFIG.maxParallelKimiWorkers;
+  } else {
+    merged.maxParallelKimiWorkers = maxKimiParallel;
   }
 
   const claimTtl = Number(merged.ownershipClaimTtlMinutes);
@@ -241,7 +285,7 @@ function gateDisabled(cfg, gate) {
  */
 function handoffUsed(cfg) {
   const envOverride = process.env.ORCH_CODEX_HANDOFF_USED;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isInteger(n) && n >= 0 && n <= 100) return n;
   }
@@ -262,6 +306,49 @@ function codexQuotaCacheSeconds(cfg) {
   return cfg.codexQuotaCacheSeconds;
 }
 
+/**
+ * Kimi's own handoff threshold — separate from the Codex one (binding operator decision,
+ * 2026-09-30): Sonnet takes over once Kimi has used this much (or more) of its tightest
+ * quota window. `ORCH_KIMI_HANDOFF_USED` overrides the config value for one process; an
+ * invalid override falls back to the config value, exactly like `handoffUsed`.
+ */
+function kimiHandoffUsed(cfg) {
+  const envOverride = process.env.ORCH_KIMI_HANDOFF_USED;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 100) return n;
+  }
+  return cfg.kimiHandoffUsedPercent;
+}
+
+/**
+ * Seconds a live Kimi quota reading or failed probe remains fresh (0 disables reuse).
+ * `ORCH_KIMI_QUOTA_CACHE_SECONDS` overrides the config for one process; an empty-string
+ * override counts as unset (falls back to config), same as the Codex TTL override.
+ */
+function kimiQuotaCacheSeconds(cfg) {
+  const envOverride = process.env.ORCH_KIMI_QUOTA_CACHE_SECONDS;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 3600) return n;
+  }
+  return cfg.kimiQuotaCacheSeconds;
+}
+
+/**
+ * Seconds a per-machine coder availability probe (binary present? signed in?) remains
+ * fresh before it is re-probed. `ORCH_CODER_AVAILABILITY_CACHE_SECONDS` overrides the
+ * config for one process; an empty-string override counts as unset.
+ */
+function coderAvailabilityCacheSeconds(cfg) {
+  const envOverride = process.env.ORCH_CODER_AVAILABILITY_CACHE_SECONDS;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 86400) return n;
+  }
+  return cfg.coderAvailabilityCacheSeconds;
+}
+
 /** Directory holding session state (`<sid>.json`, heartbeat files, violations.log). */
 function stateDir() {
   return process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
@@ -275,11 +362,25 @@ function stateDir() {
  */
 function maxParallelCodexWorkers(cfg) {
   const envOverride = process.env.ORCH_MAX_PARALLEL_CODEX_WORKERS;
-  if (envOverride !== undefined) {
+  if (envOverride !== undefined && envOverride.trim() !== '') {
     const n = Number(envOverride);
     if (Number.isInteger(n) && n >= 0 && n <= 32) return n;
   }
   return cfg.maxParallelCodexWorkers;
+}
+
+/**
+ * How many live Kimi worker groups this session may hold at once (0 = unlimited).
+ * `ORCH_MAX_PARALLEL_KIMI_WORKERS` overrides the config value for one process; an invalid
+ * override falls back to the config value, exactly like `maxParallelCodexWorkers`.
+ */
+function maxParallelKimiWorkers(cfg) {
+  const envOverride = process.env.ORCH_MAX_PARALLEL_KIMI_WORKERS;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 32) return n;
+  }
+  return cfg.maxParallelKimiWorkers;
 }
 
 /**
@@ -352,4 +453,5 @@ module.exports = {
   GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   parallelCoreFraction, maxParallelAgents,
+  kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
 };
