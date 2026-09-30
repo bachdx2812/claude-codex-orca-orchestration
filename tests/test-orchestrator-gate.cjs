@@ -18,6 +18,11 @@ const { spawn, spawnSync } = require('child_process');
 const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-unit-state-'));
 process.env.ORCH_STATE_DIR = STATE_DIR;
 process.env.ORCH_CONFIG_PATH = path.join(STATE_DIR, 'no-such-config.json'); // -> defaults
+process.env.ORCH_CODEX_BIN = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
+process.env.ORCH_KIMI_HOME = path.join(STATE_DIR, 'empty-kimi-home');
+process.env.ORCH_KIMI_BIN = path.join(STATE_DIR, 'missing-kimi');
+process.env.ORCH_KIMI_USAGE_URL = 'http://127.0.0.1:9/usages';
+fs.mkdirSync(process.env.ORCH_KIMI_HOME, { recursive: true });
 
 const gate = require('../hooks/orchestrator-gate.cjs');
 const heartbeat = require('../hooks/orca-heartbeat.cjs');

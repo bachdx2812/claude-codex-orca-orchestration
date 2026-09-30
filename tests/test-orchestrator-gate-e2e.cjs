@@ -43,6 +43,8 @@ const SRC = '/work/proj/src/app.py'; // synthetic, not under any real tmp/home p
 const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-e2e-'));
 const STATE_DIR = path.join(RUN_DIR, 'state');
 fs.mkdirSync(STATE_DIR, { recursive: true });
+const EMPTY_KIMI_HOME = path.join(RUN_DIR, 'empty-kimi-home');
+fs.mkdirSync(EMPTY_KIMI_HOME, { recursive: true });
 // Temp Orca-fallback flag: never the real machine's ~/.claude/orchestrator-gate/orca-unavailable.
 const FLAG = path.join(RUN_DIR, 'orca-unavailable');
 
@@ -105,6 +107,9 @@ function quotaEnv(name, claudeUsed, codexUsed, extraCfg) {
     ORCH_STATE_DIR: STATE_DIR,
     ORCH_CONFIG_PATH: configFile,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
     STUB_CODEX_PRIMARY_USED: String(codexUsed),
     ORCA_BIN: STUB, CODEX_BIN: STUB,
   };

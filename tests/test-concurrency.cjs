@@ -27,6 +27,8 @@ try { fs.chmodSync(STUB, 0o755); } catch {}
 const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-concurrency-'));
 const STATE_DIR = path.join(RUN_DIR, 'state');
 fs.mkdirSync(STATE_DIR, { recursive: true });
+const EMPTY_KIMI_HOME = path.join(RUN_DIR, 'empty-kimi-home');
+fs.mkdirSync(EMPTY_KIMI_HOME, { recursive: true });
 function seedQuota(stateDir, usedPercent = 30) {
   fs.mkdirSync(stateDir, { recursive: true });
   fs.writeFileSync(path.join(stateDir, 'codex-quota-live.json'), JSON.stringify({
@@ -51,6 +53,10 @@ const ENV = {
   ...BASE_ENV,
   ORCH_STATE_DIR: STATE_DIR,
   ORCH_CONFIG_PATH: CONFIG_FILE,
+  ORCH_CODEX_BIN: STUB,
+  ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+  ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
   ORCA_BIN: STUB, CODEX_BIN: STUB,
 };
 
