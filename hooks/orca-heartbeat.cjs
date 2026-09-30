@@ -209,6 +209,22 @@ function setOnCoderExhausted(fn) {
   onCoderExhausted = typeof fn === 'function' ? fn : defaultOnCoderExhausted;
 }
 
+/**
+ * The once-per-terminal-per-session usage-exhausted report: persists the handle BEFORE
+ * emitting so a daemon restart never re-marks or re-reports, calls the (injectable)
+ * exhaustion-marker hook, and returns the event text — or null when this handle was
+ * already reported. Pure apart from that one persisted set, so tests can drive it
+ * directly with a synthetic handle.
+ */
+function reportUsageExhausted({ reported, handle, label, coder }) {
+  if (reported.has(handle)) return null;
+  reported.add(handle);
+  savePersistedUsageExhaustedReports(reported);
+  onCoderExhausted(coder);
+  return `KIMI USAGE LIMIT on ${label}: Kimi is exhausted for this billing cycle - ` +
+    'route new code to Codex (or Sonnet if Codex is also out); release this worker, do not retry it until reset';
+}
+
 /** Run an orca command and return parsed JSON, or null when orca cannot answer. */
 function orca(args, timeoutMs = 20000) {
   try {
@@ -921,14 +937,11 @@ function main() {
         const verdict = classifyTerminal(t, ctx);
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
         if (verdict.kind === 'usage_exhausted') {
-          if (reportedUsageExhausted.has(t.handle)) continue;
-          reportedUsageExhausted.add(t.handle);
-          savePersistedUsageExhaustedReports(reportedUsageExhausted);
-          onCoderExhausted(verdict.coder);
-          events.push(
-            `KIMI USAGE LIMIT on ${label}: Kimi is exhausted for this billing cycle - ` +
-            'route new code to Codex (or Sonnet if Codex is also out); release this worker, do not retry it until reset'
-          );
+          const event = reportUsageExhausted({
+            reported: reportedUsageExhausted, handle: t.handle, label, coder: verdict.coder,
+          });
+          if (!event) continue;
+          events.push(event);
         } else if (verdict.kind === 'rate_limit') {
           if (reportedRateLimit.has(t.handle)) continue;
           reportedRateLimit.add(t.handle);
@@ -979,5 +992,5 @@ module.exports = {
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
-  setOnCoderExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
+  setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
 };
