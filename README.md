@@ -60,7 +60,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, losing its Codex app-server connection, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
+| Orca worker | Codex (`gpt-5.6-sol`) or Kimi | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, making no real progress past its configured stall threshold, losing its Codex app-server connection, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -106,6 +106,20 @@ If Codex prints a lost/reconnect-failed app-server message, continuing TUI repai
 does not count as progress. The heartbeat reports `WORKER STUCK` once for that terminal in
 the session; release it and re-dispatch because work since the last commit may be lost. Once
 reported disconnected, that terminal skips the idle and orphan checks for the same poll.
+
+**Progress-based stall detection.** A busy-looking TUI is not necessarily making progress.
+For each supervised worker, the heartbeat fingerprints the worker worktree's `HEAD`,
+`git status --porcelain`, and `git diff --stat` together with meaningful terminal output.
+Spinner frames, elapsed-time counters, rotating `Tip:` lines, token/cursor counters, and
+prompt box chrome are ignored. If that fingerprint does not change for
+`heartbeat.stallSeconds` (default 900 seconds), or the agent-specific value in
+`heartbeat.stallSecondsByAgent` (Kimi defaults to 600 seconds), the daemon emits one
+`WORKER STALLED` wake event. Nudge the terminal with `continue`, or stop it and re-dispatch
+the same brief to the other coder; the daemon never kills it automatically. The report is
+persisted once per unchanged episode across daemon restarts and is re-armed by a file or
+meaningful-output change. Disconnected, rate-limited, and usage-exhausted workers keep their
+more specific diagnosis instead of also being labeled stalled. Set `ORCH_STALL_SECONDS` to
+override the global threshold for one process; blank or invalid values fall back to config.
 
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the

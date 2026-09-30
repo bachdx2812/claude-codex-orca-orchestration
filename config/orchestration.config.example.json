@@ -19,7 +19,13 @@
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "execFallbackWhenCodexUnavailable": "sonnet",
-  "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
+  "heartbeat": {
+    "intervalSeconds": 20,
+    "idleSeconds": 60,
+    "maxSeconds": 3600,
+    "stallSeconds": 900,
+    "stallSecondsByAgent": { "kimi": 600 }
+  },
   "maxParallelCodexWorkers": 3,
   "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 120,

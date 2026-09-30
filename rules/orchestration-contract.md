@@ -218,7 +218,13 @@ backup precedes their removal. Help and unknown options never enter the install 
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "execFallbackWhenCodexUnavailable": "sonnet",
-  "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
+  "heartbeat": {
+    "intervalSeconds": 20,
+    "idleSeconds": 60,
+    "maxSeconds": 3600,
+    "stallSeconds": 900,
+    "stallSecondsByAgent": { "kimi": 600 }
+  },
   "maxParallelCodexWorkers": 3,
   "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
@@ -260,6 +266,12 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `models.kimi`: `{ "alias": null, "id": null }` by default; `id` is shown in banner text
   only — Orca cannot pin a Kimi model on `worker-start`, so the real pin is
   `default_model` in `~/.kimi-code/config.toml`.
+- `heartbeat.stallSeconds`: integer 1-86400, default 900. With no worktree change or new
+  meaningful terminal output for this long, a supervised worker produces an informational
+  stall wake event. `ORCH_STALL_SECONDS` overrides the global value for one process; blank
+  is unset and invalid values fall back to config.
+- `heartbeat.stallSecondsByAgent`: object of per-agent integer thresholds 1-86400. These
+  take precedence over the global value; the default is `{ "kimi": 600 }`.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
   the SessionStart banner.
@@ -305,7 +317,7 @@ and which executable the routing fallback checks; legacy `CODEX_BIN` remains a l
 alias), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
 `ORCH_KIMI_HANDOFF_USED`, `ORCH_KIMI_QUOTA_CACHE_SECONDS`,
 `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`, `ORCH_MAX_PARALLEL_KIMI_WORKERS`,
-`ORCH_CLOSE_DONE_WORKTREES`. Non-config env for tests/ops only: `ORCH_KIMI_BIN` (which
+`ORCH_STALL_SECONDS`, `ORCH_CLOSE_DONE_WORKTREES`. Non-config env for tests/ops only: `ORCH_KIMI_BIN` (which
 `kimi` executable the availability probe checks — authoritative when set, no `which`
 fallback), `ORCH_KIMI_HOME` (default `~/.kimi-code`; where the credentials file is read),
 `ORCH_KIMI_USAGE_URL` (full quota URL; must be `https:` unless the host is loopback). An invalid or missing config value never crashes
@@ -321,7 +333,8 @@ worker start (built from this install's own `process.execPath` and `__dirname`, 
 correct wherever the hooks were installed). The daemon polls Orca and exits the moment
 something needs a decision — a worker changing state, a finished worker still holding a
 terminal, a supervised terminal quiet longer than `heartbeat.idleSeconds`, a Codex session
-that lost its app-server connection, an orphaned terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
+that lost its app-server connection, a supervised worker making no real progress for its
+stall threshold, an orphaned terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
 its exit is the wake-up: the panel does not have to remember to poll, and it costs nothing
 while everything is healthy.
 
@@ -356,6 +369,23 @@ Codex connection-lost/reconnect-failed messages are terminal even when the TUI k
 repainting. The heartbeat reports that terminal as `WORKER STUCK` once per session,
 persisted across daemon restarts; release and re-dispatch it because uncommitted work may
 have been lost. A reported disconnected terminal skips its idle and orphan checks.
+
+Terminal repaint activity alone is not progress. For every supervised worker terminal, the
+heartbeat combines meaningful terminal text with a bounded fingerprint of that worker's
+worktree (`HEAD`, `git status --porcelain`, and `git diff --stat`). Spinner/moon frames,
+`Thinking…` / elapsed `Working (...)` lines, rotating tips, counters, and prompt chrome are
+removed before terminal text is compared. If neither side changes for the applicable
+`heartbeat.stallSeconds` / `heartbeat.stallSecondsByAgent` threshold, it emits:
+
+```text
+WORKER STALLED <dispatch|terminal> (<agent>, no file change or new output for Nm) - nudge it (terminal send "continue ..."), or stop it and re-dispatch the same brief to the other coder
+```
+
+This is informational and never auto-kills the worker. The handle, fingerprint, progress
+time, and reported marker are persisted per session, so an unchanged episode is reported
+once even across daemon restarts; a file or meaningful-output change re-arms it. A worker
+already classified disconnected, rate-limited, or usage-exhausted retains that more
+specific diagnosis and is not also reported stalled.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
