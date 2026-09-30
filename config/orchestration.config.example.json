@@ -6,7 +6,8 @@
     "escalation": { "alias": "fable", "id": "claude-fable-5-1" },
     "code": { "alias": "sonnet", "id": null },
     "lookup": { "alias": "haiku", "id": null },
-    "codex": { "alias": null, "id": "gpt-5.6-sol" }
+    "codex": { "alias": null, "id": "gpt-5.6-sol" },
+    "kimi": { "alias": null, "id": null }
   },
   "agents": {
     "escalation": [],
@@ -14,9 +15,13 @@
   },
   "codexHandoffUsedPercent": 95,
   "codexQuotaCacheSeconds": 60,
+  "kimiHandoffUsedPercent": 95,
+  "kimiQuotaCacheSeconds": 60,
+  "coderAvailabilityCacheSeconds": 600,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,
+  "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
   "closeDoneWorktrees": true,

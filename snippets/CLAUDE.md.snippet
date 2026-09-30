@@ -12,9 +12,11 @@ the SessionStart banner printed each session as the exact current numbers, not t
 - The main panel orchestrates only: it dispatches and supervises, and does not itself
   Edit/Write or run mutating shell commands outside `.claude/`, `plans/`, `docs/`, scratch.
 - Planning, review and verification run on the configured review model, in-session.
-- Code goes to Codex in an Orca worker first, then the configured in-session code model
-  once Codex has used the configured handoff percentage of its quota. The operator can
-  override with `--code-model <alias|codex|codex:<model>|auto>` or the `--exec-*` shortcuts.
+- Code goes to an external coder (Codex or Kimi) in an Orca worker first, then the
+  configured in-session code model once every usable coder has used its configured handoff
+  percentage of its quota (separate Codex/Kimi thresholds, both default 95). The operator can
+  override with `--code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>` or the
+  `--exec-*` shortcuts. A Kimi worker starts with `worker-start --agent kimi` (no `--model`).
 - Every code brief names a verify command.
 - A heartbeat daemon must supervise any live Orca worker; `Stop` refuses to end the
   session with one still live and unwatched.

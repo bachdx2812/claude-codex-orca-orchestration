@@ -12,9 +12,11 @@ Repo: <https://github.com/bachdx2812/claude-codex-orca-orchestration>
 ## Who does what
 
 ```
-Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
-[Sonnet once Codex has used >= 95% of its quota, read live; configurable via
- codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED] -> Opus 5.5 reviews -> main panel reports
+Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kimi writes code
+[Sonnet only once BOTH coders are unusable or have used >= their handoff threshold of quota,
+ read live; separate, configurable thresholds via codexHandoffUsedPercent /
+ ORCH_CODEX_HANDOFF_USED and kimiHandoffUsedPercent / ORCH_KIMI_HANDOFF_USED]
+-> Opus 5.5 reviews -> main panel reports
 ```
 
 | Role | What it does | Model (exact version) | How it is dispatched | Config key |
@@ -23,14 +25,15 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) write
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Reviewer / verifier | Code review, verification | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Coder (default) | Implement / fix / refactor | Codex `gpt-5.6-sol` | Orca worker: `orca orchestration worker-start --agent codex --model gpt-5.6-sol` (brief must name a verify command) | `models.codex` |
-| Coder (handoff) | Same work once Codex has used >= `codexHandoffUsedPercent` (default 95) of its live-read quota, or when `orca`/`codex` is not installed; override with `ORCH_CODEX_HANDOFF_USED` | Sonnet | `Agent` with `model: "sonnet"` (brief must name a verify command) | `codexHandoffUsedPercent`, `models.code`, `execFallbackWhenCodexUnavailable` |
+| Coder (parallel) | Same work, in parallel with Codex on disjoint `Owns:` | Kimi (`default_model` in `~/.kimi-code/config.toml`) | Orca worker: `orca orchestration worker-start --agent kimi` — no `--model` (Orca cannot pin one for Kimi); brief must name a verify command | `models.kimi`, `maxParallelKimiWorkers` |
+| Coder (handoff) | Same work once every usable coder has used >= its handoff threshold of its live-read quota (Codex: `codexHandoffUsedPercent`, default 95, override `ORCH_CODEX_HANDOFF_USED`; Kimi: `kimiHandoffUsedPercent`, default 95, override `ORCH_KIMI_HANDOFF_USED`) or is unusable on this machine | Sonnet | `Agent` with `model: "sonnet"` (brief must name a verify command) | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `models.code`, `execFallbackWhenCodexUnavailable` |
 | Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
 | Escalation | Only after Opus 5.5 failed even at higher effort; the dispatch must say both | Fable 5.1 (`claude-fable-5-1`) | `Agent` with `model: "fable"` + "escalation: opus failed ... at high effort ..." | `models.escalation` |
 
 ### Override from the main panel
 
-`--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto` (session-scoped, last flag
-wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The per-prompt "Model
+`--code-model opus|sonnet|haiku|fable|codex|codex:<model>|kimi|kimi:<model>|auto` (session-scoped, last flag
+wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-kimi`, `--exec-auto`). The per-prompt "Model
 routing" line always shows the current coder and why. Active overrides also show when
 they were set and how to return to automatic quota routing, both per prompt and in the
 `SessionStart` banner.
@@ -143,7 +146,8 @@ Orca-worker sessions are never gated); `Stop` refuses to end the session while a
 running and unwatched (`workers-unwatched` — no live heartbeat) or finished but still
 holding a terminal (`workers-unreconciled` — needs `worker-retain` or `worker-release`);
 **no more than `maxParallelCodexWorkers` (default 3) live Codex workers at once**
-(`max-parallel-codex-workers`); **no more than a MACHINE-wide budget of live Orca workers
+(`max-parallel-codex-workers`) **and no more than `maxParallelKimiWorkers` (default 3)
+live Kimi workers at once** (`max-parallel-kimi-workers`); **no more than a MACHINE-wide budget of live Orca workers
 (any agent) plus live in-session subagents, summed across every recent session on this
 machine** (`max-parallel-agents` — the resource is this machine's cores, not any one
 session's own concurrency: `max(1, floor(parallelCoreFraction x cores))` by default, an
@@ -161,6 +165,7 @@ claim in a *shared* workspace only avoids that specific conflict, not the next o
 | Gate | Refuses when | Escape |
 |---|---|---|
 | `max-parallel-codex-workers` | a new Codex `worker-start` would exceed `maxParallelCodexWorkers` | release/reuse/retry an existing worker; raise the cap; `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` |
+| `max-parallel-kimi-workers` | a new Kimi `worker-start` would exceed `maxParallelKimiWorkers` | release/reuse/retry an existing worker; raise the cap; `ORCH_MAX_PARALLEL_KIMI_WORKERS=0` |
 | `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it, or ask the operator to release a claim, delete a dead session's state file, or raise/disable the cap — never the model's own call |
 | `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
 | `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
@@ -297,8 +302,12 @@ The file is plain JSON — no comments — parsed as-is:
 {
   "codexHandoffUsedPercent": 90,
   "codexQuotaCacheSeconds": 60,
+  "kimiHandoffUsedPercent": 95,
+  "kimiQuotaCacheSeconds": 60,
+  "coderAvailabilityCacheSeconds": 600,
   "replyLanguage": "Vietnamese",
   "maxParallelCodexWorkers": 5,
+  "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 60,
   "disabledGates": ["code-brief-needs-verify"],
   "parallelCoreFraction": 0.8,
@@ -307,11 +316,16 @@ The file is plain JSON — no comments — parsed as-is:
 ```
 
 (`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95;
+`kimiHandoffUsedPercent` is Kimi's own, separate threshold (default 95) — both are
+tunable via this file or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`);
+`kimiQuotaCacheSeconds` and `coderAvailabilityCacheSeconds` (default 600, the per-machine
+"is this coder installed and signed in?" probe TTL) mirror the Codex cache key;
 `codexQuotaCacheSeconds` controls the cross-process live-reading
 cache TTL (`0` disables file-cache reuse but retains memoization inside one hook process);
 `replyLanguage` accepts any language name, or `null` for no
-language instruction at all; `maxParallelCodexWorkers` raises or lowers how many live
-Codex workers this session may hold at once (`0` = unlimited); `ownershipClaimTtlMinutes`
+language instruction at all; `maxParallelCodexWorkers` / `maxParallelKimiWorkers` raise or
+lower how many live
+workers of each coder this session may hold at once (`0` = unlimited); `ownershipClaimTtlMinutes`
 changes how long a background Agent's `Owns:` claim survives before it auto-expires;
 `parallelCoreFraction` (default `0.8`) is the share of this machine's cores the
 machine-wide `max-parallel-agents` budget derives its limit from; `maxParallelAgents`
@@ -339,7 +353,7 @@ exact-match removal (never a blind restore, so edits you made after installing s
   session;
   `--orchestrate` re-enables them. If both appear, the last flag wins. While disabled,
   every prompt and the `SessionStart` banner show when bypass began and how to re-enable.
-- `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` (see
+- `--exec-sonnet` / `--exec-codex` / `--exec-kimi` / `--exec-auto` and `--code-model <value>` (see
   `rules/orchestration-contract.md`) let the operator override coding-model routing
   without a full bypass.
 - Harness-injected notifications and compaction summaries are never interpreted as fresh
@@ -348,7 +362,8 @@ exact-match removal (never a blind restore, so edits you made after installing s
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees a stuck `Owns:`
   claim OR a stuck `max-parallel-agents` registration; `maxParallelCodexWorkers: 0`
   (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env) makes the parallel-Codex-worker cap
-  unlimited; `maxParallelAgents: 0` (config) or `ORCH_MAX_PARALLEL_AGENTS=0` (env) makes
+  unlimited; `maxParallelKimiWorkers: 0` (config) or `ORCH_MAX_PARALLEL_KIMI_WORKERS=0`
+  (env) makes the parallel-Kimi-worker cap unlimited; `maxParallelAgents: 0` (config) or `ORCH_MAX_PARALLEL_AGENTS=0` (env) makes
   the machine-wide max-parallel-agents budget unlimited.
 
 ## Known limitations

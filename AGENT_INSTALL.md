@@ -6,9 +6,10 @@ Read `rules/orchestration-contract.md` first for what gets enforced and why.
 ## Who does what
 
 ```
-Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
-[Sonnet once Codex has used >= 95% of its quota, read live; configurable via
- codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED] -> Opus 5.5 reviews -> main panel reports
+Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kimi writes code
+[Sonnet only once BOTH coders are unusable or past their handoff threshold, read live;
+ separate thresholds via codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED and
+ kimiHandoffUsedPercent / ORCH_KIMI_HANDOFF_USED] -> Opus 5.5 reviews -> main panel reports
 ```
 
 | Role | Model | Dispatched as | Config key |
@@ -16,11 +17,12 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) write
 | Main panel | session default; never writes code | — | `activation` |
 | Planner / red-team / reviewer / verifier | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Coder (default) | Codex `gpt-5.6-sol` | Orca worker (`worker-start --agent codex --model gpt-5.6-sol`) | `models.codex` |
-| Coder (handoff) | Sonnet, once Codex used >= `codexHandoffUsedPercent` (default 95) of its live-read quota, or `orca`/`codex` is missing; override with `ORCH_CODEX_HANDOFF_USED` | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `models.code` |
+| Coder (parallel) | Kimi (`default_model` in `~/.kimi-code/config.toml`) | Orca worker (`worker-start --agent kimi`, no `--model`) | `models.kimi`, `maxParallelKimiWorkers` |
+| Coder (handoff) | Sonnet, once every usable coder is at/past its handoff threshold (Codex `codexHandoffUsedPercent` / Kimi `kimiHandoffUsedPercent`, both default 95) of its live-read quota or is unusable; overrides `ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED` | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `models.code` |
 | Lookups | Haiku (advised, not enforced) | `Agent` with `model: "haiku"` | `models.lookup` |
 | Escalation | Fable 5.1 (`claude-fable-5-1`), only after Opus 5.5 failed at high effort | `Agent` with `model: "fable"` | `models.escalation` |
 
-Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto`. Full
+Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|kimi|kimi:<model>|auto`. Full
 detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
 
 **Subagents and parallel work.** In-session subagents (`Agent` tool) return their result
@@ -32,7 +34,8 @@ merged/closed with no live terminal left on it; `Stop` refuses to end the sessio
 unwatched, or finished and unreleased (an explicitly retained worker Orca reports done is
 informational). A terminal reported disconnected skips idle/orphan classification for that poll.
 No more than `maxParallelCodexWorkers` (default 3)
-live Codex workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget
+live Codex workers at once, and no more than `maxParallelKimiWorkers` (default 3) live
+Kimi workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget
 (default `max(1, floor(0.8 x cores))`, `0` = unlimited) caps every live Orca worker group
 (any agent) plus every live in-session Agent/Task dispatch, summed across every recent
 session on this machine — this one IS registered for every main-panel Agent/Task dispatch
@@ -188,19 +191,28 @@ The file is plain JSON — no comments — parsed as-is:
 {
   "codexHandoffUsedPercent": 90,
   "codexQuotaCacheSeconds": 60,
+  "kimiHandoffUsedPercent": 95,
+  "kimiQuotaCacheSeconds": 60,
+  "coderAvailabilityCacheSeconds": 600,
   "replyLanguage": "Vietnamese",
   "disabledGates": ["code-brief-needs-verify"]
 }
 ```
 
-(`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95; `codexQuotaCacheSeconds`
-controls the live-reading cache TTL and accepts `0` to disable reuse; `replyLanguage`
+(`codexHandoffUsedPercent: 90` hands Codex off slightly earlier than the default 95;
+`kimiHandoffUsedPercent` is Kimi's own, separate threshold (default 95) — both tunable via
+json or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`); `codexQuotaCacheSeconds`
+controls the live-reading cache TTL and accepts `0` to disable reuse (`kimiQuotaCacheSeconds`
+mirrors it for Kimi, `coderAvailabilityCacheSeconds` (default 600) is the per-machine
+"installed and signed in?" probe TTL); `replyLanguage`
 accepts any language name, or `null` for no language sentence at all.)
 
 Several more keys gate parallel work: `maxParallelCodexWorkers` (integer 0-32, default 3,
 `0` = unlimited) caps how many live Codex `worker-start` dispatches this session may hold
 at once — a `--terminal`/`--retry-of` that replaces an existing worker does not count as
-new, and a non-Codex agent is never counted; `parallelCoreFraction` (number 0.1-1, default
+new, and a non-Codex agent is never counted; `maxParallelKimiWorkers` (integer 0-32,
+default 3, `0` = unlimited) is the same cap for Kimi worker-starts, overridable with
+`ORCH_MAX_PARALLEL_KIMI_WORKERS`; `parallelCoreFraction` (number 0.1-1, default
 0.8) and `maxParallelAgents` (integer 0-256 or `null`, default `null`) together derive the
 MACHINE-wide `max-parallel-agents` budget — `null` means `max(1, floor(parallelCoreFraction
 x cores))`, an explicit integer overrides that derivation outright, `0` means unlimited;
@@ -236,6 +248,8 @@ The operator can pick who writes code for the rest of the session directly from 
 --code-model fable           # the configured escalation model, for code work specifically
 --code-model codex           # Codex in an Orca worker (same as --exec-codex)
 --code-model codex:gpt-5-custom   # Codex in an Orca worker, pinned to this model
+--code-model kimi            # Kimi in an Orca worker (same as --exec-kimi); no --model, Kimi uses default_model from ~/.kimi-code/config.toml
+--code-model kimi:<model>    # Kimi, recorded model preference (Orca cannot pin it)
 --code-model auto            # back to automatic routing (same as --exec-auto)
 ```
 
