@@ -265,7 +265,12 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   const agentCapActive = !gateDisabled(cfg, 'max-parallel-agents') &&
     Number.isFinite(deps.agentParallelLimit(cfg));
   const codexCapActive = cap > 0 && !gateDisabled(cfg, 'max-parallel-codex-workers');
-  const kimiCapActive = kimiCap > 0 && !gateDisabled(cfg, 'max-parallel-kimi-workers');
+  const kimiCapActive = kimiCap > 0 && !gateDisabled(cfg, 'max-parallel-kimi-workers') &&
+    // The Kimi cap only justifies the long cap lock timeout when this command actually
+    // contains a Kimi dispatch — otherwise every Codex/Claude worker-start would pay the
+    // ~10.5s stale-lock wait for a cap that can never apply to it.
+    invs.some((inv) => inv.sub === 'orchestration worker-start' &&
+      (flagValue(inv.args, '--agent') || '').toLowerCase() === 'kimi');
   const hardCapActive = agentCapActive || codexCapActive || kimiCapActive;
   let violation = null;
   // True once a mid-loop Orca reconcile (`applyOrcaReconciliation`) has actually changed
