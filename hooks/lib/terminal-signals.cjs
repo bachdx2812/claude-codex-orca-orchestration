@@ -29,8 +29,9 @@ function hasRateLimitError(text) {
   return false;
 }
 
-const KIMI_USAGE_LIMIT_SENTENCE = /you(?:'|’)?ve\s+reached\s+your\s+usage\s+limit\s+for\s+this\s+billing\s+cycle/i;
-const KIMI_ERROR_SHAPED = /^\s*(?:■|⚠|error:)/i;
+const KIMI_USAGE_LIMIT_SENTENCE = /^you(?:'|’)?ve\s+reached\s+your\s+usage\s+limit\s+for\s+this\s+billing\s+cycle/i;
+const KIMI_IGNORED_LINE_PREFIX = /^\s*(?:["'`>]|\/\/|#|[-*](?:\s|$))/;
+const KIMI_ERROR_PREFIX = /^\s*\+?\s*(?:[■⚠✗]\s*(?:(?:ERROR\b|(?:HTTP\s*)?403\b)[:\s-]*)*|error\b[:\s]+|(?:HTTP\s*)?403\b[:\s]+)/i;
 
 /** True only when Kimi's billing-cycle usage-limit sentence appears on an error-shaped
  * line — deliberately NOT a strong marker: the sentence alone, in plain prose (a worker
@@ -41,14 +42,15 @@ function hasKimiUsageExhausted(text) {
   for (const raw of terminalLines(text)) {
     const line = raw.trimEnd();
     if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
-    if (inFence || /^\s*(?:└\s*)?Tip:/i.test(line) || isSourceExcerpt(line)) continue;
-    if (!KIMI_USAGE_LIMIT_SENTENCE.test(line)) continue;
-    if (KIMI_ERROR_SHAPED.test(line) || /\bERROR\b/.test(line) || /\b403\b/.test(line)) return true;
+    if (inFence || /^\s*(?:└\s*)?Tip:/i.test(line) || KIMI_IGNORED_LINE_PREFIX.test(line) || isSourceExcerpt(line)) continue;
+    const prefix = line.match(KIMI_ERROR_PREFIX);
+    if (prefix && KIMI_USAGE_LIMIT_SENTENCE.test(line.slice(prefix[0].length))) return true;
   }
   return false;
 }
 
-function hasCodexDisconnect(text) {  let inFence = false;
+function hasCodexDisconnect(text) {
+  let inFence = false;
   for (const raw of terminalLines(text)) {
     const line = raw.trimEnd();
     if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }

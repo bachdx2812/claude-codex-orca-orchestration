@@ -192,6 +192,22 @@ check('the sentence as a js string literal is NOT usage-exhausted', hasKimiUsage
   'const msg = "■ ERROR 403 You\'ve reached your usage limit for this billing cycle.";'), false);
 check('a matching line later in the output still counts', hasKimiUsageExhausted(
   'some normal output\nworking...\n' + KIMI_403), true);
+check('the contract-doc sentence is NOT usage-exhausted', hasKimiUsageExhausted(
+  '403 ("You\'ve reached your usage limit for this billing cycle", error-shaped lines only, and'), false);
+check('a double-quote-prefixed test-source line is NOT usage-exhausted', hasKimiUsageExhausted(
+  '"\u26a0 You\'ve reached your usage limit for this billing cycle (HTTP 403)."), true);'), false);
+check('a single-quote-prefixed test-source line is NOT usage-exhausted', hasKimiUsageExhausted(
+  '\'\u25a0 ERROR 403 You’ve reached your usage limit for this billing cycle.\'), true);'), false);
+check('worker narration mentioning 403 is NOT usage-exhausted', hasKimiUsageExhausted(
+  "The server replied 403: You've reached your usage limit for this billing cycle, so I will stop."), false);
+check('worker narration mentioning ERROR is NOT usage-exhausted', hasKimiUsageExhausted(
+  "I handle the ERROR case where You've reached your usage limit for this billing cycle appears"), false);
+for (const marker of ['`', '> ', '// ', '# ', '- ', '* ']) {
+  check(`${marker.trim() || marker} source/list prefix is NOT usage-exhausted`, hasKimiUsageExhausted(
+    `${marker}\u25a0 ERROR 403 You've reached your usage limit for this billing cycle.`), false);
+}
+check('a direct HTTP 403 prefix counts', hasKimiUsageExhausted(
+  "HTTP 403: You've reached your usage limit for this billing cycle."), true);
 
 // --- heartbeat classification (agent-scoped, RT-3) -----------------------------
 
