@@ -91,6 +91,18 @@ async function run() {
     });
     check('codex is unusable on the same prompt that observes logout',
       [map.codex.usable, map.codex.reason], [false, 'not logged in']);
+    const warmDir = path.join(root, 'warm-state');
+    const warmUp = availability.coderAvailability({
+      stateDir: warmDir, cacheSeconds: 600, now: Date.now(), codexAuthState: 'ok',
+      orcaInstalled: true, env: envFor(path.join(root, 'kimi-home'), { ORCH_KIMI_BIN: path.join(root, 'missing-kimi') }),
+    });
+    check('warm availability cache starts usable', warmUp.codex.usable, true);
+    const warmFlip = availability.coderAvailability({
+      stateDir: warmDir, cacheSeconds: 600, now: Date.now(), codexAuthState: 'logged-out',
+      orcaInstalled: true, env: envFor(path.join(root, 'kimi-home'), { ORCH_KIMI_BIN: path.join(root, 'missing-kimi') }),
+    });
+    check('cached-usable entry flips to unusable on the prompt that observes logout',
+      [warmFlip.codex.usable, warmFlip.codex.reason], [false, 'not logged in']);
     const flipBack = availability.coderAvailability({
       stateDir, cacheSeconds: 600, now: Date.now(), codexAuthState: 'ok',
       orcaInstalled: true, env: envFor(path.join(root, 'kimi-home'), { ORCH_KIMI_BIN: path.join(root, 'missing-kimi') }),
@@ -99,6 +111,20 @@ async function run() {
       flipBack.codex.usable, true);
     quota.codexQuota(Date.now() + 1, { stateDir, cacheSeconds: 600 });
     check('logged-out failure is cached', fs.readFileSync(calls, 'utf8').trim().split('\n').length, 1);
+
+    const route = quota.execRoute(95, Date.now(), { stateDir, cacheSeconds: 600 });
+    check('execRoute treats a failed logged-out quota as unknown', route.codexLeft, null);
+    ok('execRoute summary never prints NaN% left', /Codex unknown/.test(route.summary) && !/NaN/.test(route.summary));
+    check('fresh logged-out auth state respects maxAge', quota.codexAuthState(stateDir, Date.now(), 600000), 'logged-out');
+    check('logged-out auth state older than maxAge reports unknown',
+      quota.codexAuthState(stateDir, Date.now() + 86400000, 600000), 'unknown');
+
+    process.env.STUB_CODEX_MODE = 'auth-error-but-signed-in';
+    const authErrorDir = path.join(root, 'auth-error');
+    check('rate-limit auth error text with a valid account stays quota unknown',
+      quota.codexQuota(Date.now(), { stateDir: authErrorDir, cacheSeconds: 60 }), null);
+    check('a signed-in account/read overrides the error-message fallback',
+      quota.codexAuthState(authErrorDir), 'unknown');
 
     const unsupportedDir = path.join(root, 'unsupported');
     process.env.STUB_CODEX_MODE = 'account-read-unsupported';
@@ -128,6 +154,10 @@ async function run() {
     check('codex stub malformed mode is quota unknown',
       quota.codexQuota(Date.now(), { stateDir: malformedDir, cacheSeconds: 60 }), null);
     check('codex stub malformed leaves auth unknown', quota.codexAuthState(malformedDir), 'unknown');
+    check('unknown auth after timeout/malformed keeps Codex usable',
+      availability.probeCoderAvailability('codex', {
+        env: envFor(path.join(root, 'kimi-home')), codexAuthState: quota.codexAuthState(malformedDir),
+      }).usable, true);
 
     for (const key of Object.keys(process.env)) if (!(key in old)) delete process.env[key];
     Object.assign(process.env, old);
@@ -314,6 +344,9 @@ async function run() {
     const unusable = pick({ availability: { codex: { usable: false, reason: 'not logged in' }, kimi: { usable: false, reason: 'not installed' } } });
     check('both unusable route to code with both reasons', [unusable.route, /not logged in/.test(unusable.why), /not installed/.test(unusable.why)], [ 'code', true, true ]);
     check('free capacity outranks quota headroom', pick({ live: { codex: 3, kimi: 2 } }).pick, 'kimi');
+    check('fewer live workers beats quota headroom', pick({
+      live: { codex: 2, kimi: 0 }, quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 20 } },
+    }).pick, 'kimi');
     check('both at cap stay external and rank by headroom', pick({ live: { codex: 3, kimi: 3 } }).route, 'external');
     check('unknown quota ranks by fewer live workers', pick({ quotas: { codex: null, kimi: null }, live: { codex: 2, kimi: 1 } }).pick, 'kimi');
     check('unknown quota tie prefers Codex', pick({ quotas: { codex: null, kimi: null } }).pick, 'codex');
@@ -329,6 +362,11 @@ async function run() {
     check('a lastCoder that is not eligible is ignored', pick({
       quotas: { codex: { usedPercent: 1 }, kimi: { usedPercent: 95 } }, lastCoder: 'kimi',
     }).pick, 'codex');
+    check('an unknown lastCoder value is ignored', pick({
+      quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 10 } }, lastCoder: 'bogus',
+    }).pick, 'codex');
+    const spread = pick({ live: { codex: 2, kimi: 0 }, quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 20 } } });
+    ok('why names the spread reason', /auto: spread, pick Kimi \(fewer live\)/.test(spread.why));
     check('omitted thresholds never compare NaN', pick({
       quotas: { codex: { usedPercent: 50 }, kimi: { usedPercent: 80 } }, thresholds: {},
     }).pick, 'codex');

@@ -32,6 +32,10 @@ process.stdin.on('data', (chunk) => {
         process.stdout.write(`${JSON.stringify({ id: 2, error: { message: 'rate limits unavailable' } })}\n`);
         continue;
       }
+      if (process.env.STUB_CODEX_MODE === 'auth-error-but-signed-in') {
+        process.stdout.write(`${JSON.stringify({ id: 2, error: { message: 'authentication required' } })}\n`);
+        continue;
+      }
       if (process.env.STUB_CODEX_MODE === 'malformed') {
         process.stdout.write(`${JSON.stringify({ id: 2, result: { nope: true } })}\n`);
         continue;
@@ -59,7 +63,8 @@ process.stdin.on('data', (chunk) => {
       } else if (process.env.STUB_CODEX_MODE === 'account-read-unsupported') {
         process.stdout.write(`${JSON.stringify({ id: 3, error: { message: 'method not found' } })}\n`);
       } else {
-        // Keep the default id 1/id 2 behaviour unchanged while answering unexpected id 3 promptly.
+        // Signed-in account (also the 'auth-error-but-signed-in' answer): a valid
+        // account/read result must always override the id-2 error text.
         process.stdout.write(`${JSON.stringify({ id: 3, result: { account: { type: 'chatgpt' }, requiresOpenaiAuth: true } })}\n`);
       }
     }
