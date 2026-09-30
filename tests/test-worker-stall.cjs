@@ -18,6 +18,7 @@ const {
   approvalPromptFingerprint, hasCodexUsageExhausted,
 } = require('../hooks/lib/terminal-signals.cjs');
 const handover = require('../hooks/lib/worker-quota-handover.cjs');
+const resume = require('../hooks/lib/quota-reset-resume.cjs');
 const {
   meaningfulTerminalOutput,
   workerProgressSample,
@@ -54,6 +55,8 @@ function withEnv(name, value, fn) {
   check('default stall threshold is 15 minutes', defaults.heartbeat.stallSeconds, 900);
   check('Kimi default override is 10 minutes', defaults.heartbeat.stallSecondsByAgent, { kimi: 600 });
   check('default handover warning margin is 5 percent', defaults.handoverWarnMarginPercent, 5);
+  check('quota reset auto-resume defaults on for workers and panel',
+    [defaults.autoResumeAfterReset, defaults.autoResumePanel], [true, true]);
   check('ORCH_STALL_SECONDS overrides the global threshold',
     withEnv('ORCH_STALL_SECONDS', '45', () => config.stallSeconds(defaults)), 45);
   check('blank ORCH_STALL_SECONDS is unset',
@@ -80,6 +83,15 @@ function withEnv(name, value, fn) {
     [valid.heartbeat.stallSeconds, valid.heartbeat.stallSecondsByAgent], [120, { kimi: 30, codex: 90 }]);
   check('a valid zero handover warning margin is retained',
     withConfig({ handoverWarnMarginPercent: 0 }, () => config.loadConfig()).handoverWarnMarginPercent, 0);
+  check('invalid auto-resume booleans fall back independently',
+    withConfig({ autoResumeAfterReset: 'yes', autoResumePanel: 0 }, () => {
+      const value = config.loadConfig();
+      return [value.autoResumeAfterReset, value.autoResumePanel];
+    }), [true, true]);
+  check('ORCH_AUTO_RESUME accepts false and blank remains unset', [
+    withEnv('ORCH_AUTO_RESUME', 'false', () => config.autoResumeAfterReset(defaults)),
+    withEnv('ORCH_AUTO_RESUME', '   ', () => config.autoResumeAfterReset(defaults)),
+  ], [false, true]);
 }
 
 // Repaint-only changes collapse to the same meaningful output.
@@ -594,6 +606,204 @@ const codexExhaustedVerdict = heartbeat.classifyTerminal({
 }, { ...approvalCtx, handleAgent: new Map([['term_approval', 'codex']]) });
 check('Codex usage-limit output symmetrically triggers handover',
   [codexExhaustedVerdict.kind, codexExhaustedVerdict.coder], ['usage_exhausted', 'codex']);
+
+// Exhausted workers with no available handover destination are parked and resumed by a
+// detached, per-terminal scheduler. Every clock, probe, and terminal action is stubbed.
+const resetNow = new Date(2026, 9, 1, 12, 0, 0, 0).getTime();
+check('Codex reset seconds convert to epoch milliseconds',
+  resume.quotaResetAt({ resetsAt: (resetNow + 3_600_000) / 1000 }), resetNow + 3_600_000);
+check('Kimi resetTime-derived seconds use the same reset conversion',
+  resume.quotaResetAt({ resetsAt: (resetNow + 7_200_000) / 1000 }), resetNow + 7_200_000);
+check('Claude local 5pm reset text is parsed',
+  resume.parseClaudeResetAt('Limit reached — resets 5pm', resetNow),
+  new Date(2026, 9, 1, 17, 0, 0, 0).getTime());
+check('Claude 24-hour reset text is parsed',
+  resume.parseClaudeResetAt('Usage limit reached, resets at 17:00', resetNow),
+  new Date(2026, 9, 1, 17, 0, 0, 0).getTime());
+check('Claude relative reset text is parsed',
+  resume.parseClaudeResetAt('You hit your limit; try again in 2h 15m', resetNow),
+  resetNow + 2 * 3_600_000 + 15 * 60_000);
+check('ordinary reset discussion is not a Claude limit screen',
+  resume.hasClaudeLimitMessage('Updated reset parsing tests for 5pm.'), false);
+check('prose quoting limit and reset wording is not a Claude limit screen',
+  resume.hasClaudeLimitMessage('The panel reports limit reached and resets 5pm in this test.'), false);
+check('an unmarked exact quote is not treated as panel limit UI',
+  resume.hasClaudeLimitMessage('Usage limit reached · resets at 17:00'), false);
+check('captured Claude limit banner is detected',
+  resume.hasClaudeLimitMessage('■ Usage limit reached · resets at 17:00'), true);
+check('an exhausted worker parks only when no handover target exists', [
+  resume.shouldPark({ limited: true, handoverTarget: null }),
+  resume.shouldPark({ limited: true, handoverTarget: 'codex' }),
+  resume.shouldPark({ limited: false, handoverTarget: null }),
+], [true, false, false]);
+check('a missing or limited panel removes the Sonnet fallback', [
+  resume.availableHandoverTarget('sonnet', false),
+  resume.availableHandoverTarget('sonnet', true),
+  resume.availableHandoverTarget('codex', false),
+], [null, 'sonnet', 'codex']);
+
+let schedulerSpawns = 0;
+const parkedResetAt = resetNow + 3_600_000;
+const firstPark = resume.park({
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  resetAt: parkedResetAt, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow,
+  spawnScheduler: () => { schedulerSpawns += 1; return 4321; }, pidAlive: () => false,
+});
+check('first park emits and persists scheduler pid/reset time', [
+  /^WORKER PARKED ctx_park \(kimi limit, resets .+\) - will auto-resume$/.test(firstPark.event),
+  firstPark.scheduled, resume.readJob(firstPark.file).pid, resume.readJob(firstPark.file).resetAt,
+], [true, true, 4321, parkedResetAt]);
+const duplicatePark = resume.park({
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  resetAt: parkedResetAt, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 1,
+  spawnScheduler: () => { schedulerSpawns += 1; return 9876; }, pidAlive: (pid) => pid === 4321,
+});
+check('park scheduler is deduped once per persisted episode',
+  [duplicatePark.event, duplicatePark.scheduled, schedulerSpawns], [null, true, 1]);
+const firstParkToken = resume.readJob(firstPark.file).token;
+check('scheduler ownership rejects a replaced or cleared park episode', [
+  resume.withOwnedJob(firstPark.file, 'stale-token', 4321, () => true).owned,
+  resume.withOwnedJob(firstPark.file, firstParkToken, 4321, () => true).owned,
+], [false, true]);
+const completedParkJob = resume.readJob(firstPark.file);
+completedParkJob.status = 'resumed';
+completedParkJob.pid = 0;
+resume.writeJob(firstPark.file, completedParkJob);
+check('a still-visible completed park episode does not schedule again', resume.park({
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  resetAt: parkedResetAt, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 2,
+  spawnScheduler: () => { schedulerSpawns += 1; return 2222; }, pidAlive: () => false,
+}).event, null);
+resume.clearJob(stateDir, 'park-test', 'term_park');
+check('clearing a park invalidates the scheduler ownership token',
+  resume.withOwnedJob(firstPark.file, firstParkToken, 4321, () => true).owned, false);
+check('clearing a recovered episode re-arms a later park', typeof resume.park({
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  resetAt: parkedResetAt + 5000, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 3,
+  spawnScheduler: () => { schedulerSpawns += 1; return 3333; }, pidAlive: () => false,
+}).event, 'string');
+check('foreign terminals are never parked or scheduled', resume.park({
+  stateDir, session: 'park-test', handle: 'term_foreign', identity: 'ctx_foreign', agent: 'codex',
+  authorizedHandles: new Set(), now: resetNow,
+  spawnScheduler: () => { schedulerSpawns += 1; return 1111; },
+}).reason, 'foreign-terminal');
+
+const resumeJob = {
+  handle: 'term_resume', identity: 'ctx_resume', agent: 'codex', panel: false,
+  status: 'scheduled', parkedAt: resetNow, resetAt: resetNow + 1000, threshold: 95,
+};
+let sentMessages = [];
+check('scheduler sends nothing before reset plus grace', resume.attemptResume(resumeJob, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS - 1,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+  send: (...args) => { sentMessages.push(args); return true; },
+}).reason, 'before-reset');
+check('nothing was typed before reset', sentMessages.length, 0);
+check('scheduler sends nothing while quota is still unavailable', resume.attemptResume(resumeJob, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 97, resetsAt: (resetNow + 999999) / 1000 }),
+  send: (...args) => { sentMessages.push(args); return true; },
+}).reason, 'quota-unavailable');
+check('scheduler sends nothing to a now-foreign terminal', resume.attemptResume(resumeJob, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => false, probeQuota: () => ({ usedPercent: 0 }),
+  send: (...args) => { sentMessages.push(args); return true; },
+}).reason, 'foreign-terminal');
+check('scheduler treats an unavailable authorization probe as retryable uncertainty', resume.attemptResume(resumeJob, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => null, probeQuota: () => ({ usedPercent: 0 }),
+  send: (...args) => { sentMessages.push(args); return true; },
+}).reason, 'authorization-unknown');
+check('no unavailable or foreign attempt typed into a terminal', sentMessages.length, 0);
+const resumed = resume.attemptResume(resumeJob, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 2 }),
+  readScreen: () => 'Ready',
+  send: (...args) => { sentMessages.push(args); return true; },
+  verifyStarted: () => true,
+});
+check('available quota resumes the worker with the exact continuation guard',
+  [resumed.resumed, sentMessages.at(-1)[1]], [true, resume.WORKER_RESUME_MESSAGE]);
+
+const kimiSends = [];
+const kimiScreens = [
+  'Permission mode: Ask When Needed',
+  'Permission mode: Ask When Needed',
+  '❯ 1. Ask When Needed\n  2. Never Ask',
+  '❯ 1. Ask When Needed\n  2. Never Ask',
+  'Permission mode: Never Ask',
+];
+check('Kimi resume re-asserts Never Ask before continuing when needed', resume.attemptResume({
+  ...resumeJob, handle: 'term_kimi_resume', agent: 'kimi', threshold: 95,
+}, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
+  readScreen: () => kimiScreens.shift() || 'Permission mode: Never Ask',
+  send: (...args) => { kimiSends.push(args); return true; }, verifyStarted: () => true, wait: () => {},
+}).resumed, true);
+check('Kimi permission sequence precedes its resume message',
+  kimiSends.map((entry) => entry[1]), ['/auto', '\u001b[B', resume.WORKER_RESUME_MESSAGE]);
+check('Kimi option parser moves once in a two-option Ask-to-Never-Ask menu',
+  resume.kimiPermissionMoves('❯ 1. Ask When Needed\n  2. Never Ask'), 1);
+const failedPermissionSends = [];
+check('Kimi never resumes when Never Ask cannot be verified', resume.attemptResume({
+  ...resumeJob, handle: 'term_kimi_unverified', agent: 'kimi', threshold: 95,
+}, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
+  readScreen: () => 'Permission mode: Ask When Needed',
+  send: (...args) => { failedPermissionSends.push(args); return true; }, verifyStarted: () => true,
+  wait: () => {},
+}).reason, 'permission-unverified');
+check('unverified permission mode never receives the resume message',
+  failedPermissionSends.some((entry) => entry[1] === resume.WORKER_RESUME_MESSAGE), false);
+
+const panelSends = [];
+check('panel self-resume uses its orchestration-specific message', resume.attemptResume({
+  handle: 'term_panel', identity: 'term_panel', agent: 'claude', panel: true,
+  panelHandle: 'term_panel', status: 'scheduled', parkedAt: resetNow,
+  resetAt: resetNow + 1000, threshold: 100,
+}, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }), readScreen: () => 'Ready',
+  send: (...args) => { panelSends.push(args); return true; }, verifyStarted: () => true,
+}).resumed, true);
+check('panel resume message is distinct from worker resume',
+  panelSends.at(-1)[1], resume.PANEL_RESUME_MESSAGE);
+const staleClaudeSends = [];
+check('known Claude reset resumes despite an unchanged stale banner', resume.attemptResume({
+  handle: 'term_panel_stale', identity: 'term_panel_stale', agent: 'claude', panel: true,
+  status: 'scheduled', parkedAt: resetNow, resetAt: resetNow + 1000, threshold: 100,
+}, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+  readScreen: () => '■ Usage limit reached · resets at 17:00',
+  send: (...args) => { staleClaudeSends.push(args); return true; }, verifyStarted: () => true,
+}).resumed, true);
+const unknownClaudeSends = [];
+check('unknown Claude reset actively probes a static limit banner without shifting its timer', resume.attemptResume({
+  handle: 'term_panel_unknown', identity: 'term_panel_unknown', agent: 'claude', panel: true,
+  status: 'scheduled', parkedAt: resetNow - resume.UNKNOWN_RETRY_MS, resetAt: 0, threshold: 100,
+}, {
+  now: resetNow, isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+  readScreen: () => '■ You\'ve hit your usage limit · try again in 2h',
+  send: (...args) => { unknownClaudeSends.push(args); return true; }, verifyStarted: () => false,
+}), { resumed: false, reason: 'not-started' });
+check('unknown Claude retry uses only the exact continuation probe',
+  unknownClaudeSends.map((entry) => entry[1]), [resume.PANEL_RESUME_MESSAGE]);
+check('threshold zero never resumes because no nonnegative quota is below it', resume.attemptResume({
+  ...resumeJob, threshold: 0,
+}, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+  send: () => { throw new Error('must not send'); },
+}).reason, 'quota-unavailable');
+check('turn verification requires an active status, not merely changed screen text', [
+  resume.turnStarted('Resume message echoed', 'Ready'),
+  resume.turnStarted('• Working (1s • esc to interrupt)', 'Ready'),
+], [false, true]);
+check('panel auto-resume opt-out is retained by config',
+  withConfig({ autoResumePanel: false }, () => config.loadConfig()).autoResumePanel, false);
 
 if (failures.length) {
   console.error(`${failures.length} failure(s), ${pass} passed`);

@@ -39,11 +39,11 @@ const MANIFEST_FILE = path.join(HOOKS_DIR, 'install-manifest.json');
 
 const GATE_SCRIPT = 'orchestrator-gate.cjs';
 const HOOK_FILES = [
-  'orchestrator-gate.cjs', 'orca-heartbeat.cjs',
+  'orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'orca-resume-scheduler.cjs',
   'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/codex-quota-probe.cjs', 'lib/shell-orca-invocations.cjs',
   'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
-  'lib/terminal-signals.cjs', 'lib/worker-progress-fingerprint.cjs', 'lib/worker-quota-handover.cjs', 'lib/live-probe-cache.cjs', 'lib/kimi-quota-probe.cjs',
+  'lib/terminal-signals.cjs', 'lib/worker-progress-fingerprint.cjs', 'lib/worker-quota-handover.cjs', 'lib/quota-reset-resume.cjs', 'lib/live-probe-cache.cjs', 'lib/kimi-quota-probe.cjs',
   'lib/coder-availability.cjs', 'lib/coder-pool-route.cjs',
 ];
 const EVENTS = {

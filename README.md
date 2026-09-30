@@ -161,6 +161,24 @@ worktree or branch. Dispatch the same brief to the selected coder in that same w
 branch, prefixed: `Continue a task handed over from <agent>. Read HANDOVER.md and git log
 first; do not redo finished steps.` For Sonnet, point the in-session Agent at that worktree.
 
+**Park and resume after quota reset.** When a worker is fully exhausted and neither the
+other external coder nor the in-session Sonnet panel is available, the heartbeat emits
+`WORKER PARKED <id> (<agent> limit, resets <local time>) - will auto-resume`. It starts one
+detached scheduler per parked terminal, persisted with its PID and reset time. At the known
+reset plus 90 seconds—or every 15 minutes when reset time is unknown—the scheduler rechecks
+quota and, once it is below the coder's handoff threshold, sends the worker the guarded
+continue message and verifies that the terminal started another turn. Kimi permission mode
+is returned to Never Ask first when its screen shows another mode. Only this session's
+supervised terminal handles are eligible.
+
+`autoResumeAfterReset` defaults to `true`; `ORCH_AUTO_RESUME=false` disables scheduling for
+one process (blank is unset). `autoResumePanel` also defaults to `true`: when the exact panel
+terminal shows a Claude limit message such as `resets 5pm`, `resets at 17:00`, or `try again
+in 2h`, it gets its own scheduler and orchestration-specific resume message. Set it to
+`false` to opt the panel out. In-session Agent subagents cannot survive a rate-limited panel
+turn, so the resumed panel must re-dispatch them; prefer Orca workers for long resumable code
+tasks.
+
 **Close finished worker panels.** After a worker finishes: read its result, then `orca
 orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
 worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree
@@ -363,6 +381,8 @@ The file is plain JSON — no comments — parsed as-is:
   "codexHandoffUsedPercent": 90,
   "kimiHandoffUsedPercent": 95,
   "handoverWarnMarginPercent": 5,
+  "autoResumeAfterReset": true,
+  "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,

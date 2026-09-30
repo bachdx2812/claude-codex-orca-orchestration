@@ -50,6 +50,8 @@ const DEFAULT_CONFIG = {
   },
   codexHandoffUsedPercent: 95,
   handoverWarnMarginPercent: 5,
+  autoResumeAfterReset: true,
+  autoResumePanel: true,
   codexQuotaCacheSeconds: 60,
   kimiHandoffUsedPercent: 95,
   kimiQuotaCacheSeconds: 60,
@@ -178,6 +180,13 @@ function loadConfig() {
     merged.handoverWarnMarginPercent = DEFAULT_CONFIG.handoverWarnMarginPercent;
   } else {
     merged.handoverWarnMarginPercent = handoverWarnMargin;
+  }
+
+  for (const key of ['autoResumeAfterReset', 'autoResumePanel']) {
+    if (typeof merged[key] !== 'boolean') {
+      warnings.push(`${key} must be a boolean; using ${DEFAULT_CONFIG[key]}.`);
+      merged[key] = DEFAULT_CONFIG[key];
+    }
   }
 
   const quotaCacheSeconds = configuredNumber(merged.codexQuotaCacheSeconds);
@@ -404,6 +413,16 @@ function stallSeconds(cfg) {
   return cfg.heartbeat.stallSeconds;
 }
 
+/** Whether exhausted work is parked for a detached reset scheduler. */
+function autoResumeAfterReset(cfg) {
+  const envOverride = process.env.ORCH_AUTO_RESUME;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    if (/^(?:1|true|yes|on)$/i.test(envOverride)) return true;
+    if (/^(?:0|false|no|off)$/i.test(envOverride)) return false;
+  }
+  return cfg.autoResumeAfterReset;
+}
+
 /** Directory holding session state (`<sid>.json`, heartbeat files, violations.log). */
 function stateDir() {
   return process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
@@ -509,5 +528,5 @@ module.exports = {
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
-  stallSeconds,
+  stallSeconds, autoResumeAfterReset,
 };

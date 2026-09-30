@@ -36,12 +36,13 @@
  * terminals that were already open when it started cannot drown the signal.
  */
 
-const { execFileSync, spawnSync } = require('child_process');
+const { execFileSync, spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const {
   loadConfig, stateDir, closeDoneWorktreesEnabled, stallSeconds, handoffUsed, kimiHandoffUsed,
   codexQuotaCacheSeconds, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds,
+  autoResumeAfterReset,
 } = require('./lib/config.cjs');
 const {
   hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, hasCodexUsageExhausted,
@@ -54,12 +55,14 @@ const QUOTA = require('./lib/exec-route-by-quota.cjs');
 const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
 const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const HANDOVER = require('./lib/worker-quota-handover.cjs');
+const RESUME = require('./lib/quota-reset-resume.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
 // Overridable the same way ORCA_BIN is (tests point this at a deterministic stub); a bare
 // "git" resolves against PATH exactly like the bare "orca" default does.
 const GIT_BIN = process.env.ORCH_GIT_BIN || 'git';
+const RESUME_SCHEDULER = path.join(__dirname, 'orca-resume-scheduler.cjs');
 const DONE_PR_STATES = new Set(['merged', 'closed']);
 // GitLab's MR state vocabulary uses "opened"/"merged"/"closed"/"locked" where GitHub's PR
 // vocabulary uses "open"/"merged"/"closed" — normalize the "still open" spelling so a linked
@@ -77,6 +80,7 @@ const INTERVAL_SECONDS = arg('interval', cfg.heartbeat.intervalSeconds);
 const MAX_SECONDS = arg('max', cfg.heartbeat.maxSeconds);           // hard stop so a forgotten daemon dies
 const STALL_SECONDS = stallSeconds(cfg);
 const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
+const AUTO_RESUME = autoResumeAfterReset(cfg);
 // A fleet with many worktrees means many per-row git subprocess calls (idle/accepted/clean,
 // each independently bounded ~3s by runGit) inside one `processDoneWorktrees` pass — capped
 // (on the steady-state pass only, see processDoneWorktrees's item-4 note) so a single
@@ -285,6 +289,27 @@ function reportUsageExhausted({ reported, handle, label, coder }) {
   return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
     `route new code to ${other} (or Sonnet if ${other} is also out); follow the WORKER HANDOVER recipe ` +
     'to commit WIP and HANDOVER.md before stopping/releasing this worker; do not retry it until reset';
+}
+
+function pidAlive(pid, file) {
+  try {
+    process.kill(pid, 0);
+    if (process.platform === 'win32') return true;
+    const command = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
+      encoding: 'utf8', timeout: 1000,
+    });
+    return command.includes('orca-resume-scheduler.cjs') && (!file || command.includes(file));
+  } catch { return false; }
+}
+
+function spawnResumeScheduler(file) {
+  try {
+    const child = spawn(process.execPath, [RESUME_SCHEDULER, '--job', file], {
+      detached: true, stdio: 'ignore', env: process.env,
+    });
+    child.unref();
+    return child.pid || 0;
+  } catch { return 0; }
 }
 
 /** Probe only coders with live supervised workers. The existing quota helpers own the
@@ -1147,6 +1172,30 @@ function main() {
         retainedHandles: explicitRetainedHandles, started, now, idleSeconds: IDLE_SECONDS,
         handleAgent,
       };
+      const panelHandle = process.env.ORCA_TERMINAL_HANDLE || '';
+      let panelLimited = false;
+      let panelAvailable = false;
+      if (panelHandle) {
+        const panelTerminal = ts.find((terminal) => terminal.handle === panelHandle);
+        if (panelTerminal) {
+          const panelScreen = terminalScreen(panelHandle) || panelTerminal.preview || '';
+          beat(started);
+          const recentPanelScreen = panelScreen.split(/\r?\n/).slice(-8).join('\n');
+          panelLimited = RESUME.hasClaudeLimitMessage(panelTerminal.preview) ||
+            RESUME.hasClaudeLimitMessage(recentPanelScreen);
+          panelAvailable = !panelLimited;
+          if (panelLimited && AUTO_RESUME && cfg.autoResumePanel) {
+            const parked = RESUME.park({
+              stateDir: DIR, session: SESSION, handle: panelHandle, identity: panelHandle,
+              agent: 'claude', resetAt: RESUME.parseClaudeResetAt(panelScreen, now),
+              panel: true, panelHandle, now, spawnScheduler: spawnResumeScheduler, pidAlive,
+            });
+            if (parked.event) events.push(parked.event);
+          } else if (!panelLimited || !AUTO_RESUME || !cfg.autoResumePanel) {
+            RESUME.clearJob(DIR, SESSION, panelHandle);
+          }
+        }
+      }
       const activeCoderHandles = new Set(ts.filter((terminal) =>
         ownTerminalHandles.has(terminal.handle) &&
         !TERMINAL_WORKER_STATES.has(handleWorkerState.get(terminal.handle)) &&
@@ -1242,22 +1291,45 @@ function main() {
           // existing episode until a known below-margin reading or worker completion.
           if (exhausted || typeof quota?.usedPercent === 'number') {
             const threshold = agent === 'kimi' ? kimiHandoffUsed(cfg) : handoffUsed(cfg);
-            const target = HANDOVER.pickNextCoder(agent, handoverPool);
-            const handover = HANDOVER.observe(handoverRecords, {
-              handle: t.handle,
-              identity: handleDispatch.get(t.handle) || t.handle,
-              agent,
-              usedPercent: quota?.usedPercent,
-              threshold,
-              warnMargin: cfg.handoverWarnMarginPercent,
-              exhausted,
+            let target = HANDOVER.pickNextCoder(agent, handoverPool);
+            const limited = exhausted || quota.usedPercent >= 100;
+            if (!limited) RESUME.clearJob(DIR, SESSION, t.handle);
+            // Sonnet lives inside the panel. If that panel is itself quota-limited, there
+            // is no viable handover destination and the resumable worker must be parked.
+            target = RESUME.availableHandoverTarget(target, panelAvailable);
+            if (RESUME.shouldPark({ limited, handoverTarget: target })) {
+              if (handoverRecords.delete(t.handle)) handoverChanged = true;
+              if (AUTO_RESUME) {
+                const parked = RESUME.park({
+                  stateDir: DIR, session: SESSION, handle: t.handle,
+                  identity: handleDispatch.get(t.handle) || t.handle, agent,
+                  resetAt: RESUME.quotaResetAt(quota), panelHandle, threshold,
+                  authorizedHandles: activeCoderHandles, now,
+                  spawnScheduler: spawnResumeScheduler, pidAlive,
+                });
+                if (parked.event) events.push(parked.event);
+              } else {
+                RESUME.clearJob(DIR, SESSION, t.handle);
+              }
+            } else if (target) {
+              // A newly available handover destination supersedes any older park timer.
+              RESUME.clearJob(DIR, SESSION, t.handle);
+              const handover = HANDOVER.observe(handoverRecords, {
+                handle: t.handle,
+                identity: handleDispatch.get(t.handle) || t.handle,
+                agent,
+                usedPercent: quota?.usedPercent,
+                threshold,
+                warnMargin: cfg.handoverWarnMarginPercent,
+                exhausted,
                 target,
                 aliases: handleAliases.get(t.handle) || [t.handle],
                 worktreePath: terminalWorktreePath(t, ws || []),
-              now,
-            });
-            if (handover.changed) handoverChanged = true;
-            if (handover.event) events.push(handover.event);
+                now,
+              });
+              if (handover.changed) handoverChanged = true;
+              if (handover.event) events.push(handover.event);
+            }
           }
         }
 
@@ -1319,4 +1391,5 @@ module.exports = {
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
   parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen,
   probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
+  pidAlive, spawnResumeScheduler,
 };

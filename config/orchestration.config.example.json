@@ -16,6 +16,8 @@
   "codexHandoffUsedPercent": 95,
   "kimiHandoffUsedPercent": 95,
   "handoverWarnMarginPercent": 5,
+  "autoResumeAfterReset": true,
+  "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,

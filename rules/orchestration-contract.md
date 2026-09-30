@@ -215,6 +215,8 @@ backup precedes their removal. Help and unknown options never enter the install 
   "codexHandoffUsedPercent": 95,
   "kimiHandoffUsedPercent": 95,
   "handoverWarnMarginPercent": 5,
+  "autoResumeAfterReset": true,
+  "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
@@ -255,6 +257,11 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `handoverWarnMarginPercent`: integer 0-100, default 5. A live worker gets a persisted
   early-warning episode this many percentage points before its coder's threshold; `0`
   disables the early warning while retaining threshold/exhaustion handover.
+- `autoResumeAfterReset`: boolean, default `true`. When no handover target exists, park an
+  exhausted supervised worker and launch its detached reset scheduler. `ORCH_AUTO_RESUME`
+  accepts true/false, 1/0, yes/no, or on/off for one process; blank is unset.
+- `autoResumePanel`: boolean, default `true`. Apply the same reset scheduling to the exact
+  panel terminal in `ORCA_TERMINAL_HANDLE` when its screen shows a Claude limit message.
 - `codexQuotaCacheSeconds`: integer 0-3600, default 60. How long a successful live
   `codex app-server` quota reading or a failed probe is reused from `codex-quota-live.json` in the gate
   state directory; `0` disables cross-process file reuse but not the memo inside one hook
@@ -432,6 +439,30 @@ verification instructions; wait up to about three minutes. Then `worker-stop` an
 worktree/branch, prefixed `Continue a task handed over from <agent>. Read HANDOVER.md and
 git log first; do not redo finished steps.` For Sonnet, point the in-session Agent at that
 worktree.
+
+When the current coder is fully exhausted (100% or a usage-limit signal) and the other
+external coder plus the in-session panel are unavailable, handover is impossible. With
+`autoResumeAfterReset` enabled the heartbeat persists and emits once:
+
+```text
+WORKER PARKED <dispatch|terminal> (<agent> limit, resets <local time>) - will auto-resume
+```
+
+Reset time comes from Kimi `/usages`, Codex app-server `resetsAt`, or a Claude screen hint
+(`resets 5pm`, `resets at 17:00`, `try again in 2h`). Unknown reset times are re-probed every
+15 minutes. One detached `orca-resume-scheduler.cjs` process is persisted per parked worker
+(PID and reset time), deduped across heartbeat restarts, and does not depend on the panel
+remaining alive. At reset plus 90 seconds it re-probes; once quota is below the coder's
+handoff threshold it sends `Quota has reset. Continue the task from where you stopped;
+check git status/log (and HANDOVER.md if present) first; do not redo finished steps.` and
+verifies a new terminal turn. A Kimi screen in another permission mode is returned to Never
+Ask first.
+
+With `autoResumePanel`, the exact `ORCA_TERMINAL_HANDLE` gets the analogous message `Quota
+has reset - continue the orchestration from where you stopped (check worker-list, plans)`.
+Schedulers recheck authorization and never type into foreign terminals. In-session Agent
+subagents die with the panel turn and cannot be resumed; the panel re-dispatches them after
+it resumes. Prefer Orca workers for long-running resumable code tasks.
 
 Manual polling counts as a heartbeat too: any `orca orchestration worker-list` /
 `worker-read` / `task-list`, or `orca worktree ps`. If more than `heartbeat.idleSeconds`
