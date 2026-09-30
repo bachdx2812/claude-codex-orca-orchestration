@@ -74,7 +74,10 @@ child.stdout.on('data', (chunk) => {
       const result = message.result;
       if (result && result.account === null && result.requiresOpenaiAuth === true) {
         stop(3, { authState: 'logged-out' });
-      } else if (/not\s+(?:logged|signed)\s+in|authentication\s+required/i.test(rateLimitError)) {
+      } else if (message.error &&
+          /not\s+(?:logged|signed)\s+in|authentication\s+required/i.test(rateLimitError)) {
+        // The rateLimits error text only counts as a logged-out signal when
+        // account/read itself errored; a successful account/read answer wins.
         stop(3, { authState: 'logged-out' });
       } else {
         stop(1);
