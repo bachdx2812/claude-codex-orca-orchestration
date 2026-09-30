@@ -756,10 +756,18 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   }
 
   const prompt = NON_OPERATOR_TURN.test(raw) ? '' : raw;
-  if (operatorFlag(prompt, '--no-orchestrate')) {
-    s.bypass = true; save(s);
-    process.stdout.write('orchestrator-gate: BYPASSED for this session by explicit user request.\n');
-    return;
+  const promptLower = prompt.toLowerCase();
+  const bypassFlags = ['--no-orchestrate', '--orchestrate']
+    .map((flag) => [flag, operatorFlag(prompt, flag) ? promptLower.lastIndexOf(flag) : -1])
+    .filter(([, index]) => index >= 0)
+    .sort((a, b) => b[1] - a[1]);
+  if (bypassFlags.length) {
+    s.bypass = bypassFlags[0][0] === '--no-orchestrate';
+    save(s);
+    process.stdout.write(s.bypass
+      ? 'orchestrator-gate: BYPASSED for this session by explicit user request.\n'
+      : 'orchestrator-gate: orchestration gates re-enabled for this session.\n');
+    if (s.bypass) return;
   }
   if (s.bypass) return;
 
@@ -769,7 +777,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   // --code-model <value> lets the operator pick the coding model directly; --exec-sonnet /
   // --exec-codex are shortcuts for the configured code model / Codex. Whichever of these
   // appears last in the prompt wins.
-  const flagAt = (f) => (operatorFlag(prompt, f) ? prompt.toLowerCase().lastIndexOf(f) : -1);
+  const flagAt = (f) => (operatorFlag(prompt, f) ? promptLower.lastIndexOf(f) : -1);
   const cm = [...prompt.matchAll(/(^|\s)--code-model(?:=|\s+)(\S+)/gi)].pop();
   const bareCm = !cm && /(^|\s)--code-model(?:=)?\s*$/i.test(prompt);
   if (bareCm) {

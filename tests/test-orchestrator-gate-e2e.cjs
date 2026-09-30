@@ -659,6 +659,16 @@ expect('auto: Codex at/over 95% used -> code on another model is refused',
   expect('bypass allows an exec-intent dispatch with no exec-agent flag at all',
     bypassDispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan' }), ALLOW);
 
+  expect('--orchestrate is accepted after bypass', promptSubmit(BYPASS_SID, '--orchestrate'), ALLOW);
+  expect('--orchestrate re-enables the main-panel write gate', bypassEdit(SRC), DENY);
+
+  expect('last bypass flag wins when --orchestrate comes last',
+    promptSubmit(BYPASS_SID, '--no-orchestrate then --orchestrate'), ALLOW);
+  expect('a last --orchestrate leaves gates enabled', bypassEdit(SRC), DENY);
+  expect('last bypass flag wins when --no-orchestrate comes last',
+    promptSubmit(BYPASS_SID, '--orchestrate then --no-orchestrate'), ALLOW);
+  expect('a last --no-orchestrate leaves gates disabled', bypassEdit(SRC), ALLOW);
+
   rmState(BYPASS_SID);
 }
 
