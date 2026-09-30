@@ -1552,20 +1552,25 @@ function readinessTimeoutAdvice(replyText) {
 /**
  * Parse fallback for a piped/redirected dispatch: when the invocation's own JSON reply is
  * unparseable, a `"dispatchId": "ctx_..."` line is often still present in the raw output
- * (e.g. `worker-start --json | grep dispatchId`). Accept it ONLY when this command holds a
- * single dispatch invocation AND the whole output contains exactly one distinct dispatchId —
- * anything else (a second invocation's segment, a chained worker-list's many ids) stays a
- * pending placeholder, never a guessed registration. Optional single taskId / terminal
- * handle are picked up the same way. Returns a Set of ids, possibly empty.
+ * (e.g. `worker-start --json | grep dispatchId`), or — via `jq -r .result.dispatchId` — a
+ * bare `ctx_...` token. Accept either ONLY when the whole output pins exactly one distinct
+ * dispatch id — anything else (a second invocation's segment, a chained worker-list's many
+ * ids) stays a pending placeholder, never a guessed registration. Optional single taskId /
+ * terminal handle are picked up the same way. Returns a Set of ids, possibly empty.
  */
 function singleDispatchIdsFromRawOutput(out) {
   const ids = new Set();
-  const dispatchIds = new Set([...String(out || '').matchAll(/"dispatchId"\s*:\s*"(ctx_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  const text = String(out || '');
+  let dispatchIds = new Set([...text.matchAll(/"dispatchId"\s*:\s*"(ctx_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  if (dispatchIds.size !== 1) {
+    // A raw-mode formatter (`jq -r ...`) prints the id bare, with no field name around it.
+    dispatchIds = new Set([...text.matchAll(/\b(ctx_[A-Za-z0-9_-]+)\b/g)].map((m) => m[1]));
+  }
   if (dispatchIds.size !== 1) return ids;
   ids.add([...dispatchIds][0]);
-  const taskIds = new Set([...String(out).matchAll(/"taskId"\s*:\s*"(task_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  const taskIds = new Set([...text.matchAll(/"taskId"\s*:\s*"(task_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
   if (taskIds.size === 1) ids.add([...taskIds][0]);
-  const handles = new Set([...String(out).matchAll(/"(?:agentTerminalHandle|terminalHandle|handle)"\s*:\s*"(term_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
+  const handles = new Set([...text.matchAll(/"(?:agentTerminalHandle|terminalHandle|handle)"\s*:\s*"(term_[A-Za-z0-9_-]+)"/g)].map((m) => m[1]));
   if (handles.size === 1) ids.add([...handles][0]);
   return ids;
 }
@@ -1652,14 +1657,19 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
     }
 
     const ids = reply ? WG.idsFromReply(reply) : new Set();
-    // Parse fallback only for a PIPED single dispatch whose reply left NO parseable JSON
-    // anywhere in the output: the pipe's downstream fragments (a grep/tail/formatter line)
-    // still derive from this invocation's own reply. A surviving dispatch-shaped JSON object
-    // could belong to a chained worker-show/list and must never be claimed; a captured
-    // (`$( )`/backtick) or redirected reply never reaches the tool's stdout at all.
-    if (!ids.size && assumeDispatched && dispatchInvs.length === 1 && rawReplies.length === 0 &&
+    // Parse fallback only for a PIPED single dispatch (the whole command is this one
+    // invocation): a captured (`$( )`/backtick) or redirected reply never reaches the tool's
+    // stdout at all, and with any other orca invocation in the command a surviving id could
+    // belong to its segment. Three shapes are accepted, all unambiguous by construction:
+    // the formatter re-emitted the reply as JSON (| jq ., | tee) -> the single surviving
+    // reply's own ids; no JSON survived -> exactly one dispatchId line / bare ctx_ token.
+    if (!ids.size && assumeDispatched && dispatchInvs.length === 1 && allInvs.length === 1 &&
         inv.stdoutPiped && !inv.stdoutCaptured && !inv.stdoutRedirected) {
-      for (const id of singleDispatchIdsFromRawOutput(out)) ids.add(id);
+      if (rawReplies.length === 1) {
+        for (const id of WG.idsFromReply(rawReplies[0])) ids.add(id);
+      } else if (rawReplies.length === 0) {
+        for (const id of singleDispatchIdsFromRawOutput(out)) ids.add(id);
+      }
     }
     if (!ids.size) {
       if (!assumeDispatched) return; // unknown outcome on a failure event: keep the reservation.
@@ -1772,16 +1782,34 @@ function onPostToolUse(p, s, cfg) {
   // once) would otherwise both mutate their own stale copy and the later save() would
   // silently clobber the earlier one's registration entirely.
   const lockDir = path.join(DIR, '.lock');
+  // A release naming an id this session does not track may refer to a worker only tracked
+  // as a "pending-*" placeholder. Deciding that safely needs the release target's agent
+  // from Orca (see the settle branch below) — fetched OUTSIDE the lock (up to 5s), and only
+  // when a cheap unlocked read says the situation could actually apply.
+  let releaseRows;
+  if (p.tool_name === 'Bash') {
+    const preCmd = String((p.tool_input && p.tool_input.command) || '');
+    const releaseTargets = orcaInvocations(preCmd)
+      .map((inv) => WG.releaseTarget(inv, flagValue)).filter(Boolean);
+    if (releaseTargets.length) {
+      const snapshot = load(p.session_id);
+      const livePendings = Object.entries(snapshot.workers || {})
+        .filter(([k, w]) => k.startsWith('pending-') && w.status === 'live');
+      if (livePendings.length === 1 && releaseTargets.some((t) => !snapshot.workers[t])) {
+        releaseRows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+      }
+    }
+  }
   const locked = acquireLock(lockDir, {});
   try {
     s = load(p.session_id);
-    return onPostToolUseLocked(p, s, cfg);
+    return onPostToolUseLocked(p, s, cfg, releaseRows);
   } finally {
     if (locked) releaseLock(lockDir);
   }
 }
 
-function onPostToolUseLocked(p, s, cfg) {
+function onPostToolUseLocked(p, s, cfg, releaseRows) {
   const tool = p.tool_name;
   const input = p.tool_input || {};
   const resp = p.tool_response || {};
@@ -1896,18 +1924,41 @@ function onPostToolUseLocked(p, s, cfg) {
         if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
       } else {
         // The id may belong to a worker this session only tracks as a "pending-*"
-        // placeholder (its start reply never yielded the real id). With exactly one live
-        // placeholder there is nothing to confuse it with — settle it so its Owns: claim
-        // and cap slot go away with the release the operator clearly intends. More than
-        // one live placeholder makes the target ambiguous: settle nothing.
+        // placeholder (its start reply never yielded the real id). Settle it only when the
+        // identification is sound (plan item 3's agent match): exactly one live placeholder
+        // at least a few seconds old, and — when Orca lists the release target — of the
+        // SAME agent (projection.provider.id). Without an Orca row for the target there is
+        // nothing to check against, so uniqueness + age is the guard; more than one live
+        // placeholder, a too-fresh one, or an agent mismatch settles nothing.
         const livePendings = Object.entries(s.workers)
           .filter(([k, w]) => k.startsWith('pending-') && w.status === 'live');
+        let settledPending = null;
         if (livePendings.length === 1) {
-          livePendings[0][1].status = 'settled';
+          const [pendingKey, pendingWorker] = livePendings[0];
+          let started = Number.isFinite(pendingWorker.started) ? pendingWorker.started : NaN;
+          if (!Number.isFinite(started)) {
+            const m = /^pending-(\d+)(?:-\d+)?$/.exec(pendingKey);
+            started = m ? Number(m[1]) : NaN;
+          }
+          const oldEnough = Number.isFinite(started) && Date.now() - started >= 5000;
+          let agentMatch = true;
+          if (releaseRows) {
+            const row = releaseRows.find((r) =>
+              [r.dispatchId, r.taskId, r.agentTerminalHandle].includes(target));
+            const rowAgent = row && row.projection && row.projection.provider && row.projection.provider.id;
+            if (rowAgent && pendingWorker.agent &&
+                String(rowAgent).toLowerCase() !== String(pendingWorker.agent).toLowerCase()) {
+              agentMatch = false;
+            }
+          }
+          if (oldEnough && agentMatch) settledPending = pendingKey;
+        }
+        if (settledPending) {
+          s.workers[settledPending].status = 'settled';
           dirty = true;
           process.stdout.write(
             `orchestrator-gate: ${inv.sub} named untracked "${target}"; settled the one live placeholder ` +
-            `${livePendings[0][0]} it could only have referred to.\n`);
+            `${settledPending} it could only have referred to.\n`);
         } else {
           process.stdout.write(
             `orchestrator-gate: ${inv.sub} named "${target}", which this session is not tracking as a live worker; ` +

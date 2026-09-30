@@ -236,9 +236,16 @@ function isPendingPlaceholderKey(key) {
 
 function pendingPlaceholderExpired(key, entry, now = Date.now()) {
   if (!isPendingPlaceholderKey(key)) return false;
-  // No recorded start time means the placeholder cannot be aged — never treat it as expired.
-  if (!entry || !Number.isFinite(entry.started)) return false;
-  return now - entry.started > PENDING_PLACEHOLDER_TTL_MS;
+  // Every creation path stamps `started`; for an entry that lacks one (legacy or hand-edited
+  // state) fall back to the timestamp embedded in the `pending-<ts>-<idx>` key itself rather
+  // than declaring it ageless — a placeholder that cannot be aged could leak forever.
+  let started = entry && Number.isFinite(entry.started) ? entry.started : NaN;
+  if (!Number.isFinite(started)) {
+    const m = /^pending-(\d+)(?:-\d+)?$/.exec(String(key));
+    started = m ? Number(m[1]) : NaN;
+  }
+  if (!Number.isFinite(started)) return false;
+  return now - started > PENDING_PLACEHOLDER_TTL_MS;
 }
 
 /**

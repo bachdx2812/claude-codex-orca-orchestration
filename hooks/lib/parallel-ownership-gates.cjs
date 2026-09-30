@@ -186,6 +186,14 @@ function applyOrcaReconciliation(s, rows) {
  * ids (dispatchId/taskId/agentTerminalHandle) and is deleted; a placeholder no candidate
  * matches settles once it is older than its TTL, freeing its Owns: claim and cap slot.
  *
+ * Matching reads the REAL `worker-list` row shape (verified against a live reply
+ * 2026-10-01): a row's top level carries only `dispatchId, taskId, runId, workerState,
+ * dispatchStatus, agentTerminalHandle, terminalState, resource, projection` — the agent is
+ * at `projection.provider.id`, the worktree at `resource.worktreeId` (falling back to
+ * `projection.workspace.id`), and there is NO start-time field, so no time window is
+ * claimed. Released rows and rows Orca already reports done are never candidates: adopting
+ * a released/finished row as `live` would resurrect a settled claim.
+ *
  * Mutates `s.workers` in place; must be called with the state lock held against a freshly
  * reloaded state, exactly like `applyOrcaReconciliation`. Returns
  * `{ changed, adopted, settled }` (adopted/settled are the affected placeholder keys) so the
@@ -198,26 +206,25 @@ function reconcilePendingPlaceholders(s, rows, now = Date.now()) {
   if (!pendings.length) return result;
 
   const trackedIds = new Set(Object.keys(s.workers));
-  const rowStartMs = (row) => {
-    const raw = row.startedAt ?? row.createdAt ?? row.started;
-    if (raw == null) return null;
-    const ms = typeof raw === 'number' ? raw : Date.parse(raw);
-    return Number.isFinite(ms) ? ms : null;
-  };
+  const rowAgent = (row) => (row.projection && row.projection.provider && row.projection.provider.id) || null;
+  const rowWorktree = (row) => (row.resource && row.resource.worktreeId) ||
+    (row.projection && row.projection.workspace && row.projection.workspace.id) || null;
   const compatible = (row, ph) => {
-    const agent = row.agent || (row.projection && row.projection.agent) || null;
+    const agent = rowAgent(row);
     if (agent && ph.agent && String(agent).toLowerCase() !== String(ph.agent).toLowerCase()) return false;
-    if (row.worktreeId && Array.isArray(ph.worktreeIds) && ph.worktreeIds.length &&
-        !ph.worktreeIds.includes(row.worktreeId)) return false;
-    const start = rowStartMs(row);
-    if (start !== null && Number.isFinite(ph.started) && Math.abs(start - ph.started) > 5 * 60 * 1000) return false;
+    const worktree = rowWorktree(row);
+    if (worktree && Array.isArray(ph.worktreeIds) && ph.worktreeIds.length &&
+        !ph.worktreeIds.includes(worktree)) return false;
     return true;
   };
   const rowIds = (row) => [row.dispatchId, row.taskId, row.agentTerminalHandle]
     .filter((id) => typeof id === 'string' && /^(?:ctx|task|term)_[A-Za-z0-9_-]+$/.test(id));
 
-  // Candidates: rows with at least one usable id, none of which is already tracked.
+  // Candidates: rows with at least one usable id, none already tracked, and still a live
+  // worker per Orca — never a released terminal or a done (succeeded/finished/failed) row.
   const candidates = (rows || []).filter((row) => {
+    if (row.terminalState === 'released') return false;
+    if (DONE.test(String(row.workerState || '')) || DONE.test(String(row.dispatchStatus || ''))) return false;
     const ids = rowIds(row);
     return ids.length > 0 && ids.every((id) => !trackedIds.has(id));
   });
@@ -233,7 +240,6 @@ function reconcilePendingPlaceholders(s, rows, now = Date.now()) {
       for (const id of ids) {
         s.workers[id] = {
           ...ph, role: `${ph.agent || 'worker'}-exec`,
-          started: rowStartMs(row) ?? ph.started,
           status: 'live', last_seen: now, unverified: false, group,
           kind: WG.kindOf(id),
         };

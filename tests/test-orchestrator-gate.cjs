@@ -802,6 +802,12 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   write('sessE.json', {
     workers: {}, reservations: {}, agents: { toolu_e1: { ts: now - 121 * 60 * 1000 } },
   });
+  // An expired "pending-*" placeholder (older than its 10-min TTL) must not count either —
+  // another session's dead placeholder holds no machine slot.
+  write('sessF.json', {
+    workers: { [`pending-${now - 11 * 60 * 1000}-0`]: { status: 'live', started: now - 11 * 60 * 1000, group: `pending-${now - 11 * 60 * 1000}-0` } },
+    reservations: {}, agents: {},
+  });
   // Not a session state file at all — must be ignored by the directory scan.
   write('sessA.role.json', { handle: 'x', role: 'worker' });
   write('heartbeat-sessA.json', { pid: 1, last_tick: now });
@@ -818,6 +824,8 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('machineWideLiveUnits never counts an expired reservation', usage.ids.includes('toolu_d1#0'), false);
   check('machineWideLiveUnits never counts a reservation with newSlot:false', usage.ids.includes('toolu_d2#0'), false);
   check('machineWideLiveUnits never counts an agent past its TTL', usage.ids.includes('toolu_e1'), false);
+  check('machineWideLiveUnits never counts an expired pending placeholder',
+    usage.ids.some((id) => String(id).includes('pending-')), false);
   // Exactly the 3 genuinely-live units: sessA's worker, sessA's agent, sessB's reservation.
   check('machineWideLiveUnits total is exactly the 3 genuinely-live units', usage.total, 3);
 
@@ -1429,9 +1437,22 @@ check('workspaceKey: non-isolated with a named worktree',
   };
   check('countLiveGroups: a second, distinct group counts separately', WG.countLiveGroups(twoWorkers, 'codex'), 2);
 
-  const withPending = { ...workers, 'pending-1': { status: 'live', agent: 'codex' } }; // no `group` (legacy) -> own group
+  const freshPendingKey = `pending-${Date.now()}-0`;
+  const withPending = { ...workers, [freshPendingKey]: { status: 'live', agent: 'codex' } }; // no `group` (legacy) -> own group
   check('countLiveGroups: a pending/legacy entry without `group` counts as its own group',
     WG.countLiveGroups(withPending, 'codex'), 2);
+
+  // An expired placeholder (older than 10 min) never counts — here aged only through the
+  // timestamp embedded in its `pending-<ts>-<idx>` key, with no `started` field at all.
+  const stalePendingKey = `pending-${Date.now() - 11 * 60 * 1000}-0`;
+  const withStalePending = { ...workers, [stalePendingKey]: { status: 'live', agent: 'codex' } };
+  check('countLiveGroups: an expired pending placeholder never counts (key-ts fallback)',
+    WG.countLiveGroups(withStalePending, 'codex'), 1);
+  check('pendingPlaceholderExpired falls back to the ts in the key when `started` is missing',
+    [WG.pendingPlaceholderExpired(stalePendingKey, { status: 'live' }),
+     WG.pendingPlaceholderExpired(freshPendingKey, { status: 'live' }),
+     WG.pendingPlaceholderExpired('pending-notimestamp', { status: 'live' })],
+    [true, false, false]);
 
   const withClaude = { ...workers, ctx_c: { status: 'live', agent: 'claude', group: 'ctx_c' } };
   check('countLiveGroups: a non-codex agent is never counted', WG.countLiveGroups(withClaude, 'codex'), 1);

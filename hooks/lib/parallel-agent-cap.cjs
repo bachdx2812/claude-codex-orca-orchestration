@@ -134,6 +134,9 @@ function collectLiveUnitsFromState(s, sid, nowMs, entries) {
   const groups = new Map(); // group id -> earliest known ts
   for (const [key, w] of Object.entries(s.workers || {})) {
     if (!w || w.status !== 'live' || w.capExempt) continue;
+    // An expired "pending-*" placeholder holds no machine slot anywhere (worker-groups.cjs);
+    // the machine-wide budget must not count it either, whatever session it leaked in.
+    if (WG.pendingPlaceholderExpired(key, w, nowMs)) continue;
     const g = WG.groupOf(w, key);
     const ts = Number.isFinite(w.started) ? w.started : nowMs;
     if (!groups.has(g) || ts < groups.get(g)) groups.set(g, ts);
