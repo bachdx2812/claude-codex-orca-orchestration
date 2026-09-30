@@ -168,8 +168,18 @@ detached scheduler per parked terminal, persisted with its PID and reset time. A
 reset plus 90 seconds—or every 15 minutes when reset time is unknown—the scheduler rechecks
 quota and, once it is below the coder's handoff threshold, sends the worker the guarded
 continue message and verifies that the terminal started another turn. Kimi permission mode
-is returned to Never Ask first when its screen shows another mode. Only this session's
-supervised terminal handles are eligible.
+is returned to Never Ask first when its screen shows another mode. Claude worker screens use
+the same parking path as the panel. Reset hints also accept month/day and an explicit IANA
+timezone, for example `resets Oct 3, 5pm (Asia/Saigon)`. Only live, supervised, non-released
+terminal handles from this session are eligible.
+
+The scheduler persists its attempt count and first-attempt time and stops after 768 attempts
+or eight days. It never retypes a resume after a successful terminal send: if no new turn can
+be confirmed—or a scheduler dies after persisting its pre-send marker—the heartbeat reports
+`WORKER RESUME UNVERIFIED ... do not retype` for manual
+inspection. If Claude responds to that send with a fresh limit banner, that is a new quota
+episode and is parked at the newly parsed reset instead. Expired schedulers are also reported,
+and reported/finished scheduler records are removed after one day.
 
 `autoResumeAfterReset` defaults to `true`; `ORCH_AUTO_RESUME=false` disables scheduling for
 one process (blank is unset). `autoResumePanel` also defaults to `true`: when the exact panel

@@ -1005,7 +1005,7 @@ function snapshotWorkers(list) {
   return m;
 }
 
-const TERMINAL_WORKER_STATES = new Set(['succeeded', 'failed', 'stopped', 'completed']);
+const TERMINAL_WORKER_STATES = new Set(['succeeded', 'failed', 'stopped', 'cancelled', 'completed']);
 
 function terminalWorkerStates(workerRows) {
   const states = new Map();
@@ -1102,6 +1102,8 @@ function main() {
     beat(started);
     const events = [];
     const now = Date.now();
+    events.push(...RESUME.resumeJobEvents(DIR, SESSION, now, pidAlive));
+    RESUME.sweepJobs(DIR, SESSION, now);
 
     const ws = workers();
     beat(started); // item L1: refresh liveness between round trips at a short --interval
@@ -1181,26 +1183,42 @@ function main() {
           const panelScreen = terminalScreen(panelHandle) || panelTerminal.preview || '';
           beat(started);
           const recentPanelScreen = panelScreen.split(/\r?\n/).slice(-8).join('\n');
-          panelLimited = RESUME.hasClaudeLimitMessage(panelTerminal.preview) ||
-            RESUME.hasClaudeLimitMessage(recentPanelScreen);
+          const panelLimit = RESUME.claudeLimitInfo(recentPanelScreen, now);
+          panelLimited = panelLimit.limited;
           panelAvailable = !panelLimited;
           if (panelLimited && AUTO_RESUME && cfg.autoResumePanel) {
             const parked = RESUME.park({
               stateDir: DIR, session: SESSION, handle: panelHandle, identity: panelHandle,
-              agent: 'claude', resetAt: RESUME.parseClaudeResetAt(panelScreen, now),
+              agent: 'claude', resetAt: panelLimit.resetAt, limitLine: panelLimit.line,
               panel: true, panelHandle, now, spawnScheduler: spawnResumeScheduler, pidAlive,
             });
             if (parked.event) events.push(parked.event);
-          } else if (!panelLimited || !AUTO_RESUME || !cfg.autoResumePanel) {
+          } else if (!AUTO_RESUME || !cfg.autoResumePanel) {
             RESUME.clearJob(DIR, SESSION, panelHandle);
+          } else if (!panelLimited) {
+            // Recovery ends a settled episode so a later, separate limit can be parked.
+            // Pending jobs remain scheduler-owned even if the live quota recovers early.
+            RESUME.clearSettledJob(DIR, SESSION, panelHandle);
           }
         }
       }
-      const activeCoderHandles = new Set(ts.filter((terminal) =>
+      const liveWorkerHandles = new Set((ws || []).filter((worker) => worker &&
+        worker.workerState !== 'unsupervised' &&
+        !TERMINAL_WORKER_STATES.has(worker.workerState) &&
+        !TERMINAL_WORKER_STATES.has(worker.dispatchStatus) && worker.terminalState !== 'released')
+        .map((worker) => worker.agentTerminalHandle).filter(Boolean));
+      const activeResumeHandles = new Set(ts.filter((terminal) =>
         ownTerminalHandles.has(terminal.handle) &&
-        !TERMINAL_WORKER_STATES.has(handleWorkerState.get(terminal.handle)) &&
-        ['codex', 'kimi'].includes(handleAgent.get(terminal.handle))
+        liveWorkerHandles.has(terminal.handle) &&
+        ['codex', 'kimi', 'claude'].includes(handleAgent.get(terminal.handle))
       ).map((terminal) => terminal.handle));
+      const activeCoderHandles = new Set([...activeResumeHandles]
+        .filter((handle) => ['codex', 'kimi'].includes(handleAgent.get(handle))));
+      const authorizedResumeHandles = new Set(activeResumeHandles);
+      if (panelHandle && ts.some((terminal) => terminal.handle === panelHandle)) {
+        authorizedResumeHandles.add(panelHandle);
+      }
+      RESUME.clearMissingPendingJobs(DIR, SESSION, authorizedResumeHandles);
       const liveCoderAgents = new Set([...activeCoderHandles].map((handle) => handleAgent.get(handle)));
       const liveQuotas = probeLiveCoderQuotas(liveCoderAgents, now);
       beat(started);
@@ -1284,6 +1302,23 @@ function main() {
         }
 
         const agent = handleAgent.get(t.handle) || 'unknown';
+        if (agent === 'claude' && activeResumeHandles.has(t.handle)) {
+          const claudeLimit = RESUME.claudeLimitInfo(screenText, now);
+          if (claudeLimit.limited && AUTO_RESUME) {
+            const parked = RESUME.park({
+              stateDir: DIR, session: SESSION, handle: t.handle,
+              identity: handleDispatch.get(t.handle) || t.handle, agent,
+              resetAt: claudeLimit.resetAt, limitLine: claudeLimit.line, panelHandle,
+              authorizedHandles: activeResumeHandles, now,
+              spawnScheduler: spawnResumeScheduler, pidAlive,
+            });
+            if (parked.event) events.push(parked.event);
+          } else if (!AUTO_RESUME) {
+            RESUME.clearJob(DIR, SESSION, t.handle);
+          } else if (!claudeLimit.limited) {
+            RESUME.clearSettledJob(DIR, SESSION, t.handle);
+          }
+        }
         if (activeCoderHandles.has(t.handle)) {
           const quota = liveQuotas[agent];
           const exhausted = verdict.kind === 'usage_exhausted';
@@ -1293,7 +1328,6 @@ function main() {
             const threshold = agent === 'kimi' ? kimiHandoffUsed(cfg) : handoffUsed(cfg);
             let target = HANDOVER.pickNextCoder(agent, handoverPool);
             const limited = exhausted || quota.usedPercent >= 100;
-            if (!limited) RESUME.clearJob(DIR, SESSION, t.handle);
             // Sonnet lives inside the panel. If that panel is itself quota-limited, there
             // is no viable handover destination and the resumable worker must be parked.
             target = RESUME.availableHandoverTarget(target, panelAvailable);
@@ -1312,8 +1346,6 @@ function main() {
                 RESUME.clearJob(DIR, SESSION, t.handle);
               }
             } else if (target) {
-              // A newly available handover destination supersedes any older park timer.
-              RESUME.clearJob(DIR, SESSION, t.handle);
               const handover = HANDOVER.observe(handoverRecords, {
                 handle: t.handle,
                 identity: handleDispatch.get(t.handle) || t.handle,
@@ -1327,6 +1359,9 @@ function main() {
                 worktreePath: terminalWorktreePath(t, ws || []),
                 now,
               });
+              // Only a real warning/handover supersedes the scheduler. A below-margin
+              // reading can arrive before reset+grace and must not erase a pending job.
+              if (handover.record) RESUME.clearJob(DIR, SESSION, t.handle);
               if (handover.changed) handoverChanged = true;
               if (handover.event) events.push(handover.event);
             }

@@ -29,12 +29,21 @@ function terminalScreen(handle) {
     : typeof terminal?.tail === 'string' ? terminal.tail : '';
 }
 
+function authorizedWorkerHandles(workers, panelHandle = process.env.ORCA_TERMINAL_HANDLE || '') {
+  const done = new Set(['succeeded', 'failed', 'stopped', 'cancelled', 'completed']);
+  return new Set((workers || []).filter((worker) => worker &&
+    worker.workerState !== 'unsupervised' && !done.has(worker.workerState) &&
+    !done.has(worker.dispatchStatus) &&
+    worker.terminalState !== 'released' && worker.agentTerminalHandle !== panelHandle)
+    .map((worker) => worker.agentTerminalHandle).filter(Boolean));
+}
+
 function workerHandles() {
   const reply = orca(['orchestration', 'worker-list', '--json']);
   if (!reply || reply.ok === false) return null;
   const result = reply?.result || reply;
   const workers = Array.isArray(result) ? result : result?.workers;
-  return new Set((workers || []).map((worker) => worker?.agentTerminalHandle).filter(Boolean));
+  return authorizedWorkerHandles(workers);
 }
 
 function isAuthorized(job) {
@@ -65,35 +74,65 @@ function send(handle, text, enter) {
 function verifyStarted(handle, before) {
   // Give the TUI a short opportunity to repaint, then require visible change. This child
   // process is dedicated to one resume and does not own heartbeat liveness.
+  let screen = '';
   for (let attempt = 0; attempt < 5; attempt++) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
-    if (RESUME.turnStarted(terminalScreen(handle), before)) return true;
+    screen = terminalScreen(handle);
+    if (RESUME.turnStarted(screen, before)) return { started: true, screen };
   }
-  return false;
+  return { started: false, screen };
 }
 
 function schedule(file, expectedToken = '') {
   const initial = RESUME.readJob(file);
-  if (!initial || initial.status === 'resumed' || initial.status === 'cancelled') return;
+  if (!initial || RESUME.isSettledJob(initial)) return;
   const token = expectedToken || initial.token;
   if (!token) return;
   const claimed = RESUME.withOwnedJob(file, token, process.pid, (job) => {
+    if (RESUME.recoverDeliveredJob(job, Date.now())) {
+      RESUME.writeJob(file, job);
+      return { settled: true };
+    }
     job.pid = process.pid;
     job.status = 'scheduled';
     RESUME.writeJob(file, job);
-    return { ...job };
+    return { settled: false, job: { ...job } };
   });
-  if (!claimed.owned) return;
-  const job = claimed.value;
+  if (!claimed.owned || claimed.value.settled) return;
+  const job = claimed.value.job;
   const delay = Math.max(0, Math.min(0x7fffffff, RESUME.nextAttemptAt(job) - Date.now()));
   setTimeout(() => {
-    const current = RESUME.readJob(file);
+    let current = RESUME.readJob(file);
     if (!current || current.token !== token || Number(current.pid) !== process.pid ||
-        current.status === 'resumed' || current.status === 'cancelled') return;
+        RESUME.isSettledJob(current)) return;
+    const begun = RESUME.withOwnedJob(file, token, process.pid, (owned) => {
+      const attempt = RESUME.beginAttempt(owned, Date.now());
+      owned.attempts = attempt.attempts;
+      owned.firstAttemptAt = attempt.firstAttemptAt;
+      if (attempt.expired) {
+        owned.status = 'expired';
+        owned.expiredAt = Date.now();
+        owned.pid = 0;
+      }
+      RESUME.writeJob(file, owned);
+      return { expired: attempt.expired, job: { ...owned } };
+    });
+    if (!begun.owned || begun.value.expired) return;
+    current = begun.value.job;
     let lostOwnership = false;
     const guardedSend = (handle, text, enter) => {
-      const result = RESUME.withOwnedJob(file, token, process.pid,
-        () => send(handle, text, enter));
+      const result = RESUME.withOwnedJob(file, token, process.pid, (owned) => {
+        const alreadyAttempted = Boolean(owned.inFlightSendAt);
+        RESUME.recordDelivery(owned, text, Date.now());
+        if (!RESUME.writeJob(file, owned)) return false;
+        const delivered = send(handle, text, enter);
+        if (!delivered && !alreadyAttempted) {
+          delete owned.inFlightSendAt;
+          delete owned.lastAttemptedText;
+          RESUME.writeJob(file, owned);
+        }
+        return delivered;
+      });
       if (!result.owned) lostOwnership = true;
       return result.owned && result.value;
     };
@@ -102,27 +141,12 @@ function schedule(file, expectedToken = '') {
       send: guardedSend, verifyStarted,
     });
     if (lostOwnership) return;
-    let retry = false;
     const updated = RESUME.withOwnedJob(file, token, process.pid, (owned) => {
-      if (result.resumed) {
-        owned.status = 'resumed';
-        owned.resumedAt = Date.now();
-        owned.pid = 0;
-      } else if (result.reason === 'foreign-terminal') {
-        owned.status = 'cancelled';
-        owned.pid = 0;
-      } else if (result.reason === 'before-reset') {
-        retry = true;
-      } else {
-        owned.resetAt = result.resetAt > Date.now() ? result.resetAt : 0;
-        owned.nextAttemptAt = owned.resetAt > 0
-          ? owned.resetAt + RESUME.RESET_GRACE_MS
-          : Date.now() + RESUME.UNKNOWN_RETRY_MS;
-        retry = true;
-      }
+      const applied = RESUME.applyAttemptResult(owned, result, Date.now());
       RESUME.writeJob(file, owned);
+      return applied.retry;
     });
-    if (updated.owned && retry) schedule(file, token);
+    if (updated.owned && updated.value) schedule(file, token);
   }, delay);
 }
 
@@ -134,4 +158,7 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { terminalScreen, workerHandles, isAuthorized, probeQuota, send, verifyStarted, schedule };
+module.exports = {
+  terminalScreen, authorizedWorkerHandles, workerHandles, isAuthorized,
+  probeQuota, send, verifyStarted, schedule,
+};

@@ -449,8 +449,12 @@ WORKER PARKED <dispatch|terminal> (<agent> limit, resets <local time>) - will au
 ```
 
 Reset time comes from Kimi `/usages`, Codex app-server `resetsAt`, or a Claude screen hint
-(`resets 5pm`, `resets at 17:00`, `try again in 2h`). Unknown reset times are re-probed every
-15 minutes. One detached `orca-resume-scheduler.cjs` process is persisted per parked worker
+(`resets 5pm`, `resets at 17:00`, `try again in 2h`, or `resets Oct 3, 5pm
+(Asia/Saigon)`). An explicit IANA timezone is honored; otherwise local machine time is used.
+The latest recent limit line remains authoritative until a newer prompt or active-turn line
+appears. Unknown reset times are re-probed every 15 minutes without typing into a terminal
+that still visibly shows the limit. Claude worker terminals use this same screen-based path,
+not only the panel. One detached `orca-resume-scheduler.cjs` process is persisted per parked worker
 (PID and reset time), deduped across heartbeat restarts, and does not depend on the panel
 remaining alive. At reset plus 90 seconds it re-probes; once quota is below the coder's
 handoff threshold it sends `Quota has reset. Continue the task from where you stopped;
@@ -458,9 +462,20 @@ check git status/log (and HANDOVER.md if present) first; do not redo finished st
 verifies a new terminal turn. A Kimi screen in another permission mode is returned to Never
 Ask first.
 
+Attempts and the first-attempt time are persisted. A scheduler expires after 768 attempts or
+eight days. A successfully delivered resume is never typed again when turn verification is
+inconclusive. A send-attempt marker is persisted before terminal input, so a scheduler crash
+is also recovered conservatively without retyping. The job becomes `resumed-unverified`, exits, and wakes the panel with `WORKER
+RESUME UNVERIFIED ... inspect the terminal; do not retype`. A fresh Claude limit response to
+the one allowed send is instead re-parked at its new reset. `expired` jobs likewise wake the
+panel for a manual decision. Settled records and abandoned lock directories are cleaned after
+one day. A pending job is not deleted merely because a quota probe recovers before its timer;
+only a real handover or the worker leaving supervision cancels it.
+
 With `autoResumePanel`, the exact `ORCA_TERMINAL_HANDLE` gets the analogous message `Quota
 has reset - continue the orchestration from where you stopped (check worker-list, plans)`.
-Schedulers recheck authorization and never type into foreign terminals. In-session Agent
+Schedulers recheck authorization and exclude unsupervised, released, and finished workers;
+they never type into foreign terminals. In-session Agent
 subagents die with the panel turn and cannot be resumed; the panel re-dispatches them after
 it resumes. Prefer Orca workers for long-running resumable code tasks.
 

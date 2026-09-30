@@ -19,6 +19,7 @@ const {
 } = require('../hooks/lib/terminal-signals.cjs');
 const handover = require('../hooks/lib/worker-quota-handover.cjs');
 const resume = require('../hooks/lib/quota-reset-resume.cjs');
+const resumeScheduler = require('../hooks/orca-resume-scheduler.cjs');
 const {
   meaningfulTerminalOutput,
   workerProgressSample,
@@ -291,7 +292,8 @@ check('done worker states are mapped by terminal handle', [...heartbeat.terminal
   { agentTerminalHandle: 'term_live', workerState: 'running' },
 ])], [['term_done', 'completed'], ['term_live', 'running']]);
 check('all Orca terminal worker states are excluded from stall checks',
-  ['succeeded', 'failed', 'stopped', 'completed'].every((state) => heartbeat.TERMINAL_WORKER_STATES.has(state)), true);
+  ['succeeded', 'failed', 'stopped', 'cancelled', 'completed']
+    .every((state) => heartbeat.TERMINAL_WORKER_STATES.has(state)), true);
 check('done workers are skipped even when their terminals classify idle',
   heartbeat.shouldTrackWorkerProgress('idle', 'succeeded'), false);
 check('running workers remain eligible for progress checks',
@@ -623,6 +625,9 @@ check('Claude 24-hour reset text is parsed',
 check('Claude relative reset text is parsed',
   resume.parseClaudeResetAt('You hit your limit; try again in 2h 15m', resetNow),
   resetNow + 2 * 3_600_000 + 15 * 60_000);
+check('Claude month/day reset honors an explicit IANA timezone',
+  resume.parseClaudeResetAt('■ Usage limit reached · resets Oct 3, 5pm (Asia/Saigon)', resetNow),
+  Date.parse('2026-10-03T10:00:00.000Z'));
 check('ordinary reset discussion is not a Claude limit screen',
   resume.hasClaudeLimitMessage('Updated reset parsing tests for 5pm.'), false);
 check('prose quoting limit and reset wording is not a Claude limit screen',
@@ -631,6 +636,9 @@ check('an unmarked exact quote is not treated as panel limit UI',
   resume.hasClaudeLimitMessage('Usage limit reached · resets at 17:00'), false);
 check('captured Claude limit banner is detected',
   resume.hasClaudeLimitMessage('■ Usage limit reached · resets at 17:00'), true);
+check('a newer prompt makes an older Claude limit line historical',
+  resume.claudeLimitInfo('■ Usage limit reached · resets at 17:00\n❯ Ready for your next task', resetNow).limited,
+  false);
 check('an exhausted worker parks only when no handover target exists', [
   resume.shouldPark({ limited: true, handoverTarget: null }),
   resume.shouldPark({ limited: true, handoverTarget: 'codex' }),
@@ -653,6 +661,10 @@ check('first park emits and persists scheduler pid/reset time', [
   /^WORKER PARKED ctx_park \(kimi limit, resets .+\) - will auto-resume$/.test(firstPark.event),
   firstPark.scheduled, resume.readJob(firstPark.file).pid, resume.readJob(firstPark.file).resetAt,
 ], [true, true, 4321, parkedResetAt]);
+check('new park episodes persist bounded-attempt counters', [
+  resume.readJob(firstPark.file).attempts,
+  resume.readJob(firstPark.file).firstAttemptAt,
+], [0, 0]);
 const duplicatePark = resume.park({
   stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
   resetAt: parkedResetAt, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 1,
@@ -668,13 +680,45 @@ check('scheduler ownership rejects a replaced or cleared park episode', [
 const completedParkJob = resume.readJob(firstPark.file);
 completedParkJob.status = 'resumed';
 completedParkJob.pid = 0;
+completedParkJob.resumedAt = resetNow + 2;
 resume.writeJob(firstPark.file, completedParkJob);
-check('a still-visible completed park episode does not schedule again', resume.park({
+check('a successfully resumed terminal can park for a second limit episode', typeof resume.park({
   stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
-  resetAt: parkedResetAt, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 2,
+  resetAt: 0, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 2,
   spawnScheduler: () => { schedulerSpawns += 1; return 2222; }, pidAlive: () => false,
-}).event, null);
+}).event, 'string');
 resume.clearJob(stateDir, 'park-test', 'term_park');
+const panelFirstPark = resume.park({
+  stateDir, session: 'panel-repeat', handle: 'term_panel_repeat', identity: 'term_panel_repeat',
+  agent: 'claude', panel: true, panelHandle: 'term_panel_repeat', resetAt: 0, now: resetNow,
+  spawnScheduler: () => 5555, pidAlive: () => false,
+});
+const panelFirstJob = resume.readJob(panelFirstPark.file);
+panelFirstJob.status = 'resumed';
+panelFirstJob.pid = 0;
+panelFirstJob.resumedAt = resetNow + 1;
+resume.writeJob(panelFirstPark.file, panelFirstJob);
+check('a panel can be parked again after a second unknown-reset limit', typeof resume.park({
+  stateDir, session: 'panel-repeat', handle: 'term_panel_repeat', identity: 'term_panel_repeat',
+  agent: 'claude', panel: true, panelHandle: 'term_panel_repeat', resetAt: 0, now: resetNow + 2,
+  spawnScheduler: () => 6666, pidAlive: () => false,
+}).event, 'string');
+resume.clearJob(stateDir, 'panel-repeat', 'term_panel_repeat');
+const slidingLine = '■ Usage limit reached · try again in 2h';
+const slidingFirst = resume.park({
+  stateDir, session: 'panel-sliding', handle: 'term_panel_sliding', identity: 'term_panel_sliding',
+  agent: 'claude', panel: true, panelHandle: 'term_panel_sliding', limitLine: slidingLine,
+  resetAt: resetNow + 2 * 3_600_000, now: resetNow, spawnScheduler: () => 7777, pidAlive: () => false,
+});
+resume.park({
+  stateDir, session: 'panel-sliding', handle: 'term_panel_sliding', identity: 'term_panel_sliding',
+  agent: 'claude', panel: true, panelHandle: 'term_panel_sliding', limitLine: slidingLine,
+  resetAt: resetNow + 2 * 3_600_000 + 60_000, now: resetNow + 60_000,
+  spawnScheduler: () => 8888, pidAlive: (pid) => pid === 7777,
+});
+check('the same visible Claude limit line cannot slide its persisted reset forward',
+  resume.readJob(slidingFirst.file).resetAt, resetNow + 2 * 3_600_000);
+resume.clearJob(stateDir, 'panel-sliding', 'term_panel_sliding');
 check('clearing a park invalidates the scheduler ownership token',
   resume.withOwnedJob(firstPark.file, firstParkToken, 4321, () => true).owned, false);
 check('clearing a recovered episode re-arms a later park', typeof resume.park({
@@ -682,11 +726,71 @@ check('clearing a recovered episode re-arms a later park', typeof resume.park({
   resetAt: parkedResetAt + 5000, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 3,
   spawnScheduler: () => { schedulerSpawns += 1; return 3333; }, pidAlive: () => false,
 }).event, 'string');
+const pendingFile = resume.jobFile(stateDir, 'pending-test', 'term_pending');
+resume.writeJob(pendingFile, {
+  version: 1, session: 'pending-test', handle: 'term_pending', identity: 'ctx_pending',
+  agent: 'codex', status: 'scheduled', token: 'pending', pid: 11, parkedAt: resetNow,
+});
+check('a quota recovery does not clear a scheduler-owned pending job', [
+  resume.clearSettledJob(stateDir, 'pending-test', 'term_pending'),
+  resume.readJob(pendingFile).status,
+], [false, 'scheduled']);
+check('a worker leaving the supervised set clears its pending job', [
+  resume.clearMissingPendingJobs(stateDir, 'pending-test', new Set()),
+  resume.readJob(pendingFile),
+], [1, null]);
 check('foreign terminals are never parked or scheduled', resume.park({
   stateDir, session: 'park-test', handle: 'term_foreign', identity: 'ctx_foreign', agent: 'codex',
   authorizedHandles: new Set(), now: resetNow,
   spawnScheduler: () => { schedulerSpawns += 1; return 1111; },
 }).reason, 'foreign-terminal');
+check('Claude workers use the same authorized park path as external coders',
+  typeof resume.park({
+    stateDir, session: 'claude-worker', handle: 'term_claude', identity: 'ctx_claude', agent: 'claude',
+    resetAt: parkedResetAt, authorizedHandles: new Set(['term_claude']), now: resetNow,
+    spawnScheduler: () => 4444, pidAlive: () => false,
+  }).event, 'string');
+check('resume authorization excludes unsupervised, released, finished, and panel rows',
+  [...resumeScheduler.authorizedWorkerHandles([
+    { agentTerminalHandle: 'term_live', workerState: 'running', terminalState: 'active' },
+    { agentTerminalHandle: 'term_unsupervised', workerState: 'unsupervised', terminalState: 'active' },
+    { agentTerminalHandle: 'term_released', workerState: 'running', terminalState: 'released' },
+    { agentTerminalHandle: 'term_done', workerState: 'succeeded', terminalState: 'active' },
+    { agentTerminalHandle: 'term_dispatch_done', workerState: 'running', dispatchStatus: 'completed', terminalState: 'active' },
+    { agentTerminalHandle: 'term_panel', workerState: 'running', terminalState: 'active' },
+  ], 'term_panel')], ['term_live']);
+
+check('attempt accounting persists a first-attempt time and increments', [
+  resume.beginAttempt({ attempts: 0, firstAttemptAt: 0 }, resetNow),
+  resume.beginAttempt({ attempts: 1, firstAttemptAt: resetNow }, resetNow + 1000),
+], [
+  { expired: false, attempts: 1, firstAttemptAt: resetNow },
+  { expired: false, attempts: 2, firstAttemptAt: resetNow },
+]);
+check('attempt accounting expires by count and by eight-day lifetime', [
+  resume.beginAttempt({ attempts: resume.MAX_ATTEMPTS, firstAttemptAt: resetNow }, resetNow).expired,
+  resume.beginAttempt({ attempts: 2, firstAttemptAt: resetNow }, resetNow + resume.MAX_LIFETIME_MS).expired,
+], [true, true]);
+const crashSafeDelivery = resume.recordDelivery({ status: 'scheduled', pid: 99 },
+  resume.WORKER_RESUME_MESSAGE, resetNow);
+check('a pre-send marker recovered after scheduler death becomes report-only', [
+  resume.recoverDeliveredJob(crashSafeDelivery, resetNow + 1),
+  crashSafeDelivery.status, crashSafeDelivery.pid,
+], [true, 'resumed-unverified', 0]);
+const appliedUnverified = resume.applyAttemptResult({ status: 'scheduled', pid: 99 }, {
+  resumed: false, reason: 'resumed-unverified', delivered: true,
+}, resetNow);
+check('a delivered unverified result settles without another scheduled attempt', [
+  appliedUnverified.job.status, appliedUnverified.job.pid, appliedUnverified.retry,
+], ['resumed-unverified', 0, false]);
+const appliedRelimit = resume.applyAttemptResult({ status: 'scheduled', pid: 99 }, {
+  resumed: false, reason: 'quota-unavailable', delivered: true, reparked: true,
+  resetAt: resetNow + 5_000,
+}, resetNow);
+check('a new post-send limit response is re-parked at its new reset', [
+  appliedRelimit.job.status, appliedRelimit.job.resetAt,
+  appliedRelimit.job.nextAttemptAt, appliedRelimit.retry,
+], ['scheduled', resetNow + 5_000, resetNow + 5_000 + resume.RESET_GRACE_MS, true]);
 
 const resumeJob = {
   handle: 'term_resume', identity: 'ctx_resume', agent: 'codex', panel: false,
@@ -724,6 +828,15 @@ const resumed = resume.attemptResume(resumeJob, {
 });
 check('available quota resumes the worker with the exact continuation guard',
   [resumed.resumed, sentMessages.at(-1)[1]], [true, resume.WORKER_RESUME_MESSAGE]);
+const unverifiedSends = [];
+const unverified = resume.attemptResume(resumeJob, {
+  now: resetNow + 1000 + resume.RESET_GRACE_MS,
+  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 2 }), readScreen: () => 'Ready',
+  send: (...args) => { unverifiedSends.push(args); return true; }, verifyStarted: () => false,
+});
+check('a delivered resume with no confirmed turn becomes terminal and is never a retry result',
+  [unverified.reason, unverified.delivered, unverifiedSends.length],
+  ['resumed-unverified', true, 1]);
 
 const kimiSends = [];
 const kimiScreens = [
@@ -757,6 +870,15 @@ check('Kimi never resumes when Never Ask cannot be verified', resume.attemptResu
 }).reason, 'permission-unverified');
 check('unverified permission mode never receives the resume message',
   failedPermissionSends.some((entry) => entry[1] === resume.WORKER_RESUME_MESSAGE), false);
+check('a delivered Kimi permission interaction is marked delivered instead of blindly retried',
+  resume.attemptResume({
+    ...resumeJob, handle: 'term_kimi_unverified_2', agent: 'kimi', threshold: 95,
+  }, {
+    now: resetNow + 1000 + resume.RESET_GRACE_MS,
+    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
+    readScreen: () => 'Permission mode: Ask When Needed', send: () => true,
+    verifyStarted: () => true, wait: () => {},
+  }).delivered, true);
 
 const panelSends = [];
 check('panel self-resume uses its orchestration-specific message', resume.attemptResume({
@@ -774,23 +896,82 @@ const staleClaudeSends = [];
 check('known Claude reset resumes despite an unchanged stale banner', resume.attemptResume({
   handle: 'term_panel_stale', identity: 'term_panel_stale', agent: 'claude', panel: true,
   status: 'scheduled', parkedAt: resetNow, resetAt: resetNow + 1000, threshold: 100,
+  limitLine: '■ Usage limit reached · resets at 12:00',
 }, {
   now: resetNow + 1000 + resume.RESET_GRACE_MS,
   isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
-  readScreen: () => '■ Usage limit reached · resets at 17:00',
+  readScreen: () => '■ Usage limit reached · resets at 12:00',
   send: (...args) => { staleClaudeSends.push(args); return true; }, verifyStarted: () => true,
 }).resumed, true);
+check('an unchanged post-reset Claude banner is not mistaken for a fresh rejection',
+  resume.attemptResume({
+    handle: 'term_panel_stale_unverified', identity: 'term_panel_stale_unverified',
+    agent: 'claude', panel: true, status: 'scheduled', parkedAt: resetNow,
+    resetAt: resetNow + 1000, threshold: 100,
+    limitLine: '■ Usage limit reached · resets at 12:00',
+  }, {
+    now: resetNow + 1000 + resume.RESET_GRACE_MS,
+    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+    readScreen: () => '■ Usage limit reached · resets at 12:00',
+    send: () => true, verifyStarted: () => ({ started: false,
+      screen: '■ Usage limit reached · resets at 12:00' }),
+  }).reason, 'resumed-unverified');
+const changedResetSends = [];
+check('a newer visible Claude reset overrides an expired persisted reset and waits',
+  resume.attemptResume({
+    handle: 'term_panel_new_reset', identity: 'term_panel_new_reset', agent: 'claude', panel: true,
+    status: 'scheduled', parkedAt: resetNow,
+    resetAt: resetNow - resume.RESET_GRACE_MS - 1000,
+    limitLine: '■ Usage limit reached · resets at 12:00',
+  }, {
+    now: resetNow, isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+    readScreen: () => '■ Usage limit reached · resets Oct 3, 5pm (Asia/Saigon)',
+    send: (...args) => { changedResetSends.push(args); return true; }, verifyStarted: () => true,
+  }), {
+    resumed: false, reason: 'quota-unavailable', resetAt: Date.parse('2026-10-03T10:00:00.000Z'),
+    limitLine: '■ Usage limit reached · resets Oct 3, 5pm (Asia/Saigon)',
+  });
+check('a panel showing a changed future reset gets zero sends', changedResetSends.length, 0);
 const unknownClaudeSends = [];
-check('unknown Claude reset actively probes a static limit banner without shifting its timer', resume.attemptResume({
+check('a still-limited panel with an unknown reset receives zero sends', resume.attemptResume({
   handle: 'term_panel_unknown', identity: 'term_panel_unknown', agent: 'claude', panel: true,
   status: 'scheduled', parkedAt: resetNow - resume.UNKNOWN_RETRY_MS, resetAt: 0, threshold: 100,
 }, {
   now: resetNow, isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
   readScreen: () => '■ You\'ve hit your usage limit · try again in 2h',
   send: (...args) => { unknownClaudeSends.push(args); return true; }, verifyStarted: () => false,
-}), { resumed: false, reason: 'not-started' });
-check('unknown Claude retry uses only the exact continuation probe',
-  unknownClaudeSends.map((entry) => entry[1]), [resume.PANEL_RESUME_MESSAGE]);
+}), {
+  resumed: false, reason: 'quota-unavailable', resetAt: resetNow + 2 * 3_600_000,
+  limitLine: '■ You\'ve hit your usage limit · try again in 2h',
+});
+check('still-limited Claude pre-send check types nothing', unknownClaudeSends.length, 0);
+const reparkingSends = [];
+check('a fresh Claude limit response after delivery re-parks instead of becoming unverified',
+  resume.attemptResume({
+    handle: 'term_panel_relimit', identity: 'term_panel_relimit', agent: 'claude', panel: true,
+    status: 'scheduled', parkedAt: resetNow, resetAt: resetNow - resume.RESET_GRACE_MS,
+  }, {
+    now: resetNow, isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+    readScreen: () => 'Ready', send: (...args) => { reparkingSends.push(args); return true; },
+    verifyStarted: () => ({ started: false,
+      screen: '■ Usage limit reached · resets Oct 3, 5pm (Asia/Saigon)' }),
+  }), {
+    resumed: false, reason: 'quota-unavailable', resetAt: Date.parse('2026-10-03T10:00:00.000Z'),
+    limitLine: '■ Usage limit reached · resets Oct 3, 5pm (Asia/Saigon)',
+    delivered: true, reparked: true,
+  });
+check('a re-limit attempt still delivers only once in that episode', reparkingSends.length, 1);
+check('an ordinary repaint below the same stale limit line never creates a re-send episode',
+  resume.attemptResume({
+    handle: 'term_panel_repaint', identity: 'term_panel_repaint', agent: 'claude', panel: true,
+    status: 'scheduled', parkedAt: resetNow, resetAt: resetNow - resume.RESET_GRACE_MS,
+    limitLine: '■ Usage limit reached · resets at 12:00',
+  }, {
+    now: resetNow, isAuthorized: () => true, probeQuota: () => ({ usedPercent: 0 }),
+    readScreen: () => '■ Usage limit reached · resets at 12:00', send: () => true,
+    verifyStarted: () => ({ started: false,
+      screen: '■ Usage limit reached · resets at 12:00\nQuota has reset - continue the orchestration' }),
+  }).reason, 'resumed-unverified');
 check('threshold zero never resumes because no nonnegative quota is below it', resume.attemptResume({
   ...resumeJob, threshold: 0,
 }, {
@@ -804,6 +985,65 @@ check('turn verification requires an active status, not merely changed screen te
 ], [false, true]);
 check('panel auto-resume opt-out is retained by config',
   withConfig({ autoResumePanel: false }, () => config.loadConfig()).autoResumePanel, false);
+
+const eventFile = resume.jobFile(stateDir, 'event-test', 'term_unverified');
+resume.writeJob(eventFile, {
+  session: 'event-test', handle: 'term_unverified', identity: 'ctx_unverified', agent: 'codex',
+  status: 'resumed-unverified', unverifiedAt: resetNow,
+});
+const unverifiedEvents = resume.resumeJobEvents(stateDir, 'event-test', resetNow + 1);
+check('heartbeat reports a delivered-but-unverified resume once without retyping', [
+  unverifiedEvents.length,
+  /do not retype/.test(unverifiedEvents[0]),
+  resume.resumeJobEvents(stateDir, 'event-test', resetNow + 2).length,
+], [1, true, 0]);
+const crashedFile = resume.jobFile(stateDir, 'event-crash', 'term_crashed_send');
+resume.writeJob(crashedFile, {
+  session: 'event-crash', handle: 'term_crashed_send', identity: 'ctx_crashed_send', agent: 'codex',
+  status: 'scheduled', pid: 1234, inFlightSendAt: resetNow,
+});
+check('heartbeat recovers and reports a marked send after its scheduler dies', [
+  resume.resumeJobEvents(stateDir, 'event-crash', resetNow + 1, () => false).length,
+  resume.readJob(crashedFile).status,
+], [1, 'resumed-unverified']);
+const liveSendFile = resume.jobFile(stateDir, 'event-live-send', 'term_live_send');
+resume.writeJob(liveSendFile, {
+  session: 'event-live-send', handle: 'term_live_send', identity: 'ctx_live_send', agent: 'codex',
+  status: 'scheduled', pid: 5678, inFlightSendAt: resetNow,
+});
+check('heartbeat leaves a marked send alone while its scheduler is still verifying', [
+  resume.resumeJobEvents(stateDir, 'event-live-send', resetNow + 1, () => true).length,
+  resume.readJob(liveSendFile).status,
+], [0, 'scheduled']);
+const unreportedFile = resume.jobFile(stateDir, 'event-race', 'term_unreported');
+resume.writeJob(unreportedFile, {
+  session: 'event-race', handle: 'term_unreported', identity: 'ctx_unreported', agent: 'claude',
+  status: 'resumed-unverified', unverifiedAt: resetNow,
+});
+check('heartbeat recovery cleanup cannot erase an unreported scheduler outcome', [
+  resume.clearSettledJob(stateDir, 'event-race', 'term_unreported'),
+  resume.readJob(unreportedFile).status,
+], [false, 'resumed-unverified']);
+const expiredFile = resume.jobFile(stateDir, 'event-test', 'term_expired');
+resume.writeJob(expiredFile, {
+  session: 'event-test', handle: 'term_expired', identity: 'ctx_expired', agent: 'claude',
+  status: 'expired', expiredAt: resetNow,
+});
+check('heartbeat emits an expired scheduler outcome once',
+  resume.resumeJobEvents(stateDir, 'event-test', resetNow + 3).some((event) =>
+    event.startsWith('WORKER AUTO-RESUME EXPIRED ctx_expired (claude)')), true);
+check('settled jobs are retained for one day then swept', [
+  resume.sweepJobs(stateDir, 'event-test', resetNow + resume.SETTLED_RETENTION_MS - 1),
+  resume.sweepJobs(stateDir, 'event-test', resetNow + resume.SETTLED_RETENTION_MS + 10),
+  resume.readJob(eventFile), resume.readJob(expiredFile),
+], [0, 2, null, null]);
+const orphanLock = path.join(stateDir, 'resume-event-test-orphan.json.lock');
+fs.mkdirSync(orphanLock);
+const oldLockTime = new Date(resetNow - resume.SETTLED_RETENTION_MS - 1);
+fs.utimesSync(orphanLock, oldLockTime, oldLockTime);
+resume.sweepJobs(stateDir, 'event-test', resetNow);
+check('orphaned resume lock directories older than one day are swept',
+  fs.existsSync(orphanLock), false);
 
 if (failures.length) {
   console.error(`${failures.length} failure(s), ${pass} passed`);
