@@ -21,7 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { acquireLock, releaseLock } = require('./file-lock.cjs');
+function liveCache() { return require('./live-probe-cache.cjs'); }
 
 // Claude's cache is refreshed by an external hook; older than this it no longer reflects
 // this machine.
@@ -36,8 +36,7 @@ const DEFAULT_CACHE_SECONDS = 60;
 const LIVE_CACHE_FILE = 'codex-quota-live.json';
 const LIVE_PROBE_LOCK = '.codex-quota-probe.lock';
 const LIVE_PROBE = path.join(__dirname, 'codex-quota-probe.cjs');
-const processCache = new Map();
-const processFallbackCache = new Map();
+const authStateCache = new Map();
 
 function codexSessionsDir() {
   // CODEX_SESSIONS_DIR lets tests point at a fixture instead of live data.
@@ -194,7 +193,8 @@ function effectiveUsedPercent(window, now) {
   if (!window || typeof window.usedPercent !== 'number' || !Number.isFinite(window.usedPercent) ||
       window.usedPercent < 0 || window.usedPercent > 100) return null;
   const resetsAt = typeof window.resetsAt === 'number' && Number.isFinite(window.resetsAt) ? window.resetsAt : 0;
-  return { usedPercent: resetsAt && resetsAt * 1000 <= now ? 0 : window.usedPercent, resetsAt };
+  if (resetsAt && resetsAt * 1000 <= now) return { usedPercent: 0, resetsAt: 0 };
+  return { usedPercent: window.usedPercent, resetsAt };
 }
 
 /** Convert a live app-server result to the tightest usable window. */
@@ -215,29 +215,41 @@ function parseLiveQuota(result, now = Date.now()) {
   ));
 }
 
-function liveQuota(now = Date.now()) {
+function liveQuotaResult(now = Date.now()) {
   const codexBin = process.env.ORCH_CODEX_BIN || process.env.CODEX_BIN || 'codex';
   const probe = spawnSync(process.execPath, [LIVE_PROBE, codexBin], {
     encoding: 'utf8',
     timeout: LIVE_TIMEOUT_MS,
     maxBuffer: 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'],
   });
-  if (probe.error || probe.status !== 0 || !probe.stdout) return null;
-  try { return parseLiveQuota(JSON.parse(probe.stdout.trim()), now); } catch { return null; }
+  const stdout = String(probe.stdout || '').trim();
+  if (probe.status === 3 && stdout === '{"authState":"logged-out"}') {
+    return { failed: true, authState: 'logged-out' };
+  }
+  if (probe.error || probe.status !== 0 || !stdout) return null;
+  try {
+    const quota = parseLiveQuota(JSON.parse(stdout), now);
+    return quota ? { ...quota, authState: 'ok' } : null;
+  } catch { return null; }
+}
+
+function liveQuota(now = Date.now()) {
+  const result = liveQuotaResult(now);
+  return result && !result.failed ? result : null;
 }
 
 function cachePath(stateDir) {
   return path.join(stateDir, LIVE_CACHE_FILE);
 }
 
-function cacheEntryFresh(cached, cacheSeconds, now) {
-  return cached && typeof cached.fetchedAt === 'number' && Number.isFinite(cached.fetchedAt) &&
-    now >= cached.fetchedAt && now - cached.fetchedAt < cacheSeconds * 1000;
-}
-
 function cachedQuotaResult(cached, now) {
   if (!cached || typeof cached.fetchedAt !== 'number' || !Number.isFinite(cached.fetchedAt)) return null;
-  if (cached.failed === true) return { failed: true, fetchedAt: cached.fetchedAt };
+  if (cached.failed === true) return {
+    failed: true,
+    fetchedAt: cached.fetchedAt,
+    ...(cached.authState === 'logged-out' ? { authState: 'logged-out' } : {}),
+  };
   if (typeof cached.usedPercent !== 'number' || !Number.isFinite(cached.usedPercent) ||
       cached.usedPercent < 0 || cached.usedPercent > 100 ||
       typeof cached.resetsAt !== 'number' || !Number.isFinite(cached.resetsAt) || cached.resetsAt < 0 ||
@@ -249,75 +261,9 @@ function cachedQuotaResult(cached, now) {
 }
 
 function readFreshCache(stateDir, cacheSeconds, now = Date.now()) {
-  if (!stateDir) return null;
-  const file = cachePath(stateDir);
-  try {
-    // One hook process can ask for the route more than once while evaluating one Agent
-    // dispatch. Keep the parsed result in memory as well as on disk so the second lookup is
-    // effectively free. Requiring the cache file to still exist keeps tests and operators
-    // able to invalidate it explicitly by removing the file.
-    const memoized = processCache.get(file);
-    if (memoized && fs.existsSync(file) &&
-        (cacheSeconds <= 0 || cacheEntryFresh(memoized, cacheSeconds, now))) {
-      return cachedQuotaResult(memoized, now);
-    }
-
-    if (cacheSeconds <= 0) return null;
-
-    const cached = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (!cacheEntryFresh(cached, cacheSeconds, now)) return null;
-    const result = cachedQuotaResult(cached, now);
-    if (!result) return null;
-    processCache.set(file, cached);
-    return result;
-  } catch { return null; }
-}
-
-/** A stale fallback already selected by this process while another process held the lease. */
-function readProcessFallback(stateDir, now = Date.now()) {
-  const file = cachePath(stateDir);
-  const memoized = processFallbackCache.get(file);
-  if (!memoized) return null;
-  try {
-    if (fs.readFileSync(file, 'utf8') !== memoized.text) {
-      processFallbackCache.delete(file);
-      return null;
-    }
-    return cachedQuotaResult(memoized.cached, now);
-  } catch {
-    processFallbackCache.delete(file);
-    return null;
-  }
-}
-
-/** A structurally valid cache entry even when its file TTL expired, for probe-lock losers. */
-function readStaleCache(stateDir, now = Date.now(), memoize = false) {
-  try {
-    const file = cachePath(stateDir);
-    const text = fs.readFileSync(file, 'utf8');
-    const cached = JSON.parse(text);
-    const result = cachedQuotaResult(cached, now);
-    if (memoize && result) processFallbackCache.set(file, { text, cached });
-    return result;
-  } catch { return null; }
-}
-
-function writeCache(stateDir, quota, now = Date.now()) {
-  if (!stateDir) return;
-  try {
-    fs.mkdirSync(stateDir, { recursive: true });
-    const file = cachePath(stateDir);
-    const temp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
-    const cached = quota ? {
-      usedPercent: quota.usedPercent,
-      resetsAt: quota.resetsAt || 0,
-      fetchedAt: now,
-      limitReached: quota.limitReached === true,
-    } : { failed: true, fetchedAt: now };
-    fs.writeFileSync(temp, JSON.stringify(cached), { mode: 0o600 });
-    fs.renameSync(temp, file);
-    processCache.set(file, cached);
-  } catch {}
+  return liveCache().readFresh({
+    stateDir, cacheFile: LIVE_CACHE_FILE, cacheSeconds, now, validate: cachedQuotaResult,
+  });
 }
 
 /** Fresh cache -> live app-server -> session log -> unknown. */
@@ -334,39 +280,36 @@ function codexQuota(now = Date.now(), options = {}) {
   }
   stateDir ||= process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
   if (cacheSeconds === undefined) cacheSeconds = DEFAULT_CACHE_SECONDS;
-  const cached = readFreshCache(stateDir, cacheSeconds, now);
-  if (cached && !cached.failed) return cached;
-  if (cached && cached.failed) return readSessionQuota(now);
-  const processFallback = readProcessFallback(stateDir, now);
-  if (processFallback && !processFallback.failed) return processFallback;
-  if (processFallback && processFallback.failed) return readSessionQuota(now);
-  const probeLockDir = path.join(stateDir, LIVE_PROBE_LOCK);
-  const probeLock = acquireLock(probeLockDir, {
-    timeoutMs: 300,
-    retryMs: 25,
-    staleMs: LIVE_TIMEOUT_MS + 1000,
+  const result = liveCache().cachedLiveProbe({
+    stateDir,
+    cacheFile: LIVE_CACHE_FILE,
+    lockName: LIVE_PROBE_LOCK,
+    cacheSeconds,
+    now,
+    probe: () => liveQuotaResult(now),
+    validate: cachedQuotaResult,
+    probeTimeoutMs: LIVE_TIMEOUT_MS,
   });
-  if (probeLock === false) {
-    const afterWait = readFreshCache(stateDir, cacheSeconds, Math.max(now, Date.now()));
-    if (afterWait && !afterWait.failed) return afterWait;
-    if (afterWait && afterWait.failed) return readSessionQuota(now);
-    const stale = readStaleCache(stateDir, now, true);
-    return stale && !stale.failed ? stale : readSessionQuota(now);
-  }
+  if (result && !result.failed) return result;
+  if (result && result.authState === 'logged-out') return result;
+  return readSessionQuota(now);
+}
+
+/** Read the last cached Codex auth state without spawning the app-server probe. */
+function codexAuthState(stateDir, now = Date.now()) {
+  const file = cachePath(stateDir);
   try {
-    // Another process may have refreshed the cache while this process waited for the lease.
-    const afterAcquire = readFreshCache(stateDir, cacheSeconds, Math.max(now, Date.now()));
-    if (afterAcquire && !afterAcquire.failed) return afterAcquire;
-    if (afterAcquire && afterAcquire.failed) return readSessionQuota(now);
-    const live = liveQuota(now);
-    if (live) {
-      writeCache(stateDir, live, now);
-      return { ...live, fetchedAt: now, source: 'live' };
-    }
-    writeCache(stateDir, null, now);
-    return readSessionQuota(now);
-  } finally {
-    if (probeLock) releaseLock(probeLockDir);
+    const stat = fs.statSync(file);
+    const memo = authStateCache.get(file);
+    if (memo && memo.mtimeMs === stat.mtimeMs && memo.size === stat.size) return memo.state;
+    const entry = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const state = entry && entry.authState === 'logged-out' ? 'logged-out'
+      : entry && entry.failed !== true && cachedQuotaResult(entry, now) ? 'ok'
+        : 'unknown';
+    authStateCache.set(file, { mtimeMs: stat.mtimeMs, size: stat.size, state });
+    return state;
+  } catch {
+    return 'unknown';
   }
 }
 
@@ -414,5 +357,5 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
 
 module.exports = {
   pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
-  parseLiveQuota, liveQuota, codexQuota, readFreshCache, formatAge,
+  parseLiveQuota, liveQuota, codexQuota, codexAuthState, readFreshCache, formatAge,
 };

@@ -14,6 +14,7 @@ let buffer = '';
 let finished = false;
 let exitCode = 1;
 let forceTimer = null;
+let rateLimitError = '';
 
 const deadline = setTimeout(() => stop(1), DEADLINE_MS);
 
@@ -47,7 +48,8 @@ child.on('error', () => stop(1));
 child.on('exit', (code) => {
   if (!finished) {
     finished = true;
-    exitCode = code === 0 ? 1 : (code || 1);
+    // Never forward a child exit code: exit 3 is reserved for our exact logged-out payload.
+    exitCode = 1;
   }
   exitNow();
 });
@@ -63,8 +65,20 @@ child.stdout.on('data', (chunk) => {
       send({ method: 'initialized' });
       send({ id: 2, method: 'account/rateLimits/read', params: {} });
     } else if (message.id === 2) {
-      if (!message.result || message.error) stop(1);
+      if (!message.result || message.error) {
+        rateLimitError = String(message.error && message.error.message || '');
+        send({ id: 3, method: 'account/read', params: { refreshToken: false } });
+      }
       else stop(0, message.result);
+    } else if (message.id === 3) {
+      const result = message.result;
+      if (result && result.account === null && result.requiresOpenaiAuth === true) {
+        stop(3, { authState: 'logged-out' });
+      } else if (/not\s+(?:logged|signed)\s+in|authentication\s+required/i.test(rateLimitError)) {
+        stop(3, { authState: 'logged-out' });
+      } else {
+        stop(1);
+      }
     }
   }
 });

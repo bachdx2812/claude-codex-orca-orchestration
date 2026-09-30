@@ -27,6 +27,11 @@ process.stdin.on('data', (chunk) => {
       if (process.env.STUB_CODEX_MODE === 'timeout' || process.env.STUB_CODEX_MODE === 'ignore-signals') continue;
       process.stdout.write(`${JSON.stringify({ id: 1, result: {} })}\n`);
     } else if (message.id === 2) {
+      if (process.env.STUB_CODEX_MODE === 'logged-out' ||
+          process.env.STUB_CODEX_MODE === 'account-read-unsupported') {
+        process.stdout.write(`${JSON.stringify({ id: 2, error: { message: 'rate limits unavailable' } })}\n`);
+        continue;
+      }
       if (process.env.STUB_CODEX_MODE === 'malformed') {
         process.stdout.write(`${JSON.stringify({ id: 2, result: { nope: true } })}\n`);
         continue;
@@ -48,6 +53,15 @@ process.stdin.on('data', (chunk) => {
       }
       if (process.env.STUB_CODEX_ORDINARY_USAGE_ALLOWED === 'false') result.ordinaryUsageAllowed = false;
       process.stdout.write(`${JSON.stringify({ id: 2, result })}\n`);
+    } else if (message.id === 3) {
+      if (process.env.STUB_CODEX_MODE === 'logged-out') {
+        process.stdout.write(`${JSON.stringify({ id: 3, result: { account: null, requiresOpenaiAuth: true } })}\n`);
+      } else if (process.env.STUB_CODEX_MODE === 'account-read-unsupported') {
+        process.stdout.write(`${JSON.stringify({ id: 3, error: { message: 'method not found' } })}\n`);
+      } else {
+        // Keep the default id 1/id 2 behaviour unchanged while answering unexpected id 3 promptly.
+        process.stdout.write(`${JSON.stringify({ id: 3, result: { account: { type: 'chatgpt' }, requiresOpenaiAuth: true } })}\n`);
+      }
     }
   }
 });
