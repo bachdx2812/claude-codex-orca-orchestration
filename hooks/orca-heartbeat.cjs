@@ -283,7 +283,8 @@ function reportUsageExhausted({ reported, handle, label, coder }) {
   const name = coder === 'codex' ? 'Codex' : 'Kimi';
   const other = coder === 'codex' ? 'Kimi' : 'Codex';
   return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
-    `route new code to ${other} (or Sonnet if ${other} is also out); release this worker, do not retry it until reset`;
+    `route new code to ${other} (or Sonnet if ${other} is also out); follow the WORKER HANDOVER recipe ` +
+    'to commit WIP and HANDOVER.md before stopping/releasing this worker; do not retry it until reset';
 }
 
 /** Probe only coders with live supervised workers. The existing quota helpers own the
@@ -1125,12 +1126,15 @@ function main() {
       // attributed to a terminal whose tracked worker agent is kimi (RT-3).
       const handleAgent = new Map();
       const handleDispatch = new Map();
+      const handleAliases = new Map();
       const handleWorkerState = terminalWorkerStates(ws || []);
       for (const row of ws || []) {
         if (row && row.agentTerminalHandle) {
           const agent = stateWorkerForRow(row, tickState)?.agent || row.agent;
           if (agent) handleAgent.set(row.agentTerminalHandle, agent);
           if (row.dispatchId) handleDispatch.set(row.agentTerminalHandle, row.dispatchId);
+          handleAliases.set(row.agentTerminalHandle,
+            [row.agentTerminalHandle, row.dispatchId, row.taskId].filter(Boolean));
         }
       }
       for (const [id, w] of Object.entries(tickState.workers || {})) {
@@ -1183,21 +1187,23 @@ function main() {
           });
           if (event) events.push(event);
         } else if (verdict.kind === 'rate_limit') {
-          if (reportedRateLimit.has(t.handle)) continue;
-          reportedRateLimit.add(t.handle);
-          events.push(
-            `RATE LIMIT on ${label}: back off, then retry the SAME dispatch with ` +
-            '`orca orchestration worker-start --retry-of <dispatchId>`. Do not start a replacement, ' +
-            'and reduce how many coder workers run in parallel.'
-          );
+          if (!reportedRateLimit.has(t.handle)) {
+            reportedRateLimit.add(t.handle);
+            events.push(
+              `RATE LIMIT on ${label}: back off, then retry the SAME dispatch with ` +
+              '`orca orchestration worker-start --retry-of <dispatchId>`. Do not start a replacement, ' +
+              'and reduce how many coder workers run in parallel.'
+            );
+          }
         } else if (verdict.kind === 'connection_lost') {
-          if (reportedDisconnect.has(t.handle)) continue;
-          reportedDisconnect.add(t.handle);
-          savePersistedDisconnectReports(reportedDisconnect);
-          events.push(
-            `WORKER STUCK on ${label}: Codex session lost its app-server connection - ` +
-            'its work since the last commit may be lost; release and re-dispatch'
-          );
+          if (!reportedDisconnect.has(t.handle)) {
+            reportedDisconnect.add(t.handle);
+            savePersistedDisconnectReports(reportedDisconnect);
+            events.push(
+              `WORKER STUCK on ${label}: Codex session lost its app-server connection - ` +
+              'its work since the last commit may be lost; release and re-dispatch'
+            );
+          }
         } else if (verdict.kind === 'approval_waiting') {
           if (TERMINAL_WORKER_STATES.has(workerState)) {
             if (reportedApproval.delete(t.handle)) savePersistedApprovalReports(reportedApproval);
@@ -1214,9 +1220,10 @@ function main() {
         } else if (verdict.kind === 'orphaned') {
           // Orphans already present at startup are backlog, not this run's event: reporting
           // them would make every restarted daemon exit on its first tick, breaking the loop.
-          if (baseOrphans.has(t.handle) || reportedOrphans.has(t.handle)) continue;
-          reportedOrphans.add(t.handle);
-          events.push(`ORPHANED terminal ${label} — close it.`);
+          if (!baseOrphans.has(t.handle) && !reportedOrphans.has(t.handle)) {
+            reportedOrphans.add(t.handle);
+            events.push(`ORPHANED terminal ${label} — close it.`);
+          }
         } else if (verdict.kind === 'idle' && reportedIdle.get(t.handle) !== t.lastOutputAt) {
           reportedIdle.set(t.handle, t.lastOutputAt);
           savePersistedIdleReports(reportedIdle);
@@ -1244,8 +1251,9 @@ function main() {
               threshold,
               warnMargin: cfg.handoverWarnMarginPercent,
               exhausted,
-              target,
-              worktreePath: terminalWorktreePath(t, ws || []),
+                target,
+                aliases: handleAliases.get(t.handle) || [t.handle],
+                worktreePath: terminalWorktreePath(t, ws || []),
               now,
             });
             if (handover.changed) handoverChanged = true;

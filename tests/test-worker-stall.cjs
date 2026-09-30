@@ -521,6 +521,10 @@ check('handover episode persists across heartbeat restart', handover.observe(han
 }).event, null);
 check('gate reminder lists persisted workers needing handover',
   handover.reminder(stateDir, 'worker-stall-test').includes('ctx_kimi_quota (kimi 95%, handover -> Codex)'), true);
+check('gate drops a saved handover record after its worker is gone',
+  handover.reminder(stateDir, 'worker-stall-test', new Set()), '');
+check('stale handover removal is persisted without a heartbeat',
+  handover.loadRecords(stateDir, 'worker-stall-test').size, 0);
 
 const codexHandoverEvent = handover.observe(new Map(), {
   handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 97,
@@ -535,11 +539,44 @@ const kimiExhaustedVerdict = heartbeat.classifyTerminal({
 }, kimiExhaustedCtx);
 check('Kimi 403 billing-cycle output is a handover exhaustion trigger',
   [kimiExhaustedVerdict.kind, kimiExhaustedVerdict.coder], ['usage_exhausted', 'kimi']);
-check('Kimi exhaustion emits handover even without a quota probe reading',
-  /^WORKER HANDOVER ctx_kimi_403 \(kimi 100% >= 95%\)/.test(handover.observe(new Map(), {
+check('Kimi exhaustion names the usage-limit signal instead of inventing a percentage',
+  /^WORKER HANDOVER ctx_kimi_403 \(kimi usage-limit signal\)/.test(handover.observe(new Map(), {
     handle: 'term_kimi_403', identity: 'ctx_kimi_403', agent: 'kimi', usedPercent: undefined,
     threshold: 95, warnMargin: 5, exhausted: true, target: 'codex', now: start,
   }).event), true);
+check('a signal-triggered handover ignores a contradictory low live percentage in its text',
+  /^WORKER HANDOVER ctx_kimi_low \(kimi usage-limit signal\)/.test(handover.observe(new Map(), {
+    handle: 'term_kimi_low', identity: 'ctx_kimi_low', agent: 'kimi', usedPercent: 40,
+    threshold: 95, warnMargin: 5, exhausted: true, target: 'codex', now: start,
+  }).event), true);
+const aliasedSignalRecords = new Map();
+handover.observe(aliasedSignalRecords, {
+  handle: 'term_alias', identity: 'ctx_alias', aliases: ['task_alias'],
+  agent: 'kimi', usedPercent: 40, threshold: 95, warnMargin: 5,
+  exhausted: true, target: 'codex', now: start,
+});
+handover.saveRecords(stateDir, 'aliased-handover', aliasedSignalRecords);
+check('usage-limit gate reminder never shows the contradictory live percentage',
+  handover.reminder(stateDir, 'aliased-handover', new Set(['task_alias']))
+    .includes('ctx_alias (kimi usage-limit signal, handover -> Codex)'), true);
+check('a live task alias preserves the persisted terminal/dispatch handover record',
+  handover.loadRecords(stateDir, 'aliased-handover').size, 1);
+check('the same aliased record is dropped once no worker alias remains live',
+  handover.reminder(stateDir, 'aliased-handover', new Set()), '');
+
+const usageReport = heartbeat.reportUsageExhausted({
+  reported: new Set(), handle: 'term_usage_recipe', label: 'term_usage_recipe', coder: 'kimi',
+});
+check('usage-limit report points to committing WIP and HANDOVER.md before release',
+  usageReport.includes('follow the WORKER HANDOVER recipe') &&
+    usageReport.includes('commit WIP and HANDOVER.md before stopping/releasing'), true);
+
+const repeatedSignalHandover = handover.observe(new Map(), {
+  handle: 'term_rate_loop', identity: 'ctx_rate_loop', agent: 'codex', usedPercent: 96,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'kimi', now: start,
+}).event;
+check('handover remains evaluable for an already-reported terminal signal',
+  /^WORKER HANDOVER ctx_rate_loop \(codex 96% >= 95%\)/.test(repeatedSignalHandover), true);
 
 const codexUsageLine = '■ You\'ve hit your usage limit. Try again later.';
 check('Codex usage-limit output is distinguished from a transient generic 429',

@@ -1037,7 +1037,10 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   }
   parts.push(`Model routing: plan/red-team/review -> model ${modelLabel(cfg.models.review)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);
-  const handoverReminder = HANDOVER.reminder(DIR, s.session_id);
+  const activeHandoverIds = new Set(live.flatMap(([key, worker]) => [
+    key, worker.group, worker.dispatchId, worker.taskId, worker.terminalHandle,
+  ].filter(Boolean)));
+  const handoverReminder = HANDOVER.reminder(DIR, s.session_id, activeHandoverIds);
   if (handoverReminder) parts.push(handoverReminder);
   if (live.length) {
     const baseline = s.last_heartbeat || Math.min(...live.map(([, w]) => w.started || Date.now()));

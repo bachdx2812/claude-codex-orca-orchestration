@@ -69,6 +69,10 @@ function formatEvent(record) {
       `${record.warnAt}% warning; handover at ${record.threshold}%) -> prepare ${destination}; ` +
       'let the worker finish only a small safe step';
   }
+  if (record.trigger === 'usage-limit') {
+    return `WORKER HANDOVER ${record.identity} (${record.agent} usage-limit signal) -> ` +
+      `hand over to ${destination}. ${handoverRecipe(record.agent, record.target, record.worktreePath)}`;
+  }
   return `WORKER HANDOVER ${record.identity} (${record.agent} ${used}% >= ${record.threshold}%) -> ` +
     `hand over to ${destination}. ${handoverRecipe(record.agent, record.target, record.worktreePath)}`;
 }
@@ -92,6 +96,8 @@ function observe(records, input) {
     threshold: input.threshold,
     warnAt: Math.max(0, input.threshold - input.warnMargin),
     target: input.target,
+    trigger: input.exhausted ? 'usage-limit' : 'quota',
+    aliases: [...new Set([input.handle, input.identity, ...(input.aliases || [])].filter(Boolean))],
     worktreePath: input.worktreePath || '',
     observedAt: previous?.signature === signature ? previous.observedAt : input.now,
   };
@@ -100,11 +106,24 @@ function observe(records, input) {
   return { event: emit ? formatEvent(record) : null, changed: emit || JSON.stringify(previous) !== JSON.stringify(record), record };
 }
 
-function reminder(stateDir, session) {
-  const records = [...loadRecords(stateDir, session).values()];
+function reminder(stateDir, session, activeIds) {
+  const persisted = loadRecords(stateDir, session);
+  if (activeIds instanceof Set) {
+    let changed = false;
+    for (const [handle, record] of persisted) {
+      const aliases = new Set([handle, record.identity, ...(record.aliases || [])].filter(Boolean));
+      if (![...aliases].some((id) => activeIds.has(id))) {
+        persisted.delete(handle);
+        changed = true;
+      }
+    }
+    if (changed) saveRecords(stateDir, session, persisted);
+  }
+  const records = [...persisted.values()];
   if (!records.length) return '';
   return 'Workers needing quota handover: ' + records.map((record) =>
-    `${record.identity} (${record.agent} ${Math.round(record.usedPercent)}%, ${record.stage} -> ${targetLabel(record.target)})`
+    `${record.identity} (${record.agent} ${record.trigger === 'usage-limit' ? 'usage-limit signal' : `${Math.round(record.usedPercent)}%`}, ` +
+    `${record.stage} -> ${targetLabel(record.target)})`
   ).join(', ') + '. Follow the heartbeat handover recipe; preserve the same worktree/branch.';
 }
 
