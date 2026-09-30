@@ -167,13 +167,13 @@ function readSessionQuota(now = Date.now()) {
       }
       if (now - observedAt > CODEX_SESSION_STALE_MS) continue;
       const rl = event.rateLimits;
-      const used = [rl.primary, rl.secondary]
+      const windows = [rl.primary, rl.secondary]
         .filter(Boolean)
         .map((w) => windowUsed(w.used_percent, w.resets_at ? w.resets_at * 1000 : 0, now, false))
         .filter((v) => v !== null);
-      if (used.length) {
+      if (windows.length) {
         return {
-          usedPercent: Math.max(...used),
+          usedPercent: Math.max(...windows),
           resetsAt: 0,
           fetchedAt: observedAt,
           source: 'session log',
@@ -201,6 +201,15 @@ function effectiveUsedPercent(window, now) {
   return { usedPercent: window.usedPercent, resetsAt };
 }
 
+/** Every usable window of a live app-server result (unreduced). */
+function liveQuotaWindows(result, now = Date.now()) {
+  const limits = result && result.rateLimits;
+  if (!limits || typeof limits !== 'object') return [];
+  return [limits.primary, limits.secondary]
+    .map((window) => effectiveUsedPercent(window, now))
+    .filter(Boolean);
+}
+
 /** Convert a live app-server result to the tightest usable window. */
 function parseLiveQuota(result, now = Date.now()) {
   const limits = result && result.rateLimits;
@@ -209,10 +218,7 @@ function parseLiveQuota(result, now = Date.now()) {
     !!(result && result.ordinaryUsageAllowed === false) ||
     !!(limits && limits.ordinaryUsageAllowed === false);
   if (limitReached) return { usedPercent: 100, resetsAt: 0, limitReached: true };
-  if (!limits || typeof limits !== 'object') return null;
-  const windows = [limits.primary, limits.secondary]
-    .map((window) => effectiveUsedPercent(window, now))
-    .filter(Boolean);
+  const windows = liveQuotaWindows(result, now);
   if (!windows.length) return null;
   return windows.reduce((tightest, window) => (
     window.usedPercent > tightest.usedPercent ? window : tightest
@@ -241,9 +247,9 @@ function kimiWindow(limit, remaining, resetTime, now, usedRatio) {
   return resetsAt && resetsAt * 1000 <= now ? { usedPercent: 0, resetsAt: 0 } : { usedPercent, resetsAt };
 }
 
-/** Convert Kimi's /usages response to the tightest usable quota window. */
-function parseKimiUsages(body, now = Date.now()) {
-  if (!body || typeof body !== 'object') return null;
+/** Every usable window of a Kimi /usages response (unreduced). */
+function kimiQuotaWindows(body, now = Date.now()) {
+  if (!body || typeof body !== 'object') return [];
   const windows = [];
   const usage = body.usage;
   if (usage && typeof usage === 'object') {
@@ -264,7 +270,12 @@ function parseKimiUsages(body, now = Date.now()) {
       }
     }
   }
-  const valid = windows.filter(Boolean);
+  return windows.filter(Boolean);
+}
+
+/** Convert Kimi's /usages response to the tightest usable quota window. */
+function parseKimiUsages(body, now = Date.now()) {
+  const valid = kimiQuotaWindows(body, now);
   return valid.length ? valid.reduce((a, b) => b.usedPercent > a.usedPercent ? b : a) : null;
 }
 
@@ -292,7 +303,7 @@ function kimiLiveResult(now, env) {
       return { failed: true, kind: typeof reply.kind === 'string' ? reply.kind : 'http' };
     }
     const quota = parseKimiUsages(reply.body, now);
-    return quota || { failed: true, kind: 'parse' };
+    return quota ? { ...quota, windows: kimiQuotaWindows(reply.body, now) } : { failed: true, kind: 'parse' };
   } catch {
     return { failed: true, kind: 'parse' };
   }
@@ -308,13 +319,65 @@ function cachedKimiResult(entry, now) {
       entry.usedPercent < 0 || entry.usedPercent > 100 ||
       typeof entry.resetsAt !== 'number' || !Number.isFinite(entry.resetsAt) || entry.resetsAt < 0 ||
       (entry.resetsAt && entry.resetsAt * 1000 <= now)) return null;
-  return { usedPercent: entry.usedPercent, resetsAt: entry.resetsAt, fetchedAt: entry.fetchedAt, source: 'live' };
+  return { usedPercent: entry.usedPercent, resetsAt: entry.resetsAt, fetchedAt: entry.fetchedAt, source: 'live',
+    ...(Array.isArray(entry.windows) ? { windows: entry.windows } : {}) };
+}
+
+// --- last-known quota + reset-aware estimate ---------------------------------
+// A live read often fails (Kimi's access token expires whenever no Kimi CLI is running).
+// The last SUCCESSFUL reading per coder is therefore persisted on its own — used% per
+// window, resetAt per window, readAt — so a later failure can still produce an ESTIMATE:
+// a window whose reset time has passed counts as 0% used, every other window keeps its last
+// reading, and the tightest window wins. Unknown only when a coder was never read at all.
+const LAST_KNOWN_FILE = { codex: 'codex-quota-last-known.json', kimi: 'kimi-quota-last-known.json' };
+
+function validKnownWindow(w) {
+  return w && typeof w.usedPercent === 'number' && Number.isFinite(w.usedPercent) &&
+    w.usedPercent >= 0 && w.usedPercent <= 100 &&
+    (w.resetsAt === undefined || (typeof w.resetsAt === 'number' && Number.isFinite(w.resetsAt) && w.resetsAt >= 0));
+}
+
+/** Persist a successful reading (`quota.windows` when present, else its tightest window). */
+function persistLastKnownQuota(stateDir, coder, quota, now = Date.now()) {
+  const file = LAST_KNOWN_FILE[coder];
+  if (!file || !stateDir || !quota) return;
+  const raw = Array.isArray(quota.windows) && quota.windows.length
+    ? quota.windows
+    : [{ usedPercent: quota.usedPercent, resetsAt: quota.resetsAt || 0 }];
+  const windows = raw.filter(validKnownWindow)
+    .map((w) => ({ usedPercent: w.usedPercent, resetsAt: w.resetsAt || 0 }));
+  if (!windows.length) return;
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    const target = path.join(stateDir, file);
+    const temp = `${target}.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify({ windows, readAt: now }), { mode: 0o600 });
+    fs.renameSync(temp, target);
+  } catch {}
+}
+
+/**
+ * The reset-aware estimate from the persisted last-known reading, or null when the coder
+ * was never read successfully. Marked `estimated: true` with `fetchedAt` = the original
+ * read time, so the reminder can say "est., read 40m ago".
+ */
+function estimatedQuota(stateDir, coder, now = Date.now()) {
+  const file = LAST_KNOWN_FILE[coder];
+  if (!file || !stateDir) return null;
+  let entry;
+  try { entry = JSON.parse(fs.readFileSync(path.join(stateDir, file), 'utf8')); } catch { return null; }
+  if (!entry || !Array.isArray(entry.windows) ||
+      typeof entry.readAt !== 'number' || !Number.isFinite(entry.readAt)) return null;
+  const used = entry.windows.filter(validKnownWindow)
+    .map((w) => (w.resetsAt && w.resetsAt * 1000 <= now ? 0 : w.usedPercent));
+  if (!used.length) return null;
+  return { usedPercent: Math.max(...used), resetsAt: 0, fetchedAt: entry.readAt, estimated: true, source: 'estimate' };
 }
 
 function kimiQuota(now = Date.now(), options = {}) {
   const stateDir = options.stateDir || process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
   const cacheSeconds = options.cacheSeconds === undefined ? DEFAULT_CACHE_SECONDS : options.cacheSeconds;
-  return liveCache().cachedLiveProbe({
+  const result = liveCache().cachedLiveProbe({
     stateDir,
     cacheFile: KIMI_LIVE_CACHE_FILE,
     lockName: KIMI_LIVE_PROBE_LOCK,
@@ -324,6 +387,12 @@ function kimiQuota(now = Date.now(), options = {}) {
     validate: cachedKimiResult,
     probeTimeoutMs: KIMI_LIVE_TIMEOUT_MS,
   });
+  if (result && !result.failed) {
+    persistLastKnownQuota(stateDir, 'kimi', result, now);
+    return result;
+  }
+  // Live read unavailable: fall back to the reset-aware estimate of the last known reading.
+  return estimatedQuota(stateDir, 'kimi', now) || result;
 }
 
 function liveQuotaResult(now = Date.now()) {
@@ -340,8 +409,9 @@ function liveQuotaResult(now = Date.now()) {
   }
   if (probe.error || probe.status !== 0 || !stdout) return null;
   try {
-    const quota = parseLiveQuota(JSON.parse(stdout), now);
-    return quota ? { ...quota, authState: 'ok' } : null;
+    const parsed = JSON.parse(stdout);
+    const quota = parseLiveQuota(parsed, now);
+    return quota ? { ...quota, authState: 'ok', windows: liveQuotaWindows(parsed, now) } : null;
   } catch { return null; }
 }
 
@@ -367,7 +437,8 @@ function cachedQuotaResult(cached, now) {
       (cached.resetsAt && cached.resetsAt * 1000 <= now)) return null;
   const effective = effectiveUsedPercent(cached, now);
   return effective
-    ? { ...effective, fetchedAt: cached.fetchedAt, source: 'live', limitReached: cached.limitReached === true }
+    ? { ...effective, fetchedAt: cached.fetchedAt, source: 'live', limitReached: cached.limitReached === true,
+        ...(Array.isArray(cached.windows) ? { windows: cached.windows } : {}) }
     : null;
 }
 
@@ -401,9 +472,18 @@ function codexQuota(now = Date.now(), options = {}) {
     validate: cachedQuotaResult,
     probeTimeoutMs: LIVE_TIMEOUT_MS,
   });
-  if (result && !result.failed) return result;
+  if (result && !result.failed) {
+    persistLastKnownQuota(stateDir, 'codex', result, now);
+    return result;
+  }
   if (result && result.authState === 'logged-out') return result;
-  return readSessionQuota(now);
+  const sessionQuota = readSessionQuota(now);
+  if (sessionQuota) {
+    persistLastKnownQuota(stateDir, 'codex', sessionQuota, now);
+    return sessionQuota;
+  }
+  // Same fallback as Kimi: estimate from the last known reading when nothing live answers.
+  return estimatedQuota(stateDir, 'codex', now);
 }
 
 /** Read the last cached Codex auth state without spawning the app-server probe.
@@ -466,7 +546,9 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
     : 'Claude unknown';
   const codexSource = !quota ? 'unknown' : quota.source === 'live'
     ? `${quota.limitReached ? 'limit reached, ' : ''}live, ${formatAge(Math.max(0, now - quota.fetchedAt))} ago`
-    : `session log, ${formatAge(quota.ageMs)} old`;
+    : quota.source === 'estimate'
+      ? `est., read ${formatAge(Math.max(0, now - quota.fetchedAt))} ago`
+      : `session log, ${formatAge(quota.ageMs)} old`;
   return {
     route: pickExecRoute(claudeLeft, codexLeft, handoffUsedPct),
     claudeLeft,
@@ -478,5 +560,7 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
 
 module.exports = {
   pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
-  parseLiveQuota, parseKimiUsages, liveQuota, codexQuota, kimiQuota, codexAuthState, readFreshCache, formatAge,
+  parseLiveQuota, parseKimiUsages, liveQuotaWindows, kimiQuotaWindows,
+  liveQuota, codexQuota, kimiQuota, codexAuthState, readFreshCache, formatAge,
+  persistLastKnownQuota, estimatedQuota,
 };

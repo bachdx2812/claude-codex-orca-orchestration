@@ -53,6 +53,8 @@ const DEFAULT_CONFIG = {
   kimiHandoffUsedPercent: 95,
   kimiQuotaCacheSeconds: 60,
   coderAvailabilityCacheSeconds: 600,
+  coderHeadroomTieBand: 10, // headroom points within which two coders tie (falls back to fewer live workers)
+  unknownHeadroomAssumed: 30, // headroom points a quota-unknown coder is ranked as
   execFallbackWhenCodexUnavailable: 'sonnet',
   heartbeat: { intervalSeconds: 20, idleSeconds: 60, maxSeconds: 3600 },
   maxParallelCodexWorkers: 3, // 0 = unlimited
@@ -195,6 +197,30 @@ function loadConfig() {
     merged.coderAvailabilityCacheSeconds = DEFAULT_CONFIG.coderAvailabilityCacheSeconds;
   } else {
     merged.coderAvailabilityCacheSeconds = availabilityCache;
+  }
+
+  // Blank (null / empty string) counts as unset and silently takes the default; any other
+  // non-integer or out-of-range value warns and defaults.
+  const tieBand = configuredNumber(merged.coderHeadroomTieBand);
+  if (merged.coderHeadroomTieBand === null ||
+      (typeof merged.coderHeadroomTieBand === 'string' && merged.coderHeadroomTieBand.trim() === '')) {
+    merged.coderHeadroomTieBand = DEFAULT_CONFIG.coderHeadroomTieBand;
+  } else if (!Number.isInteger(tieBand) || tieBand < 0 || tieBand > 100) {
+    warnings.push(`coderHeadroomTieBand "${merged.coderHeadroomTieBand}" is not an integer 0-100; using ${DEFAULT_CONFIG.coderHeadroomTieBand}.`);
+    merged.coderHeadroomTieBand = DEFAULT_CONFIG.coderHeadroomTieBand;
+  } else {
+    merged.coderHeadroomTieBand = tieBand;
+  }
+
+  const unknownAssumed = configuredNumber(merged.unknownHeadroomAssumed);
+  if (merged.unknownHeadroomAssumed === null ||
+      (typeof merged.unknownHeadroomAssumed === 'string' && merged.unknownHeadroomAssumed.trim() === '')) {
+    merged.unknownHeadroomAssumed = DEFAULT_CONFIG.unknownHeadroomAssumed;
+  } else if (!Number.isInteger(unknownAssumed) || unknownAssumed < 0 || unknownAssumed > 100) {
+    warnings.push(`unknownHeadroomAssumed "${merged.unknownHeadroomAssumed}" is not an integer 0-100; using ${DEFAULT_CONFIG.unknownHeadroomAssumed}.`);
+    merged.unknownHeadroomAssumed = DEFAULT_CONFIG.unknownHeadroomAssumed;
+  } else {
+    merged.unknownHeadroomAssumed = unknownAssumed;
   }
 
   if (!Array.isArray(merged.disabledGates)) {

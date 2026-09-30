@@ -13,11 +13,17 @@
  *     of this option.
  *   - nothing usable => `route: 'code'`: the in-session code model (default alias sonnet).
  *
- * Tie-breaking among eligible coders (spread load, never concentrate on one coder):
- * free concurrency slot (a ranking key, not a filter) -> fewer live workers -> more
- * headroom below each coder's OWN resolved threshold (only when both quotas are known)
- * -> alternate away from `options.lastCoder` (validated; ignored when not eligible)
- * -> Codex first.
+ * Ranking among eligible coders (binding operator decision, 2026-10-01 — MORE QUOTA LEFT
+ * first, superseding the older "fewer live workers first" order):
+ * free per-session concurrency slot (a ranking key, not a filter) -> MORE HEADROOM below
+ * each coder's OWN resolved threshold -> within a tie band (`options.tieBand`, default 10
+ * headroom points) fewer live workers machine-wide -> the coder other than
+ * `options.lastCoder` -> Codex first. A coder whose quota is UNKNOWN ranks as if its
+ * headroom were `options.unknownAssumed` (default 30) points: below any coder with known
+ * headroom >= that value, above one with less. Headroom is known as often as possible —
+ * quota readings may carry `estimated: true` (a reset-aware estimate of the last
+ * successful live read, see exec-route-by-quota.cjs) and then count as known, surfaced
+ * via `coders[coder].estimated` / `quotaFetchedAt` for the reminder text.
  *
  * `options.live` is MACHINE-wide live counts (the load-balancing ordering key);
  * `options.sessionLive` is THIS session's live counts, the basis of the free-slot key:
@@ -67,9 +73,18 @@ function pickCoderPool(options = {}) {
   const sessionLive = options.sessionLive || live;
   const caps = options.caps || {};
   const lastCoder = CODERS.includes(options.lastCoder) ? options.lastCoder : null;
+  const tieBand = Number.isInteger(options.tieBand) && options.tieBand >= 0 ? options.tieBand : 10;
+  const unknownAssumed = Number.isInteger(options.unknownAssumed) &&
+    options.unknownAssumed >= 0 && options.unknownAssumed <= 100 ? options.unknownAssumed : 30;
   const coders = {};
   const thresholdFor = (coder) => typeof thresholds[coder] === 'number' ? thresholds[coder] : 95;
   const headroomFor = (coder) => knownQuota(quotas[coder]) ? thresholdFor(coder) - quotas[coder].usedPercent : null;
+  // The ranking headroom: known when a (possibly estimated) reading exists, the configured
+  // assumed value when unknown — unknown ranks below known >= assumed and above known < assumed.
+  const rankHeadroomFor = (coder) => {
+    const h = headroomFor(coder);
+    return h === null ? unknownAssumed : h;
+  };
 
   for (const coder of CODERS) {
     const available = availability[coder] || { usable: false, reason: 'not installed' };
@@ -94,7 +109,9 @@ function pickCoderPool(options = {}) {
       state = 'exhausted';
       reason = exhaustion[coder].reason || 'quota exhaustion marker active';
     }
-    coders[coder] = { state, leftPct, headroom: headroomFor(coder), live: liveCount, sessionLive: sessionLiveCount, cap, reason };
+    coders[coder] = { state, leftPct, headroom: headroomFor(coder), live: liveCount, sessionLive: sessionLiveCount, cap, reason,
+      estimated: knownQuota(quota) && quota.estimated === true,
+      quotaFetchedAt: knownQuota(quota) && typeof quota.fetchedAt === 'number' ? quota.fetchedAt : null };
   }
 
   const order = CODERS.filter((coder) => coders[coder].state === 'eligible');
@@ -102,9 +119,9 @@ function pickCoderPool(options = {}) {
   order.sort((a, b) => {
     const aFree = freeSlot(a); const bFree = freeSlot(b);
     if (aFree !== bFree) return aFree ? -1 : 1;
+    const ah = rankHeadroomFor(a); const bh = rankHeadroomFor(b);
+    if (Math.abs(ah - bh) > tieBand) return bh - ah;
     if (coders[a].live !== coders[b].live) return coders[a].live - coders[b].live;
-    const ah = headroomFor(a); const bh = headroomFor(b);
-    if (ah !== null && bh !== null && ah !== bh) return bh - ah;
     if (lastCoder === a) return 1;
     if (lastCoder === b) return -1;
     return a === 'codex' ? -1 : 1;
@@ -124,17 +141,20 @@ function pickCoderPool(options = {}) {
     pickReason = 'all at cap, wait';
   } else if (order.length > 1) {
     const other = order[1];
+    const pickH = rankHeadroomFor(pick); const otherH = rankHeadroomFor(other);
     if (freeSlot(pick) !== freeSlot(other)) pickReason = 'free capacity';
-    else if (coders[pick].live !== coders[other].live) pickReason = 'fewer live';
-    else if (headroomFor(pick) !== null && headroomFor(other) !== null &&
-        headroomFor(pick) !== headroomFor(other)) pickReason = 'more headroom';
+    else if (Math.abs(pickH - otherH) > tieBand) {
+      pickReason = `more quota left: ${Math.round(pickH)} vs ${Math.round(otherH)}`;
+    } else if (coders[pick].live !== coders[other].live) pickReason = 'fewer live';
     else if (lastCoder === other) pickReason = 'alternation';
     else pickReason = 'codex first';
   }
   const summary = `${CODERS.map((coder) => {
     const state = coders[coder];
     if (state.state !== 'eligible') return formatCoderState(coder, state);
-    const quotaText = state.leftPct === null ? 'quota unknown, available' : `${Math.round(state.leftPct)}% left`;
+    const quotaText = state.leftPct === null ? 'quota unknown, available'
+      : state.estimated ? `~${Math.round(100 - state.leftPct)}% used (est.)`
+        : `${Math.round(state.leftPct)}% left`;
     return `${label(coder)} ${quotaText} (${liveText(state)})`;
   }).join(' or ')}; pick ${label(pick)}`;
   return { route: 'external', order, pick, coders, summary, why: `auto: spread, pick ${label(pick)} (${pickReason})` };

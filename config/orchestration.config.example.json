@@ -18,6 +18,8 @@
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
+  "coderHeadroomTieBand": 10,
+  "unknownHeadroomAssumed": 30,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,

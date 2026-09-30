@@ -462,6 +462,7 @@ function coderPoolRoute(cfg, s, now = Date.now()) {
   return CODER_POOL.pickCoderPool({
     availability, quotas,
     thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg) },
+    tieBand: cfg.coderHeadroomTieBand, unknownAssumed: cfg.unknownHeadroomAssumed,
     exhaustion: CODER_AVAILABILITY.readCoderExhaustion(DIR, now),
     live: machineWideCoderLive(s, now),
     sessionLive: sessionCoderLive(s),
@@ -1075,8 +1076,16 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     const coderText = (coder) => {
       const c = ex.coders[coder];
       const liveText = `${c.live} live`;
-      const headroomText = c.headroom === null ? 'quota unknown' : `${Math.max(0, Math.round(c.headroom))}% headroom`;
-      return `${coder === 'codex' ? 'Codex' : 'Kimi'} (${liveText}, ${headroomText})`;
+      let quotaText;
+      if (c.headroom === null || c.headroom === undefined) {
+        quotaText = 'quota unknown';
+      } else if (c.estimated) {
+        const readAgo = c.quotaFetchedAt ? EXEC_QUOTA.formatAge(Math.max(0, Date.now() - c.quotaFetchedAt)) : 'unknown';
+        quotaText = `~${Math.max(0, Math.round(100 - c.leftPct))}% used (est., read ${readAgo} ago)`;
+      } else {
+        quotaText = `${Math.max(0, Math.round(c.headroom))}% headroom`;
+      }
+      return `${coder === 'codex' ? 'Codex' : 'Kimi'} (${liveText}, ${quotaText})`;
     };
     codeRoute = `split: ${coderText('codex')} + ${coderText('kimi')}; next -> ${ex.pick === 'codex' ? 'Codex' : 'Kimi'}`;
   } else if (ex.route === 'external' && ex.coders) {

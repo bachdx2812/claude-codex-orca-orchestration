@@ -25,7 +25,7 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kim
 | Main panel (orchestrator) | Takes the request, delegates, supervises workers, reports; never writes code | Session default model | — | `activation` |
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Reviewer / verifier | Code review, verification | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
-| Coder pool (peers) | Every task class previously handled by Codex: code, builds, refactors, tests, bulk conversions, and fix loops | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) | Spread across eligible Orca workers. Pick fewer live workers, then more headroom below that coder's own threshold, then the coder other than `lastCoder`, then Codex as the final tie-break. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`. | `models.codex`, `models.kimi`, per-coder caps and thresholds |
+| Coder pool (peers) | Every task class previously handled by Codex: code, builds, refactors, tests, bulk conversions, and fix loops | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) | Spread across eligible Orca workers. Pick the coder with MORE QUOTA LEFT first: a free per-session slot, then more headroom below that coder's own threshold; within `coderHeadroomTieBand` (default 10 points), fewer live workers machine-wide; then the coder other than `lastCoder`; then Codex. A quota-unknown coder ranks as `unknownHeadroomAssumed` (default 30) headroom points; a reset-aware estimate of the last successful reading counts as known. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`. | `models.codex`, `models.kimi`, per-coder caps and thresholds, `coderHeadroomTieBand`, `unknownHeadroomAssumed` |
 | Coder (handoff) | Same work once every usable coder has used >= its handoff threshold of its live-read quota (Codex: `codexHandoffUsedPercent`, default 95, override `ORCH_CODEX_HANDOFF_USED`; Kimi: `kimiHandoffUsedPercent`, default 95, override `ORCH_KIMI_HANDOFF_USED`) or is unusable on this machine | Sonnet | `Agent` with `model: "sonnet"` (brief must name a verify command) | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `models.code`, `execFallbackWhenCodexUnavailable` |
 | Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
 | Escalation | Only after Opus 5.5 failed even at higher effort; the dispatch must say both | Fable 5.1 (`claude-fable-5-1`) | `Agent` with `model: "fable"` + "escalation: opus failed ... at high effort ..." | `models.escalation` |
@@ -311,6 +311,8 @@ The file is plain JSON — no comments — parsed as-is:
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
+  "coderHeadroomTieBand": 10,
+  "unknownHeadroomAssumed": 30,
   "replyLanguage": "Vietnamese",
   "maxParallelCodexWorkers": 5,
   "maxParallelKimiWorkers": 3,
@@ -326,6 +328,10 @@ The file is plain JSON — no comments — parsed as-is:
 tunable via this file or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`);
 `kimiQuotaCacheSeconds` and `coderAvailabilityCacheSeconds` (default 600, the per-machine
 "is this coder installed and signed in?" probe TTL) mirror the Codex cache key;
+`coderHeadroomTieBand` (default 10) is the headroom-point band within which two coders tie
+and the pick falls back to fewer live workers; `unknownHeadroomAssumed` (default 30) is the
+headroom a quota-unknown coder is ranked as — below any coder with known headroom >= that
+value, above one with less (both blank/unset = default);
 `codexQuotaCacheSeconds` controls the cross-process live-reading
 cache TTL (`0` disables file-cache reuse but retains memoization inside one hook process);
 `replyLanguage` accepts any language name, or `null` for no

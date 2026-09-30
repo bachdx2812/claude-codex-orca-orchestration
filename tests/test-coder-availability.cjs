@@ -333,7 +333,7 @@ async function run() {
     check('Codex threshold exhaustion leaves Kimi only', pick({ quotas: { codex: { usedPercent: 95 }, kimi: { usedPercent: 1 } } }).order, ['kimi']);
     check('Kimi threshold exhaustion leaves Codex only', pick({ quotas: { codex: { usedPercent: 1 }, kimi: { usedPercent: 95 } } }).order, ['codex']);
     check('separate thresholds rank by own-threshold headroom', pick({
-      quotas: { codex: { usedPercent: 50 }, kimi: { usedPercent: 80 } }, thresholds: { codex: 60, kimi: 95 },
+      quotas: { codex: { usedPercent: 50 }, kimi: { usedPercent: 60 } }, thresholds: { codex: 60, kimi: 95 },
     }).pick, 'kimi');
     check('active Kimi marker excludes it', pick({ exhaustion: { kimi: { at: Date.now(), until: Date.now() + 10000 } } }).order, ['codex']);
     check('newer healthy live quota supersedes marker', pick({
@@ -344,6 +344,47 @@ async function run() {
     const unusable = pick({ availability: { codex: { usable: false, reason: 'not logged in' }, kimi: { usable: false, reason: 'not installed' } } });
     check('both unusable route to code with both reasons', [unusable.route, /not logged in/.test(unusable.why), /not installed/.test(unusable.why)], [ 'code', true, true ]);
     check('free capacity outranks quota headroom', pick({ live: { codex: 3, kimi: 2 } }).pick, 'kimi');
+    // Fix 6 pick order (binding, 2026-10-01): MORE QUOTA LEFT first — more headroom beats
+    // fewer live workers once the difference is outside the tie band. (`sessionLive` is
+    // zeroed so the per-session free-slot key does not mask the headroom ordering.)
+    check('more headroom beats fewer live workers outside the tie band', pick({
+      live: { codex: 3, kimi: 0 }, sessionLive: { codex: 0, kimi: 0 },
+      quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 80 } },
+    }).pick, 'codex');
+    check('the pick reason names both headrooms', /more quota left: 85 vs 15/.test(pick({
+      live: { codex: 3, kimi: 0 }, sessionLive: { codex: 0, kimi: 0 },
+      quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 80 } },
+    }).why), true);
+    check('within the tie band fewer live workers decides', pick({
+      live: { codex: 3, kimi: 0 }, sessionLive: { codex: 0, kimi: 0 },
+      quotas: { codex: { usedPercent: 20 }, kimi: { usedPercent: 10 } },
+    }).pick, 'kimi');
+    check('a wider configured tie band widens the tie', pick({
+      live: { codex: 3, kimi: 0 }, sessionLive: { codex: 0, kimi: 0 },
+      quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 30 } },
+      tieBand: 25,
+    }).pick, 'kimi');
+    check('an estimated quota reading counts as known headroom', pick({
+      live: { codex: 3, kimi: 0 }, sessionLive: { codex: 0, kimi: 0 },
+      quotas: { codex: { usedPercent: 5, estimated: true, fetchedAt: Date.now() - 2400000 }, kimi: { usedPercent: 85 } },
+    }).pick, 'codex');
+    check('an estimated quota reading surfaces in the summary', /~5% used \(est\.\)/.test(pick({
+      quotas: { codex: { usedPercent: 89 }, kimi: { usedPercent: 5, estimated: true, fetchedAt: Date.now() } },
+    }).summary), true);
+    // Unknown headroom ranks as the assumed 30 points: below known >= 30, above known < 30.
+    check('unknown headroom ranks below a coder with known headroom >= 30', pick({
+      quotas: { codex: null, kimi: { usedPercent: 50 } },
+    }).pick, 'kimi');
+    check('unknown headroom ranks above a coder with known headroom < 30', pick({
+      quotas: { codex: null, kimi: { usedPercent: 80 } },
+    }).pick, 'codex');
+    check('the assumed unknown value is configurable', pick({
+      quotas: { codex: null, kimi: { usedPercent: 60 } }, unknownAssumed: 50,
+    }).pick, 'codex');
+    check('the per-session cap still outranks more headroom', pick({
+      sessionLive: { codex: 3, kimi: 0 }, live: { codex: 3, kimi: 0 },
+      quotas: { codex: { usedPercent: 0 }, kimi: { usedPercent: 90 } },
+    }).pick, 'kimi');
     check('fewer live workers beats quota headroom', pick({
       live: { codex: 2, kimi: 0 }, quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 20 } },
     }).pick, 'kimi');
@@ -395,6 +436,62 @@ async function run() {
       quotas: { codex: null, kimi: null }, fallbackEnabled: null,
     }).order, ['codex']);
     check('formatter reports unknown available quota', pool.formatCoderState('kimi', { state: 'eligible', leftPct: null }), 'Kimi (quota unknown, available)');
+  }
+
+  // Fix 6: persisted last-known quota + reset-aware estimate. Stubs only: the reading is
+  // persisted directly, and the probe is pointed at an unreachable binary so the estimate
+  // path is the only one that can answer.
+  {
+    const root = temp('coder-last-known-'); const stateDir = path.join(root, 'state');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const now = Date.now();
+    check('no reading ever means estimate unknown', quota.estimatedQuota(stateDir, 'kimi', now), null);
+    quota.persistLastKnownQuota(stateDir, 'kimi', {
+      usedPercent: 40, resetsAt: Math.floor((now + 3600000) / 1000),
+      windows: [
+        { usedPercent: 40, resetsAt: Math.floor((now + 3600000) / 1000) },
+        { usedPercent: 90, resetsAt: Math.floor((now - 60000) / 1000) }, // already reset
+      ],
+    }, now - 2400000);
+    const est = quota.estimatedQuota(stateDir, 'kimi', now);
+    check('a reset window counts as 0% used, an unreset window keeps its reading',
+      [est.usedPercent, est.estimated, est.source], [40, true, 'estimate']);
+    check('the estimate carries the original read time', est.fetchedAt, now - 2400000);
+    quota.persistLastKnownQuota(stateDir, 'codex', { usedPercent: 88, resetsAt: 0 }, now - 1000);
+    check('a reading without a reset time is kept as-is', quota.estimatedQuota(stateDir, 'codex', now).usedPercent, 88);
+
+    // codexQuota end-to-end: live probe fails (missing binary), no session log, so the
+    // estimate from the persisted reading answers instead of "unknown".
+    const old = { ORCH_CODEX_BIN: process.env.ORCH_CODEX_BIN, CODEX_SESSIONS_DIR: process.env.CODEX_SESSIONS_DIR };
+    process.env.ORCH_CODEX_BIN = path.join(root, 'missing-codex');
+    process.env.CODEX_SESSIONS_DIR = path.join(root, 'empty-sessions');
+    fs.mkdirSync(process.env.CODEX_SESSIONS_DIR);
+    const integrated = quota.codexQuota(now, { stateDir, cacheSeconds: 60 });
+    check('codexQuota falls back to the estimate when nothing live answers',
+      [integrated.usedPercent, integrated.estimated], [88, true]);
+    const estKimi = quota.kimiQuota(now, {
+      stateDir, cacheSeconds: 60,
+      env: envFor(path.join(root, 'kimi-home-empty'), { ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages' }),
+    });
+    check('kimiQuota falls back to the estimate when the live read fails',
+      [estKimi.usedPercent, estKimi.estimated], [40, true]);
+    // A fresh successful reading persists as the new last-known and is returned live.
+    // (Separate state dir: the failed probe above cached a fresh failure in `stateDir`.)
+    const liveStateDir = path.join(root, 'state-live');
+    const home = path.join(root, 'kimi-home');
+    credentials(home, { access_token: TOKEN, expires_at: Date.now() + 3600000 });
+    const server = await startServer({});
+    const live = quota.kimiQuota(Date.now(), {
+      stateDir: liveStateDir, cacheSeconds: 60,
+      env: envFor(home, { ORCH_KIMI_USAGE_URL: `http://127.0.0.1:${server.port}/usages` }),
+    });
+    await stopServer(server);
+    ok('a successful live Kimi read is returned live, not estimated', live && !live.estimated && !live.failed);
+    check('the successful read replaces the persisted last-known',
+      quota.estimatedQuota(liveStateDir, 'kimi', Date.now()).usedPercent, live.usedPercent);
+    if (old.ORCH_CODEX_BIN === undefined) delete process.env.ORCH_CODEX_BIN; else process.env.ORCH_CODEX_BIN = old.ORCH_CODEX_BIN;
+    if (old.CODEX_SESSIONS_DIR === undefined) delete process.env.CODEX_SESSIONS_DIR; else process.env.CODEX_SESSIONS_DIR = old.CODEX_SESSIONS_DIR;
+    fs.rmSync(root, { recursive: true, force: true });
   }
 
   process.stdout.write(`${pass} passed, ${failures.length} failed\n`);

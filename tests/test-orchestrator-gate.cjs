@@ -1094,7 +1094,10 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     if (JSON.stringify(got) === JSON.stringify(want)) pass += 1;
     else failures.push(`${name}: got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
   };
-  const clearCache = () => { try { fs.unlinkSync(path.join(stateDir, 'codex-quota-live.json')); } catch {} };
+  const clearCache = () => {
+    try { fs.unlinkSync(path.join(stateDir, 'codex-quota-live.json')); } catch {}
+    try { fs.unlinkSync(path.join(stateDir, 'codex-quota-last-known.json')); } catch {}
+  };
   const clearStub = () => {
     delete process.env.STUB_CODEX_MODE;
     delete process.env.STUB_CODEX_SECONDARY_USED;

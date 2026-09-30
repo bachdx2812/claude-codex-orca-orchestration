@@ -29,10 +29,13 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    its quota — Codex at `codexHandoffUsedPercent` (default 95), Kimi at the separate
    `kimiHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. Routing
    spreads every Codex task class — code, builds, refactors, tests, bulk conversions, and
-   fix loops — across both peers. Among eligible coders, pick fewer live worker groups across
-   every recent session on this machine, then more
-   headroom below the coder's own threshold, then the coder other than `lastCoder`, and
-   finally Codex as the last tie-break. A coder that is not installed, signed in, or
+   fix loops — across both peers. Among eligible coders, pick the coder with MORE QUOTA
+   LEFT: a free per-session slot first, then more
+   headroom below the coder's own threshold; within `coderHeadroomTieBand` (default 10
+   headroom points) of each other, fewer live worker groups across every recent session on
+   this machine, then the coder other than `lastCoder`, and finally Codex as the last
+   tie-break. A quota-unknown coder ranks as `unknownHeadroomAssumed` (default 30) headroom
+   points; a reset-aware estimate of the last successful reading counts as known. A coder that is not installed, signed in, or
    launchable on this machine is excluded; both coders exhausted or unusable means Sonnet.
    The operator can pick the coding model directly with `--code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>`,
    or use the `--exec-sonnet` / `--exec-codex` / `--exec-kimi` / `--exec-auto` shortcuts.
@@ -143,7 +146,12 @@ Codex quota discovery first uses a fresh state-dir live cache (including cached 
 JSON-RPC `account/rateLimits/read` (5-second parent timeout, 4.5-second helper deadline,
 no model call), then scans local Codex session logs no older than six hours. A helper that
 must stop its app-server child escalates from SIGTERM to SIGKILL. If all three sources are
-unavailable, the reading is unknown rather than evidence that Codex is unusable. If only
+unavailable, the reading falls back to a reset-aware ESTIMATE of the last successful
+reading: each coder's last known quota (used% per window, resetAt per window, readAt) is
+persisted in `codex-quota-last-known.json` / `kimi-quota-last-known.json` in the state dir,
+and a window whose reset time has passed counts as 0% used while every other window keeps
+its last reading (marked "est., read <age> ago" in the reminder). Only a coder that was
+never read successfully is unknown rather than evidence that it is unusable. If only
 one coder is eligible, all code goes to it; if neither coder is eligible,
 `execFallbackWhenCodexUnavailable: "sonnet"` (the default) routes to the configured code
 model. Setting the legacy-named option to `null` disables that automatic in-session
@@ -217,6 +225,8 @@ backup precedes their removal. Help and unknown options never enter the install 
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
+  "coderHeadroomTieBand": 10,
+  "unknownHeadroomAssumed": 30,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": { "intervalSeconds": 20, "idleSeconds": 60, "maxSeconds": 3600 },
   "maxParallelCodexWorkers": 3,
@@ -257,6 +267,13 @@ backup precedes their removal. Help and unknown options never enter the install 
   coder availability probe (binary present? signed in?) is reused from
   `coder-availability.json`. Overridable for one process with
   `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`.
+- `coderHeadroomTieBand`: integer 0-100, default 10 (blank/unset = default). The
+  headroom-point band within which two eligible coders tie; inside it the pick falls back
+  to fewer live workers machine-wide, outside it the coder with MORE QUOTA LEFT wins.
+- `unknownHeadroomAssumed`: integer 0-100, default 30 (blank/unset = default). The headroom
+  a quota-unknown coder is ranked as: below any coder with known headroom >= this value,
+  above one with less. A reset-aware estimate of the last successful reading counts as
+  known, not unknown.
 - `models.kimi`: `{ "alias": null, "id": null }` by default; `id` is shown in banner text
   only — Orca cannot pin a Kimi model on `worker-start`, so the real pin is
   `default_model` in `~/.kimi-code/config.toml`.
