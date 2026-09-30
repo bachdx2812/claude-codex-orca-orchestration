@@ -21,9 +21,10 @@ function isRepaintGarble(line) {
 
 function normalizeTerminalLine(rawLine) {
   const rawWithoutAnsi = String(rawLine || '').replace(ANSI_ESCAPE, '');
+  const footerHint = /^\s*[|│┃]\s*(?:[!/?@#]|shift\s*\+\s*tab|ctrl\s*\+\s*\S+)\s+to\s+\S/i.test(rawWithoutAnsi);
   const statusCandidate = rawWithoutAnsi.replace(BOX_CHROME, ' ').replace(LEADING_NOISE, '').trim();
   const compactStatus = statusCandidate.toLowerCase().replace(/[•·\s\d…]/g, '');
-  const toolCount = statusCandidate.match(/\b(\d+)\s+tools?\b/i);
+  const toolCount = statusCandidate.match(/(?:^|\s)·\s*(\d+)\s+tools?\s*·(?:\s|$)/i);
   const cleanActiveChild = /^(?:waiting\s+(?:\/\s*[·•]\s*)?for\s+background\s+(?:terminal|task|agent)s?\b|waiting\s*\/.*\b\d+\s+background\s+tasks?\s+still\s+running\b|.*\b\d+\s+background\s+(?:terminal|task)s?\s+(?:still\s+)?running\b)/i.test(statusCandidate);
   const garbledActiveChild = isRepaintGarble(statusCandidate) && /backg.*term/i.test(compactStatus);
   const activeChild = cleanActiveChild || garbledActiveChild;
@@ -38,6 +39,7 @@ function normalizeTerminalLine(rawLine) {
     .trim();
 
   if (activeChild) return { text: ACTIVE_CHILD_MARKER, activeChild: true };
+  if (footerHint) return { text: '', activeChild: false };
   if (/^context\s*:/i.test(statusCandidate)) return { text: '', activeChild: false };
   if (toolCount) return { text: `tools:${toolCount[1]}`, activeChild: false };
   if (isRepaintGarble(statusCandidate)) return { text: '', activeChild: false };

@@ -306,6 +306,18 @@ const kimiToolScreen173 = [
 check('Kimi tool count survives while its context counter is ignored',
   [meaningfulTerminalOutput(kimiToolScreen172), meaningfulTerminalOutput(kimiToolScreen173)],
   ['tools:172', 'tools:173']);
+check('Kimi toggling footer hints are ignored like context counters',
+  [meaningfulTerminalOutput('| ! to run a shell command'),
+    meaningfulTerminalOutput('| / to open commands'),
+    meaningfulTerminalOutput('| shift+tab to cycle modes')], ['', '', '']);
+check('Kimi footer hint toggles do not change the fingerprint',
+  fingerprint(`${kimiToolScreen173}\n| ! to run a shell command`),
+  fingerprint(`${kimiToolScreen173}\n| / to open commands`));
+check('ordinary prose containing a tool count is preserved',
+  meaningfulTerminalOutput('Reviewed output from 173 tools before summarizing.'),
+  'Reviewed output from 173 tools before summarizing.');
+check('only the delimited Kimi status shape collapses to a tool counter',
+  meaningfulTerminalOutput('173 tools · Using Bash'), '173 tools · Using Bash');
 check('Kimi context counters alone do not change the fingerprint',
   fingerprint('context: 5% (47.4k/1M)'), fingerprint('context: 5% (47.5k/1M)'));
 const kimiToolRecords = new Map();
