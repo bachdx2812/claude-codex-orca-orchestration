@@ -3202,6 +3202,40 @@ async function heartbeatWorktreeTests() {
     checkBool('item 4: no worktree the budget-constrained seeding pass could not reach in one tick fires as a later wake event',
       out.includes('DONE worktree'), false);
   }
+
+  // Released-group settle: the gate's session state still shows the group `live` (its
+  // release reply was non-ok, so nothing ever settled it) but Orca's worker-list — which
+  // the heartbeat already polls every tick — reports it released. The tick must settle the
+  // whole group and persist it, or the dead group keeps holding its Owns: claim forever.
+  {
+    const name = 'released-group-settle';
+    const started = Date.now();
+    const seedState = { workers: {
+      ctx_hb_released: { role: 'claude-exec', status: 'live', group: 'ctx_hb_released',
+        started, agent: 'claude', owns: ['src/hb-released/**'], ws: 'ws-hb-released' },
+      task_hb_released: { role: 'claude-exec', status: 'live', group: 'ctx_hb_released',
+        started, agent: 'claude' },
+    } };
+    await runHeartbeat({
+      name, worktrees: [], seedState, terminalRows: [],
+      workerRows: [{ dispatchId: 'ctx_hb_released', taskId: 'task_hb_released', runId: 'run_hb_released',
+        workerState: 'stopped', dispatchStatus: 'failed', agentTerminalHandle: 'term_hb_released',
+        terminalState: 'released',
+        resource: { id: 'wtr_hb_released', ownershipState: 'owned', releaseState: 'not_requested' },
+        projection: { id: 'ctx_hb_released', stage: { worker: 'stopped', dispatch: 'failed' },
+          outcome: 'failed', liveness: { verdict: 'dead', observedAt: started, source: 'agent_status' },
+          resource: { state: 'released' } } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '2'],
+    });
+    let st = null;
+    try {
+      st = JSON.parse(fs.readFileSync(
+        path.join(RUN_DIR, `hb-${name}`, `hb-${name}-${process.pid}.json`), 'utf8'));
+    } catch {}
+    checkBool('heartbeat tick settles (and persists) a group Orca reports released',
+      !!st && st.workers.ctx_hb_released && st.workers.ctx_hb_released.status === 'settled' &&
+        st.workers.task_hb_released.status === 'settled', true);
+  }
 }
 
 // --- H1 (real git, no stub): a fresh worktree with zero new commits must never be reported
@@ -3570,6 +3604,160 @@ async function heartbeatH1RealGitTests() {
     else failures.push(`releasing an untracked id with two live placeholders must settle nothing (${JSON.stringify(st.workers)})`);
   }
   rmState(P_SID);
+}
+
+// --- released/stopped worker groups must not keep holding their Owns: claims (2026-10-01) ---
+// Workers that were worker-stop + worker-release'd (Orca: workerState stopped, dispatchStatus
+// failed, terminalState released) stayed `live` in gate state forever — the release replies
+// were non-ok, so nothing settled the group — and every later dispatch overlapping their
+// Owns: globs was refused. Fixes: the ownership-overlap path reconciles the HOLDER groups
+// against a fresh worker-list before refusing; a failed stop/release/abandon reply whose
+// text shows the worker already stopped still settles the group; the heartbeat settles
+// released groups it already lists (heartbeat case further down).
+{
+  const REL_ENV = quotaEnv('released-holders', 10, 30, {});
+  // The REAL worker-list row shape (captured live 2026-10-01): top-level
+  // dispatchId/taskId/workerState/dispatchStatus/terminalState plus nested resource/projection.
+  const realRow = (overrides = {}) => ({
+    dispatchId: 'ctx_rel_a', taskId: 'task_rel_a', runId: 'run_rel_a',
+    workerState: 'stopped', dispatchStatus: 'failed',
+    agentTerminalHandle: 'term_rel_a', terminalState: 'released',
+    resource: { id: 'wtr_rel_a', ownershipState: 'owned', releaseState: 'not_requested',
+      releaseRequestedAt: null, releaseCompletedAt: null, releaseError: null },
+    projection: { id: 'ctx_rel_a', dispatchId: 'ctx_rel_a', taskId: 'task_rel_a',
+      stage: { worker: 'stopped', dispatch: 'failed', detail: 'stopped', activity: 'idle' },
+      outcome: 'failed', liveness: { verdict: 'dead', observedAt: Date.now(), source: 'agent_status' },
+      resource: { state: 'released' } },
+    ...overrides,
+  });
+  const OWN_LIB_REL = require('../hooks/lib/ownership.cjs');
+  const REL_WS = OWN_LIB_REL.workspaceKey({
+    repoRootDir: OWN_LIB_REL.repoRoot(FAKE_REPO), worktreeValue: null, isolated: false,
+  });
+  const seedHolder = (sid, id, started) => {
+    fs.writeFileSync(path.join(STATE_DIR, `${sid}.json`), JSON.stringify({
+      session_id: sid, created: new Date().toISOString(), bypass: false, execAgent: null,
+      workers: {
+        [`ctx_${id}`]: { role: 'claude-exec', started, status: 'live', last_seen: started,
+          rate_limited_until: 0, group: `ctx_${id}`, kind: 'worker', agent: 'claude',
+          owns: ['src/released/**'], ws: REL_WS },
+        [`task_${id}`]: { role: 'claude-exec', started, status: 'live', last_seen: started,
+          rate_limited_until: 0, group: `ctx_${id}`, kind: 'worker', agent: 'claude',
+          owns: ['src/released/**'], ws: REL_WS },
+      },
+      reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+    }));
+  };
+  let relTuCounter = 0;
+  const overlapAttempt = (sid) => mainBash(
+    'orca orchestration worker-start --agent codex --spec "Implement the overlap. Verify: npm test\nOwns: src/released/**" --json',
+    { sid, cwd: FAKE_REPO, tool_use_id: `toolu_rel_new_${relTuCounter++}` });
+
+  // 1a. Every worker-list row of the holder reports stopped/failed + terminal released (the
+  //     exact state from the bug report) -> the group settles and the overlap is admitted.
+  {
+    const sid = `${SID}-rel-rows`;
+    rmState(sid);
+    seedHolder(sid, 'rel_a', Date.now());
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: JSON.stringify([realRow()]) });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === ALLOW && st.workers.ctx_rel_a && st.workers.ctx_rel_a.status === 'settled' &&
+        st.workers.task_rel_a.status === 'settled') pass += 1;
+    else failures.push(`overlap reconcile: a holder whose rows all report released must settle and admit the dispatch (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+  // 1b. Holder absent from a real reply but only seconds old (Orca may not have listed a
+  //     recent dispatch yet) -> not settled, refusal stands.
+  {
+    const sid = `${SID}-rel-young`;
+    rmState(sid);
+    seedHolder(sid, 'rel_young', Date.now());
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: '[]' });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === DENY && st.workers.ctx_rel_young && st.workers.ctx_rel_young.status === 'live') pass += 1;
+    else failures.push(`overlap reconcile: a fresh holder absent from the list must not settle (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+  // 1c. Holder absent from a real reply and older than 10 minutes -> settled, admitted.
+  {
+    const sid = `${SID}-rel-stale`;
+    rmState(sid);
+    seedHolder(sid, 'rel_stale', Date.now() - 11 * 60 * 1000);
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: '[]' });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === ALLOW && st.workers.ctx_rel_stale && st.workers.ctx_rel_stale.status === 'settled') pass += 1;
+    else failures.push(`overlap reconcile: a holder absent from the list for >10min must settle (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+  // 1d. A truncated reply is not a real worker list — nothing settles, refusal stands.
+  {
+    const sid = `${SID}-rel-trunc`;
+    rmState(sid);
+    seedHolder(sid, 'rel_trunc', Date.now() - 11 * 60 * 1000);
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: '[]', STUB_WORKERS_TRUNCATED: '1' });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === DENY && st.workers.ctx_rel_trunc && st.workers.ctx_rel_trunc.status === 'live') pass += 1;
+    else failures.push(`overlap reconcile: a truncated worker-list must settle nothing (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+  // 1e. An ok:false reply is not a real worker list either.
+  {
+    const sid = `${SID}-rel-okfalse`;
+    rmState(sid);
+    seedHolder(sid, 'rel_okfalse', Date.now() - 11 * 60 * 1000);
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_OK_FALSE: '1' });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === DENY && st.workers.ctx_rel_okfalse && st.workers.ctx_rel_okfalse.status === 'live') pass += 1;
+    else failures.push(`overlap reconcile: an ok:false worker-list must settle nothing (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+  // 1f. A holder Orca still shows genuinely live keeps the refusal.
+  {
+    const sid = `${SID}-rel-live`;
+    rmState(sid);
+    seedHolder(sid, 'rel_live', Date.now());
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: JSON.stringify([
+      realRow({ dispatchId: 'ctx_rel_live', taskId: 'task_rel_live', workerState: 'running',
+        dispatchStatus: 'running', terminalState: 'active' }),
+    ]) });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === DENY && st.workers.ctx_rel_live && st.workers.ctx_rel_live.status === 'live') pass += 1;
+    else failures.push(`overlap reconcile: a holder Orca still shows live must keep the refusal (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+
+  // 2. A failed worker-stop/-release/-abandon reply whose TEXT shows the worker already
+  //    stopped/closed settles the group even though the command exit/ok is false.
+  {
+    const sid = `${SID}-rel-markers`;
+    for (const [id, sub, marker] of [
+      ['ctx_mark_1', 'worker-stop', 'worker ctx_mark_1 [stopped]'],
+      ['ctx_mark_2', 'worker-release', 'release failed: process=closed for ctx_mark_2'],
+      ['ctx_mark_3', 'worker-abandon', '{"ok":false,"error":"only a settled worker can release"} terminal [released]'],
+    ]) {
+      rmState(sid);
+      seedHolder(sid, id.replace('ctx_', ''), Date.now());
+      invoke({ session_id: sid, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+        tool_input: { command: `orca orchestration ${sub} --dispatch ${id} --json` },
+        tool_use_id: `toolu_${id}`, error: marker }, REL_ENV);
+      const st = readState(sid) || { workers: {} };
+      if (st.workers[id] && st.workers[id].status === 'settled') pass += 1;
+      else failures.push(`a failed ${sub} whose reply shows "${marker}" must still settle the group (${JSON.stringify(st.workers)})`);
+    }
+    // Control: a failed release with no stopped/closed marker settles nothing.
+    rmState(sid);
+    seedHolder(sid, 'mark_control', Date.now());
+    invoke({ session_id: sid, hook_event_name: 'PostToolUseFailure', effort: 'high', tool_name: 'Bash',
+      tool_input: { command: 'orca orchestration worker-release --dispatch ctx_mark_control --json' },
+      tool_use_id: 'toolu_mark_control',
+      error: '{"ok":false,"error":"release_unknown: only a settled worker can release"}' }, REL_ENV);
+    {
+      const st = readState(sid) || { workers: {} };
+      if (st.workers.ctx_mark_control && st.workers.ctx_mark_control.status === 'live') pass += 1;
+      else failures.push(`a failed release with no stopped/closed marker must settle nothing (${JSON.stringify(st.workers)})`);
+    }
+    rmState(sid);
+  }
 }
 
 heartbeatWorktreeTests()

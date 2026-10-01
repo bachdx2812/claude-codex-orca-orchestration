@@ -56,6 +56,8 @@ const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
 const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const HANDOVER = require('./lib/worker-quota-handover.cjs');
 const RESUME = require('./lib/quota-reset-resume.cjs');
+const WG = require('./lib/worker-groups.cjs');
+const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -566,6 +568,48 @@ function workerWorktreePaths(workerRows) {
 function loadSessionState() {
   try { return JSON.parse(fs.readFileSync(path.join(DIR, `${SESSION}.json`), 'utf8')); }
   catch { return { workers: {} }; }
+}
+
+/**
+ * Settle this session's gate-state groups that Orca's worker-list reports released. A
+ * worker stopped/released whose release reply was non-ok never settles in the gate's own
+ * PostToolUse bookkeeping, so its group stays `live` and keeps holding its Owns: claim
+ * forever — the heartbeat already polls the list, so it reconciles what it sees. Runs under
+ * the same state-file lock the gate uses, and persists only when something changed.
+ */
+function settleOrcaReleasedSessionGroups(workerRows) {
+  const byId = new Map();
+  for (const row of workerRows || []) {
+    for (const id of [row && row.dispatchId, row && row.taskId, row && row.agentTerminalHandle].filter(Boolean)) {
+      byId.set(id, row);
+    }
+  }
+  if (!byId.size) return;
+  const lockDir = path.join(DIR, '.lock');
+  const locked = acquireLock(lockDir, {});
+  if (!locked) return;
+  try {
+    const state = loadSessionState();
+    let changed = false;
+    for (const [key, w] of Object.entries(state.workers || {})) {
+      if (!w || w.status !== 'live') continue;
+      const row = byId.get(key);
+      if (!row) continue;
+      const terminalState = String(row.terminalState || '').toLowerCase();
+      if (terminalState !== 'released' && terminalState !== 'closed') continue;
+      if (WG.settleGroup(state.workers, WG.groupOf(w, key))) changed = true;
+    }
+    if (changed) {
+      try {
+        const file = path.join(DIR, `${SESSION}.json`);
+        const tmp = `${file}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+        fs.renameSync(tmp, file);
+      } catch {}
+    }
+  } finally {
+    releaseLock(lockDir);
+  }
 }
 
 function stateWorkerForRow(row, state) {
@@ -1231,6 +1275,7 @@ function main() {
     const ws = workers();
     beat(started); // item L1: refresh liveness between round trips at a short --interval
     if (ws) {
+      settleOrcaReleasedSessionGroups(ws);
       for (const worktreePath of workerWorktreePaths(ws)) ownedWorktreePaths.add(worktreePath);
       for (const handle of sessionTerminalHandles(ws)) ownTerminalHandles.add(handle);
       for (const handle of retainedTerminalHandles(ws)) explicitRetainedHandles.add(handle);

@@ -107,7 +107,12 @@ function fetchOrcaWorkerRows(orcaBin) {
   }
   try {
     const parsed = JSON.parse(out);
+    // A non-ok or page-truncated reply is not a real worker list: treating it as one (or
+    // worse, as an EMPTY list) would let "absent from the list" settle groups that are
+    // actually still live. Degrade to null — the caller then trusts local state instead.
+    if (parsed.ok === false) return null;
     const r = parsed.result ?? parsed;
+    if (r.truncated === true || parsed.truncated === true) return null;
     return Array.isArray(r) ? r : r.workers || [];
   } catch {
     return null;
@@ -115,6 +120,49 @@ function fetchOrcaWorkerRows(orcaBin) {
 }
 
 const DONE = /^(succeeded|failed|stopped|cancelled|canceled|completed)$/i;
+
+// A worker-list row Orca reports as fully released: its terminal is released/closed — either
+// directly, or with the worker itself done (stopped/failed/...) and the terminal released,
+// which is the same terminalState check. Released rows keep the REAL nested reply shape
+// (top-level dispatchId/taskId/workerState/dispatchStatus/terminalState plus nested
+// `resource`/`projection` objects) — only the top-level fields are read here.
+function rowReportsReleased(row) {
+  const terminalState = String(row.terminalState || '').toLowerCase();
+  return terminalState === 'released' || terminalState === 'closed';
+}
+
+/**
+ * Pure apply for the ownership-overlap path: settle the HOLDER groups of overlapping claims
+ * that a fresh worker-list shows are actually gone, so a released/stopped worker's group
+ * cannot hold its Owns: globs forever. Settles a group when every worker-list row of it
+ * reports released (see `rowReportsReleased`), or when the group is entirely ABSENT from the
+ * list and its oldest live entry is more than 10 minutes old (a recent dispatch Orca simply
+ * hasn't listed yet is kept). `rows` must come from a real (ok, non-truncated) reply — a null
+ * fetch result must never reach this function. Same lock discipline as
+ * `applyOrcaReconciliation`: only against a freshly reloaded state under the held lock.
+ * Returns true when anything changed.
+ */
+function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now()) {
+  let changed = false;
+  const tenMinAgo = now - 10 * 60 * 1000;
+  for (const group of groupIds || []) {
+    const keys = Object.keys(s.workers || {})
+      .filter((k) => s.workers[k].status === 'live' && WG.groupOf(s.workers[k], k) === group);
+    if (!keys.length) continue;
+    const groupRows = (rows || []).filter((row) =>
+      keys.includes(row.dispatchId) || keys.includes(row.taskId) || keys.includes(row.agentTerminalHandle));
+    if (groupRows.length > 0) {
+      if (groupRows.every(rowReportsReleased) && WG.settleGroup(s.workers, group)) changed = true;
+      continue;
+    }
+    const oldest = Math.min(...keys.map((k) => {
+      const started = s.workers[k].started;
+      return Number.isFinite(started) ? started : now;
+    }));
+    if (oldest < tenMinAgo && WG.settleGroup(s.workers, group)) changed = true;
+  }
+  return changed;
+}
 
 /**
  * Pure apply: mutates `s.workers` in place against already-fetched Orca rows — dropping rows
@@ -509,8 +557,32 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
         null;
 
       if (!isolated && owns && owns.length) {
-        const claims = OC.liveClaims(s, ttl, replacesGroup).filter((c) => c.id !== sourceTaskResKey);
-        const conflict = OC.findOverlap(claims, ws, owns);
+        let claims = OC.liveClaims(s, ttl, replacesGroup).filter((c) => c.id !== sourceTaskResKey);
+        let conflict = OC.findOverlap(claims, ws, owns);
+        if (conflict && !gateDisabled(cfg, 'ownership-overlap')) {
+          // Before refusing, reconcile the HOLDER groups of the overlapping claims against
+          // a fresh worker-list: a worker that was stopped/released outside this session's
+          // PostToolUse tracking (or whose release reply was non-ok) still shows `live`
+          // locally and would hold its Owns: globs forever. Same out-of-lock-fetch +
+          // locked-reapply pattern as the at-cap reconcile below; a null (unreachable,
+          // non-ok or truncated) reply settles nothing and the refusal stands.
+          const holderGroups = new Set(claims.filter((c) => c.source === 'worker').map((c) => c.id));
+          if (holderGroups.size) {
+            if (locked) { releaseStateLock(lockDir); locked = false; }
+            const rows = fetchOrcaWorkerRows(ORCA_BIN);
+            locked = acquireStateLock(lockDir, deps.capLockOpts);
+            if (locked === null) return;
+            if (locked === false) {
+              violation = { gate: 'ownership-overlap', reason: deps.lockContentionMessage };
+              break;
+            }
+            s = load(sessionId);
+            Object.assign(s.reservations, localReservations);
+            if (rows !== null && applyOwnershipHolderReconciliation(s, rows, holderGroups)) reconcileChanged = true;
+            claims = OC.liveClaims(s, ttl, replacesGroup).filter((c) => c.id !== sourceTaskResKey);
+            conflict = OC.findOverlap(claims, ws, owns);
+          }
+        }
         if (conflict) {
           if (gateDisabled(cfg, 'ownership-overlap')) {
             // fall through: disabled, still reserve and still run the cap check below
@@ -673,5 +745,6 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
 module.exports = {
   OWNS_BRIEF_HELP, resolveWorkerStartAgent, liveGroupIds, liveCodexGroupIds, reconcileCodexGroupsWithOrca,
-  fetchOrcaWorkerRows, applyOrcaReconciliation, reconcilePendingPlaceholders, handleOrcaDispatchGates, resolveSpecText,
+  fetchOrcaWorkerRows, applyOrcaReconciliation, applyOwnershipHolderReconciliation, rowReportsReleased,
+  reconcilePendingPlaceholders, handleOrcaDispatchGates, resolveSpecText,
 };

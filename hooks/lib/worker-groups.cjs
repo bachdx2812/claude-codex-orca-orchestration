@@ -358,8 +358,19 @@ function outputTarget(inv, flagValue) {
     rest.find((a) => !a.startsWith('-')) || null;
 }
 
+// Text markers in a worker-stop/-release/-abandon reply that show the worker is already
+// stopped/closed even when the command's exit/ok is false (e.g. "only a settled worker can
+// release" against a worker Orca had already torn down) — the group must still settle.
+const STOPPED_REPLY_MARKERS = ['[stopped]', 'process=closed', 'terminal [released]'];
+
+function replyShowsWorkerStopped(text) {
+  const t = String(text || '').toLowerCase();
+  return STOPPED_REPLY_MARKERS.some((m) => t.includes(m));
+}
+
 module.exports = {
   idsFromOutput, idsFromReply, fieldValuesFromReply,
+  replyShowsWorkerStopped,
   splitJsonReplies, splitConcatenatedJson, isDispatchReply, kindOf,
   PENDING_PLACEHOLDER_TTL_MS, isPendingPlaceholderKey, pendingPlaceholderExpired,
   canonicalGroup, groupOf, countLiveGroups, liveGroupByTerminal, groupById, settleGroup,

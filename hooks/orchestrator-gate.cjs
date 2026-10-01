@@ -1770,6 +1770,17 @@ function onPostToolUseFailure(p, s, cfg) {
     let dirty = false;
     if (p.tool_name === 'Bash') {
       const cmd = String((p.tool_input && p.tool_input.command) || '');
+      // A worker-stop/-release/-abandon whose command exited non-zero can still carry a
+      // reply showing the worker already stopped/closed ("[stopped]", "process=closed",
+      // "terminal [released]") — settle its group anyway, or a failed release command
+      // leaves the group `live` and holding its Owns: claim forever.
+      if (WG.replyShowsWorkerStopped(p.error)) {
+        for (const inv of orcaInvocations(cmd)) {
+          const target = WG.releaseTarget(inv, flagValue);
+          if (!target || !s.workers[target]) continue;
+          if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
+        }
+      }
       const hasDispatch = orcaInvocations(cmd).some((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
       const errorText = String(p.error || '');
       // Two different "no id was found" cases must NOT be treated the same:
@@ -1857,6 +1868,16 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
   const toolFailed = !!(resp && (resp.is_error === true || resp.error || resp.isError === true));
   if (toolFailed) {
     if (dropFailedToolState(s, p.tool_use_id || p.toolUseId)) dirty = true;
+    // Same settle-on-stopped-marker rule as onPostToolUseFailure, for environments that
+    // report a failed Bash call through PostToolUse with an error flag instead.
+    if (tool === 'Bash' && WG.replyShowsWorkerStopped(`${resp.stdout || ''}\n${resp.stderr || ''}`)) {
+      const failedCmd = String(input.command || '');
+      for (const inv of orcaInvocations(failedCmd)) {
+        const target = WG.releaseTarget(inv, flagValue);
+        if (!target || !s.workers[target]) continue;
+        if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
+      }
+    }
     // Nothing below this point should be trusted on a failed call: a Bash failure's
     // stdout/stderr is not a real Orca reply and must never be scanned for ids (that would
     // register a phantom "pending" worker for a dispatch that never actually happened).

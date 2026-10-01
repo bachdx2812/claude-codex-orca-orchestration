@@ -44,6 +44,12 @@ const args = process.argv.slice(2);
 const handle = process.env.STUB_WORKER_HANDLE;
 
 if (args[0] === 'orchestration' && args[1] === 'worker-list') {
+  // STUB_WORKERS_OK_FALSE=1 answers `{ ok: false }`, STUB_WORKERS_TRUNCATED=1 marks the
+  // reply `truncated: true` — neither is a real worker list the gate may reconcile against.
+  if (process.env.STUB_WORKERS_OK_FALSE === '1') {
+    process.stdout.write(JSON.stringify({ ok: false }));
+    process.exit(0);
+  }
   let workers;
   if (process.env.STUB_WORKERS_JSON) {
     try { workers = JSON.parse(process.env.STUB_WORKERS_JSON); } catch { workers = []; }
@@ -59,7 +65,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
       projection: { role: 'worker' },
     }] : [];
   }
-  process.stdout.write(JSON.stringify({ result: { workers } }));
+  process.stdout.write(JSON.stringify({ result: { workers, truncated: process.env.STUB_WORKERS_TRUNCATED === '1' } }));
   process.exit(0);
 }
 if (args[0] === 'terminal' && args[1] === 'list') {
