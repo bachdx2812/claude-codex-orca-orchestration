@@ -463,6 +463,13 @@ expect('a neutral first verb still classifies code-reviewer as review work',
   // In-session code on the code model (no external coder eligible) records "sonnet", whose
   // review the review model owns.
   const sonnetEnv = { ...env, STUB_CODEX_PRIMARY_USED: '97' };
+  // A later gate refuses the in-session code dispatch: the author must NOT flip to sonnet,
+  // or the next Sonnet review of Kimi's code would be wrongly refused (review, blocker 6).
+  expect('in-session code without Owns is refused by the later owns gate',
+    dispatch({ subagent_type: 'fullstack-developer', description: 'implement the parser fix', model: 'sonnet',
+      prompt: 'Verify: npm test' }, sid, { tool_use_id: 'toolu_rfc_sonnet_refused' }), DENY, sonnetEnv);
+  checkBool('a refused in-session code dispatch does not record sonnet as the author',
+    stateOf().lastCodeAuthor, 'kimi');
   expect('in-session code on the code model is admitted when no external coder is eligible',
     dispatch({ subagent_type: 'fullstack-developer', description: 'implement the parser fix', model: 'sonnet',
       prompt: 'Owns: n/a isolated\nVerify: npm test', isolation: 'worktree' }, sid, { tool_use_id: 'toolu_rfc_sonnet' }),

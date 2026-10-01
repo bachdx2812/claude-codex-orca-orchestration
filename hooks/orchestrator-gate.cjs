@@ -1517,6 +1517,9 @@ function onPreToolUse(p, s, cfg) {
     // never blocked just because the gate cannot tell who wrote the code.
     const codeAlias = cfg.models.code.alias;
     const isCodeModel = new RegExp(escapeRegex(codeAlias), 'i').test(model);
+    // Set by the exec branch when this is in-session code on the code model; the author is
+    // recorded ONLY after every refusing gate below has run (review, blocker 6).
+    let recordSonnetAuthor = false;
     const planning = isPlanningReview(description, type, input.prompt);
     const author = s.lastCodeAuthor || null;
     if (wantsPlanReview && !isEscalation) {
@@ -1601,18 +1604,9 @@ function onPreToolUse(p, s, cfg) {
         d('code-brief-needs-verify', CODE_BRIEF_HELP);
       }
       // In-session code on the configured code model makes the code's author "sonnet", so a
-      // later review/verify of it is routed to the review model (never the same model).
-      if (inSession && wantAlias === cfg.models.code.alias) {
-        const lockDir = path.join(DIR, '.lock');
-        const locked = acquireLock(lockDir, {});
-        try {
-          const fresh = load(s.session_id);
-          recordCodeAuthor(fresh, 'sonnet', Date.now());
-          save(fresh);
-        } finally {
-          if (locked) releaseLock(lockDir);
-        }
-      }
+      // later review/verify of it is routed to the review model (never the same model). The
+      // actual write happens after every refusing gate below (blocker 6).
+      recordSonnetAuthor = inSession && wantAlias === cfg.models.code.alias;
 
       // Gate B for in-session code dispatches: isolated work (a fresh worktree, or a
       // remote sandbox) needs no Owns:; anything sharing this workspace does. Runs under
@@ -1710,6 +1704,23 @@ function onPreToolUse(p, s, cfg) {
         if (locked) releaseLock(lockDir);
       }
       if (violation) d('max-parallel-agents', violation);
+    }
+
+    // Record the in-session code author LAST, after every gate that can refuse this
+    // dispatch has run (review, blocker 6): a refused code dispatch must never flip
+    // `lastCodeAuthor` to sonnet, which would wrongly refuse the next Sonnet review of an
+    // external coder's code. Skip the write entirely when the lock cannot be held.
+    if (recordSonnetAuthor) {
+      const lockDir = path.join(DIR, '.lock');
+      const locked = acquireLock(lockDir, {});
+      if (locked) {
+        try {
+          const fresh = load(s.session_id);
+          if (recordCodeAuthor(fresh, 'sonnet', Date.now())) save(fresh);
+        } finally {
+          releaseLock(lockDir);
+        }
+      }
     }
   }
 }
