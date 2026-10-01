@@ -83,6 +83,17 @@ function modelLabel(role) {
 }
 
 /**
+ * The model a code review / verify dispatch should run on right now, as reminder / banner
+ * text: the reviewer mapped to the last code author, e.g. `sonnet (coder: kimi)`, or the
+ * configured review model when no code author is known yet.
+ */
+function reviewRouteText(cfg, s) {
+  const mapped = s.lastCodeAuthor ? reviewModelForCoder(cfg, s.lastCodeAuthor) : null;
+  const alias = mapped || cfg.models.review.alias;
+  return s.lastCodeAuthor ? `${alias} (coder: ${s.lastCodeAuthor})` : alias;
+}
+
+/**
  * How to dispatch in-session code on the configured code model (Fix 7), e.g.
  * `sonnet (claude-sonnet-5-5), effort medium: Agent subagent_type sonnet-coder + model sonnet`
  * — plus, when an exact model id is configured, the Orca Claude-worker equivalent
@@ -215,6 +226,13 @@ function redirectTargets(cmd) {
 
 // Intent of a dispatched task. Generic English verbs — not tied to any operator's roster.
 const PLAN_REVIEW_INTENT = /\b(plan|planning|design|review|reviewer|verify|verification|audit|red.?team|critique|assess|architect)\b/i;
+// Review / verify of code follows the code's author's mapped reviewer; planning and
+// red-team stay on the review model (operator decision, 2026-10-01). These two regexes
+// tell those apart: a planning first verb (or a planning noun with no review first verb)
+// is planning work, everything else in PLAN_REVIEW_INTENT is review work.
+const PLANNING_FIRST_VERB = /^(plan|planning|design|architect|red.?team)\b/i;
+const REVIEW_FIRST_VERB = /^(review|reviewer|verify|verification|audit|critique|assess)\b/i;
+const PLANNING_INTENT = /\b(plan|planning|design|red.?team|architect|architecture)\b/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
@@ -239,6 +257,32 @@ function hasEscalationReason(cfg, input) {
   );
   const text = `${input.description || ''} ${String(input.prompt || '').slice(0, 300)}`;
   return escalationMarker.test(text) && effortTried.test(text);
+}
+
+// True when a review dispatch explicitly escalates to the review model after the mapped
+// reviewer could not decide — the review ladder's "say why in the dispatch" rule (operator
+// decision, 2026-10-01), mirroring hasEscalationReason's marker shape. `reviewerAlias` is
+// the model the mapped review (e.g. sonnet for external-authored code) actually ran on.
+function hasReviewEscalationReason(input, reviewerAlias) {
+  const alias = escapeRegex(reviewerAlias || 'sonnet');
+  const marker = new RegExp(
+    `\\bescalation:\\s*\\S|\\b${alias}\\s+(?:review\\s+)?(?:was\\s+)?(?:failed|could\\s*n[o'’]t|cannot|can[’']t|unable|undecided|inconclusive|stuck)\\b`,
+    'i'
+  );
+  const text = `${input.description || ''} ${String(input.prompt || '').slice(0, 300)}`;
+  return marker.test(text);
+}
+
+/**
+ * True when a plan/review-intent dispatch is PLANNING or red-team work (always the review
+ * model) rather than a review of code (which follows the code's author). The governing
+ * first verb wins; a review first verb beats a planning noun later in the text, and a
+ * planning noun in the subagent_type only counts when no review verb governs.
+ */
+function isPlanningReview(description, type) {
+  if (PLANNING_FIRST_VERB.test(description)) return true;
+  if (REVIEW_FIRST_VERB.test(description)) return false;
+  return PLANNING_INTENT.test(description) || PLANNING_INTENT.test(type);
 }
 
 // Markers that an orca command itself failed, which justifies the in-session fallback.
@@ -268,6 +312,11 @@ function blank(sid) {
                              // max-parallel-agents budget; see lib/parallel-agent-cap.cjs
     tasks: {},              // taskId -> { owns, ws } — recorded when `task-create` resolves its id
     last_heartbeat: 0,      // epoch ms of the last worker-status poll
+    lastCodeAuthor: null,   // author of this session's pending code: 'codex' | 'kimi' |
+                            // 'deepseek' (the last external code worker group, opencode ->
+                            // deepseek) | 'sonnet' (the last in-session code dispatch)
+    lastCodeAuthorAt: 0,    // epoch ms of that author's dispatch/finish, so a late settle
+                            // of an older group never clobbers a newer code event
     rate_limit_hits: 0,
   };
 }
@@ -296,6 +345,8 @@ function load(sid) {
     if (!s.agentClaims) s.agentClaims = {};
     if (!s.agents) s.agents = {};
     if (!s.tasks) s.tasks = {};
+    if (!Object.prototype.hasOwnProperty.call(s, 'lastCodeAuthor')) s.lastCodeAuthor = null;
+    if (!Object.prototype.hasOwnProperty.call(s, 'lastCodeAuthorAt')) s.lastCodeAuthorAt = 0;
     return s;
   } catch {
     return blank(sid);
@@ -416,6 +467,56 @@ function describeOverride(cfg, o) {
 /** The pool coder name for a worker agent (opencode runs DeepSeek). */
 function poolCoderForAgent(agent) {
   return agent === 'opencode' ? 'deepseek' : agent;
+}
+
+/** The pool coder whose code a worker group carried, or null for a non-code group (a
+ * terminal create, an unknown agent). opencode counts as deepseek. */
+function codeAuthorOfGroup(workers, group) {
+  for (const [key, w] of Object.entries(workers || {})) {
+    if (WG.groupOf(w, key) !== group) continue;
+    const coder = poolCoderForAgent(w.agent);
+    if (['codex', 'kimi', 'deepseek'].includes(coder)) return coder;
+  }
+  return null;
+}
+
+/** The latest `started` timestamp across `group`'s tracked entries, or null. */
+function groupStartedAt(workers, group) {
+  let started = -Infinity;
+  for (const [key, w] of Object.entries(workers || {})) {
+    if (WG.groupOf(w, key) !== group) continue;
+    const t = Number.isFinite(w.started) ? w.started : NaN;
+    if (t > started) started = t;
+  }
+  return Number.isFinite(started) ? started : null;
+}
+
+/**
+ * Remember `coder` as this session's last code author when `at` is at least as recent as
+ * any previously recorded code event — so a worker group that settles AFTER a newer
+ * dispatch started never clobbers the newer author. Returns true when it changed.
+ */
+function recordCodeAuthor(s, coder, at) {
+  if (!['codex', 'kimi', 'deepseek', 'sonnet'].includes(coder)) return false;
+  const when = Number.isFinite(at) ? at : Date.now();
+  if ((s.lastCodeAuthorAt || 0) > when) return false;
+  s.lastCodeAuthor = coder;
+  s.lastCodeAuthorAt = when;
+  return true;
+}
+
+/**
+ * Settle `group` and remember the code author it carried as this session's last code
+ * author, dated at the group's own start so a late settle never clobbers a newer group —
+ * the review / verify model follows whoever last wrote code (operator decision,
+ * 2026-10-01). Only a real change records: an already-settled group does not re-stamp it.
+ */
+function settleCodeGroup(s, group) {
+  const author = codeAuthorOfGroup(s.workers, group);
+  const at = groupStartedAt(s.workers, group);
+  const changed = WG.settleGroup(s.workers, group);
+  if (changed && author) recordCodeAuthor(s, author, at);
+  return changed;
 }
 
 function readLastCoder() {
@@ -939,7 +1040,7 @@ function onSessionStart(p, s, cfg) {
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
     `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> ${usableCoders.map(coderLabel).join(' + ') || 'in-session'} coder${usableCoders.length === 1 ? '' : 's'} -> reviews.\n` +
-    `- Planning / red-team / review / verification -> in-session subagent on model ${modelLabel(cfg.models.review)}.\n` +
+    `- Planning / red-team -> in-session subagent on model ${modelLabel(cfg.models.review)}. Review / verify -> model ${reviewRouteText(cfg, s)} (review model follows the code's author).\n` +
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (external spec or in-session prompt) names the exact test / build command to run green.\n' +
@@ -1161,7 +1262,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     const others = ['codex', 'kimi', 'deepseek'].filter((c) => c !== ex.pick);
     codeRoute += `; ${others.map((c) => `${coderName(c)} ${ex.coders[c]?.standby ? 'overflow standby' : (ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable')}`).join('; ')}; next -> ${coderName(ex.pick)}`;
   }
-  parts.push(`Model routing: plan/red-team/review -> model ${modelLabel(cfg.models.review)}; code -> ${codeRoute} [${ex.why}].`);
+  parts.push(`Model routing: plan/red-team -> model ${modelLabel(cfg.models.review)}; review -> ${reviewRouteText(cfg, s)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);
   const activeHandoverIds = new Set(live.flatMap(([key, worker]) => [
     key, worker.group, worker.dispatchId, worker.taskId, worker.terminalHandle,
@@ -1398,11 +1499,46 @@ function onPreToolUse(p, s, cfg) {
       || cfg.agents.escalation.some((n) => n.toLowerCase() === type.toLowerCase());
     const isReviewModel = new RegExp(escapeRegex(reviewAlias), 'i').test(model);
 
-    if (wantsPlanReview && !isEscalation && !isReviewModel) {
-      d('route-review',
-        `Planning / review / verification must run on model "${reviewAlias}".\n` +
-        `Re-dispatch with model: "${reviewAlias}". ` +
-        `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
+    // Review / verify follows the code's author (operator decision, 2026-10-01): code by an
+    // external coder (codex/kimi/deepseek) is reviewed on the mapped model (default the code
+    // model, sonnet), code by the code model itself on the review model. Planning and
+    // red-team stay on the review model. An unknown author allows either, so a review is
+    // never blocked just because the gate cannot tell who wrote the code.
+    const codeAlias = cfg.models.code.alias;
+    const isCodeModel = new RegExp(escapeRegex(codeAlias), 'i').test(model);
+    const planning = isPlanningReview(description, type);
+    const author = s.lastCodeAuthor || null;
+    if (wantsPlanReview && !isEscalation) {
+      if (planning || !author) {
+        const allowed = isReviewModel || (!planning && isCodeModel);
+        if (!allowed) {
+          d('route-review',
+            `Planning / red-team / review / verification must run on model "${reviewAlias}"` +
+            (planning ? '' : ` (or "${codeAlias}" when the code was written by an external coder)`) + '.\n' +
+            `Re-dispatch with model: "${reviewAlias}". ` +
+            `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
+        }
+      } else {
+        const mapped = reviewModelForCoder(cfg, author) || reviewAlias;
+        const onMapped = new RegExp(escapeRegex(mapped), 'i').test(model);
+        if (!onMapped) {
+          if (isReviewModel && mapped !== reviewAlias) {
+            if (!hasReviewEscalationReason(input, mapped)) {
+              d('review-model-follows-coder',
+                `Code here was written by ${author}: review / verify it on model "${mapped}" first, not "${reviewAlias}" ` +
+                `(a model never reviews its own output; "${reviewAlias}" is reserved for code "${codeAlias}" wrote).\n` +
+                `Escalate to "${reviewAlias}" only after the "${mapped}" review cannot decide — say so in the dispatch, e.g.\n` +
+                `  "escalation: ${mapped} review could not decide ...".\n` +
+                `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
+            }
+          } else {
+            d('route-review',
+              `Review / verify of ${author}-authored code must run on model "${mapped}".\n` +
+              `Re-dispatch with model: "${mapped}". ` +
+              `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
+          }
+        }
+      }
     }
     // The review model is reserved for the work it took over from the escalation model:
     // planning / review / verification — unless the operator explicitly picked it to code.
@@ -1449,6 +1585,19 @@ function onPreToolUse(p, s, cfg) {
       }
       if (!VERIFY_COMMAND.test(`${input.description || ''}\n${input.prompt || ''}`)) {
         d('code-brief-needs-verify', CODE_BRIEF_HELP);
+      }
+      // In-session code on the configured code model makes the code's author "sonnet", so a
+      // later review/verify of it is routed to the review model (never the same model).
+      if (inSession && wantAlias === cfg.models.code.alias) {
+        const lockDir = path.join(DIR, '.lock');
+        const locked = acquireLock(lockDir, {});
+        try {
+          const fresh = load(s.session_id);
+          recordCodeAuthor(fresh, 'sonnet', Date.now());
+          save(fresh);
+        } finally {
+          if (locked) releaseLock(lockDir);
+        }
       }
 
       // Gate B for in-session code dispatches: isolated work (a fresh worktree, or a
@@ -1742,7 +1891,10 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
           worktreeIds, readinessTimeout: true,
         };
-        if (inv.sub === 'orchestration worker-start') writeLastCoder(agent);
+        if (inv.sub === 'orchestration worker-start') {
+          writeLastCoder(agent);
+          recordCodeAuthor(s, poolCoderForAgent(agent), Date.now());
+        }
         dirty = true;
       }
       if (resId && s.reservations[resId]) { delete s.reservations[resId]; dirty = true; }
@@ -1769,6 +1921,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
         owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
         worktreeIds,
       };
+      recordCodeAuthor(s, poolCoderForAgent(agent), s.workers[pendingId].started);
       dirty = true;
       process.stdout.write(
         'orchestrator-gate: orca worker-start ran but no dispatch id was found in its output; ' +
@@ -1784,7 +1937,10 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           worktreeIds,
         };
       }
-      if (inv.sub === 'orchestration worker-start') writeLastCoder(agent);
+      if (inv.sub === 'orchestration worker-start') {
+        writeLastCoder(agent);
+        recordCodeAuthor(s, poolCoderForAgent(agent), Date.now());
+      }
       dirty = true;
       if (!heartbeatAlive(s.session_id)) {
         process.stdout.write(
@@ -1836,7 +1992,7 @@ function onPostToolUseFailure(p, s, cfg) {
         for (const inv of orcaInvocations(cmd)) {
           const target = WG.releaseTarget(inv, flagValue);
           if (!target || !s.workers[target]) continue;
-          if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
+          if (settleCodeGroup(s, WG.groupOf(s.workers[target], target))) dirty = true;
         }
       }
       const hasDispatch = orcaInvocations(cmd).some((inv) => DISPATCH_SUBS.has(inv.sub) && !hasFlag(inv.args, '--help'));
@@ -1933,7 +2089,7 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
       for (const inv of orcaInvocations(failedCmd)) {
         const target = WG.releaseTarget(inv, flagValue);
         if (!target || !s.workers[target]) continue;
-        if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
+        if (settleCodeGroup(s, WG.groupOf(s.workers[target], target))) dirty = true;
       }
     }
     // Nothing below this point should be trusted on a failed call: a Bash failure's
@@ -1991,6 +2147,7 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
             delete s.workers[pendingId];
           } else {
             s.workers[pendingId].status = 'settled';
+            recordCodeAuthor(s, poolCoderForAgent(s.workers[pendingId].agent), s.workers[pendingId].started);
           }
         }
       }
@@ -2031,7 +2188,7 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
       const target = WG.releaseTarget(inv, flagValue);
       if (!target) continue;
       if (s.workers[target]) {
-        if (WG.settleGroup(s.workers, WG.groupOf(s.workers[target], target))) dirty = true;
+        if (settleCodeGroup(s, WG.groupOf(s.workers[target], target))) dirty = true;
       } else {
         // The id may belong to a worker this session only tracks as a "pending-*"
         // placeholder (its start reply never yielded the real id). Settle it only when the
@@ -2065,6 +2222,7 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
         }
         if (settledPending) {
           s.workers[settledPending].status = 'settled';
+          recordCodeAuthor(s, poolCoderForAgent(s.workers[settledPending].agent), s.workers[settledPending].started);
           dirty = true;
           process.stdout.write(
             `orchestrator-gate: ${inv.sub} named untracked "${target}"; settled the one live placeholder ` +
@@ -2104,6 +2262,8 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
           dirty = true;
         }
       }
+      // A retained code worker is finished-and-kept: its review model follows its author.
+      if (recordCodeAuthor(s, codeAuthorOfGroup(s.workers, group), Date.now())) dirty = true;
     }
 
     // Rate limiting: record it and set a backoff deadline instead of re-dispatching now.
@@ -2265,7 +2425,11 @@ function onStop(p, s, cfg) {
       // A "pending-*" placeholder past its TTL no longer counts toward caps or ownership
       // (worker-groups.cjs) and must not keep the panel from stopping either.
       for (const [key, w] of Object.entries(fresh.workers || {})) {
-        if (w.status === 'live' && WG.pendingPlaceholderExpired(key, w)) { w.status = 'settled'; purgedAny = true; }
+        if (w.status === 'live' && WG.pendingPlaceholderExpired(key, w)) {
+          w.status = 'settled';
+          recordCodeAuthor(fresh, poolCoderForAgent(w.agent), w.started);
+          purgedAny = true;
+        }
       }
       if (purgedAny) { save(fresh); s = fresh; }
     } finally {
@@ -2302,7 +2466,10 @@ function onStop(p, s, cfg) {
     try {
       s = load(p.session_id);
       const freshTrackable = liveWorkers(s).filter(([k]) => !k.startsWith('pending-') && ids.includes(k));
-      for (const [, w] of freshTrackable) w.status = 'settled';
+      for (const [, w] of freshTrackable) {
+        w.status = 'settled';
+        recordCodeAuthor(s, poolCoderForAgent(w.agent), w.started);
+      }
       save(s);
     } finally {
       if (locked) releaseLock(lockDir);
@@ -2383,4 +2550,5 @@ module.exports = {
   shellSyntaxOnly, redirectTargets, isExemptPath, movesOnlyExemptPaths, shellSegments,
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
   hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds,
+  isPlanningReview, hasReviewEscalationReason,
 };
