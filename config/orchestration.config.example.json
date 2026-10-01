@@ -7,7 +7,10 @@
     "code": { "alias": "sonnet", "id": null, "effort": "medium", "agentType": "sonnet-coder" },
     "lookup": { "alias": "haiku", "id": null },
     "codex": { "alias": null, "id": "gpt-5.6-sol" },
-    "kimi": { "alias": null, "id": null }
+    "kimi": { "alias": null, "id": null },
+    "deepseek": { "alias": null, "id": null },
+    "reviewByCoder": { "codex": "sonnet", "kimi": "sonnet", "deepseek": "sonnet", "sonnet": "opus" },
+    "reviewEffort": "medium"
   },
   "agents": {
     "escalation": [],
@@ -15,14 +18,18 @@
   },
   "codexHandoffUsedPercent": 95,
   "kimiHandoffUsedPercent": 95,
+  "deepseekHandoffUsedPercent": 95,
   "handoverWarnMarginPercent": 5,
   "autoResumeAfterReset": true,
   "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
+  "deepseekQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "coderHeadroomTieBand": 10,
   "unknownHeadroomAssumed": 30,
+  "deepseekRole": "overflow",
+  "deepseekDailySpendCapUsd": 0,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": {
     "intervalSeconds": 20,
@@ -33,6 +40,7 @@
   },
   "maxParallelCodexWorkers": 3,
   "maxParallelKimiWorkers": 3,
+  "maxParallelDeepseekWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
   "closeDoneWorktrees": "remove",

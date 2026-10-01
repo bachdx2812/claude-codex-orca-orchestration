@@ -9,8 +9,11 @@ exact current numbers - it now names both the alias and the exact id, e.g.
 `model "opus" (claude-opus-5-5)`.
 
 **Shipped versions** (the example config; override in `~/.claude/orchestration.config.json`):
-review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fable 5.1**
-(`claude-fable-5-1`), Codex worker dispatches on **`gpt-5.6-sol`**.
+planning/red-team on **Opus 5.5** (`claude-opus-5-5`); review/verify on the model mapped to
+the code's author — the code model **Sonnet** for external coders, Opus for code Sonnet
+itself wrote; escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
+**`gpt-5.6-sol`**; DeepSeek runs through `opencode` with the model from
+`~/.config/opencode/opencode.jsonc` (Orca cannot pin it).
 
 ## The contract
 
@@ -18,29 +21,46 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    dispatches work, and supervises it. It does not implement. Edit/Write/MultiEdit/
    NotebookEdit and mutating shell commands are refused outside `.claude/`, `plans/`,
    `docs/`, scratch, and a temp dir.
-2. **Planning, review and verification run on the configured review model**
+2. **Planning and red-team run on the configured review model**
    (`models.review.alias`, default `opus`), as an in-session subagent (`Agent` with
-   `model: "<review alias>"`). The configured escalation model
-   (`models.escalation.alias`, default `fable`) is reserved for work the review model
-   could not do, even at higher effort — a dispatch to it must say so.
-3. **Code goes to an external coder (Codex or Kimi) in an Orca worker first**, and to the
-   configured in-session code
+   `model: "<review alias>"`). **Review and verification follow the code's author**
+   (`models.reviewByCoder`, default `{ "codex": "sonnet", "kimi": "sonnet",
+   "deepseek": "sonnet", "sonnet": "opus" }`): code written by an external coder (Codex,
+   Kimi, DeepSeek/opencode) is reviewed on the code model, code the code model itself wrote
+   on the review model — a model never reviews its own output. When no code author is known
+   yet the gate allows either, so a review is never blocked for lack of an author. The
+   configured escalation model (`models.escalation.alias`, default `fable`) is reserved for
+   work the review model could not do, even at higher effort — a dispatch to it must say so.
+   An Opus review of external-coder code is refused unless the dispatch says the mapped
+   (Sonnet) review already ran and could not decide
+   (`escalation: sonnet review could not decide ...`).
+3. **Code goes to an external coder (Codex, Kimi or DeepSeek) in an Orca worker first**, and
+   to the configured in-session code
    model (`models.code.alias`, default `sonnet`) only once every usable coder has exhausted
    its quota — Codex at `codexHandoffUsedPercent` (default 95), Kimi at the separate
-   `kimiHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window. Routing
+   `kimiHandoffUsedPercent` (default 95) of its tightest live-read rate-limit window, DeepSeek
+   at `deepseekHandoffUsedPercent` (default 95) of its daily spend cap (default unlimited, so
+   it stops only on an exhausted balance). Routing
    spreads every Codex task class — code, builds, refactors, tests, bulk conversions, and
-   fix loops — across both peers. Among eligible coders, pick the coder with MORE QUOTA
+   fix loops — across the peers. Among eligible coders, pick the coder with MORE QUOTA
    LEFT: a free per-session slot first, then more
    headroom below the coder's own threshold; within `coderHeadroomTieBand` (default 10
    headroom points) of each other, fewer live worker groups across every recent session on
    this machine, then the coder other than `lastCoder`, and finally Codex as the last
    tie-break. A quota-unknown coder ranks as `unknownHeadroomAssumed` (default 30) headroom
-   points; a reset-aware estimate of the last successful reading counts as known. A coder that is not installed, signed in, or
-   launchable on this machine is excluded; both coders exhausted or unusable means Sonnet.
-   The operator can pick the coding model directly with `--code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>`,
-   or use the `--exec-sonnet` / `--exec-codex` / `--exec-kimi` / `--exec-auto` shortcuts.
+   points; a reset-aware estimate of the last successful reading counts as known. Each coder
+   is optional: one not installed, signed in, or
+   launchable on this machine is excluded; all coders exhausted or unusable means Sonnet.
+   DeepSeek defaults to the `overflow` role — picked only once no subscription coder (Codex,
+   Kimi) is eligible, before Sonnet — and is a full peer once `deepseekRole` is `peer`. The
+   operator can pick the coding model directly with `--code-model
+   <alias|codex|codex:<model>|kimi|kimi:<model>|deepseek|deepseek:<model>|auto>`,
+   or use the `--exec-sonnet` / `--exec-codex` / `--exec-kimi` / `--exec-deepseek` /
+   `--exec-auto` shortcuts.
    A `worker-start --agent kimi` is dispatched WITHOUT `--model` (Kimi uses
-   `default_model` from `~/.kimi-code/config.toml`).
+   `default_model` from `~/.kimi-code/config.toml`); a `worker-start --agent opencode`
+   (DeepSeek) is likewise dispatched WITHOUT `--model`, using the model from
+   `~/.config/opencode/opencode.jsonc`.
 4. **Light lookups** (find/locate code, read logs or test output, explore) are advised
    toward the configured lookup model (`models.lookup.alias`, default `haiku`) — this is
    advisory only and never blocks.
@@ -88,6 +108,11 @@ unless the description contains code intent, which wins when both signals are pr
 inside ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` counts; only review-style
 prefixes such as `review-fix` are excluded, so `Commit review-fix round` remains operational.
 
+A review-intent dispatch is then routed by author: `plan`/`planning`/`design`/`red-team`/
+`architect` stay on the review model, while `review`/`verify`/`audit`/`critique`/`assess`
+follow `models.reviewByCoder` for the session's last code author (a planning noun only counts
+as planning when no review verb governs the text).
+
 ## Activation
 
 `config.activation` decides which sessions this gate governs at all:
@@ -127,6 +152,9 @@ The operator (only) can pick who writes code for the rest of the session:
 --code-model codex:gpt-5-custom   # Codex in an Orca worker, pinned to this model
 --code-model kimi          # Kimi in an Orca worker (same as --exec-kimi); no --model — Kimi uses default_model from ~/.kimi-code/config.toml
 --code-model kimi:<model>  # Kimi, recorded model preference shown in reminders (Orca cannot pin it)
+--code-model deepseek      # DeepSeek via opencode in an Orca worker (same as --exec-deepseek); no --model
+--code-model deepseek:<model>  # DeepSeek, recorded model preference (the real pin is "model" in ~/.config/opencode/opencode.jsonc)
+--code-model opencode      # alias of deepseek (the Orca agent name)
 --code-model auto          # back to automatic routing (same as --exec-auto)
 ```
 
@@ -143,9 +171,12 @@ active**, in-session code still runs on the configured code model, not Codex —
 fallback exists precisely because Orca cannot be reached, so it cannot honor "use Codex"
 either, regardless of what the operator's standing override says.
 
-## Coder availability (no Orca / no Codex / no Kimi)
+## Coder availability (no Orca / no Codex / no Kimi / no DeepSeek)
 
-Codex and Kimi are peers. Automatic routing first establishes which coders are usable,
+Codex and Kimi are peers; DeepSeek (via `opencode`) is an `overflow` coder by default
+(picked only once no subscription coder is eligible, before Sonnet) and a full peer when
+`deepseekRole` is `peer`. Every coder is optional: any machine may have none of them.
+Automatic routing first establishes which coders are usable,
 then applies the load-balancing order in rule 3; Codex is chosen first only at the final
 tie-break. A quota-unknown reading does not by itself make a usable coder ineligible.
 Codex quota discovery first uses a fresh state-dir live cache (including cached failures), then queries `codex app-server`
@@ -184,13 +215,28 @@ until the marker expires or a fresh quota reading shows it below its threshold. 
 a Kimi terminal (another session's worker records or a Kimi-identifying title) — never on an
 absent agent — and writes the marker silently, without a wake event. A reported terminal
 re-arms once its episode's `until` passes, so a Kimi terminal re-used after the window reset
-marks again on the next limit. No state
-file ever contains a token.
+marks again on the next limit.
 
-The gate checks `orca`/`codex` reachability itself (an absolute `ORCA_BIN`/`ORCH_CODEX_BIN`
-path is checked with a file-exists test; the bare default name via `which`/`where`) — no
-per-invocation cost beyond those two lookups, and never a live `worker-list` call just to
-decide routing.
+DeepSeek runs through the `opencode` agent and is **unusable** (excluded from routing) unless
+all three hold: the `opencode` binary is present (`ORCH_OPENCODE_BIN` overrides which binary
+is checked), a DeepSeek credential is configured in opencode (`opencode auth list` shows
+DeepSeek, or `DEEPSEEK_API_KEY` is set), and opencode's default `model` is a `deepseek/*`
+model — otherwise a worker would silently run Claude. DeepSeek is pay-per-use with no
+rate-limit window: its headroom is the remaining share of a **daily spend cap**
+(`deepseekDailySpendCapUsd`, default `0` = unlimited, env `ORCH_DEEPSEEK_DAILY_CAP_USD`),
+computed from today's DeepSeek spend read from opencode; when that spend cannot be read the
+reading is quota-unknown (ranked `unknownHeadroomAssumed`). An optional balance check
+`GET https://api.deepseek.com/user/balance` (the API key travels only in the spawned probe's
+header, never in output, state, or logs) treats a zero balance or `is_available: false` as
+exhausted. A worker whose output shows DeepSeek's 402 `Insufficient Balance` (error-shaped
+lines only, and only for terminals whose tracked agent is `opencode`) is recorded in
+`coder-exhausted.json` with a `reason`, mirroring Kimi's billing-cycle limit. No state
+file ever contains a token or an API key.
+
+The gate checks `orca`/`codex`/`opencode` reachability itself (an absolute
+`ORCA_BIN`/`ORCH_CODEX_BIN`/`ORCH_OPENCODE_BIN` path is checked with a file-exists test; a
+bare default name via `which`/`where`) — no per-invocation cost beyond those lookups, and
+never a live `worker-list` call just to decide routing.
 
 Live-cache refresh is single-flight across hook processes through a short lease in the
 state directory. The lease winner probes app-server; peers consume the refreshed value or
@@ -206,9 +252,10 @@ Independent of that automatic fallback, the operator can always route explicitly
   and expires after 15 minutes on purpose — a permanent flag would silently disable the
   Codex-in-Orca rule forever after one transient failure.
 
-`node install.mjs --check` reports whether `orca` and `codex` are on `PATH`, whether Codex
-looks logged in, and the effective config (including `execFallbackWhenCodexUnavailable`)
-as the installed hooks would actually read it. It also reports any registered foreign
+`node install.mjs --check` reports whether `orca`, `codex` and `opencode` are on `PATH`,
+whether Codex looks logged in, whether opencode is set up for DeepSeek, and the effective
+config (including `execFallbackWhenCodexUnavailable`) as the installed hooks would actually
+read it. It also reports any registered foreign
 `orchestrator-gate.cjs` as a problem. Install preserves such registrations with a warning
 unless the operator explicitly supplies `--replace-foreign-gate`; the ordinary settings
 backup precedes their removal. Help and unknown options never enter the install path.
@@ -228,19 +275,26 @@ backup precedes their removal. Help and unknown options never enter the install 
     "code": { "alias": "sonnet", "id": null, "effort": "medium", "agentType": "sonnet-coder" },
     "lookup": { "alias": "haiku", "id": null },
     "codex": { "alias": null, "id": "gpt-5.6-sol" },
-    "kimi": { "alias": null, "id": null }
+    "kimi": { "alias": null, "id": null },
+    "deepseek": { "alias": null, "id": null },
+    "reviewByCoder": { "codex": "sonnet", "kimi": "sonnet", "deepseek": "sonnet", "sonnet": "opus" },
+    "reviewEffort": "medium"
   },
   "agents": { "escalation": [], "lookup": ["Explore"] },
   "codexHandoffUsedPercent": 95,
   "kimiHandoffUsedPercent": 95,
+  "deepseekHandoffUsedPercent": 95,
   "handoverWarnMarginPercent": 5,
   "autoResumeAfterReset": true,
   "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "kimiQuotaCacheSeconds": 60,
+  "deepseekQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "coderHeadroomTieBand": 10,
   "unknownHeadroomAssumed": 30,
+  "deepseekRole": "overflow",
+  "deepseekDailySpendCapUsd": 0,
   "execFallbackWhenCodexUnavailable": "sonnet",
   "heartbeat": {
     "intervalSeconds": 20,
@@ -251,6 +305,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   },
   "maxParallelCodexWorkers": 3,
   "maxParallelKimiWorkers": 3,
+  "maxParallelDeepseekWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
   "closeDoneWorktrees": "remove",
@@ -282,6 +337,17 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `kimiHandoffUsedPercent`: integer 0-100, default 95. Kimi's own, independent threshold:
   Kimi leaves the eligible peer pool once it has used this much of its
   tightest quota window. Overridable for one process with `ORCH_KIMI_HANDOFF_USED`.
+- `deepseekHandoffUsedPercent`: integer 0-100, default 95. DeepSeek leaves the eligible
+  coder pool once it has used this much of its daily spend cap. Overridable for one process
+  with `ORCH_DEEPSEEK_HANDOFF_USED`.
+- `deepseekRole`: `"overflow"` (default) or `"peer"`. `overflow` picks DeepSeek only when no
+  subscription coder (Codex, Kimi) is eligible, before the Sonnet fallback; `peer` gives it
+  the same headroom / tie-band / live-count / `lastCoder` rules as Codex and Kimi.
+  Overridable for one process with `ORCH_DEEPSEEK_ROLE`.
+- `deepseekDailySpendCapUsd`: number 0-100000, default `0` (= unlimited). DeepSeek's
+  pay-per-use "quota" is the remaining share of this daily cap; at `0` only an exhausted
+  balance (or a 402 `Insufficient Balance`) stops it. Overridable for one process with
+  `ORCH_DEEPSEEK_DAILY_CAP_USD`.
 - `handoverWarnMarginPercent`: integer 0-100, default 5. A live worker gets a persisted
   early-warning episode this many percentage points before its coder's threshold; `0`
   disables the early warning while retaining threshold/exhaustion handover.
@@ -298,6 +364,9 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `kimiQuotaCacheSeconds`: integer 0-3600, default 60. Same as `codexQuotaCacheSeconds`,
   for the Kimi `/usages` reading cached in `kimi-quota-live.json`. Overridable for one
   process with `ORCH_KIMI_QUOTA_CACHE_SECONDS`.
+- `deepseekQuotaCacheSeconds`: integer 0-3600, default 60. Same as `codexQuotaCacheSeconds`,
+  for the DeepSeek spend/balance reading. Overridable for one process with
+  `ORCH_DEEPSEEK_QUOTA_CACHE_SECONDS`.
 - `coderAvailabilityCacheSeconds`: integer 0-86400, default 600. How long a per-machine
   coder availability probe (binary present? signed in?) is reused from
   `coder-availability.json`. Overridable for one process with
@@ -312,6 +381,18 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `models.kimi`: `{ "alias": null, "id": null }` by default; `id` is shown in banner text
   only — Orca cannot pin a Kimi model on `worker-start`, so the real pin is
   `default_model` in `~/.kimi-code/config.toml`.
+- `models.deepseek`: `{ "alias": null, "id": null }` by default; shown in banner text only.
+  Orca cannot pin a model for `--agent opencode`, so the real pin is `model` in
+  `~/.config/opencode/opencode.jsonc`, and that model must be a `deepseek/*` one for the
+  coder to count as usable.
+- `models.reviewByCoder`: author coder -> review model alias (a string per entry). Default
+  `{ "codex": "sonnet", "kimi": "sonnet", "deepseek": "sonnet", "sonnet": "opus" }` — code
+  by an external coder is reviewed on the code model, code by the code model on the review
+  model. `ORCH_REVIEW_MODEL_EXTERNAL` / `ORCH_REVIEW_MODEL_SONNET` override the external
+  and sonnet mappings for one process. An entry that is not a non-empty string falls back to
+  its own default with a banner warning.
+- `models.reviewEffort`: one of `low|medium|high|xhigh|max`, default `medium` — the effort
+  the in-session (code-model) reviewer runs at.
 - `heartbeat.stallSeconds`: integer 1-86400, default 900. With no worktree change or new
   meaningful terminal output for this long, a supervised worker produces an informational
   stall wake event. `ORCH_STALL_SECONDS` overrides the global value for one process; blank
@@ -331,6 +412,9 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `maxParallelKimiWorkers`: integer 0-32, default 3. The same per-session group cap for
   Kimi-agent worker-starts; `0` is unlimited. Overridable for one process with
   `ORCH_MAX_PARALLEL_KIMI_WORKERS`.
+- `maxParallelDeepseekWorkers`: integer 0-32, default 3. The same per-session group cap for
+  DeepSeek (`opencode`-agent) worker-starts; `0` is unlimited. Overridable for one process
+  with `ORCH_MAX_PARALLEL_DEEPSEEK_WORKERS`.
 - `ownershipClaimTtlMinutes`: integer 1-10080, default 120. How long a background
   in-session Agent's `Owns:` claim survives without an explicit release before it
   auto-expires. Overridable for one process with `ORCH_CLAIM_TTL_MINUTES`.
@@ -373,11 +457,17 @@ for tests), `ORCH_CODEX_BIN` (which `codex` executable the live quota probe invo
 and which executable the routing fallback checks; legacy `CODEX_BIN` remains a lower-priority
 alias), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
 `ORCH_KIMI_HANDOFF_USED`, `ORCH_KIMI_QUOTA_CACHE_SECONDS`,
+`ORCH_DEEPSEEK_HANDOFF_USED`, `ORCH_DEEPSEEK_QUOTA_CACHE_SECONDS`,
+`ORCH_DEEPSEEK_ROLE`, `ORCH_DEEPSEEK_DAILY_CAP_USD`,
+`ORCH_REVIEW_MODEL_EXTERNAL`, `ORCH_REVIEW_MODEL_SONNET`,
 `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`, `ORCH_MAX_PARALLEL_KIMI_WORKERS`,
+`ORCH_MAX_PARALLEL_DEEPSEEK_WORKERS`,
 `ORCH_STALL_SECONDS`, `ORCH_CLOSE_DONE_WORKTREES`. Non-config env for tests/ops only: `ORCH_KIMI_BIN` (which
 `kimi` executable the availability probe checks — authoritative when set, no `which`
 fallback), `ORCH_KIMI_HOME` (default `~/.kimi-code`; where the credentials file is read),
-`ORCH_KIMI_USAGE_URL` (full quota URL; must be `https:` unless the host is loopback). An invalid or missing config value never crashes
+`ORCH_KIMI_USAGE_URL` (full quota URL; must be `https:` unless the host is loopback),
+`ORCH_OPENCODE_BIN` (which `opencode` executable and the DeepSeek credential probe are
+checked). An invalid or missing config value never crashes
 the gate; it falls back to the default for that field alone and reports the fallback as a
 warning in the SessionStart banner. Config is re-read on every hook invocation (each is
 its own Node process), so an edit takes effect on the very next tool call — no restart
@@ -512,8 +602,10 @@ on a terminal usage-exhaustion signal:
 WORKER HANDOVER <dispatch|terminal> (<agent> <used>% >= <threshold>%) -> hand over to <other eligible coder, else Sonnet>
 ```
 
-Selection is symmetric and excludes the current coder: Kimi -> Codex -> Sonnet fallback;
-Codex -> Kimi -> Sonnet fallback. The per-prompt gate reminder lists persisted workers that
+Selection is symmetric across every other eligible coder and excludes the current one:
+Kimi -> Codex/DeepSeek -> Sonnet fallback, Codex -> Kimi/DeepSeek -> Sonnet fallback,
+DeepSeek -> Codex/Kimi -> Sonnet fallback (DeepSeek's "quota" being its daily spend cap /
+balance). The per-prompt gate reminder lists persisted workers that
 still need handover. If responsive, tell the worker to stop after committing all WIP as
 `wip: handover` and writing/committing `HANDOVER.md` with done, remaining, next step, and
 verification instructions; wait up to about three minutes. Then `worker-stop` and
@@ -693,6 +785,11 @@ parallel batch and must still see the first reservation. A same-command reservat
 numeric timestamp is treated as old and replaced. When a fresh identical retry conflicts
 with its own reservation, the refusal explicitly says to retry in a few seconds.
 
+**`max-parallel-kimi-workers` / `max-parallel-deepseek-workers`.** The same per-session
+group cap and cap-exempt / reconcile / retry-replacement rules apply to Kimi
+(`maxParallelKimiWorkers`) and DeepSeek (`maxParallelDeepseekWorkers`, the `opencode`
+agent), each counted independently of Codex.
+
 **`max-parallel-agents`.** A MACHINE-wide budget, on top of (never instead of) the
 Codex-only cap above: the resource is this machine's cores, not any one session's own
 concurrency, so the count sums every recent session's own state file under the shared
@@ -863,24 +960,35 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
                              "capExempt": false } },
   "reservations": { "<toolUseId>#<idx>": { "ts": 0, "agent": "codex",
                                             "owns": ["src/api/**"], "ws": "<repoRoot>|current",
-                                            "codexSlot": true, "kimiSlot": false, "newSlot": true } },
+                                            "codexSlot": true, "kimiSlot": false,
+                                            "deepseekSlot": false, "newSlot": true } },
   "agentClaims": { "<toolUseId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current", "ts": 0,
                                      "background": false } },
   "tasks": { "<taskId>": { "owns": ["src/api/**"], "ws": "<repoRoot>|current" } },
+  "lastCodeAuthor": "kimi|codex|deepseek|sonnet|null", "lastCodeAuthorAt": 0,
   "last_heartbeat": 0, "rate_limit_hits": 0 }
 ```
 
 `execAgent` is one of `null` (automatic, by coder pool), `"codex"`, `"codex:<model>"`,
-`"kimi"`, `"kimi:<model>"`, or `"claude:<alias>"`. A Kimi model suffix is a persisted
-preference shown in reminders; Orca cannot pin it, so the worker still launches without
+`"kimi"`, `"kimi:<model>"`, `"deepseek"`, `"deepseek:<model>"`, or `"claude:<alias>"`. A Kimi
+or DeepSeek model suffix is a persisted
+preference shown in reminders; Orca cannot pin either, so the worker still launches without
 `--model`. Any other persisted value is reset to `null` and reported once. The
 `*Since` fields contain ISO-8601 timestamps only while their corresponding override is
 active.
 
+`lastCodeAuthor` records who wrote this session's pending code — the last external coder
+group (opencode counts as `deepseek`), the `sonnet` code model for an in-session code
+dispatch, or `null` before any code work — and `lastCodeAuthorAt` is its epoch-ms ordering
+stamp, so a worker group that settles after a newer dispatch started never clobbers the
+newer author. A review / verify dispatch is routed by this value (`models.reviewByCoder`);
+a `null` author allows either the review or the code model.
+
 Machine-wide coder routing state lives at `<ORCH_STATE_DIR>/coder-route-state.json` as
-`{ "lastCoder": "codex|kimi", "updatedAt": 0 }`. The gate writes `lastCoder` atomically
-under the shared state lock only when a `worker-start` reply registers a real Codex or Kimi
-worker. Automatic routing uses it after the machine-wide live-count and per-coder headroom
+`{ "lastCoder": "codex|kimi|deepseek", "updatedAt": 0 }`. The gate writes `lastCoder`
+atomically
+under the shared state lock only when a `worker-start` reply registers a real coder worker.
+Automatic routing uses it after the machine-wide live-count and per-coder headroom
 ties, so equal peers alternate without trusting free-text command output.
 
 `group`/`kind`/`agent`/`owns`/`ws` on a worker entry, `reservations`, `agentClaims` and
@@ -894,11 +1002,13 @@ the safe cleanup paths. An `agentClaims` entry is removed at release, whichever 
 above fires first. A worker Orca reports done but still holding its terminal is marked
 `capExempt: true` — it no longer counts toward `maxParallelCodexWorkers`, but stays `live`
 so the Stop gate still catches it as an unreleased resource. A reservation's `codexSlot` /
-`kimiSlot` flags record which per-coder cap (`maxParallelCodexWorkers` /
-`maxParallelKimiWorkers`) it holds capacity against; `newSlot` is set for any agent's
+`kimiSlot` / `deepseekSlot` flags record which per-coder cap (`maxParallelCodexWorkers` /
+`maxParallelKimiWorkers` / `maxParallelDeepseekWorkers`) it holds capacity against;
+`newSlot` is set for any agent's
 genuinely new dispatch and counts toward the machine-wide `max-parallel-agents` budget.
 Cross-session, machine-wide files in the same state directory: `codex-quota-live.json`,
-`kimi-quota-live.json` (cached live quota readings, never a token),
+`kimi-quota-live.json`, `deepseek-quota-live.json` (cached live quota readings, never a token
+or API key),
 `coder-availability.json` (cached per-coder usable/unusable probe), `coder-exhausted.json`
 (billing-cycle exhaustion markers per coder, each with `at`/`until`/`reason`). An `agentClaims` entry from a
 `run_in_background: true` dispatch is marked `background: true` and is deliberately NOT
@@ -932,6 +1042,8 @@ processes racing the same session id can otherwise silently drop each other's wr
   process) makes the parallel-Codex-worker cap unlimited.
 - `maxParallelKimiWorkers: 0` (config) or `ORCH_MAX_PARALLEL_KIMI_WORKERS=0` (env, one
   process) makes the parallel-Kimi-worker cap unlimited.
+- `maxParallelDeepseekWorkers: 0` (config) or `ORCH_MAX_PARALLEL_DEEPSEEK_WORKERS=0` (env,
+  one process) makes the parallel-DeepSeek-worker cap unlimited.
 - `maxParallelAgents: 0` (config) or `ORCH_MAX_PARALLEL_AGENTS=0` (env, one process) makes
   the machine-wide `max-parallel-agents` budget unlimited.
 
@@ -947,11 +1059,17 @@ Refusals are appended to `<ORCH_STATE_DIR>/violations.log`
 ## Tests
 
 ```
-npm test                                             # all four suites (913 checks)
+npm test                                             # every suite below, in order
 node tests/test-orchestrator-gate.cjs                # classifiers, pure functions, config
 node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the hook
 node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)
 node tests/test-install.cjs                          # CLI safety + foreign-gate handling
+node tests/test-coder-availability.cjs               # per-coder usability probes (no Orca/Codex/Kimi/DeepSeek)
+node tests/test-kimi-signals-caps.cjs                # Kimi signals + caps
+node tests/test-gate-kimi-wiring.cjs                 # gate wiring for coder dispatches
+node tests/test-worker-stall.cjs                     # heartbeat stall/liveness
+node tests/test-kimi-exhausted-misread.cjs           # Kimi exhaustion false-positive guards
+node tests/test-released-groups.cjs                  # released-group accounting
 ```
 
 Every false positive found in real use became a permanent case in these suites: a `>`
