@@ -2,9 +2,9 @@
 
 Installable [Claude Code](https://claude.com/claude-code) hooks that turn a described
 orchestration workflow into a mechanically enforced one: a main panel that only
-dispatches and supervises, planning/red-team pinned to one model while review/verify
-follows the author of the code (Opus for code Sonnet wrote, Sonnet for external-coder
-code), code spread across Codex, Kimi and DeepSeek peers in [Orca](https://orca.dev)
+dispatches and supervises, planning/red-team pinned to one model, review of code pinned
+to Opus (regardless of which coder wrote it) while verify-run work (running existing
+checks) runs on Sonnet, code spread across Codex, Kimi and DeepSeek peers in [Orca](https://orca.dev)
 workers (or an in-session model
 once no coder is eligible), every code brief required to name how it will be
 verified, and a supervision
@@ -20,7 +20,7 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kim
  read live; separate, configurable thresholds via codexHandoffUsedPercent /
  ORCH_CODEX_HANDOFF_USED, kimiHandoffUsedPercent / ORCH_KIMI_HANDOFF_USED and
  deepseekHandoffUsedPercent / ORCH_DEEPSEEK_HANDOFF_USED]
--> review follows the code's author: Sonnet for Codex/Kimi/DeepSeek code, Opus for Sonnet code
+-> review reads code and judges the diff on Opus; verify runs existing checks on Sonnet
 -> main panel reports
 ```
 
@@ -28,7 +28,8 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kim
 |---|---|---|---|---|
 | Main panel (orchestrator) | Takes the request, delegates, supervises workers, reports; never writes code | Session default model | — | `activation` |
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
-| Reviewer / verifier | Code review, verification — follows the code's author | Sonnet 5.5 for external-coder code, Opus 5.5 for Sonnet's own code | `Agent` with `model: "sonnet"`/`"opus"` per `models.reviewByCoder` | `models.reviewByCoder`, `models.reviewEffort` |
+| Reviewer | Code review — reads code and judges the diff | Opus 5.5 (`claude-opus-5-5`), regardless of which coder wrote it | `Agent` with `model: "opus"` per `models.reviewByCoder` | `models.reviewByCoder`, `models.reviewEffort` |
+| Verifier | Verify-run — runs existing checks (CI gate, screenshots, play-test, post-deploy smoke), not reading/judging the diff | Sonnet 5.5 (`claude-sonnet-5-5`) | `Agent` with `model: "sonnet"` at `models.verify.effort` | `models.verify` |
 | Coder pool (peers) | Every task class previously handled by Codex: code, builds, refactors, tests, bulk conversions, and fix loops | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) + DeepSeek (`model` in `~/.config/opencode/opencode.jsonc`) | Spread across eligible Orca workers. Pick the coder with MORE QUOTA LEFT first: a free per-session slot, then more headroom below that coder's own threshold; within `coderHeadroomTieBand` (default 10 points), fewer live workers machine-wide; then the coder other than `lastCoder`; then Codex. A quota-unknown coder ranks as `unknownHeadroomAssumed` (default 30) headroom points; a reset-aware estimate of the last successful reading counts as known. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`; DeepSeek uses `worker-start --agent opencode` without `--model`. DeepSeek defaults to `deepseekRole: "overflow"` — picked only once no subscription coder is eligible, before Sonnet. | `models.codex`, `models.kimi`, `models.deepseek`, `deepseekRole`, per-coder caps and thresholds, `coderHeadroomTieBand`, `unknownHeadroomAssumed` |
 | Coder (handoff) | Same work once every usable coder has used >= its handoff threshold of its live-read quota (Codex: `codexHandoffUsedPercent`, default 95, override `ORCH_CODEX_HANDOFF_USED`; Kimi: `kimiHandoffUsedPercent`, default 95, override `ORCH_KIMI_HANDOFF_USED`; DeepSeek: `deepseekHandoffUsedPercent`, default 95, override `ORCH_DEEPSEEK_HANDOFF_USED`) or is unusable on this machine | Sonnet | `Agent` with `subagent_type: "sonnet-coder"` + `model: "sonnet"` at `models.code.effort` (default medium; brief must name a verify command) | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `deepseekHandoffUsedPercent`, `models.code` (incl. `effort` / `agentType`), `execFallbackWhenCodexUnavailable` |
 | Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
@@ -49,22 +50,28 @@ routing" line always shows the current coder and why. Active overrides also show
 they were set and how to return to automatic quota routing, both per prompt and in the
 `SessionStart` banner.
 
-**Review / verify follows the code's author** (`models.reviewByCoder`): code written by an
-external coder (Codex, Kimi, DeepSeek/opencode) is reviewed on the code model (Sonnet 5.5);
-code the code model itself wrote is reviewed on the review model (Opus 5.5) — a model never
-reviews its own output. Planning and red-team stay on Opus. An Opus review of external-coder
-code is refused unless the dispatch says the mapped Sonnet review already ran and could not
-decide (`escalation: sonnet review could not decide ...`), the review ladder's "say why"
-rule. Before any code is written the author is unknown and either review model is allowed.
+**Review reads code and judges the diff, always on Opus** (`models.reviewByCoder`, default
+all `opus`): code written by any coder (Codex, Kimi, DeepSeek/opencode, or Sonnet) is
+reviewed on Opus 5.5 — "code by deepseek/kimi/codex MUST be reviewed by opus". Planning
+and red-team stay on Opus. **Verify-run work runs existing checks and always runs on
+Sonnet** (`models.verify`, default `{ alias: "sonnet", id: "claude-sonnet-5-5", effort:
+"medium" }`): the CI gate, UI screenshots, play-testing, post-deploy smoke — not reading
+or judging the diff. An Opus verify is refused unless the dispatch says the mapped Sonnet
+verify already ran and could not decide (`escalation: sonnet verify could not decide ...`),
+the same "say why" escalation shape as review. Before any code is written the author is
+unknown and either review model is allowed.
 
 For Agent/Task descriptions, a recognized first verb governs intent before later nouns do:
-`Review ...` and `Plan ...` route to review, while `Implement ...` and `Generate code/assets/components ...`
+`Review ...` and `Plan ...` route to review, `Verify ...` / `Test ...` / `Smoke ...` /
+`Re-run ...` route to verify (Sonnet), and `Implement ...` / `Generate code/assets/components ...`
 route to code. Operational verbs (`commit`, `push`, `merge`, `publish`, `rebase`, `tag`,
 `release`, `deploy`, `update`, `write`) suppress later review nouns, so `Commit review-fix round`
 is not mistaken for review work; they do not suppress later code intent (`Update the parser to fix X`).
-Code intent in ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` still counts; only
-review-style compounds such as `review-fix` are excluded. Code intent also overrides a
-review-oriented `subagent_type` when both signals are present.
+A brief that both reviews and verifies (`Review and verify X`) counts as review (the stronger
+model). A `tester` / `verifier` / `browser-verifier` / `e2e-runner` `subagent_type` is
+verify-run work. Code intent in ordinary hyphenated verbs such as `Re-implement` and `Hot-fix`
+still counts; only review-style compounds such as `review-fix` are excluded. Code intent also
+overrides a review-oriented `subagent_type` when both signals are present.
 
 ## Subagents and parallel work
 
@@ -72,7 +79,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
-| In-session subagent | Opus 5.5 planning/red-team and Sonnet-coded review, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
+| In-session subagent | Opus 5.5 planning/red-team and review, Sonnet verify-run, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
 | Orca worker | Codex (`gpt-5.6-sol`), Kimi, or DeepSeek (`opencode`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, making no real progress past its configured stall threshold, losing its Codex app-server connection, a failed/stopped worker still holding a terminal (a successfully-done one is released and its terminal closed by the daemon itself), this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
@@ -408,7 +415,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 1767 checks, hermetic (no live Orca/Codex/Kimi/DeepSeek needed)
+npm test                     # 1788 checks, hermetic (no live Orca/Codex/Kimi/DeepSeek needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION
@@ -444,8 +451,8 @@ operator prompt
                  (once every coder is exhausted, or via --code-model / --exec-sonnet)
       |
       v
-  review / verify  ---->  in-session subagent, model = models.reviewByCoder[<code author>]
-                          (sonnet for external-coder code, opus for sonnet's own code)
+  review  ---->  in-session subagent, model = models.reviewByCoder[<code author>] (all opus)
+  verify  ---->  in-session subagent, model = models.verify.alias (sonnet)
 ```
 
 Automatic routing reads Codex quota live from `codex app-server` without making a model
@@ -483,7 +490,7 @@ The file is plain JSON — no comments — parsed as-is:
   "coderAvailabilityCacheSeconds": 600,
   "coderHeadroomTieBand": 10,
   "unknownHeadroomAssumed": 30,
-  "models": { "reviewByCoder": { "codex": "sonnet", "kimi": "sonnet", "deepseek": "sonnet", "sonnet": "opus" }, "reviewEffort": "medium" },
+  "models": { "verify": { "alias": "sonnet", "id": "claude-sonnet-5-5", "effort": "medium" }, "reviewByCoder": { "codex": "opus", "kimi": "opus", "deepseek": "opus", "sonnet": "opus" }, "reviewEffort": "medium" },
   "replyLanguage": "Vietnamese",
   "maxParallelCodexWorkers": 5,
   "maxParallelKimiWorkers": 3,
@@ -505,7 +512,8 @@ subscription coder (Codex, Kimi) is already at its per-session worker cap; the c
 today's DeepSeek spend from opencode's sqlite store
 (`~/.local/share/opencode/opencode.db`, `ORCH_OPENCODE_DB` overrides it) or the `deepseek/*`
 blocks of `opencode stats --days 1 --models`, and when neither is readable a non-zero cap
-makes DeepSeek quota-unknown rather than exhausted. `models.reviewByCoder` maps the code's author to its review model (defaults shown);
+makes DeepSeek quota-unknown rather than exhausted. `models.verify` is the model verify-run work (running existing checks)
+runs on (default Sonnet 5.5; `ORCH_VERIFY_MODEL` overrides its alias); `models.reviewByCoder` maps the code's author to its review model (defaults shown, all opus);
 `models.reviewEffort` sets the in-session reviewer's effort. `handoverWarnMarginPercent` warns that many
 percentage points before either threshold (default 5; set 0 to disable the early warning).
 tunable via this file or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED` /

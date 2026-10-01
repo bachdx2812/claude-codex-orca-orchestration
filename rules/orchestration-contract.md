@@ -9,9 +9,10 @@ exact current numbers - it now names both the alias and the exact id, e.g.
 `model "opus" (claude-opus-5-5)`.
 
 **Shipped versions** (the example config; override in `~/.claude/orchestration.config.json`):
-planning/red-team on **Opus 5.5** (`claude-opus-5-5`); review/verify on the model mapped to
-the code's author — the code model **Sonnet** for external coders, Opus for code Sonnet
-itself wrote; escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
+planning/red-team on **Opus 5.5** (`claude-opus-5-5`); review — reading code and judging the
+diff — on **Opus 5.5** regardless of which coder wrote it (`models.reviewByCoder`, all `opus`);
+verify-run — running existing checks — on **Sonnet 5.5** (`claude-sonnet-5-5`, `models.verify`);
+escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
 **`gpt-5.6-sol`**; DeepSeek runs through `opencode` with the model from
 `~/.config/opencode/opencode.jsonc` (Orca cannot pin it).
 
@@ -23,17 +24,20 @@ itself wrote; escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dis
    `docs/`, scratch, and a temp dir.
 2. **Planning and red-team run on the configured review model**
    (`models.review.alias`, default `opus`), as an in-session subagent (`Agent` with
-   `model: "<review alias>"`). **Review and verification follow the code's author**
-   (`models.reviewByCoder`, default `{ "codex": "sonnet", "kimi": "sonnet",
-   "deepseek": "sonnet", "sonnet": "opus" }`): code written by an external coder (Codex,
-   Kimi, DeepSeek/opencode) is reviewed on the code model, code the code model itself wrote
-   on the review model — a model never reviews its own output. When no code author is known
-   yet the gate allows either, so a review is never blocked for lack of an author. The
+   `model: "<review alias>"`). **Review — reading code and judging the diff — also runs on
+   the review model** (`models.reviewByCoder`, default all `opus`): code written by any
+   coder (Codex, Kimi, DeepSeek/opencode, or the in-session code model) is reviewed on Opus
+   ("code by deepseek/kimi/codex MUST be reviewed by opus"). **Verify-run work — running
+   existing checks (CI, screenshots, play-test, post-deploy smoke) — runs on the verify model**
+   (`models.verify`, default `{ "alias": "sonnet", "id": "claude-sonnet-5-5", "effort":
+   "medium" }`), never on the review model: Sonnet runs the checks, Opus reads and judges
+   the diff. When no code author is known yet the gate allows either review model, so a
+   review is never blocked for lack of an author. An Opus review or an Opus verify of a
+   non-opus-mapped reviewer/verifier is refused unless the dispatch says the mapped review /
+   verify already ran and could not decide (`escalation: sonnet review could not decide ...`
+   / `escalation: sonnet verify could not decide ...`). The
    configured escalation model (`models.escalation.alias`, default `fable`) is reserved for
    work the review model could not do, even at higher effort — a dispatch to it must say so.
-   An Opus review of external-coder code is refused unless the dispatch says the mapped
-   (Sonnet) review already ran and could not decide
-   (`escalation: sonnet review could not decide ...`).
 3. **Code goes to an external coder (Codex, Kimi or DeepSeek) in an Orca worker first**, and
    to the configured in-session code
    model (`models.code.alias`, default `sonnet`) only once every usable coder has exhausted
@@ -99,12 +103,16 @@ itself wrote; escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dis
     it is refused; wait for one to finish and release it, or raise the limit.
 
 Agent/Task intent classification gives a recognized first verb in the description priority
-over later nouns: `Review ...`/`Plan ...` are review work, while `Implement ...` and
+over later nouns: `Review ...`/`Plan ...` are review work, `Verify ...`/`Test ...`/`Smoke ...`/
+`Re-run ...` are verify-run work (Sonnet), and `Implement ...` and
 `Generate code/assets/components ...` are code work.
 The operational first verbs `commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`,
 `deploy`, `update`, and `write` suppress later `review`, `plan`, or `design` tokens, but later
 code intent still routes to code. Review-oriented `subagent_type` values remain review signals
-unless the description contains code intent, which wins when both signals are present. Code intent
+unless the description contains code intent, which wins when both signals are present. A
+`tester` / `verifier` / `browser-verifier` / `e2e-runner` `subagent_type` is verify-run work.
+A brief that both reviews and verifies (`Review and verify X`) counts as review — the stronger
+model — so it is never locked out of the review model. Code intent
 inside ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` counts; only review-style
 prefixes such as `review-fix` are excluded, so `Commit review-fix round` remains operational.
 
@@ -113,9 +121,10 @@ planning noun (`plan`/`planning`/`design`/`architecture`/`architect`/`phase`/`re
 `plans/**.md` / `plan.md` path, ANYWHERE in the description, `subagent_type` or prompt head —
 always stays on the review model, whatever the first verb: `Review the plan at
 plans/x/plan.md`, `Audit the implementation plan` and `Verify plan claims` are plan reviews,
-never code reviews. Only a review of code (`review`/`verify`/`audit`/`critique`/`assess` with
-no planning object) follows `models.reviewByCoder` for the session's last code author, so a
-plan review can never silently migrate off the review model to the code model.
+never code reviews and never verify-run work. Only a review of code (`review`/`audit`/
+`critique`/`assess` with no planning object) follows `models.reviewByCoder` for the session's
+last code author — all `opus` by default — so a plan review can never silently migrate off the
+review model to the code model, and a `Verify ...` first verb is verify-run (Sonnet), not review.
 
 The planning object is narrowed when the description itself names code work (`diff`,
 `implementation`, `PR`, `commit`, `fix`, `worker output`, `branch`, `code`): the dispatch is a
@@ -125,9 +134,10 @@ planning object in the description counts — `plan`/`plans`/`plan.md`/a phase f
 `design` mention is therefore not planning, and a `plan` only counts as a whole word: it must
 not sit inside a hyphenated word, so `Review plan-detection narrowing commit` is a code review,
 not a plan review. `Review phase 2 implementation diff`, `Review kimi worker output` (prompt
-cites `plans/x/plan.md`), `Verify codex fix` (prompt mentions the design of the cache layer) and
-`Review the PR` (prompt cites `docs/design-guidelines.md`) all stay on the coder-mapped
-reviewer (sonnet for codex/kimi/deepseek code) instead of being refused for the review model.
+cites `plans/x/plan.md`) and `Review the PR` (prompt cites `docs/design-guidelines.md`) stay on
+the review model (all `opus`) instead of being refused for it, while `Verify codex fix` (prompt
+mentions the design of the cache layer) is verify-run work on Sonnet — the `Verify ...` first
+verb routes to the verify model, never the review model.
 A `red-team` / `planner` / `plan-reviewer` `subagent_type` is ALWAYS planning even when the
 description names code work — the declared role beats the summary's code noun — so
 `Audit the fix` with type `red-team` and `Review commit` with type `planner` stay on the
@@ -302,7 +312,8 @@ backup precedes their removal. Help and unknown options never enter the install 
     "codex": { "alias": null, "id": "gpt-5.6-sol" },
     "kimi": { "alias": null, "id": null },
     "deepseek": { "alias": null, "id": null },
-    "reviewByCoder": { "codex": "sonnet", "kimi": "sonnet", "deepseek": "sonnet", "sonnet": "opus" },
+    "verify": { "alias": "sonnet", "id": "claude-sonnet-5-5", "effort": "medium" },
+    "reviewByCoder": { "codex": "opus", "kimi": "opus", "deepseek": "opus", "sonnet": "opus" },
     "reviewEffort": "medium"
   },
   "agents": { "escalation": [], "lookup": ["Explore"] },
@@ -413,11 +424,14 @@ backup precedes their removal. Help and unknown options never enter the install 
   `~/.config/opencode/opencode.jsonc`, and that model must be a `deepseek/*` one for the
   coder to count as usable.
 - `models.reviewByCoder`: author coder -> review model alias (a string per entry). Default
-  `{ "codex": "sonnet", "kimi": "sonnet", "deepseek": "sonnet", "sonnet": "opus" }` — code
-  by an external coder is reviewed on the code model, code by the code model on the review
-  model. `ORCH_REVIEW_MODEL_EXTERNAL` / `ORCH_REVIEW_MODEL_SONNET` override the external
+  `{ "codex": "opus", "kimi": "opus", "deepseek": "opus", "sonnet": "opus" }` — code by any
+  coder is reviewed on Opus ("code by deepseek/kimi/codex MUST be reviewed by opus").
+  `ORCH_REVIEW_MODEL_EXTERNAL` / `ORCH_REVIEW_MODEL_SONNET` override the external
   and sonnet mappings for one process. An entry that is not a non-empty string falls back to
   its own default with a banner warning.
+- `models.verify`: `{ "alias": "sonnet", "id": "claude-sonnet-5-5", "effort": "medium" }` by
+  default — the model verify-run work (running existing checks — CI, screenshots, play-test,
+  post-deploy smoke) runs on. `ORCH_VERIFY_MODEL` overrides its alias for one process.
 - `models.reviewEffort`: one of `low|medium|high|xhigh|max`, default `medium` — the effort
   the in-session (code-model) reviewer runs at.
 - `heartbeat.stallSeconds`: integer 1-86400, default 900. With no worktree change or new
@@ -486,7 +500,7 @@ alias), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
 `ORCH_KIMI_HANDOFF_USED`, `ORCH_KIMI_QUOTA_CACHE_SECONDS`,
 `ORCH_DEEPSEEK_HANDOFF_USED`, `ORCH_DEEPSEEK_QUOTA_CACHE_SECONDS`,
 `ORCH_DEEPSEEK_ROLE`, `ORCH_DEEPSEEK_DAILY_CAP_USD`,
-`ORCH_REVIEW_MODEL_EXTERNAL`, `ORCH_REVIEW_MODEL_SONNET`,
+`ORCH_REVIEW_MODEL_EXTERNAL`, `ORCH_REVIEW_MODEL_SONNET`, `ORCH_VERIFY_MODEL`,
 `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`, `ORCH_MAX_PARALLEL_KIMI_WORKERS`,
 `ORCH_MAX_PARALLEL_DEEPSEEK_WORKERS`,
 `ORCH_STALL_SECONDS`, `ORCH_CLOSE_DONE_WORKTREES`. Non-config env for tests/ops only: `ORCH_KIMI_BIN` (which
@@ -1008,8 +1022,9 @@ active.
 group (opencode counts as `deepseek`), the `sonnet` code model for an in-session code
 dispatch, or `null` before any code work — and `lastCodeAuthorAt` is its epoch-ms ordering
 stamp, so a worker group that settles after a newer dispatch started never clobbers the
-newer author. A review / verify dispatch is routed by this value (`models.reviewByCoder`);
-a `null` author allows either the review or the code model.
+newer author. A review dispatch is routed by this value (`models.reviewByCoder`); a
+verify-run dispatch is routed to `models.verify` regardless of author. A `null` author
+allows either the review or the code model for review.
 
 Machine-wide coder routing state lives at `<ORCH_STATE_DIR>/coder-route-state.json` as
 `{ "lastCoder": "codex|kimi|deepseek", "updatedAt": 0 }`. The gate writes `lastCoder`
