@@ -238,7 +238,7 @@ const PLANNING_INTENT = /\b(plan|planning|design|red.?team|architect|architectur
 // plans/x/plan.md", "Audit the implementation plan" and "Verify plan claims" are plan reviews
 // and must stay on the review model; only code nouns (diff, implementation, PR, commit,
 // worker output, branch) route by the code's author. Operator decision, 2026-10-01.
-const PLANNING_OBJECT = /\b(plan|planning|design|architecture|architect|red.?team)\b|(?:^|[\s`("'[])(?:plans\/[^\s`"')]+\.md|plan\.md)\b/i;
+const PLANNING_OBJECT = /\b(plan|planning|design|architecture|architect|phase|phases|red.?team)\b|(?:^|[\s`("'[])(?:plans\/[^\s`"')]+\.md|plan\.md)\b/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;

@@ -109,7 +109,7 @@ inside ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` counts; on
 prefixes such as `review-fix` are excluded, so `Commit review-fix round` remains operational.
 
 A review-intent dispatch is then routed by author. Plan, red-team and design work — a
-planning noun (`plan`/`planning`/`design`/`architecture`/`architect`/`red-team`) or a
+planning noun (`plan`/`planning`/`design`/`architecture`/`architect`/`phase`/`red-team`) or a
 `plans/**.md` / `plan.md` path, ANYWHERE in the description, `subagent_type` or prompt head —
 always stays on the review model, whatever the first verb: `Review the plan at
 plans/x/plan.md`, `Audit the implementation plan` and `Verify plan claims` are plan reviews,

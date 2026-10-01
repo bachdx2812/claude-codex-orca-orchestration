@@ -2297,6 +2297,7 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   check('a plan noun in the prompt is planning', gate.isPlanningReview('review the diff', 'reviewer', 'Verify plan claims against the codebase before dispatch.'), true);
   check('a design doc in the description is planning', gate.isPlanningReview('review phase-2 design doc', 'reviewer'), true);
   check('red-team in the type is planning', gate.isPlanningReview('audit the findings', 'red-team'), true);
+  check('a phase file is planning', gate.isPlanningReview('review the phase-3 file', 'reviewer'), true);
   check('a code review with no planning object is not planning', gate.isPlanningReview('review the diff', 'reviewer'), false);
   check('an implementation review is not planning', gate.isPlanningReview('audit the implementation for races', 'reviewer'), false);
 }
