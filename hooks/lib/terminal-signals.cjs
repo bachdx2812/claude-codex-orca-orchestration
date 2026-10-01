@@ -70,6 +70,23 @@ function hasCodexUsageExhausted(text) {
   return false;
 }
 
+const DEEPSEEK_BALANCE_SENTENCE = /insufficient\s+balance/i;
+
+/** DeepSeek's 402 "Insufficient Balance" is terminal until the account is topped up — the
+ * pay-per-use equivalent of Kimi's billing-cycle limit. Error-shaped lines only (an opencode
+ * worker quoting or narrating the text must never mark the coder exhausted). */
+function hasDeepseekBalanceExhausted(text) {
+  let inFence = false;
+  for (const raw of terminalLines(text)) {
+    const line = raw.trimEnd();
+    if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence || KIMI_IGNORED_LINE_PREFIX.test(line) || isSourceExcerpt(line)) continue;
+    const errorShaped = /^\s*(?:■|⚠|✗|error:)/i.test(line) || /\bERROR\b/.test(line) || /\b402\b/.test(line);
+    if (errorShaped && DEEPSEEK_BALANCE_SENTENCE.test(line)) return true;
+  }
+  return false;
+}
+
 function hasCodexDisconnect(text) {
   let inFence = false;
   for (const raw of terminalLines(text)) {
@@ -153,7 +170,8 @@ function approvalPromptFingerprint(text) {
 // and `#` count bare; `❯`/`›` need a prompt-prefix before them so Claude's bare input
 // caret ("❯ ") and Codex's composer prompt can never look like a shell.
 const SHELL_PROMPT_END = /[%$#]\s*$|^\S.{2,}\s[❯›]\s*$/;
-const AGENT_TUI_HINT = /esc\s+to\s+interrupt|bypass\s+permissions|accept\s+edits|shift\s*\+\s*tab\s+to\s+cycle|⏵⏵/i;
+// Claude Code's "esc to interrupt", opencode's "esc interrupt" footer, permission-mode bars.
+const AGENT_TUI_HINT = /esc\s+(?:to\s+)?interrupt|bypass\s+permissions|accept\s+edits|shift\s*\+\s*tab\s+to\s+cycle|⏵⏵/i;
 
 /**
  * True when the screen's last meaningful line is a shell prompt and no agent TUI chrome
@@ -182,5 +200,5 @@ function endsAtShellPrompt(text) {
 
 module.exports = {
   hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
-  approvalPromptFingerprint, endsAtShellPrompt,
+  hasDeepseekBalanceExhausted, approvalPromptFingerprint, endsAtShellPrompt,
 };
