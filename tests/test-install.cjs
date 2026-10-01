@@ -139,6 +139,7 @@ const emptyEnv = {
   ORCH_KIMI_HOME: emptyKimiHome,
   ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
   ORCH_KIMI_HANDOFF_USED: '80',
+  ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
 };
 const emptyCheck = run(['--check'], 'check-kimi-empty', emptyEnv);
 const emptyOut = `${emptyCheck.stdout}${emptyCheck.stderr}`;
@@ -149,8 +150,10 @@ check('--check reports the codex coder line (stub binary, auth unknown, quota un
   /coder codex: usable \[binary [^\]]*stub 1\.0, auth unknown, quota unknown\]/.test(emptyOut), true);
 check('--check reports kimi unusable when no credentials exist',
   /coder kimi: UNUSABLE \(not signed in\)/.test(emptyOut), true);
+check('--check reports deepseek unusable when opencode is absent',
+  /coder deepseek: UNUSABLE \(not installed\)/.test(emptyOut), true);
 check('--check prints the coder pool summary',
-  /pool: Codex quota unknown, available \(0\/3 live\) or Kimi \(unusable: not signed in\); pick Codex/.test(emptyOut), true);
+  /pool: Codex quota unknown, available \(0\/3 live\) or Kimi \(unusable: not signed in\) or DeepSeek \(unusable: not installed\); pick Codex/.test(emptyOut), true);
 
 const credsKimiHome = path.join(root, 'kimi-home-creds');
 fs.mkdirSync(path.join(credsKimiHome, 'credentials'), { recursive: true });
@@ -160,6 +163,7 @@ fs.writeFileSync(path.join(credsKimiHome, 'credentials', 'kimi-code.json'),
 const credsCheck = run(['--check'], 'check-kimi-creds', {
   ORCH_KIMI_HOME: credsKimiHome,
   ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+  ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
 });
 const credsOut = `${credsCheck.stdout}${credsCheck.stderr}`;
 check('--check reports kimi usable once credentials exist (quota unknown on an unreachable URL)',

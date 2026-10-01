@@ -50,6 +50,7 @@ const HOOK_FILES = [
   'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
   'lib/terminal-signals.cjs', 'lib/worker-progress-fingerprint.cjs', 'lib/worker-quota-handover.cjs', 'lib/quota-reset-resume.cjs', 'lib/live-probe-cache.cjs', 'lib/kimi-quota-probe.cjs',
+  'lib/deepseek-quota-probe.cjs',
   'lib/coder-availability.cjs', 'lib/coder-pool-route.cjs',
 ];
 const EVENTS = {
@@ -758,16 +759,18 @@ function checkCoders(hasOrca) {
     const cfg = cfgLib.loadConfig();
     const now = Date.now();
     const stateDir = cfgLib.stateDir();
-    const thresholds = { codex: cfgLib.handoffUsed(cfg), kimi: cfgLib.kimiHandoffUsed(cfg) };
-    const caps = { codex: cfgLib.maxParallelCodexWorkers(cfg), kimi: cfgLib.maxParallelKimiWorkers(cfg) };
+    const thresholds = { codex: cfgLib.handoffUsed(cfg), kimi: cfgLib.kimiHandoffUsed(cfg), deepseek: cfgLib.deepseekHandoffUsed(cfg) };
+    const caps = { codex: cfgLib.maxParallelCodexWorkers(cfg), kimi: cfgLib.maxParallelKimiWorkers(cfg), deepseek: cfgLib.maxParallelDeepseekWorkers(cfg) };
     log(`thresholds: codexHandoffUsedPercent=${thresholds.codex} kimiHandoffUsedPercent=${thresholds.kimi} ` +
-      `maxParallelKimiWorkers=${caps.kimi} maxParallelCodexWorkers=${caps.codex}`);
+      `maxParallelKimiWorkers=${caps.kimi} maxParallelCodexWorkers=${caps.codex} ` +
+      `deepseekRole=${cfgLib.deepseekRole(cfg)} deepseekDailySpendCapUsd=${cfgLib.deepseekDailySpendCapUsd(cfg)} ` +
+      `deepseekHandoffUsedPercent=${thresholds.deepseek} maxParallelDeepseekWorkers=${caps.deepseek}`);
     const authState = quotaLib.codexAuthState(stateDir, now, cfgLib.coderAvailabilityCacheSeconds(cfg) * 1000);
     const availability = availLib.coderAvailability({
       fresh: true, env: process.env, orcaInstalled: !!hasOrca, codexAuthState: authState, now,
     });
     probeStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-check-'));
-    const quotas = { codex: null, kimi: null };
+    const quotas = { codex: null, kimi: null, deepseek: null };
     if (availability.codex && availability.codex.usable) {
       const q = quotaLib.codexQuota(now, { stateDir: probeStateDir, cacheSeconds: 0 });
       quotas.codex = q && !q.failed ? q : null;
@@ -776,10 +779,18 @@ function checkCoders(hasOrca) {
       const q = quotaLib.kimiQuota(now, { stateDir: probeStateDir, cacheSeconds: 0, env: process.env });
       quotas.kimi = q && !q.failed ? q : null;
     }
-    for (const coder of ['codex', 'kimi']) {
+    if (availability.deepseek && availability.deepseek.usable) {
+      const q = quotaLib.deepseekQuota(now, {
+        stateDir: probeStateDir, cacheSeconds: 0, env: process.env,
+        dailyCapUsd: cfgLib.deepseekDailySpendCapUsd(cfg),
+      });
+      quotas.deepseek = q && !q.failed ? q : null;
+    }
+    for (const coder of ['codex', 'kimi', 'deepseek']) {
       const a = availability[coder] || { usable: false, reason: 'unknown', auth: 'unknown', binPath: null };
       const q = quotas[coder];
-      const quotaText = q && typeof q.usedPercent === 'number' ? `${Math.round(100 - q.usedPercent)}% left` : 'unknown';
+      const quotaText = q && q.unlimited ? 'unlimited (spend cap 0)'
+        : q && typeof q.usedPercent === 'number' ? `${Math.round(100 - q.usedPercent)}% left` : 'unknown';
       const binText = a.binPath ? `${a.binPath} ${versionOf(a.binPath) || 'present'}`.trim() : 'none';
       const authText = a.auth === 'logged-out' ? 'logged out' : a.auth;
       log(`coder ${coder}: ${a.usable ? 'usable' : `UNUSABLE (${a.reason})`} ` +
@@ -787,8 +798,9 @@ function checkCoders(hasOrca) {
     }
     const pool = poolLib.pickCoderPool({
       availability, quotas, thresholds,
+      roles: { deepseek: cfgLib.deepseekRole(cfg) },
       exhaustion: availLib.readCoderExhaustion(stateDir, now),
-      live: { codex: 0, kimi: 0 }, caps,
+      live: { codex: 0, kimi: 0, deepseek: 0 }, caps,
       fallbackEnabled: cfg.execFallbackWhenCodexUnavailable === null ? null : true,
     });
     log(`pool: ${pool.summary}`);
@@ -820,8 +832,9 @@ function check() {
     const authFile = path.join(codexHome, 'auth.json');
     log(`codex login: ${fs.existsSync(authFile) ? `auth file present at ${authFile} (not a guarantee it is valid)` : `no auth file found at ${authFile} - run \`codex login\``}`);
   }
+  log(`opencode: ${which('opencode') ? (versionOf('opencode') || 'present') : 'NOT FOUND on PATH (DeepSeek coder unavailable)'}`);
   if (!hasOrca || !hasCodex) {
-    warn('Without both Orca and a usable Codex quota reading, automatic routing keeps defaulting to Codex. ' +
+    warn('Without both Orca and a usable coder quota reading, automatic routing degrades to whatever coders remain usable. ' +
       'Use --exec-sonnet (or --code-model <your code alias>) to route code in-session instead, ' +
       'or see "Coder availability (no Orca / no Codex / no Kimi)" in rules/orchestration-contract.md.');
   }
