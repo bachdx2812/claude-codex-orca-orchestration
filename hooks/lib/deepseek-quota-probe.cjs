@@ -81,7 +81,7 @@ function parseStatsText(text) {
   for (const raw of lines) {
     const line = raw.replace(/^[\s│┃|]+/, '').replace(/[\s│┃|]+$/, '');
     if (!line) continue;
-    const model = line.match(/^([\w.-]+\/[\w.-]+)\s*$/);
+    const model = line.match(/^([\w.:-]+\/[\w.:-]+)\s*$/);
     if (model) {
       inDeepseek = /^deepseek\//i.test(model[1]);
       if (inDeepseek) found = true;
