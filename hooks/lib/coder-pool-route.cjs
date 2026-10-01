@@ -34,9 +34,9 @@
  * sessions are running. `sessionLive` defaults to `live` when omitted.
  */
 
-const CODERS = ['codex', 'kimi'];
+const CODERS = ['codex', 'kimi', 'deepseek'];
 
-function label(coder) { return coder === 'codex' ? 'Codex' : 'Kimi'; }
+function label(coder) { return coder === 'codex' ? 'Codex' : coder === 'kimi' ? 'Kimi' : 'DeepSeek'; }
 
 function knownQuota(quota) {
   return quota && quota.failed !== true && typeof quota.usedPercent === 'number' && Number.isFinite(quota.usedPercent);
@@ -75,6 +75,10 @@ function pickCoderPool(options = {}) {
   const sessionLive = options.sessionLive || live;
   const caps = options.caps || {};
   const lastCoder = CODERS.includes(options.lastCoder) ? options.lastCoder : null;
+  // DeepSeek's routing role (binding operator decision, 2026-10-01): 'overflow' (default)
+  // picks it only when NO subscription coder (Codex/Kimi) is eligible, but before the
+  // in-session code model; 'peer' ranks it by the same rules as Codex and Kimi.
+  const deepseekOverflow = !(options.roles && options.roles.deepseek === 'peer');
   const tieBand = Number.isInteger(options.tieBand) && options.tieBand >= 0 ? options.tieBand : 10;
   const unknownAssumed = Number.isInteger(options.unknownAssumed) &&
     options.unknownAssumed >= 0 && options.unknownAssumed <= 100 ? options.unknownAssumed : 30;
@@ -114,6 +118,12 @@ function pickCoderPool(options = {}) {
   }
 
   const order = CODERS.filter((coder) => coders[coder].state === 'eligible');
+  // Overflow DeepSeek stands by while any subscription coder can take the dispatch.
+  if (deepseekOverflow && coders.deepseek.state === 'eligible' &&
+      (coders.codex.state === 'eligible' || coders.kimi.state === 'eligible')) {
+    coders.deepseek.standby = true;
+    order.splice(order.indexOf('deepseek'), 1);
+  }
   const freeSlot = (coder) => coders[coder].cap === 0 || coders[coder].sessionLive < coders[coder].cap;
   order.sort((a, b) => {
     const aFree = freeSlot(a); const bFree = freeSlot(b);
@@ -131,7 +141,8 @@ function pickCoderPool(options = {}) {
     if (coders[a].live !== coders[b].live) return coders[a].live - coders[b].live;
     if (lastCoder === a) return 1;
     if (lastCoder === b) return -1;
-    return a === 'codex' ? -1 : 1;
+    // Final tie-break among usable coders only (both a and b are eligible here): pool order.
+    return CODERS.indexOf(a) - CODERS.indexOf(b);
   });
 
   if (!order.length) {
@@ -157,11 +168,12 @@ function pickCoderPool(options = {}) {
     else if (headroomDecided) pickReason = `more quota left: ${fmtH(pickH)} vs ${fmtH(otherH)}`;
     else if (coders[pick].live !== coders[other].live) pickReason = 'fewer live';
     else if (lastCoder === other) pickReason = 'alternation';
-    else pickReason = 'codex first';
+    else pickReason = `${label(pick).toLowerCase()} first`;
   }
   const summary = `${CODERS.map((coder) => {
     const state = coders[coder];
     if (state.state !== 'eligible') return formatCoderState(coder, state);
+    if (state.standby) return `${label(coder)} (overflow standby)`;
     const quotaText = state.leftPct === null ? 'quota unknown, available'
       : state.estimated ? `~${Math.round(100 - state.leftPct)}% used (est.)`
         : `${Math.round(state.leftPct)}% left`;
