@@ -2036,6 +2036,10 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
       for (const [key, worker] of Object.entries(s.workers)) {
         if (worker.status === 'live' && WG.groupOf(worker, key) === group) {
           worker.retained = true;
+          // When the retain ran, so the heartbeat can tell "retained for reuse AFTER the
+          // worker finished" (blocks auto-close) apart from the Kimi readiness recipe,
+          // which retains mid-run, before any done state (does not).
+          if (!worker.retainedAt) worker.retainedAt = Date.now();
           if (!worker.readinessTimeout) worker.capExempt = true;
           dirty = true;
         }

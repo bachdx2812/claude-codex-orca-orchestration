@@ -40,6 +40,11 @@
  *
  * STUB_WORKTREES_NO_ARRAY=1 answers `{ ok: true, result: {} }` — a reply that never seeded a
  * `worktrees` array at all — item M4: also must degrade to null, not to an empty list.
+ *
+ * STUB_WORKER_RELEASE_OK_FALSE / STUB_TERMINAL_CLOSE_OK_FALSE / STUB_WORKTREE_RM_OK_FALSE
+ * (each =1) make the matching mutating call answer `{ ok: false }` instead of succeeding —
+ * auto-close-done-workers blocker 3: a failed mutation must never be logged or persisted as
+ * a success. The call is still recorded via STUB_ORCA_CALLS_LOG either way.
  */
 const fs = require('fs');
 const args = process.argv.slice(2);
@@ -56,17 +61,20 @@ function recordCall() {
 
 if (args[0] === 'orchestration' && args[1] === 'worker-release') {
   recordCall();
-  process.stdout.write(JSON.stringify({ ok: true, result: {} }));
+  const ok = process.env.STUB_WORKER_RELEASE_OK_FALSE === '1' ? false : true;
+  process.stdout.write(JSON.stringify({ ok, result: {} }));
   process.exit(0);
 }
 if (args[0] === 'terminal' && args[1] === 'close') {
   recordCall();
-  process.stdout.write(JSON.stringify({ ok: true, result: {} }));
+  const ok = process.env.STUB_TERMINAL_CLOSE_OK_FALSE === '1' ? false : true;
+  process.stdout.write(JSON.stringify({ ok, result: {} }));
   process.exit(0);
 }
 if (args[0] === 'worktree' && args[1] === 'rm') {
   recordCall();
-  process.stdout.write(JSON.stringify({ ok: true, result: {} }));
+  const ok = process.env.STUB_WORKTREE_RM_OK_FALSE === '1' ? false : true;
+  process.stdout.write(JSON.stringify({ ok, result: {} }));
   process.exit(0);
 }
 

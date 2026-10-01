@@ -568,9 +568,9 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       dispatchStatus: 'completed', terminalState: 'active', agentTerminalHandle: 'term_done',
       worktreePaths: ['/wt/done'], ...overrides,
     });
-    const recordingOrca = () => {
+    const recordingOrca = (reply = { ok: true }) => {
       const calls = [];
-      return { calls, run: (args) => { calls.push(args); return { ok: true }; } };
+      return { calls, run: (args) => { calls.push(args); return reply; } };
     };
 
     {
@@ -578,12 +578,44 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       const r = heartbeat.autoCloseDoneWorker(doneRow(), { runOrca: orcaRec.run, git: fakeGit() });
       check('a done, clean, fully-pushed worker is released and its terminal closed',
         r && r.kind === 'closed' && r.line === 'WORKER CLOSED ctx_done (done, terminal closed, worktree kept)', true);
-      check('the close path runs worker-release then terminal close',
+      check('the close path runs worker-release then terminal close, both with --json',
         JSON.stringify(orcaRec.calls),
         JSON.stringify([
-          ['orchestration', 'worker-release', '--dispatch', 'ctx_done'],
-          ['terminal', 'close', '--terminal', 'term_done'],
+          ['orchestration', 'worker-release', '--dispatch', 'ctx_done', '--json'],
+          ['terminal', 'close', '--terminal', 'term_done', '--json'],
         ]));
+    }
+    // Blocker 1: real worker-list rows carry only nested resource.worktreeId /
+    // projection.workspace.id ('<repoId>::<abs path>'), never a flat worktreePath — the
+    // same shape parseWorkerRows() produces from a real reply.
+    {
+      const nestedRow = heartbeat.parseWorkerRows({
+        result: [{
+          dispatchId: 'ctx_nested', workerState: 'succeeded', dispatchStatus: 'completed',
+          terminalState: 'active', agentTerminalHandle: 'term_nested',
+          resource: { worktreeId: 'repo1::/wt/nested' },
+        }],
+      })[0];
+      check('parseWorkerRows resolves worktreeIds from the real nested resource.worktreeId shape',
+        nestedRow.worktreeIds, ['repo1::/wt/nested']);
+      check('nestedRow carries no flat worktreePaths at all (the real-row shape)',
+        nestedRow.worktreePaths, []);
+      const orcaRec = recordingOrca();
+      const r = heartbeat.autoCloseDoneWorker(nestedRow, { runOrca: orcaRec.run, git: fakeGit() });
+      check('a real nested-row worker (no flat worktreePath) still resolves its path and closes',
+        r && r.kind === 'closed', true);
+    }
+    {
+      const projectionRow = heartbeat.parseWorkerRows({
+        result: [{
+          dispatchId: 'ctx_proj', workerState: 'succeeded', dispatchStatus: 'completed',
+          terminalState: 'active', agentTerminalHandle: 'term_proj',
+          projection: { workspace: { id: 'repo1::/wt/proj' } },
+        }],
+      })[0];
+      check('a real projection.workspace.id-only row also resolves and closes',
+        heartbeat.autoCloseDoneWorker(projectionRow, { runOrca: recordingOrca().run, git: fakeGit() })?.kind,
+        'closed');
     }
     check('dispatchStatus alone (succeeded/completed) also counts as done',
       heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'running', dispatchStatus: 'succeeded' }),
@@ -594,15 +626,24 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     check('a stopped worker is never auto-closed',
       heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'stopped', dispatchStatus: 'stopped' }),
         { runOrca: recordingOrca().run, git: fakeGit() }), null);
-    check('a worker the panel explicitly retained for reuse is never auto-closed',
-      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
-        { retained: true, runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('a cancelled worker is never auto-closed',
+      heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'cancelled', dispatchStatus: 'cancelled' }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
+    // Non-blocking note: failed/stopped/cancelled must be excluded from EITHER field, so a
+    // contradictory row (one field says done, the other says it did not finish) never
+    // auto-closes in either direction.
+    check('workerState succeeded + dispatchStatus failed never auto-closes (contradictory row)',
+      heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'succeeded', dispatchStatus: 'failed' }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('workerState failed + dispatchStatus completed never auto-closes (contradictory row)',
+      heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'failed', dispatchStatus: 'completed' }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
     check('a worker whose terminal is already released is never auto-closed',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'released' }),
         { runOrca: recordingOrca().run, git: fakeGit() }), null);
-    check('a done worker with no known worktree path is never auto-closed (uncertainty)',
+    check('a done worker with no known worktree path is "unknown", not silently dropped',
       heartbeat.autoCloseDoneWorker(doneRow({ worktreePaths: [] }),
-        { runOrca: recordingOrca().run, git: fakeGit() }), null);
+        { runOrca: recordingOrca().run, git: fakeGit() }), { kind: 'unknown' });
     {
       const orcaRec = recordingOrca();
       const r = heartbeat.autoCloseDoneWorker(doneRow(),
@@ -622,13 +663,64 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       heartbeat.autoCloseDoneWorker(doneRow(),
         { runOrca: recordingOrca().run, git: fakeGit({ status: null }) })?.kind, 'unsaved');
 
+    // Blocker 3: a failed release is never logged as a success, and the terminal is never
+    // closed after a release that did not succeed.
+    {
+      const orcaRec = recordingOrca({ ok: false });
+      const r = heartbeat.autoCloseDoneWorker(doneRow(), { runOrca: orcaRec.run, git: fakeGit() });
+      check('a release Orca answers ok:false for is reported as failed, never closed',
+        r && r.kind === 'failed' && r.line.startsWith('AUTO-CLOSE FAILED ctx_done'), true);
+      check('a failed release never attempts the terminal-close call',
+        orcaRec.calls.length, 1);
+    }
+    {
+      const orcaRec = recordingOrca(null);
+      const r = heartbeat.autoCloseDoneWorker(doneRow(), { runOrca: orcaRec.run, git: fakeGit() });
+      check('orca answering null (non-JSON / timeout / non-zero exit) is also treated as a failed release',
+        r?.kind, 'failed');
+    }
+
+    // Blocker 4: Orca's own retainedReason distinguishes an operator retain-for-reuse
+    // (blocks only when it happened after done) from its own automatic readiness-timeout
+    // retain (never blocks).
+    check('Orca-automatic identity_unproven retain is eligible for auto-close',
+      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
+        { retainedReason: 'identity_unproven', doneAt: 1000, retainedAt: 500,
+          runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
+    check('user_requested retain recorded BEFORE the done transition (the Kimi readiness recipe) still auto-closes',
+      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
+        { retainedReason: 'user_requested', doneAt: 1000, retainedAt: 500,
+          runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
+    check('user_requested retain recorded AFTER the done transition blocks auto-close',
+      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
+        { retainedReason: 'user_requested', doneAt: 500, retainedAt: 1000,
+          runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('a worker the panel explicitly retained for reuse (no retainedReason, legacy signal) is never auto-closed',
+      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
+        { retained: true, runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('isRetainedForReuse: missing timestamps on a user_requested retain err toward blocked',
+      heartbeat.isRetainedForReuse({ terminalState: 'retained' }, { retainedReason: 'user_requested' }), true);
+
+    // Panel's own terminal (defence in depth) and the lastOutputAt quiet-terminal guard.
+    check('the panel\'s own terminal is never auto-closed even if it reports done',
+      heartbeat.autoCloseDoneWorker(doneRow({ agentTerminalHandle: 'term_panel' }),
+        { panelHandle: 'term_panel', runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('a terminal that produced output within idleSeconds is not closed yet (worker-done may race the terminal)',
+      heartbeat.autoCloseDoneWorker(doneRow(),
+        { lastOutputAt: 999_500, now: 1_000_000, idleSeconds: 60, runOrca: recordingOrca().run, git: fakeGit() }),
+      null);
+    check('a terminal quiet past idleSeconds closes normally',
+      heartbeat.autoCloseDoneWorker(doneRow(),
+        { lastOutputAt: 900_000, now: 1_000_000, idleSeconds: 60, runOrca: recordingOrca().run, git: fakeGit() })?.kind,
+      'closed');
+
     {
       const orcaRec = recordingOrca();
       const r = heartbeat.actOnDoneWorktree(mergedIdle, 'PR #12 merged',
         { mode: 'remove', runOrca: orcaRec.run });
-      check('remove mode runs orca worktree rm on the done worktree itself',
+      check('remove mode runs orca worktree rm --json on the done worktree itself',
         r.kind === 'removed' && r.line.startsWith('WORKTREE REMOVED a (PR #12 merged)') &&
-        JSON.stringify(orcaRec.calls) === JSON.stringify([['worktree', 'rm', '--worktree', 'path:/wt/a']]), true);
+        JSON.stringify(orcaRec.calls) === JSON.stringify([['worktree', 'rm', '--worktree', 'path:/wt/a', '--json']]), true);
     }
     {
       const orcaRec = recordingOrca();
@@ -637,6 +729,39 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       check('remind mode only formats the wake event and never runs orca',
         r.kind === 'remind' && r.line.startsWith('DONE worktree a (PR #12 merged') &&
           orcaRec.calls.length === 0, true);
+    }
+    // Blocker 5: remove mode must never rm a worktree that still holds a live terminal,
+    // even one evaluateDoneButOpen already allowed through as idle-but-quiet.
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.actOnDoneWorktree({ ...mergedIdle, liveTerminalCount: 1 }, 'PR #12 merged',
+        { mode: 'remove', runOrca: orcaRec.run });
+      check('remove mode with a live (even quiet) terminal falls back to remind and never runs rm',
+        r.kind === 'remind' && orcaRec.calls.length === 0, true);
+    }
+    // Blocker 3: a failed rm is never recorded as removed, and returns a remind fallback.
+    {
+      const orcaRec = recordingOrca({ ok: false });
+      const r = heartbeat.actOnDoneWorktree(mergedIdle, 'PR #12 merged',
+        { mode: 'remove', runOrca: orcaRec.run });
+      check('a failed worktree rm is reported as rm_failed with a remind fallback, never removed',
+        r.kind === 'rm_failed' && r.line.startsWith('WORKTREE RM FAILED') &&
+          typeof r.remind === 'string' && r.remind.startsWith('DONE worktree a'), true);
+    }
+
+    // loadPersistedTimestampMap / savePersistedTimestampMap (done-at / rm-failed files).
+    {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-ts-map-'));
+      const file = path.join(dir, 'ts-map.json');
+      const m = new Map([['ctx_a', 123], ['ctx_b', 456]]);
+      heartbeat.savePersistedTimestampMap(file, m);
+      const reloaded = heartbeat.loadPersistedTimestampMap(file);
+      check('savePersistedTimestampMap/loadPersistedTimestampMap round-trip',
+        JSON.stringify([...reloaded].sort()), JSON.stringify([...m].sort()));
+      fs.writeFileSync(file, JSON.stringify([['bad', 'not-a-number'], ['ok', 1]]));
+      check('loadPersistedTimestampMap drops non-numeric entries',
+        JSON.stringify([...heartbeat.loadPersistedTimestampMap(file)]), JSON.stringify([['ok', 1]]));
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   }
 }

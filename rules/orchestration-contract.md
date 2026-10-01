@@ -334,12 +334,16 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `ownershipClaimTtlMinutes`: integer 1-10080, default 120. How long a background
   in-session Agent's `Owns:` claim survives without an explicit release before it
   auto-expires. Overridable for one process with `ORCH_CLAIM_TTL_MINUTES`.
-- `closeDoneWorktrees`: `remove` | `remind` | `off`, default `remind` (this operator's
-  config sets `remove`). What the heartbeat does about a worktree that is idle, accepted,
-  and clean (see "Close finished worker panels" above for the full definition) and holds
-  no live terminal: `remove` runs `orca worktree rm --worktree path:<path>` itself and logs
-  an informational `WORKTREE REMOVED` line (no panel decision needed); `remind` wakes the
-  panel with the exact, quoted rm command and never runs it; `off` does nothing. The
+- `closeDoneWorktrees`: `remove` | `remind` | `off`, default `remind` — check the live
+  `~/.claude/orchestration.config.json` for this installation's actual value. What the
+  heartbeat does about a worktree that is idle, accepted, and clean (see "Close finished
+  worker panels" above for the full definition): `remove` runs
+  `orca worktree rm --worktree path:<path> --json` itself and logs an informational
+  `WORKTREE REMOVED` line (no panel decision needed) — but ONLY when the worktree holds no
+  live terminal at all; a live-but-quiet terminal falls back to `remind` instead, and a
+  failed `rm` call is reported once as `WORKTREE RM FAILED` (with the same `remind`
+  fallback) and retried on a bounded cooldown rather than recorded as done; `remind` wakes
+  the panel with the exact, quoted rm command and never runs it; `off` does nothing. The
   never-remove guards are identical in both modes: never an open PR/MR, never uncommitted
   or unpushed work, never the main worktree, never another session's worktree. Legacy
   booleans still load (`true` -> `remind`, `false` -> `off`). Overridable for one process
@@ -392,16 +396,31 @@ its exit is the wake-up: the panel does not have to remember to poll, and it cos
 while everything is healthy.
 
 A worker Orca reports successfully done (`workerState`/`dispatchStatus`
-succeeded/completed) no longer needs that decision at all (binding operator decision,
-2026-10-01): when its worktree is provably clean (`git status --porcelain` empty) with
-nothing unpushed (`git rev-list @{u}..HEAD` empty, or — with no upstream — HEAD contained
-in the resolved base branch), the daemon itself runs `orca orchestration worker-release
---dispatch <id>` then `orca terminal close --terminal <handle>` and logs an informational
-`WORKER CLOSED <id> (done, terminal closed, worktree kept)` line without waking the panel.
-It never touches a worker the panel explicitly `worker-retain`ed for reuse, a failed or
-stopped worker (those keep the retain-or-release event below), or one whose worktree is
-dirty or unpushed — the latter wakes the panel once per session with `WORKER DONE BUT
-UNSAVED <id>` and keeps the terminal open.
+succeeded/completed, in either field — never when either field says
+failed/stopped/cancelled, so a contradictory row never closes) no longer needs that
+decision at all (binding operator decision, 2026-10-01): when its worktree is provably
+clean (`git status --porcelain` empty) with nothing unpushed (`git rev-list @{u}..HEAD`
+empty, or — with no upstream — HEAD contained in the resolved base branch), AND its agent
+terminal has been quiet past the idle threshold (a done worker may still be mid-turn), the
+daemon itself runs `orca orchestration worker-release --dispatch <id> --json` then
+`orca terminal close --terminal <handle> --json` and logs an informational `WORKER CLOSED
+<id> (done, terminal closed, worktree kept)` line without waking the panel. The worktree
+path is resolved from the real worker-list row shape (`resource.worktreeId` /
+`projection.workspace.id`, `<repoId>::<abs path>`) the same way a terminal's worktree
+path is resolved; when it cannot be resolved at all, the row falls back to the
+retain-or-release event below instead of being silently dropped. A release or
+terminal-close call Orca answers `ok: false` to (or cannot answer at all) is never logged
+or persisted as a success — the daemon reports `AUTO-CLOSE FAILED <id>` once and retries on
+a bounded cooldown. It never touches the panel's own terminal (`ORCA_TERMINAL_HANDLE`); a
+worker the panel explicitly `worker-retain`ed for reuse *after* it was already done
+(Orca's own automatic readiness-timeout retain, `resource.retainedReason:
+"identity_unproven"`, and a retain that ran *before* the done transition — e.g. the Kimi
+readiness-recovery recipe — both stay eligible for auto-close); a failed, stopped, or
+cancelled worker (those keep the retain-or-release event below); or one whose worktree is
+dirty or unpushed — the latter wakes the panel once, on the transition into that state,
+with `WORKER DONE BUT UNSAVED <id>` and keeps the terminal open; re-evaluation continues,
+so a worktree later committed and pushed still closes without re-waking the panel for the
+state it already reported.
 
 IDLE, orphan and rate-limit terminal events are limited to this session's own fleet: the
 run-scoped `worker-list` terminal handles plus bare terminals registered in this session's
@@ -591,11 +610,18 @@ many worktrees can never starve that file into looking dead — EXCEPT the very 
 reach in time used to fall through to a later tick's steady-state branch and fire as a
 brand-new wake event, even though it had been part of the original backlog all along.
 What happens next depends on `closeDoneWorktrees` (`remove`|`remind`|`off`, default
-`remind`; this operator's config sets `remove`). In `remove` mode the daemon runs
-`orca worktree rm --worktree path:<path>` itself and logs an informational
-`WORKTREE REMOVED <name> (<reason>) — <path>` line — no panel decision is needed, and the
-same never-remove guards above (open PR/MR, uncommitted or unpushed work, the main
-worktree, another session's worktree) still apply before anything is removed. In `remind`
+`remind` — read the live `~/.claude/orchestration.config.json` for this installation's
+actual value rather than assuming it). In `remove` mode, and only when the worktree
+currently holds no live terminal at all (a live-but-quiet terminal — e.g. one sitting on
+an approval prompt — falls back to the `remind` behavior below instead of an irreversible
+removal), the daemon runs `orca worktree rm --worktree path:<path> --json` itself and logs
+an informational `WORKTREE REMOVED <name> (<reason>) — <path>` line — no panel decision is
+needed, and the same never-remove guards above (open PR/MR, uncommitted or unpushed work,
+the main worktree, another session's worktree) still apply before anything is removed. A
+failed `rm` (Orca answers `ok: false`, or cannot answer at all) is never logged or
+persisted as removed: the daemon reports `WORKTREE RM FAILED <path>` once, falls back to
+the `remind` event in the same tick, and retries on a bounded cooldown rather than every
+tick. In `remind`
 mode the event line, `DONE worktree <name> (<reason>, no live terminal|quiet terminal(s)) — ...
 orca worktree rm --worktree 'path:<path>'` (control characters stripped, the path
 single-quote-escaped), names which of the above fired and which idle leg actually applied,

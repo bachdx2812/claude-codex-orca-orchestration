@@ -134,13 +134,32 @@ const EXITED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-exited-reporte
 // see processDoneWorktrees()'s doc comment for why this file exists.
 const DONE_WT_FILE = path.join(DIR, `heartbeat-${SESSION}-done-wt.json`);
 // Persists, per dispatch id, the auto-close state this session already reached for a done
-// worker ('closed' = released + terminal closed; 'unsaved' = reported WORKER DONE BUT
-// UNSAVED). A later tick (or daemon restart) never re-closes or re-reports the same worker,
-// while an 'unsaved' worker that later becomes clean still gets closed.
+// worker: {state, at} where state is 'closed' (released + terminal closed), 'unsaved'
+// (WORKER DONE BUT UNSAVED reported) or 'failed' (the release call itself failed; `at`
+// bounds the retry so a failing Orca is not hammered every tick). A later tick (or daemon
+// restart) never re-closes or re-reports the same worker, while an 'unsaved' worker that
+// later becomes clean still gets closed.
 const AUTO_CLOSED_FILE = path.join(DIR, `heartbeat-${SESSION}-auto-closed.json`);
+// Persists, per dispatch id, when this session's daemon FIRST saw the worker done. The
+// retained-for-reuse check compares the gate's retainedAt against this: only a retain
+// that ran after the done transition blocks auto-close.
+const DONE_AT_FILE = path.join(DIR, `heartbeat-${SESSION}-done-at.json`);
+// Persists, per worktree path, when a remove-mode `orca worktree rm` last failed, so the
+// retry is bounded instead of hammered on every tick (and never silently dropped).
+const RM_FAILED_FILE = path.join(DIR, `heartbeat-${SESSION}-rm-failed.json`);
 // Orca vocabulary for "the work finished successfully" — distinct from failed/stopped,
 // which keep the panel-decision flow. Auto-release only ever applies to these.
 const DONE_WORKER_STATES = new Set(['succeeded', 'completed']);
+// Orca vocabulary for "the work did not finish successfully" — never auto-closed,
+// regardless of which of workerState/dispatchStatus carries it (review, non-blocking
+// note: a contradictory row such as workerState 'succeeded' with dispatchStatus 'failed'
+// must not auto-close either).
+const FAILED_WORKER_STATES = new Set(['failed', 'stopped', 'cancelled']);
+function isFailedWorker(w) {
+  return FAILED_WORKER_STATES.has(w && w.workerState) || FAILED_WORKER_STATES.has(w && w.dispatchStatus);
+}
+// Cooldown before a failed worker-release or worktree-rm is retried.
+const MUTATION_RETRY_MS = 10 * 60 * 1000;
 
 /** Refresh the liveness file the gate checks (atomic write). */
 function beat(started) {
@@ -188,7 +207,12 @@ function loadPersistedAutoClosed() {
     const pairs = JSON.parse(fs.readFileSync(AUTO_CLOSED_FILE, 'utf8'));
     if (!Array.isArray(pairs)) return new Map();
     return new Map(pairs.filter((pair) => Array.isArray(pair) && pair.length === 2 &&
-      typeof pair[0] === 'string' && (pair[1] === 'closed' || pair[1] === 'unsaved')));
+      typeof pair[0] === 'string').map(([id, v]) => {
+      // Legacy entries were a bare 'closed'|'unsaved' string; normalize to {state, at}.
+      if (typeof v === 'string') return [id, { state: v, at: 0 }];
+      return [id, v];
+    }).filter(([, v]) => v && typeof v === 'object' &&
+      ['closed', 'unsaved', 'failed'].includes(v.state) && Number.isFinite(v.at)));
   } catch {
     return new Map();
   }
@@ -200,6 +224,27 @@ function savePersistedAutoClosed(map) {
     const tmp = `${AUTO_CLOSED_FILE}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify([...map]));
     fs.renameSync(tmp, AUTO_CLOSED_FILE);
+  } catch {}
+}
+
+/** Generic loader for the small dispatchId/path -> epoch-ms persistence files. */
+function loadPersistedTimestampMap(file) {
+  try {
+    const pairs = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!Array.isArray(pairs)) return new Map();
+    return new Map(pairs.filter((pair) => Array.isArray(pair) && pair.length === 2 &&
+      typeof pair[0] === 'string' && Number.isFinite(pair[1])));
+  } catch {
+    return new Map();
+  }
+}
+
+function savePersistedTimestampMap(file, map) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...map]));
+    fs.renameSync(tmp, file);
   } catch {}
 }
 
@@ -550,6 +595,10 @@ function parseWorkerRows(d) {
     terminalState: w.terminalState,
     agent: w.agent || '',
     agentTerminalHandle: w.agentTerminalHandle || '',
+    // Orca's own distinction between an explicit operator retain and its automatic
+    // readiness-timeout retain ('user_requested' | 'identity_unproven' | null).
+    retainedReason: typeof w.retainedReason === 'string' ? w.retainedReason
+      : (w.resource && typeof w.resource.retainedReason === 'string' ? w.resource.retainedReason : null),
     worktreeIds: [
       w.worktreeId,
       w.resource && w.resource.worktreeId,
@@ -986,30 +1035,73 @@ function isWorktreeClean(w, git) {
 }
 
 /**
+ * "Retained for reuse AFTER the done state" — the only retain that blocks auto-close.
+ * Orca's own `resource.retainedReason` distinguishes the cases (review, blocker 4):
+ *   - 'identity_unproven': Orca's AUTOMATIC retain on a readiness timeout — not an
+ *     operator decision, eligible for auto-close;
+ *   - 'user_requested': an explicit `worker-retain`. It blocks auto-close only when it ran
+ *     after the worker was first seen done (`ctx.retainedAt >= ctx.doneAt`; the gate
+ *     records retainedAt when it marks the group retained). The Kimi readiness recipe
+ *     retains mid-run, before any done state, so it stays eligible. Missing timestamps
+ *     err on the side of keeping the panel flow (blocked);
+ *   - no reason at all (older Orca): only this session's own explicit retain flag blocks.
+ */
+function isRetainedForReuse(w, ctx = {}) {
+  const reason = ctx.retainedReason !== undefined ? ctx.retainedReason : (w.retainedReason ?? null);
+  const held = w.terminalState === 'retained' || !!ctx.retained || reason != null;
+  if (!held) return false;
+  if (reason === 'identity_unproven') return false;
+  if (reason === 'user_requested') {
+    return !ctx.doneAt || !ctx.retainedAt || ctx.retainedAt >= ctx.doneAt;
+  }
+  return !!ctx.retained;
+}
+
+/**
  * Auto-close for one done worker row (binding operator decision, 2026-10-01): a worker
  * Orca reports successfully done (`workerState`/`dispatchStatus` succeeded/completed) that
  * still holds its terminal does not need a panel decision when its work is provably saved —
  * the daemon releases the dispatch and closes the agent terminal itself, keeping the
- * worktree. Pure decision parts are injectable (`git`, `runOrca`) so this is testable
- * without a live Orca or repo. Never touches:
- *   - a worker the panel explicitly retained for reuse (`ctx.retained`, or Orca's own
- *     `terminalState: retained` left by an explicit retain);
- *   - a worker whose worktree is dirty or has unpushed commits — that returns the
- *     'unsaved' wake event instead, and the terminal stays open;
- *   - anything not done, not holding a terminal, or whose worktree path is unknown
- *     (uncertainty is never a candidate — the panel's current flow keeps it).
- * Failed/stopped workers are not DONE_WORKER_STATES, so they keep the existing
- * "finished worker(s) still holding a terminal" event unchanged.
+ * worktree. Decision inputs are injectable (`git`, `runOrca`, timestamps) so this is
+ * testable without a live Orca or repo. Returns null (leave the row entirely alone) for:
+ *   - anything not done, or explicitly failed/stopped (a contradictory row such as
+ *     workerState 'failed' with dispatchStatus 'completed' never auto-closes);
+ *   - a worker retained for reuse after its done state (see isRetainedForReuse);
+ *   - the panel's own terminal (ORCA_TERMINAL_HANDLE — defence in depth, same guard as
+ *     sessionTerminalHandles);
+ *   - a worker not holding a terminal;
+ *   - a worker whose agent terminal produced output within the last idleSeconds — the
+ *     agent may still be mid-turn (worker-done races the terminal), so closing waits for
+ *     a quiet terminal.
+ * Returns {kind: 'unknown'} when the worktree path cannot be resolved — real worker-list
+ * rows carry only `resource.worktreeId` / `projection.workspace.id` in the form
+ * `<repoId>::<abs path>`, resolved here exactly the way terminalWorktreePath does — so
+ * the caller can fall back to the old retain-or-release event instead of going silent.
+ * Returns {kind: 'failed'} when the release call itself failed (orca answered ok:false or
+ * could not answer at all); the caller persists that with a timestamp so the retry is
+ * bounded, and nothing is ever logged as a success that did not happen.
  */
 function autoCloseDoneWorker(w, ctx = {}) {
   if (!w || w.workerState === 'unsupervised' || !w.dispatchId) return null;
+  if (isFailedWorker(w)) return null;
   const done = DONE_WORKER_STATES.has(w.workerState) || DONE_WORKER_STATES.has(w.dispatchStatus);
   if (!done) return null;
-  if (ctx.retained || w.terminalState === 'retained') return null;
+  if (isRetainedForReuse(w, ctx)) return null;
+  const panelHandle = ctx.panelHandle !== undefined ? ctx.panelHandle : (process.env.ORCA_TERMINAL_HANDLE || '');
+  if (panelHandle && w.agentTerminalHandle === panelHandle) return null;
   if (!isHoldingResources(w, false)) return null;
+  if (ctx.lastOutputAt != null) {
+    const now = ctx.now != null ? ctx.now : Date.now();
+    const idleSeconds = ctx.idleSeconds != null ? ctx.idleSeconds : IDLE_SECONDS;
+    if (Math.round((now - ctx.lastOutputAt) / 1000) < idleSeconds) return null;
+  }
+  const candidates = [
+    ...(w.worktreePaths || []),
+    ...(w.worktreeIds || []).flatMap((id) => [...worktreeKeys(id, '')]),
+  ];
   const worktreePath = ctx.worktreePath ||
-    (w.worktreePaths || []).find((candidate) => path.isAbsolute(candidate)) || '';
-  if (!worktreePath) return null;
+    candidates.find((candidate) => path.isAbsolute(candidate)) || '';
+  if (!worktreePath) return { kind: 'unknown' };
   const git = ctx.git || runGit;
   if (!isWorktreeClean({ path: worktreePath }, git)) {
     return {
@@ -1019,8 +1111,18 @@ function autoCloseDoneWorker(w, ctx = {}) {
     };
   }
   const runOrca = ctx.runOrca || orca;
-  runOrca(['orchestration', 'worker-release', '--dispatch', w.dispatchId]);
-  if (w.agentTerminalHandle) runOrca(['terminal', 'close', '--terminal', w.agentTerminalHandle]);
+  const releaseCmd = ['orchestration', 'worker-release', '--dispatch', w.dispatchId, '--json'];
+  const release = runOrca(releaseCmd);
+  if (!release || release.ok === false) {
+    return {
+      kind: 'failed',
+      line: `AUTO-CLOSE FAILED ${w.dispatchId}: \`orca ${releaseCmd.join(' ')}\` did not succeed — ` +
+        'the daemon will retry; release it manually if this repeats.',
+    };
+  }
+  // A close failure after a successful release is tolerated: worker-release may have
+  // closed the agent terminal itself, in which case the close fails harmlessly.
+  if (w.agentTerminalHandle) runOrca(['terminal', 'close', '--terminal', w.agentTerminalHandle, '--json']);
   return { kind: 'closed', line: `WORKER CLOSED ${w.dispatchId} (done, terminal closed, worktree kept)` };
 }
 
@@ -1031,27 +1133,57 @@ function autoCloseDoneWorker(w, ctx = {}) {
  * PR/MR, never dirty or unpushed, never the main worktree, never another session's — the
  * caller only feeds it session-owned rows) and returns the informational WORKTREE REMOVED
  * line; 'remind' returns the panel-facing wake event with the exact, quoted rm command and
- * never runs it. Injectable `runOrca`/`mode` keep it testable.
+ * never runs it. Remove mode is strictly "holds no live terminal": a live-but-quiet
+ * terminal (an approval prompt, a shell the operator left open) falls back to the remind
+ * event — evaluateDoneButOpen's idle leg alone is not enough for an irreversible rm
+ * (review, blocker 5). A failed rm returns {kind: 'rm_failed'} so the caller can bound
+ * the retry instead of recording a removal that never happened. Injectable
+ * `runOrca`/`mode` keep it testable; the real rm runs with a longer timeout than the
+ * default 20s polling calls, since a large worktree can legitimately take longer.
  */
 function actOnDoneWorktree(w, reason, ctx = {}) {
   const mode = ctx.mode || CLOSE_DONE_WORKTREES_MODE;
-  if (mode === 'remove') {
-    const runOrca = ctx.runOrca || orca;
-    runOrca(['worktree', 'rm', '--worktree', `path:${w.path}`]);
+  if (mode === 'remove' && (w.liveTerminalCount || 0) === 0) {
+    const runOrca = ctx.runOrca || ((args) => orca(args, 60000));
+    const reply = runOrca(['worktree', 'rm', '--worktree', `path:${w.path}`, '--json']);
+    if (reply && reply.ok !== false) {
+      return {
+        kind: 'removed',
+        line: `WORKTREE REMOVED ${sanitizeText(w.displayName)} (${reason}) — ${sanitizeText(w.path)}`,
+      };
+    }
     return {
-      kind: 'removed',
-      line: `WORKTREE REMOVED ${sanitizeText(w.displayName)} (${reason}) — ${sanitizeText(w.path)}`,
+      kind: 'rm_failed',
+      line: `WORKTREE RM FAILED ${sanitizeText(w.path)} — removal did not succeed; ` +
+        'the daemon will retry, or close it manually.',
+      remind: formatDoneWorktreeEvent(w, reason),
     };
   }
   return { kind: 'remind', line: formatDoneWorktreeEvent(w, reason) };
 }
 
-/** Routes one done-but-open verdict: an informational line in remove mode, a wake event
- * in remind mode. */
-function emitDoneWorktree(w, reason, events) {
+/** Routes one done-but-open verdict: an informational line on success in remove mode, a
+ * wake event otherwise (remind mode, live-terminal fallback, or a failed rm — the failure
+ * line first, then the remind line, and only on the first attempt: a bounded retry that
+ * fails again just refreshes its timestamp). `rmFailed` maps path -> last failure ms. */
+function emitDoneWorktree(w, reason, events, rmFailed, isRetry = false) {
   const act = actOnDoneWorktree(w, reason);
-  if (act.kind === 'removed') logInfoLine(act.line);
-  else events.push(act.line);
+  if (act.kind === 'removed') {
+    if (rmFailed && rmFailed.delete(w.path)) savePersistedTimestampMap(RM_FAILED_FILE, rmFailed);
+    logInfoLine(act.line);
+    return;
+  }
+  if (act.kind === 'rm_failed') {
+    if (rmFailed) {
+      rmFailed.set(w.path, Date.now());
+      savePersistedTimestampMap(RM_FAILED_FILE, rmFailed);
+    }
+    if (isRetry) return;
+    events.push(act.line);
+    events.push(act.remind);
+    return;
+  }
+  if (!isRetry) events.push(act.line);
 }
 
 /**
@@ -1160,7 +1292,7 @@ function ensureDoneWtPersistedLoaded() {
  * After seeding, this same process continues in ordinary steady-state on every later call:
  * anything done-but-open this process has not itself already reported is a wake event.
  */
-function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
+function processDoneWorktrees(data, events, started, ownedWorktreePaths, rmFailed) {
   if (!CLOSE_DONE_WORKTREES || !data || data.truncated) return;
   try {
     ensureDoneWtPersistedLoaded();
@@ -1169,13 +1301,18 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
     // seeding has happened at least once — skip its (potentially several) git subprocess
     // calls entirely instead of re-running them on every future tick forever. Before the
     // first seed, every row must still be evaluated once to establish the backlog / diff
-    // against a persisted restart, so nothing is skipped yet at that point.
+    // against a persisted restart, so nothing is skipped yet at that point. The one
+    // exception: a remove-mode `worktree rm` that FAILED earlier is re-evaluated once its
+    // retry cooldown has passed (the failure itself was reported at the time; the retry
+    // is silent unless it succeeds).
     const isSeedingPass = !doneWtSeeded;
     const sessionRows = data.rows.filter((w) => w &&
       [...worktreeKeys(w.worktreeId, w.path)].some((key) => ownedWorktreePaths.has(key)));
+    const rmRetryDue = (w) => CLOSE_DONE_WORKTREES_MODE === 'remove' && rmFailed &&
+      Number.isFinite(rmFailed.get(w.path)) && now - rmFailed.get(w.path) >= MUTATION_RETRY_MS;
     const candidates = isSeedingPass
       ? sessionRows
-      : sessionRows.filter((w) => !reportedDoneWorktrees.has(w.path));
+      : sessionRows.filter((w) => !reportedDoneWorktrees.has(w.path) || rmRetryDue(w));
     // A git-heavy pass (many worktrees left to evaluate) must never run long enough to make
     // the liveness file look stale: cap it to ~GIT_BUDGET_MS total and beat() between rows.
     // Whatever does not fit in the budget is simply retried next tick — evaluateDoneButOpen
@@ -1215,21 +1352,24 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths) {
           console.log(formatDoneWorktreeStartupSummary(backlog));
         }
         if (CLOSE_DONE_WORKTREES_MODE === 'remove') {
-          for (const { w, verdict } of evaluated) emitDoneWorktree(w, verdict.reason, events);
+          for (const { w, verdict } of evaluated) emitDoneWorktree(w, verdict.reason, events, rmFailed);
         }
         for (const { w } of evaluated) doneWtPersisted.add(w.path);
       } else {
         const newSincePersisted = evaluated.filter((e) => !doneWtPersisted.has(e.w.path));
         for (const { w } of evaluated) doneWtPersisted.add(w.path);
-        for (const { w, verdict } of newSincePersisted) emitDoneWorktree(w, verdict.reason, events);
+        for (const { w, verdict } of newSincePersisted) emitDoneWorktree(w, verdict.reason, events, rmFailed);
       }
     } else {
       for (const { w, verdict } of evaluated) {
-        if (reportedDoneWorktrees.has(w.path)) continue;
-        reportedDoneWorktrees.add(w.path);
-        doneWtPersisted.add(w.path);
-        persistedChanged = true;
-        emitDoneWorktree(w, verdict.reason, events);
+        const isRmRetry = reportedDoneWorktrees.has(w.path) && rmRetryDue(w);
+        if (reportedDoneWorktrees.has(w.path) && !isRmRetry) continue;
+        if (!isRmRetry) {
+          reportedDoneWorktrees.add(w.path);
+          doneWtPersisted.add(w.path);
+          persistedChanged = true;
+        }
+        emitDoneWorktree(w, verdict.reason, events, rmFailed, isRmRetry);
       }
     }
     if (persistedChanged) savePersistedDoneWorktrees(doneWtPersisted);
@@ -1361,6 +1501,8 @@ function main() {
   const reportedApproval = loadPersistedApprovalReports();
   const reportedExited = loadPersistedExitedReports();
   const autoClosed = loadPersistedAutoClosed();
+  const doneAtMap = loadPersistedTimestampMap(DONE_AT_FILE);
+  const rmFailed = loadPersistedTimestampMap(RM_FAILED_FILE);
   const handoverRecords = HANDOVER.loadRecords(DIR, SESSION);
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
@@ -1387,7 +1529,7 @@ function main() {
   // tick() below keeps retrying until one comes back.
   if (CLOSE_DONE_WORKTREES) {
     const startupEvents = [];
-    processDoneWorktrees(worktrees(), startupEvents, started, ownedWorktreePaths);
+    processDoneWorktrees(worktrees(), startupEvents, started, ownedWorktreePaths, rmFailed);
     if (startupEvents.length) flushAndExit(startupEvents, Date.now());
   }
 
@@ -1412,49 +1554,10 @@ function main() {
         else if (before !== state) events.push(`worker ${id} changed: ${before} -> ${state}`);
       }
       prevWorkers = cur;
-
-      // A successfully-done worker still holding a terminal no longer waits for a panel
-      // decision (binding operator decision, 2026-10-01): the daemon releases and closes
-      // it itself when the worktree is provably clean and pushed, or flags WORKER DONE BUT
-      // UNSAVED when it is not. Each dispatch id is acted on / reported once per session
-      // (persisted); an unsaved worker that later becomes clean still gets closed.
-      const doneState = loadSessionState();
-      for (const w of ws) {
-        if (w.workerState === 'unsupervised' || !w.dispatchId) continue;
-        if (!DONE_WORKER_STATES.has(w.workerState) && !DONE_WORKER_STATES.has(w.dispatchStatus)) continue;
-        if (autoClosed.get(w.dispatchId) === 'closed') continue;
-        const result = autoCloseDoneWorker(w, {
-          retained: !!stateWorkerForRow(w, doneState)?.retained,
-        });
-        if (!result) continue;
-        autoClosed.set(w.dispatchId, result.kind === 'closed' ? 'closed' : 'unsaved');
-        savePersistedAutoClosed(autoClosed);
-        if (result.kind === 'closed') logInfoLine(result.line);
-        else events.push(result.line);
-      }
-
-      // Work that finished but still owns a terminal is exactly the resource
-      // leak the contract exists to prevent. Only flag ones that changed on our
-      // watch; the backlog from earlier sessions is not this run's event.
-      // Succeeded/completed workers are handled by the auto-close above — this
-      // panel-decision event now covers only failed/stopped ones.
-      const newDoneHolding = ws.filter(
-        (w) =>
-          w.workerState !== 'unsupervised' &&
-          ['failed', 'stopped'].includes(w.workerState) &&
-          isHoldingResources(w, !!stateWorkerForRow(w, doneState)?.retained) &&
-          baseWorkerState.get(w.dispatchId) !== `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`
-      );
-      if (newDoneHolding.length) {
-        events.push(
-          `${newDoneHolding.length} finished worker(s) still holding a terminal: ` +
-          `${newDoneHolding.map((w) => w.dispatchId).join(', ')} — retain if reusable, else release.`
-        );
-      }
     }
 
     if (CLOSE_DONE_WORKTREES) {
-      processDoneWorktrees(worktrees(), events, started, ownedWorktreePaths);
+      processDoneWorktrees(worktrees(), events, started, ownedWorktreePaths, rmFailed);
       beat(started); // item L1
     }
 
@@ -1484,6 +1587,86 @@ function main() {
         if (w && w.agent && w.status === 'live' && (w.kind === 'terminal' || /^term_/.test(id))) {
           handleAgent.set(id, w.agent);
         }
+      }
+
+      // A successfully-done worker still holding a terminal no longer waits for a panel
+      // decision (binding operator decision, 2026-10-01): the daemon releases and closes
+      // it itself when the worktree is provably clean and pushed AND the agent terminal
+      // has been quiet past idleSeconds (a done agent may still be mid-turn). Dirty or
+      // unpushed work wakes the panel once with WORKER DONE BUT UNSAVED; a failed release
+      // wakes it once with AUTO-CLOSE FAILED and is retried on a bounded cooldown; a
+      // worker whose worktree path cannot be resolved at all falls back to the old
+      // retain-or-release event below rather than going silent. Terminal quiet comes from
+      // the terminal list (ts), which is why this loop lives here and not in the ws block.
+      const terminalLastOutput = new Map(ts.map((t) => [t.handle, t.lastOutputAt]));
+      const autoCloseUnknown = [];
+      for (const w of ws || []) {
+        if (w.workerState === 'unsupervised' || !w.dispatchId) continue;
+        if (isFailedWorker(w)) continue;
+        if (!DONE_WORKER_STATES.has(w.workerState) && !DONE_WORKER_STATES.has(w.dispatchStatus)) continue;
+        const previous = autoClosed.get(w.dispatchId);
+        if (previous && previous.state === 'closed') continue;
+        if (previous && previous.state === 'failed' && now - previous.at < MUTATION_RETRY_MS) continue;
+        if (!doneAtMap.has(w.dispatchId)) {
+          doneAtMap.set(w.dispatchId, now);
+          savePersistedTimestampMap(DONE_AT_FILE, doneAtMap);
+        }
+        const gateWorker = stateWorkerForRow(w, tickState);
+        const result = autoCloseDoneWorker(w, {
+          retained: !!gateWorker?.retained,
+          retainedAt: Number.isFinite(gateWorker?.retainedAt) ? gateWorker.retainedAt : null,
+          doneAt: doneAtMap.get(w.dispatchId),
+          lastOutputAt: terminalLastOutput.has(w.agentTerminalHandle)
+            ? terminalLastOutput.get(w.agentTerminalHandle) : null,
+          idleSeconds: IDLE_SECONDS, now,
+        });
+        if (!result) continue;
+        // A done worker whose worktree path cannot be resolved at all falls back to the
+        // old retain-or-release event (below) rather than the auto-close path — but that
+        // fallback is itself a done-and-holding row with no state transition to key off
+        // (it is "done" from the very first read), so it needs its own once-per-episode
+        // transition tracking here, same shape as unsaved/failed.
+        if (result.kind === 'unknown') {
+          autoCloseUnknown.push(w);
+          if (!previous || previous.state !== 'unknown') {
+            autoClosed.set(w.dispatchId, { state: 'unknown', at: now });
+            savePersistedAutoClosed(autoClosed);
+          }
+          continue;
+        }
+        autoClosed.set(w.dispatchId, { state: result.kind, at: now });
+        savePersistedAutoClosed(autoClosed);
+        if (result.kind === 'closed') logInfoLine(result.line);
+        // Unsaved/failed wake events fire only on the TRANSITION into that state —
+        // re-evaluation continues (a clean worktree still closes later), but the panel
+        // is never re-woken for a state it was already told about.
+        else if (!previous || previous.state !== result.kind) events.push(result.line);
+      }
+
+      // Work that finished but still owns a terminal is exactly the resource
+      // leak the contract exists to prevent. Failed/stopped/cancelled rows only fire when
+      // something CHANGED this tick — the backlog from earlier sessions is not this run's
+      // event. A done worker whose worktree path is unresolvable (uncertainty) instead
+      // fires once, on the transition tracked by `autoClosed` above, since it is
+      // definitionally already "done" on the very first read and has no base state to
+      // diff against.
+      const autoCloseUnknownNew = autoCloseUnknown.filter((w) => {
+        const previous = autoClosed.get(w.dispatchId);
+        return previous && previous.state === 'unknown' && previous.at === now;
+      });
+      const changedFailedOrStopped = (ws || []).filter(
+        (w) =>
+          w.workerState !== 'unsupervised' &&
+          isFailedWorker(w) &&
+          isHoldingResources(w, !!stateWorkerForRow(w, tickState)?.retained) &&
+          baseWorkerState.get(w.dispatchId) !== `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`
+      );
+      const newDoneHolding = [...changedFailedOrStopped, ...autoCloseUnknownNew];
+      if (newDoneHolding.length) {
+        events.push(
+          `${newDoneHolding.length} finished worker(s) still holding a terminal: ` +
+          `${newDoneHolding.map((w) => w.dispatchId).join(', ')} — retain if reusable, else release.`
+        );
       }
       const ctx = {
         baseHandles: baseTermHandles, ownHandles: ownTerminalHandles,
@@ -1784,6 +1967,7 @@ module.exports = {
   parseWorkerRows,
   probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
   pidAlive, spawnResumeScheduler,
-  DONE_WORKER_STATES, autoCloseDoneWorker, actOnDoneWorktree,
+  DONE_WORKER_STATES, FAILED_WORKER_STATES, isFailedWorker, autoCloseDoneWorker, actOnDoneWorktree, isRetainedForReuse,
   loadPersistedAutoClosed, savePersistedAutoClosed,
+  loadPersistedTimestampMap, savePersistedTimestampMap, MUTATION_RETRY_MS,
 };

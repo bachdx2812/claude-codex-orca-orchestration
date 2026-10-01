@@ -2965,7 +2965,7 @@ async function heartbeatWorktreeTests() {
       workerRows: [{ dispatchId: 'ctx_done_clean', taskId: 'task_done_clean',
         workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
         agentTerminalHandle: 'term_done_clean', worktreePath: wt }],
-      terminalRows: [{ handle: 'term_done_clean', title: 'done worker', lastOutputAt: Date.now(),
+      terminalRows: [{ handle: 'term_done_clean', title: 'done worker', lastOutputAt: Date.now() - 65_000,
         worktreePath: wt }],
       envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
       args: ['--interval', '1', '--idle', '60', '--max', '3'],
@@ -2993,7 +2993,7 @@ async function heartbeatWorktreeTests() {
       workerRows: [{ dispatchId: 'ctx_done_dirty', taskId: 'task_done_dirty',
         workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
         agentTerminalHandle: 'term_done_dirty', worktreePath: wt }],
-      terminalRows: [{ handle: 'term_done_dirty', title: 'done worker', lastOutputAt: Date.now(),
+      terminalRows: [{ handle: 'term_done_dirty', title: 'done worker', lastOutputAt: Date.now() - 65_000,
         worktreePath: wt }],
       envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
       gitEnv: { STUB_GIT_CLEAN: '0' },
@@ -3017,7 +3017,7 @@ async function heartbeatWorktreeTests() {
       workerRows: [{ dispatchId: 'ctx_done_unpushed', taskId: 'task_done_unpushed',
         workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
         agentTerminalHandle: 'term_done_unpushed', worktreePath: wt }],
-      terminalRows: [{ handle: 'term_done_unpushed', title: 'done worker', lastOutputAt: Date.now(),
+      terminalRows: [{ handle: 'term_done_unpushed', title: 'done worker', lastOutputAt: Date.now() - 65_000,
         worktreePath: wt }],
       envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
       gitEnv: { STUB_GIT_UNPUSHED: '1' },
@@ -3109,6 +3109,206 @@ async function heartbeatWorktreeTests() {
       out.includes('rm-open-pr') || calls.includes('worktree rm'), false);
     checkBool('remove mode never removes another session\'s worktree',
       out.includes('rm-foreign') || calls.includes('worktree rm'), false);
+  }
+
+  // 6h. Blocker 1 (review): a real worker-list row never carries a flat worktreePath — only
+  // nested `resource.worktreeId` (`<repoId>::<abs path>`). The daemon must still resolve it
+  // and auto-close exactly like the flat-path fixture above.
+  {
+    const wt = realWtDir('auto-close-real-shape');
+    const name = 'auto-close-real-row-shape';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_real_shape', taskId: 'task_real_shape',
+        workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
+        agentTerminalHandle: 'term_real_shape', resource: { worktreeId: `repo_hb::${wt}` } }],
+      terminalRows: [{ handle: 'term_real_shape', title: 'done worker',
+        lastOutputAt: Date.now() - 65_000, worktreeId: `repo_hb::${wt}` }],
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('a real nested-shape row (resource.worktreeId only, no flat worktreePath) still auto-closes',
+      out.includes('WORKER CLOSED ctx_real_shape (done, terminal closed, worktree kept)'), true);
+    checkBool('the release call ran for the real-shape row',
+      calls.includes('orchestration worker-release --dispatch ctx_real_shape'), true);
+  }
+
+  // 6i. A done worker whose worktree path cannot be resolved at all (no flat path, no
+  // worktreeIds) falls back to the old "still holding a terminal" retain-or-release event
+  // instead of being silently dropped.
+  {
+    const name = 'auto-close-unresolvable-path';
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_unresolvable', taskId: 'task_unresolvable',
+        workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
+        agentTerminalHandle: 'term_unresolvable' }],
+      terminalRows: [{ handle: 'term_unresolvable', title: 'done worker',
+        lastOutputAt: Date.now() - 65_000 }],
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    checkBool('a done worker with no resolvable worktree path never auto-closes',
+      out.includes('WORKER CLOSED'), false);
+    checkBool('it falls back to the retain-or-release wake event instead of going silent',
+      out.includes('still holding a terminal'), true);
+  }
+
+  // 6j. Blocker 2 (review): WORKER DONE BUT UNSAVED fires once per episode, not on every
+  // tick or every daemon restart within the same session.
+  {
+    const wt = realWtDir('auto-close-unsaved-restart');
+    const rows = [{ dispatchId: 'ctx_unsaved_restart', taskId: 'task_unsaved_restart',
+      workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
+      agentTerminalHandle: 'term_unsaved_restart', worktreePath: wt }];
+    const terms = [{ handle: 'term_unsaved_restart', title: 'done worker',
+      lastOutputAt: Date.now() - 65_000, worktreePath: wt }];
+    const out1 = await runHeartbeat({
+      name: 'unsaved-restart', sessionName: 'unsaved-restart-shared', dirName: 'hb-unsaved-restart-shared',
+      worktrees: [], workerRows: rows, terminalRows: terms,
+      gitEnv: { STUB_GIT_CLEAN: '0' },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    checkBool('the first run flags WORKER DONE BUT UNSAVED',
+      out1.includes('WORKER DONE BUT UNSAVED ctx_unsaved_restart'), true);
+    const out2 = await runHeartbeat({
+      name: 'unsaved-restart', sessionName: 'unsaved-restart-shared', dirName: 'hb-unsaved-restart-shared',
+      worktrees: [], workerRows: rows, terminalRows: terms,
+      gitEnv: { STUB_GIT_CLEAN: '0' },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    checkBool('a daemon restart within the same session never re-fires the same WORKER DONE BUT UNSAVED',
+      out2.includes('WORKER DONE BUT UNSAVED'), false);
+  }
+
+  // 6k. Blocker 3 (review): a failed worker-release is never logged or persisted as a
+  // success. It wakes the panel once with AUTO-CLOSE FAILED and never attempts the
+  // terminal close for a release that did not succeed.
+  {
+    const wt = realWtDir('auto-close-release-fails');
+    const name = 'auto-close-release-fails';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_release_fails', taskId: 'task_release_fails',
+        workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
+        agentTerminalHandle: 'term_release_fails', worktreePath: wt }],
+      terminalRows: [{ handle: 'term_release_fails', title: 'done worker',
+        lastOutputAt: Date.now() - 65_000, worktreePath: wt }],
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile, STUB_WORKER_RELEASE_OK_FALSE: '1' },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('a release Orca refuses is reported as AUTO-CLOSE FAILED, never WORKER CLOSED',
+      out.includes('AUTO-CLOSE FAILED ctx_release_fails') && !out.includes('WORKER CLOSED'), true);
+    checkBool('the terminal-close call is never attempted after a failed release',
+      calls.includes('terminal close'), false);
+  }
+
+  // 6l. Blocker 4 (review): Orca's own automatic readiness-timeout retain
+  // (retainedReason: identity_unproven) is distinct from an operator retain-for-reuse and
+  // stays eligible for auto-close even though terminalState reads 'retained'.
+  {
+    const wt = realWtDir('auto-close-identity-unproven');
+    const name = 'auto-close-identity-unproven';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_identity_unproven', taskId: 'task_identity_unproven',
+        workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'retained',
+        agentTerminalHandle: 'term_identity_unproven', worktreePath: wt,
+        resource: { retainedReason: 'identity_unproven' } }],
+      terminalRows: [{ handle: 'term_identity_unproven', title: 'done worker',
+        lastOutputAt: Date.now() - 65_000, worktreePath: wt }],
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('an Orca-automatic identity_unproven retain still auto-closes',
+      out.includes('WORKER CLOSED ctx_identity_unproven'), true);
+    checkBool('the release call ran despite terminalState: retained',
+      calls.includes('worker-release --dispatch ctx_identity_unproven'), true);
+  }
+
+  // 6m. Same shape, but an explicit `worker-retain` (resource.retainedReason:
+  // user_requested) that the gate recorded as having happened AFTER the worker was first
+  // seen done blocks auto-close (the operator asked to keep this one for reuse).
+  {
+    const wt = realWtDir('auto-close-user-requested-after-done');
+    const name = 'auto-close-user-requested-after-done';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const farFuture = Date.now() + 10 * 24 * 60 * 60 * 1000;
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_user_requested_late', taskId: 'task_user_requested_late',
+        workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'retained',
+        agentTerminalHandle: 'term_user_requested_late', worktreePath: wt,
+        resource: { retainedReason: 'user_requested' } }],
+      terminalRows: [{ handle: 'term_user_requested_late', title: 'done worker',
+        lastOutputAt: Date.now() - 65_000, worktreePath: wt }],
+      seedState: { workers: { ctx_user_requested_late: { status: 'live', retained: true,
+        retainedAt: farFuture, group: 'ctx_user_requested_late', started: Date.now() } } },
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('a user_requested retain recorded after the done transition is never auto-closed',
+      out.includes('WORKER CLOSED'), false);
+    checkBool('the daemon never released a worker explicitly retained for reuse after done',
+      calls.includes('worker-release'), false);
+  }
+
+  // 6n. Blocker 5 (review): remove mode never removes a worktree that still holds a live
+  // terminal, even one `isWorktreeIdle` already treats as idle-but-quiet — it falls back
+  // to the remind event instead.
+  {
+    const p = realWtDir('rm-live-terminal');
+    const name = 'remove-mode-live-terminal';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const out = await runHeartbeat({
+      name,
+      worktrees: [{ path: p, displayName: 'rm-live-terminal', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 1, lastOutputAt: Date.now() - 65_000,
+        linkedPR: { state: 'merged', number: 80 } }],
+      cfgOverrides: { closeDoneWorktrees: 'remove' },
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('remove mode with a live (even quiet) terminal never runs worktree rm',
+      calls.includes('worktree rm'), false);
+    checkBool('it falls back to the DONE worktree remind event instead',
+      out.includes('DONE worktree rm-live-terminal (PR #80 merged'), true);
+  }
+
+  // 6o. Blocker 3 (review): a failed `orca worktree rm` is never recorded as removed; it
+  // wakes the panel once with WORKTREE RM FAILED plus the remind fallback.
+  {
+    const p = realWtDir('rm-fails');
+    const name = 'remove-mode-rm-fails';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const out = await runHeartbeat({
+      name,
+      worktrees: [{ path: p, displayName: 'rm-fails', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0, linkedPR: { state: 'merged', number: 81 } }],
+      cfgOverrides: { closeDoneWorktrees: 'remove' },
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile, STUB_WORKTREE_RM_OK_FALSE: '1' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('a failed worktree rm is reported as WORKTREE RM FAILED, never WORKTREE REMOVED',
+      out.includes('WORKTREE RM FAILED') && !out.includes('WORKTREE REMOVED'), true);
+    checkBool('the rm call was attempted',
+      calls.includes('worktree rm'), true);
+    checkBool('the failed rm also falls back to the DONE worktree remind event',
+      out.includes('DONE worktree rm-fails (PR #81 merged'), true);
   }
 
   // 7. Item M4: the daemon's very first `worktree ps` call fails outright (non-zero exit,
