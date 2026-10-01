@@ -2216,6 +2216,47 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   }
 }
 
+// --- review model follows the code author ------------------------------------
+
+{
+  const cfg = config.loadConfig();
+  check('reviewByCoder defaults: external coders -> sonnet, sonnet -> opus',
+    ['codex', 'kimi', 'deepseek', 'sonnet'].map((a) => config.reviewModelForCoder(cfg, a)),
+    ['sonnet', 'sonnet', 'sonnet', 'opus']);
+  check('opencode maps to deepseek for the review model',
+    config.reviewModelForCoder(cfg, 'opencode'), 'sonnet');
+  check('an unknown author maps to no review model (fail open)',
+    config.reviewModelForCoder(cfg, 'claude'), null);
+  process.env.ORCH_REVIEW_MODEL_EXTERNAL = 'haiku';
+  check('ORCH_REVIEW_MODEL_EXTERNAL overrides the external mapping',
+    config.reviewModelForCoder(cfg, 'kimi'), 'haiku');
+  delete process.env.ORCH_REVIEW_MODEL_EXTERNAL;
+  process.env.ORCH_REVIEW_MODEL_SONNET = 'fable';
+  check('ORCH_REVIEW_MODEL_SONNET overrides the sonnet mapping',
+    config.reviewModelForCoder(cfg, 'sonnet'), 'fable');
+  delete process.env.ORCH_REVIEW_MODEL_SONNET;
+}
+
+{
+  check('a planning first verb is planning', gate.isPlanningReview('plan the refactor', 'planner'), true);
+  check('a planning noun in the type is planning', gate.isPlanningReview('draft it', 'architect'), true);
+  check('a review first verb is review', gate.isPlanningReview('review the diff', 'code-reviewer'), false);
+  check('a verify first verb is review', gate.isPlanningReview('verify the fix', 'reviewer'), false);
+  check('a review verb governing a plan noun is review', gate.isPlanningReview('review the plan', 'planner'), false);
+  check('a neutral verb with a planning noun is planning', gate.isPlanningReview('update the design doc', 'docs-manager'), true);
+}
+
+{
+  check('a bare escalation marker counts',
+    gate.hasReviewEscalationReason({ description: 'review the code', prompt: 'escalation: sonnet could not decide' }, 'sonnet'), true);
+  check('a named reviewer that could not decide counts',
+    gate.hasReviewEscalationReason({ description: 'sonnet review was inconclusive', prompt: '' }, 'sonnet'), true);
+  check('a different reviewer alias does not count',
+    gate.hasReviewEscalationReason({ description: 'opus review was inconclusive', prompt: '' }, 'sonnet'), false);
+  check('no escalation reason does not count',
+    gate.hasReviewEscalationReason({ description: 'review the code', prompt: 'please review' }, 'sonnet'), false);
+}
+
 // --- report -----------------------------------------------------------------
 
 // A clean installer copy must contain the complete runtime dependency closure. Running

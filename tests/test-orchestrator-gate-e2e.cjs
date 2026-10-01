@@ -366,11 +366,13 @@ expect('a neutral Commit verb is not misclassified by a later plan noun',
   dispatch({ subagent_type: 'git-manager', description: 'Commit the plan file', model: 'sonnet' }), ALLOW);
 expect('a neutral Update verb is not misclassified by a later design noun',
   dispatch({ subagent_type: 'docs-manager', description: 'Update design tokens doc', model: 'sonnet' }), ALLOW);
-{
-  const result = invoke(dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'sonnet' }));
-  if (result.code === DENY && /route-review/.test(result.err)) pass += 1;
-  else failures.push(`Review the diff must route as review\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
-}
+// An unknown code author (no settled coder group, no in-session code dispatch yet) fails
+// open toward the review happening: a review may run on either the review model or the
+// code model until the gate knows who wrote the code.
+expect('Review on the code model is allowed while the code author is unknown',
+  dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'sonnet' }), ALLOW);
+expect('Review on a model that is neither the review nor the code model is still refused',
+  dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'haiku' }), DENY);
 {
   const result = invoke(dispatch({ subagent_type: 'fullstack-developer', description: 'Implement the plan', model: 'sonnet' }));
   if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
@@ -383,11 +385,8 @@ for (const description of ['Generate code', 'Generate assets', 'Generate compone
   if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
   else failures.push(`${description} must route as code\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
 }
-{
-  const result = invoke(dispatch({ subagent_type: 'code-reviewer', description: 'Update the findings', model: 'sonnet' }));
-  if (result.code === DENY && /route-review/.test(result.err)) pass += 1;
-  else failures.push(`a neutral first verb must preserve code-reviewer review routing\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
-}
+expect('a neutral first verb still classifies code-reviewer as review work',
+  dispatch({ subagent_type: 'code-reviewer', description: 'Update the findings', model: 'haiku' }), DENY);
 {
   const result = invoke(dispatch({ subagent_type: 'code-reviewer', description: 'Implement the plan', model: 'sonnet' }));
   if (result.code === DENY && /route-execution-to-codex/.test(result.err)) pass += 1;
@@ -397,6 +396,65 @@ for (const description of ['Generate code', 'Generate assets', 'Generate compone
   const result = invoke(dispatch({ subagent_type: 'code-reviewer', description: 'Update the parser to fix X', model: 'sonnet' }));
   if (result.code === DENY && /route-execution-to-codex/.test(result.err) && !/route-review/.test(result.err)) pass += 1;
   else failures.push(`code intent must override code-reviewer review routing\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
+}
+
+// Review / verify follows the code's author (operator decision, 2026-10-01): code by an
+// external coder is reviewed on the mapped model (the code model), and the review model is
+// reserved for code the code model itself wrote — reachable only by escalating a review
+// whose mapped reviewer already ran.
+{
+  const dir = path.join(RUN_DIR, 'review-follows-coder');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'review-follows-coder';
+  const stateOf = () => JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
+  let reviewSeq = 0;
+  const review = (extra) => dispatch(
+    Object.assign({ subagent_type: 'reviewer', description: 'review the implementation for correctness' }, extra),
+    sid, { tool_use_id: `toolu_rfc_r${++reviewSeq}` });
+
+  const start = 'orca orchestration worker-start --agent kimi --json';
+  invoke(mainBash(start, { sid, tool_use_id: 'toolu_rfc_start' }), env);
+  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_rfc_kimi"}}', { sid, tool_use_id: 'toolu_rfc_start' }), env);
+  checkBool('a registered Kimi worker becomes the session code author', stateOf().lastCodeAuthor, 'kimi');
+
+  expect('review of external-coder code runs on the mapped model', review({ model: 'sonnet' }), ALLOW, env);
+  {
+    const r = invoke(review({ model: 'opus' }), env);
+    if (r.code === DENY && /review-model-follows-coder/.test(r.err)) pass += 1;
+    else failures.push(`opus review of external code must be refused with review-model-follows-coder\n    exit=${r.code}, stderr=${r.err.slice(0, 200)}`);
+  }
+  expect('opus review of external code is allowed once it escalates after the mapped review',
+    review({ model: 'opus', prompt: 'escalation: sonnet review could not decide even at high effort' }), ALLOW, env);
+
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_rfc_kimi --json', '{"ok":true,"result":{}}', { sid }), env);
+  checkBool('releasing the external group does not clear its recorded author', stateOf().lastCodeAuthor, 'kimi');
+
+  // In-session code on the code model (no external coder eligible) records "sonnet", whose
+  // review the review model owns.
+  const sonnetEnv = { ...env, STUB_CODEX_PRIMARY_USED: '97' };
+  expect('in-session code on the code model is admitted when no external coder is eligible',
+    dispatch({ subagent_type: 'fullstack-developer', description: 'implement the parser fix', model: 'sonnet',
+      prompt: 'Owns: n/a isolated\nVerify: npm test', isolation: 'worktree' }, sid, { tool_use_id: 'toolu_rfc_sonnet' }),
+    ALLOW, sonnetEnv);
+  checkBool('in-session code on the code model records sonnet as the author', stateOf().lastCodeAuthor, 'sonnet');
+  expect('review of the code model\'s own code runs on the review model', review({ model: 'opus' }), ALLOW, sonnetEnv);
+  expect('the code model may not review its own code',
+    review({ model: 'sonnet' }), DENY, sonnetEnv);
 }
 
 // Main panel vs Orca worker terminal, via the deterministic stub (never a live Orca).
@@ -2197,7 +2255,7 @@ const postAgent = (sid, toolUseId) => ({
   const { env } = mpaTestEnv({ maxParallelAgents: 2 });
   const sid = 'mpa-c1-no-leak-on-later-refusal';
   const wrongModelReview = (toolUseId) => dispatch(
-    { subagent_type: 'reviewer', description: 'review the implementation for correctness', model: 'sonnet' },
+    { subagent_type: 'reviewer', description: 'review the implementation for correctness', model: 'haiku' },
     sid, { tool_use_id: toolUseId });
   for (const id of ['toolu_mpa_c1_r1', 'toolu_mpa_c1_r2', 'toolu_mpa_c1_r3']) {
     const r = invoke(wrongModelReview(id), env);
