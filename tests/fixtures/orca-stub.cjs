@@ -10,7 +10,9 @@
  * STUB_WORKERS_JSON, when set, is a JSON array of full worker rows and takes priority over
  * the single-row STUB_WORKER_HANDLE form above — used by tests that need several rows at
  * once (e.g. the parallel-Codex-worker cap's at-cap reconciliation, which drops rows Orca
- * shows released or done).
+ * shows released or done). The reply carries the real `result.page = {limit, total,
+ * hasMore, nextCursor}` paging shape; STUB_WORKERS_PAGE_HAS_MORE=1 / STUB_WORKERS_PAGE_CURSOR=1
+ * simulate an incomplete / multi-page list (see the worker-list branch below).
  *
  * STUB_WORKTREES_JSON answers `orca worktree ps --json` with a JSON array of worktree rows.
  * A value starting with "@" is a file path instead of literal JSON, read fresh on every
@@ -44,8 +46,9 @@ const args = process.argv.slice(2);
 const handle = process.env.STUB_WORKER_HANDLE;
 
 if (args[0] === 'orchestration' && args[1] === 'worker-list') {
-  // STUB_WORKERS_OK_FALSE=1 answers `{ ok: false }`, STUB_WORKERS_TRUNCATED=1 marks the
-  // reply `truncated: true` — neither is a real worker list the gate may reconcile against.
+  // STUB_WORKERS_OK_FALSE=1 answers `{ ok: false }` — not a real worker list the gate may
+  // reconcile against. The reply carries the REAL paging shape: `result.page = {limit,
+  // total, hasMore, nextCursor}` (there is no `truncated` field in a worker-list reply).
   if (process.env.STUB_WORKERS_OK_FALSE === '1') {
     process.stdout.write(JSON.stringify({ ok: false }));
     process.exit(0);
@@ -65,7 +68,32 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
       projection: { role: 'worker' },
     }] : [];
   }
-  process.stdout.write(JSON.stringify({ result: { workers, truncated: process.env.STUB_WORKERS_TRUNCATED === '1' } }));
+  // Paging variants:
+  //   STUB_WORKERS_PAGE_HAS_MORE=1 — page claims more rows exist but hands out no cursor
+  //     (hasMore: true, nextCursor: null): the gate must treat the list as INCOMPLETE and
+  //     disable its "absent from the list => settle" leg.
+  //   STUB_WORKERS_PAGE_CURSOR=1 — page 1 says hasMore with nextCursor "stub-page-2"; a
+  //     follow-up call with `--cursor stub-page-2` answers page 2 (rows from
+  //     STUB_WORKERS_PAGE2_JSON, default none) with hasMore: false. Exercises the gate's
+  //     cursor-following within its 5s budget.
+  const cursorIdx = args.indexOf('--cursor');
+  const cursor = cursorIdx >= 0 ? args[cursorIdx + 1] : null;
+  let page = { limit: 100, total: workers.length, hasMore: false, nextCursor: null };
+  if (process.env.STUB_WORKERS_PAGE_HAS_MORE === '1') {
+    page = { limit: 100, total: workers.length + 100, hasMore: true, nextCursor: null };
+  } else if (process.env.STUB_WORKERS_PAGE_CURSOR === '1') {
+    if (cursor === 'stub-page-2') {
+      let page2 = [];
+      if (process.env.STUB_WORKERS_PAGE2_JSON) {
+        try { page2 = JSON.parse(process.env.STUB_WORKERS_PAGE2_JSON); } catch { page2 = []; }
+      }
+      page = { limit: 100, total: workers.length + page2.length, hasMore: false, nextCursor: null };
+      workers = page2;
+    } else {
+      page = { limit: 100, total: workers.length + 1, hasMore: true, nextCursor: 'stub-page-2' };
+    }
+  }
+  process.stdout.write(JSON.stringify({ result: { workers, page } }));
   process.exit(0);
 }
 if (args[0] === 'terminal' && args[1] === 'list') {

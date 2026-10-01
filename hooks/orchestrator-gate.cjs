@@ -737,13 +737,13 @@ function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
           // H3: reconcile THIS session's own Orca-tracked workers before refusing — the
           // same out-of-lock-fetch + locked-reapply pattern the worker-start path uses.
           releaseLock(lockDir); locked = false;
-          const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+          const fetched = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
           locked = acquireLock(lockDir, CAP_LOCK_OPTS);
           if (locked === null) return;
           if (locked === false) { violation = PAC.LOCK_CONTENTION_MESSAGE; break; }
           fresh = load(s.session_id);
           Object.assign(fresh.reservations, localReservations);
-          if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
+          if (fetched !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, fetched.rows, fetched.exhaustive);
           usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
         }
         if (usage.total >= limit) {
@@ -794,15 +794,15 @@ function maybeReconcilePendingPlaceholders(sessionId) {
   if (!hasPending) return;
   const now = Date.now();
   if (now - (snapshot.last_pending_reconcile || 0) < PENDING_RECONCILE_INTERVAL_MS) return;
-  const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+  const fetched = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
   const lockDir = path.join(DIR, '.lock');
   const locked = acquireLock(lockDir, {});
   if (!locked) return;
   try {
     const fresh = load(sessionId);
     fresh.last_pending_reconcile = now;
-    if (rows !== null) {
-      const res = PARALLEL_OWNERSHIP.reconcilePendingPlaceholders(fresh, rows, now);
+    if (fetched !== null) {
+      const res = PARALLEL_OWNERSHIP.reconcilePendingPlaceholders(fresh, fetched.rows, now);
       for (const line of res.adopted) {
         process.stdout.write(`orchestrator-gate: resolved placeholder ${line} against orca worker-list.\n`);
       }
@@ -1196,12 +1196,12 @@ function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
   const violation = checkParallelAgentCapacity(state, cfg);
   if (!violation) return { state, violation: null, locked };
   releaseLock(lockDir);
-  const rows = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+  const fetched = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
   const reacquired = acquireLock(lockDir, CAP_LOCK_OPTS);
   if (reacquired === null) return { state, violation: null, locked: null };
   if (reacquired === false) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked: false };
   const fresh = load(sessionId);
-  if (rows !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, rows);
+  if (fetched !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, fetched.rows, fetched.exhaustive);
   return { state: fresh, violation: checkParallelAgentCapacity(fresh, cfg), locked: true };
 }
 
@@ -1995,7 +1995,7 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
           const oldEnough = Number.isFinite(started) && Date.now() - started >= 5000;
           let agentMatch = true;
           if (releaseRows) {
-            const row = releaseRows.find((r) =>
+            const row = releaseRows.rows.find((r) =>
               [r.dispatchId, r.taskId, r.agentTerminalHandle].includes(target));
             const rowAgent = row && row.projection && row.projection.provider && row.projection.provider.id;
             if (rowAgent && pendingWorker.agent &&

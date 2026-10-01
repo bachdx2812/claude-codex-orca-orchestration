@@ -86,8 +86,8 @@ function liveCodexGroupIds(s) {
 }
 
 /**
- * Pure fetch: exec `orca orchestration worker-list --json` and return its parsed worker
- * rows, or null on any failure (unreachable, malformed reply). Does NO read or write of
+ * Pure fetch: exec `orca orchestration worker-list --json` and return
+ * `{ rows, exhaustive }`, or null on any failure (unreachable, malformed reply). Does NO read or write of
  * session state, so it is safe to call with the file lock NOT held — this is the (up to 5s)
  * part of reconciliation that must never block every other concurrent hook process, and,
  * just as important, must never let its own before/after state snapshot race a concurrent
@@ -96,26 +96,46 @@ function liveCodexGroupIds(s) {
  * fresh state — item 1 of the second review round).
  */
 function fetchOrcaWorkerRows(orcaBin) {
-  let out;
-  try {
-    out = require('child_process').execFileSync(
-      orcaBin, ['orchestration', 'worker-list', '--json'],
-      { encoding: 'utf8', timeout: 5000, maxBuffer: 32 * 1024 * 1024 }
-    );
-  } catch {
-    return null;
-  }
-  try {
-    const parsed = JSON.parse(out);
-    // A non-ok or page-truncated reply is not a real worker list: treating it as one (or
-    // worse, as an EMPTY list) would let "absent from the list" settle groups that are
-    // actually still live. Degrade to null — the caller then trusts local state instead.
-    if (parsed.ok === false) return null;
-    const r = parsed.result ?? parsed;
-    if (r.truncated === true || parsed.truncated === true) return null;
-    return Array.isArray(r) ? r : r.workers || [];
-  } catch {
-    return null;
+  // The real reply pages at 100 rows, newest first: `result.page = {limit, total, hasMore,
+  // nextCursor}` (there is no `truncated` field). A page that says it is not the whole list
+  // must never drive an "absent from the list => settle" decision, so the caller gets an
+  // `exhaustive` flag alongside the rows: we follow `--cursor` while the overall 5s budget
+  // lasts, and mark the list non-exhaustive when the budget runs out mid-pagination (or
+  // the reply claims more pages without giving a cursor to follow).
+  const deadline = Date.now() + 5000;
+  const rows = [];
+  let cursor = null;
+  for (;;) {
+    const args = ['orchestration', 'worker-list', '--json'];
+    if (cursor) args.push('--cursor', cursor);
+    let out;
+    try {
+      out = require('child_process').execFileSync(
+        orcaBin, args,
+        { encoding: 'utf8', timeout: Math.max(1, deadline - Date.now()), maxBuffer: 32 * 1024 * 1024 }
+      );
+    } catch {
+      return null;
+    }
+    let r;
+    try {
+      const parsed = JSON.parse(out);
+      // A non-ok reply is not a real worker list: treating it as one (or worse, as an
+      // EMPTY list) would let "absent from the list" settle groups that are actually
+      // still live. Degrade to null — the caller then trusts local state instead.
+      if (parsed.ok === false) return null;
+      r = parsed.result ?? parsed;
+    } catch {
+      return null;
+    }
+    rows.push(...(Array.isArray(r) ? r : (r && r.workers) || []));
+    const page = (!Array.isArray(r) && r && r.page) || {};
+    const hasMore = page.hasMore === true || page.nextCursor != null;
+    if (!hasMore) return { rows, exhaustive: true };
+    if (typeof page.nextCursor !== 'string' || !page.nextCursor || Date.now() >= deadline) {
+      return { rows, exhaustive: false };
+    }
+    cursor = page.nextCursor;
   }
 }
 
@@ -135,14 +155,17 @@ function rowReportsReleased(row) {
  * Pure apply for the ownership-overlap path: settle the HOLDER groups of overlapping claims
  * that a fresh worker-list shows are actually gone, so a released/stopped worker's group
  * cannot hold its Owns: globs forever. Settles a group when every worker-list row of it
- * reports released (see `rowReportsReleased`), or when the group is entirely ABSENT from the
- * list and its oldest live entry is more than 10 minutes old (a recent dispatch Orca simply
- * hasn't listed yet is kept). `rows` must come from a real (ok, non-truncated) reply — a null
- * fetch result must never reach this function. Same lock discipline as
+ * reports released (see `rowReportsReleased`), or — only when `exhaustive` is true, i.e.
+ * the fetched list was the WHOLE list (all pages followed) — when the group is entirely
+ * ABSENT from the list and its oldest live entry is more than 10 minutes old (a recent
+ * dispatch Orca simply hasn't listed yet is kept). A non-exhaustive (paged, budget-cut)
+ * list disables the absent leg entirely: a live worker sitting past page 1, or in another
+ * run, must never lose its Owns: claim to a partial view. `rows` must come from a real
+ * (ok) reply — a null fetch result must never reach this function. Same lock discipline as
  * `applyOrcaReconciliation`: only against a freshly reloaded state under the held lock.
  * Returns true when anything changed.
  */
-function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now()) {
+function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now(), exhaustive = true) {
   let changed = false;
   const tenMinAgo = now - 10 * 60 * 1000;
   for (const group of groupIds || []) {
@@ -159,7 +182,7 @@ function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now())
       const started = s.workers[k].started;
       return Number.isFinite(started) ? started : now;
     }));
-    if (oldest < tenMinAgo && WG.settleGroup(s.workers, group)) changed = true;
+    if (exhaustive && oldest < tenMinAgo && WG.settleGroup(s.workers, group)) changed = true;
   }
   return changed;
 }
@@ -167,14 +190,15 @@ function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now())
 /**
  * Pure apply: mutates `s.workers` in place against already-fetched Orca rows — dropping rows
  * Orca reports released, marking a done-but-still-terminal-held row cap-exempt (see below),
- * and dropping an id Orca never mentions at all once it is older than 10 minutes (a very
- * recent dispatch Orca simply hasn't listed yet is kept). Must only be called while the lock
- * IS held, and only against a state object freshly reloaded from disk — never a stale
+ * and — only when `exhaustive` is not false (the fetched list was the whole list, all pages
+ * followed) — dropping an id Orca never mentions at all once it is older than 10 minutes (a
+ * very recent dispatch Orca simply hasn't listed yet is kept). Must only be called while the
+ * lock IS held, and only against a state object freshly reloaded from disk — never a stale
  * snapshot taken before the (unlocked) fetch — so this mutation can never silently overwrite
  * a concurrent process's write made during the fetch's own round trip. Returns true when
  * anything changed.
  */
-function applyOrcaReconciliation(s, rows) {
+function applyOrcaReconciliation(s, rows, exhaustive = true) {
   const liveIds = new Set();
   const releasedIds = new Set();
   const doneButHeldIds = new Set();
@@ -215,7 +239,7 @@ function applyOrcaReconciliation(s, rows) {
     }
     if (releasedIds.has(key)) { w.status = 'settled'; changed = true; continue; }
     if (doneButHeldIds.has(key)) { if (!w.capExempt) { w.capExempt = true; changed = true; } continue; }
-    if (!liveIds.has(key) && (w.started || 0) < tenMinAgo) { w.status = 'settled'; changed = true; }
+    if (exhaustive && !liveIds.has(key) && (w.started || 0) < tenMinAgo) { w.status = 'settled'; changed = true; }
   }
   return changed;
 }
@@ -310,9 +334,9 @@ function reconcilePendingPlaceholders(s, rows, now = Date.now()) {
  * local state, exactly as before.
  */
 function reconcileCodexGroupsWithOrca(s, orcaBin) {
-  const rows = fetchOrcaWorkerRows(orcaBin);
-  if (rows === null) return false;
-  applyOrcaReconciliation(s, rows);
+  const fetched = fetchOrcaWorkerRows(orcaBin);
+  if (fetched === null) return false;
+  applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive);
   return true;
 }
 
@@ -563,13 +587,18 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
           // Before refusing, reconcile the HOLDER groups of the overlapping claims against
           // a fresh worker-list: a worker that was stopped/released outside this session's
           // PostToolUse tracking (or whose release reply was non-ok) still shows `live`
-          // locally and would hold its Owns: globs forever. Same out-of-lock-fetch +
-          // locked-reapply pattern as the at-cap reconcile below; a null (unreachable,
-          // non-ok or truncated) reply settles nothing and the refusal stands.
-          const holderGroups = new Set(claims.filter((c) => c.source === 'worker').map((c) => c.id));
+          // locally and would hold its Owns: globs forever. Only claims in THIS workspace
+          // that actually overlap the new dispatch's Owns: are reconciled — an unrelated
+          // group (different files, different workspace) must never be settled by this
+          // dispatch's conflict check. Same out-of-lock-fetch + locked-reapply pattern as
+          // the at-cap reconcile below; a null (unreachable, non-ok) reply settles nothing
+          // and the refusal stands.
+          const holderGroups = new Set(
+            claims.filter((c) => c.source === 'worker' && c.ws === ws && OWN.anyOverlap(owns, c.owns))
+              .map((c) => c.id));
           if (holderGroups.size) {
             if (locked) { releaseStateLock(lockDir); locked = false; }
-            const rows = fetchOrcaWorkerRows(ORCA_BIN);
+            const fetched = fetchOrcaWorkerRows(ORCA_BIN);
             locked = acquireStateLock(lockDir, deps.capLockOpts);
             if (locked === null) return;
             if (locked === false) {
@@ -578,7 +607,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             }
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
-            if (rows !== null && applyOwnershipHolderReconciliation(s, rows, holderGroups)) reconcileChanged = true;
+            if (fetched !== null &&
+                applyOwnershipHolderReconciliation(s, fetched.rows, holderGroups, Date.now(), fetched.exhaustive)) {
+              reconcileChanged = true;
+            }
             claims = OC.liveClaims(s, ttl, replacesGroup).filter((c) => c.id !== sourceTaskResKey);
             conflict = OC.findOverlap(claims, ws, owns);
           }
@@ -635,7 +667,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
               // still shows live, but that Orca has already confirmed released or done,
               // would otherwise refuse a dispatch that could actually proceed right now.
               if (locked) { releaseStateLock(lockDir); locked = false; }
-              const rows = fetchOrcaWorkerRows(ORCA_BIN);
+              const fetched = fetchOrcaWorkerRows(ORCA_BIN);
               locked = acquireStateLock(lockDir, deps.capLockOpts);
               if (locked === null) return;
               if (locked === false) {
@@ -644,7 +676,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
               }
               s = load(sessionId);
               Object.assign(s.reservations, localReservations);
-              if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;
+              if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive)) reconcileChanged = true;
               usage = deps.machineWideLiveUnits(DIR, Date.now(), { currentState: s, currentSessionId: sessionId });
             }
             if (usage.total >= limit) {
@@ -670,12 +702,12 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             // earlier localReservations, re-applied here since the reload wiped them) is
             // never lost.
             if (locked) { releaseStateLock(lockDir); locked = false; }
-            const rows = fetchOrcaWorkerRows(ORCA_BIN);
+            const fetched = fetchOrcaWorkerRows(ORCA_BIN);
             locked = acquireStateLock(lockDir, deps.capLockOpts);
             if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
-            if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;
+            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive)) reconcileChanged = true;
             live = WG.countLiveGroups(s.workers, 'codex') + OC.countPendingCodexReservations(s);
           }
           if (live >= cap) {
@@ -695,12 +727,12 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
           let live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
           if (live >= kimiCap) {
             if (locked) { releaseStateLock(lockDir); locked = false; }
-            const rows = fetchOrcaWorkerRows(ORCA_BIN);
+            const fetched = fetchOrcaWorkerRows(ORCA_BIN);
             locked = acquireStateLock(lockDir, deps.capLockOpts);
             if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
-            if (rows !== null && applyOrcaReconciliation(s, rows)) reconcileChanged = true;
+            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive)) reconcileChanged = true;
             live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
           }
           if (live >= kimiCap) {

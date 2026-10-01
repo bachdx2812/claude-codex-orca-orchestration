@@ -57,6 +57,7 @@ const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const HANDOVER = require('./lib/worker-quota-handover.cjs');
 const RESUME = require('./lib/quota-reset-resume.cjs');
 const WG = require('./lib/worker-groups.cjs');
+const GATES = require('./lib/parallel-ownership-gates.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 
 const DIR = stateDir();
@@ -578,27 +579,24 @@ function loadSessionState() {
  * the same state-file lock the gate uses, and persists only when something changed.
  */
 function settleOrcaReleasedSessionGroups(workerRows) {
-  const byId = new Map();
-  for (const row of workerRows || []) {
-    for (const id of [row && row.dispatchId, row && row.taskId, row && row.agentTerminalHandle].filter(Boolean)) {
-      byId.set(id, row);
-    }
-  }
-  if (!byId.size) return;
+  if (!workerRows || !workerRows.length) return;
   const lockDir = path.join(DIR, '.lock');
   const locked = acquireLock(lockDir, {});
   if (!locked) return;
   try {
     const state = loadSessionState();
-    let changed = false;
+    // Same rule the gate's ownership-overlap path uses: a group settles only when EVERY
+    // worker-list row matching one of its live keys reports released — never on a single
+    // released row (a --retry-of / re-dispatched group can carry an old released row while
+    // its newer dispatch, sharing the task id, is still live; the list is newest-first and
+    // `every()` keeps the live row decisive). No absent leg here: the heartbeat only
+    // settles on positive released evidence, never on a row being missing.
+    const groups = new Set();
     for (const [key, w] of Object.entries(state.workers || {})) {
-      if (!w || w.status !== 'live') continue;
-      const row = byId.get(key);
-      if (!row) continue;
-      const terminalState = String(row.terminalState || '').toLowerCase();
-      if (terminalState !== 'released' && terminalState !== 'closed') continue;
-      if (WG.settleGroup(state.workers, WG.groupOf(w, key))) changed = true;
+      if (w && w.status === 'live') groups.add(WG.groupOf(w, key));
     }
+    const changed = GATES.applyOwnershipHolderReconciliation(
+      state, workerRows, [...groups], Date.now(), false);
     if (changed) {
       try {
         const file = path.join(DIR, `${SESSION}.json`);

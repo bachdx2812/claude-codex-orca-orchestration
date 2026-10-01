@@ -3236,6 +3236,51 @@ async function heartbeatWorktreeTests() {
       !!st && st.workers.ctx_hb_released && st.workers.ctx_hb_released.status === 'settled' &&
         st.workers.task_hb_released.status === 'settled', true);
   }
+
+  // Partial-release guard: a group whose worker-list rows are NOT all released (one released
+  // old dispatch row, one still-live row — e.g. a --retry-of / re-dispatched task whose new
+  // row shares the task id) must NOT be settled: the live row is decisive. The old code kept
+  // one row per id (an older row could overwrite a newer one) and settled on ANY released row.
+  {
+    const name = 'released-group-partial';
+    const started = Date.now();
+    const seedState = { workers: {
+      ctx_hb_retry: { role: 'claude-exec', status: 'live', group: 'ctx_hb_retry',
+        started, agent: 'claude', owns: ['src/hb-retry/**'], ws: 'ws-hb-retry' },
+      task_hb_retry: { role: 'claude-exec', status: 'live', group: 'ctx_hb_retry',
+        started, agent: 'claude' },
+    } };
+    await runHeartbeat({
+      name, worktrees: [], seedState, terminalRows: [],
+      workerRows: [
+        // Newest first: the re-dispatch's own row is LIVE and shares the task id.
+        { dispatchId: 'ctx_hb_retry', taskId: 'task_hb_retry', runId: 'run_hb_retry_2',
+          workerState: 'running', dispatchStatus: 'running', agentTerminalHandle: 'term_hb_retry_2',
+          terminalState: 'active',
+          resource: { id: 'wtr_hb_retry', ownershipState: 'owned', releaseState: 'not_requested' },
+          projection: { id: 'ctx_hb_retry', stage: { worker: 'running', dispatch: 'running' },
+            liveness: { verdict: 'alive', observedAt: started, source: 'agent_status' },
+            resource: { state: 'active' } } },
+        // The older, original dispatch row of the same group: released.
+        { dispatchId: 'ctx_hb_retry_old', taskId: 'task_hb_retry', runId: 'run_hb_retry_1',
+          workerState: 'stopped', dispatchStatus: 'failed', agentTerminalHandle: 'term_hb_retry_1',
+          terminalState: 'released',
+          resource: { id: 'wtr_hb_retry', ownershipState: 'owned', releaseState: 'not_requested' },
+          projection: { id: 'ctx_hb_retry_old', stage: { worker: 'stopped', dispatch: 'failed' },
+            outcome: 'failed', liveness: { verdict: 'dead', observedAt: started, source: 'agent_status' },
+            resource: { state: 'released' } } },
+      ],
+      args: ['--interval', '1', '--idle', '60', '--max', '2'],
+    });
+    let st = null;
+    try {
+      st = JSON.parse(fs.readFileSync(
+        path.join(RUN_DIR, `hb-${name}`, `hb-${name}-${process.pid}.json`), 'utf8'));
+    } catch {}
+    checkBool('heartbeat tick must NOT settle a group while any of its rows is still live',
+      !!st && st.workers.ctx_hb_retry && st.workers.ctx_hb_retry.status === 'live' &&
+        st.workers.task_hb_retry.status === 'live', true);
+  }
 }
 
 // --- H1 (real git, no stub): a fresh worktree with zero new commits must never be reported
@@ -3689,15 +3734,55 @@ async function heartbeatH1RealGitTests() {
     else failures.push(`overlap reconcile: a holder absent from the list for >10min must settle (exit ${r.code}, ${JSON.stringify(st.workers)})`);
     rmState(sid);
   }
-  // 1d. A truncated reply is not a real worker list — nothing settles, refusal stands.
+  // 1d. An INCOMPLETE reply (page.hasMore with no cursor to follow) is not the whole worker
+  //     list: the absent-settle leg must switch off — nothing settles, refusal stands.
   {
     const sid = `${SID}-rel-trunc`;
     rmState(sid);
     seedHolder(sid, 'rel_trunc', Date.now() - 11 * 60 * 1000);
-    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: '[]', STUB_WORKERS_TRUNCATED: '1' });
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: '[]', STUB_WORKERS_PAGE_HAS_MORE: '1' });
     const st = readState(sid) || { workers: {} };
     if (r.code === DENY && st.workers.ctx_rel_trunc && st.workers.ctx_rel_trunc.status === 'live') pass += 1;
-    else failures.push(`overlap reconcile: a truncated worker-list must settle nothing (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    else failures.push(`overlap reconcile: an incomplete (hasMore) worker-list must disable the absent-settle leg (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+  // 1d2. A paged reply whose later pages ARE followed (page 1 hasMore + nextCursor, the
+  //      released row sits on page 2) is exhaustive again: the holder settles, admitted.
+  {
+    const sid = `${SID}-rel-cursor`;
+    rmState(sid);
+    seedHolder(sid, 'rel_cursor', Date.now());
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV,
+      STUB_WORKERS_JSON: '[]', STUB_WORKERS_PAGE_CURSOR: '1',
+      STUB_WORKERS_PAGE2_JSON: JSON.stringify([
+        realRow({ dispatchId: 'ctx_rel_cursor', taskId: 'task_rel_cursor' }),
+      ]) });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === ALLOW && st.workers.ctx_rel_cursor && st.workers.ctx_rel_cursor.status === 'settled') pass += 1;
+    else failures.push(`overlap reconcile: a released row on a followed --cursor page must settle the holder (exit ${r.code}, ${JSON.stringify(st.workers)})`);
+    rmState(sid);
+  }
+  // 1d3. The reconcile must touch ONLY the holder groups whose claims actually overlap this
+  //      dispatch in THIS workspace: an unrelated group (different Owns, absent from the
+  //      list, >10min old) riding the same conflict check must stay live.
+  {
+    const sid = `${SID}-rel-unrelated`;
+    rmState(sid);
+    seedHolder(sid, 'rel_a', Date.now());
+    const st0 = readState(sid);
+    const unrelatedStarted = Date.now() - 11 * 60 * 1000;
+    for (const id of ['ctx_unrel', 'task_unrel']) {
+      st0.workers[id] = { role: 'claude-exec', started: unrelatedStarted, status: 'live',
+        last_seen: unrelatedStarted, rate_limited_until: 0, group: 'ctx_unrel', kind: 'worker',
+        agent: 'claude', owns: ['src/unrelated/**'], ws: REL_WS };
+    }
+    fs.writeFileSync(path.join(STATE_DIR, `${sid}.json`), JSON.stringify(st0));
+    const r = invoke(overlapAttempt(sid), { ...REL_ENV, STUB_WORKERS_JSON: JSON.stringify([realRow()]) });
+    const st = readState(sid) || { workers: {} };
+    if (r.code === ALLOW && st.workers.ctx_rel_a && st.workers.ctx_rel_a.status === 'settled' &&
+        st.workers.ctx_unrel && st.workers.ctx_unrel.status === 'live' &&
+        st.workers.task_unrel.status === 'live') pass += 1;
+    else failures.push(`overlap reconcile: an unrelated non-overlapping group must never be settled by this dispatch's reconcile (exit ${r.code}, ${JSON.stringify(st.workers)})`);
     rmState(sid);
   }
   // 1e. An ok:false reply is not a real worker list either.

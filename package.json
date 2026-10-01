@@ -8,7 +8,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-concurrency.cjs && node tests/test-install.cjs && node tests/test-coder-availability.cjs && node tests/test-kimi-signals-caps.cjs && node tests/test-gate-kimi-wiring.cjs && node tests/test-worker-stall.cjs && node tests/test-kimi-exhausted-misread.cjs"
+    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-concurrency.cjs && node tests/test-install.cjs && node tests/test-coder-availability.cjs && node tests/test-kimi-signals-caps.cjs && node tests/test-gate-kimi-wiring.cjs && node tests/test-worker-stall.cjs && node tests/test-kimi-exhausted-misread.cjs && node tests/test-released-groups.cjs"
   },
   "files": [
     "hooks",
