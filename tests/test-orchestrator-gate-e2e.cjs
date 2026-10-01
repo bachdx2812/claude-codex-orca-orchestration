@@ -487,6 +487,42 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     review({ model: 'sonnet' }), DENY, sonnetEnv);
 }
 
+// A bare `plan` inside a hyphenated word is not a plan object: a review of the
+// "plan-detection narrowing commit" is a review OF CODE. With DeepSeek as the last code
+// author, it follows the coder-mapped reviewer (sonnet) and refuses the review model
+// (opus) without an escalation note.
+{
+  const dir = path.join(RUN_DIR, 'plan-detection-code-review');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'plan-detection-code-review';
+  const start = 'orca orchestration worker-start --agent opencode --json';
+  invoke(mainBash(start, { sid, tool_use_id: 'toolu_pdc_start' }), env);
+  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_pdc_deepseek"}}', { sid, tool_use_id: 'toolu_pdc_start' }), env);
+  checkBool('a registered opencode worker records deepseek as the session code author',
+    JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor, 'deepseek');
+  expect('a "plan-detection" review of DeepSeek code runs on the mapped reviewer',
+    dispatch({ subagent_type: 'reviewer', description: 'Review plan-detection narrowing commit', model: 'sonnet' },
+      sid, { tool_use_id: 'toolu_pdc_sonnet' }), ALLOW, env);
+  expect('a "plan-detection" review refuses the review model without an escalation note',
+    dispatch({ subagent_type: 'reviewer', description: 'Review plan-detection narrowing commit', model: 'opus' },
+      sid, { tool_use_id: 'toolu_pdc_opus' }), DENY, env);
+}
+
 // Main panel vs Orca worker terminal, via the deterministic stub (never a live Orca).
 expect('attended main panel is still gated',
   mainEdit(SRC), DENY, { ...CODEX_WINS, CLAUDE_CODE_SESSION_ATTENDED: '1', ORCA_TERMINAL_HANDLE: 'term_not-a-worker' });

@@ -408,7 +408,7 @@ git clone https://github.com/bachdx2812/claude-codex-orca-orchestration
 cd claude-codex-orca-orchestration
 node install.mjs --dry-run   # see what would change, writes nothing
 node install.mjs             # install
-npm test                     # 1759 checks, hermetic (no live Orca/Codex/Kimi/DeepSeek needed)
+npm test                     # 1767 checks, hermetic (no live Orca/Codex/Kimi/DeepSeek needed)
 ```
 
 Start a new Claude Code session; its `SessionStart` should print an "ORCHESTRATION

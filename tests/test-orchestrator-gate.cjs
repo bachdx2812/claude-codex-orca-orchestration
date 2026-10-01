@@ -2308,6 +2308,17 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   check('kimi worker output with a plan path in the prompt is not planning', gate.isPlanningReview('Review kimi worker output', 'reviewer', 'Plan: plans/x/plan.md'), false);
   check('a codex fix with a design mention in the prompt is not planning', gate.isPlanningReview('Verify codex fix', 'reviewer', 'against the design of the cache layer'), false);
   check('a PR review citing a design doc in the prompt is not planning', gate.isPlanningReview('Review the PR', 'reviewer', 'Read docs/design-guidelines.md'), false);
+  // A bare `plan` inside a hyphenated word is not a plan object: a review of the
+  // plan-detection narrowing commit is a review OF CODE, so it follows the coder-mapped
+  // reviewer rather than being forced onto the review model.
+  check('a bare plan inside a hyphenated word is not planning', gate.isPlanningReview('Review plan-detection narrowing commit', 'reviewer'), false);
+  // A red-team / planner / plan-reviewer type is planning even when the description names
+  // code work: the declared role beats the summary's code noun.
+  check('a red-team type over code work is planning', gate.isPlanningReview('Audit the fix', 'red-team'), true);
+  check('a planner type over code work is planning', gate.isPlanningReview('Review commit', 'planner'), true);
+  // `design doc` and `architecture` are strong planning objects; a bare `design` stays excluded.
+  check('a design doc over code work is planning', gate.isPlanningReview('Review phase-2 design doc for the implementation', 'reviewer'), true);
+  check('an architecture review over code work is planning', gate.isPlanningReview('Review the architecture of the fix', 'reviewer'), true);
 }
 
 {

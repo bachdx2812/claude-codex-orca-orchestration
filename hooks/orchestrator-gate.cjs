@@ -243,10 +243,18 @@ const PLANNING_OBJECT = /\b(plan|planning|design|architecture|architect|phase|ph
 // design doc for context. Then only a STRONG planning object in the description itself counts —
 // and the prompt body is context, not the task — so a bare "phase"/"design" no longer flips such
 // a review to the review model. It must be paired with plan / plans / plan.md / a phase file /
-// red-team. Without this, a Sonnet review of external-coder code that happens to mention a plan
+// red-team / design doc / architecture, or a red-team / planner / plan-reviewer subagent_type.
+// Without this, a Sonnet review of external-coder code that happens to mention a plan
 // or design doc was refused. Operator decision, 2026-10-01.
 const CODE_WORK_OBJECT = /\b(diff|implementation|implement|pull\s+request|pr|commit|fix|worker\s+output|branch|code)\b/i;
-const STRONG_PLANNING_OBJECT = /\b(plan|plans|planning|red.?team)\b|\bphase[\s-]*(?:\d+[\s-]*)?file\b|(?:^|[\s`("'[])(?:plans\/[^\s`"')]+\.md|plan\.md)\b/i;
+// A bare plan word must NOT match inside a hyphenated word: "plan-detection narrowing
+// commit" cites code work, not a plan. The lookarounds reject a `-`/word char on either
+// side while still matching a whole word and the `plans/**.md` / `plan.md` path forms.
+// `design doc` and `architecture` are strong planning words; a bare `design` is not.
+const STRONG_PLANNING_OBJECT = /(?<![\w-])(plan|plans|planning)(?![\w-])|\bred[-\s]?team\b|\bdesign[\s-]+docs?\b|\barchitecture\b|\bphase[\s-]*(?:\d+[\s-]*)?file\b|(?:^|[\s`("'[])(?:plans\/[^\s`"')]+\.md|plan\.md)\b/i;
+// A subagent_type that is red-team / planner / plan-reviewer makes a dispatch planning even
+// when its description names code work: the type is the operator's declared role, so it wins.
+const PLANNING_TYPE_HINT = /\bred-?team\b|planner|plan[- ]reviewer/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
@@ -302,7 +310,10 @@ function isPlanningReview(description, type, prompt) {
   // plan / phase / design doc for context: only a STRONG planning object in the description
   // counts, and the prompt body is context. A bare "phase"/"design" mention is not planning.
   if (CODE_WORK_OBJECT.test(desc)) {
-    return STRONG_PLANNING_OBJECT.test(desc) || PLANNING_FIRST_VERB.test(desc);
+    // The description names code work, but a red-team / planner / plan-reviewer subagent_type
+    // is ALWAYS planning: the declared role beats a code noun in the summary.
+    return STRONG_PLANNING_OBJECT.test(desc) || PLANNING_FIRST_VERB.test(desc) ||
+      STRONG_PLANNING_OBJECT.test(type) || PLANNING_TYPE_HINT.test(type);
   }
   if (PLANNING_OBJECT.test(desc) || PLANNING_OBJECT.test(type) || PLANNING_OBJECT.test(head)) return true;
   if (PLANNING_FIRST_VERB.test(desc)) return true;
