@@ -637,7 +637,9 @@ function currentExecRoute(cfg, s) {
   try {
     pool = coderPoolRoute(cfg, s);
   } catch {
-    pool = { route: 'external', pick: 'codex', order: ['codex'], coders: {}, why: 'auto: coder pool unreadable, default Codex' };
+    // No path may assume Codex: an unreadable pool fails toward ALLOW, i.e. the in-session
+    // code route, so a machine with no coders (or a config error) never locks code out.
+    pool = { route: 'code', pick: null, order: [], coders: {}, why: 'auto: coder pool unreadable' };
   }
   if (a === 'codex' || a === 'kimi' || a === 'deepseek' ||
       (typeof a === 'string' && /^(?:codex|kimi|deepseek):/.test(a))) {

@@ -1273,6 +1273,27 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('currentExecRoute: operator override "claude:opus" carries the alias',
     gate.currentExecRoute(cfg, { execAgent: 'claude:opus' }).alias, 'opus');
 
+  // Review, High 5: when the coder pool cannot be read, the route must fail toward ALLOW
+  // (in-session code) — never assume Codex, which would refuse in-session code on a machine
+  // with no coders and lock code out entirely.
+  {
+    const throwingCfg = Object.create(cfg);
+    Object.defineProperty(throwingCfg, 'deepseekRole', { get() { throw new Error('boom'); } });
+    const keys = ['ORCA_BIN', 'ORCH_CODEX_BIN'];
+    const saved = {};
+    for (const key of keys) { saved[key] = process.env[key]; process.env[key] = path.join(os.tmpdir(), `missing-${key}`); }
+    let route;
+    try {
+      route = gate.currentExecRoute(throwingCfg, { session_id: 'unit-pool-throw', workers: {} });
+    } finally {
+      for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
+    }
+    check('currentExecRoute: a pool exception routes to in-session code',
+      [route.route, route.pick, route.order], ['code', null, []]);
+    check('currentExecRoute: a pool exception never names Codex',
+      /codex/i.test(String(route.why || '')), false);
+  }
+
   check('activationApplies: off is never active', gate.activationApplies({ activation: 'off' }), false);
   check('activationApplies: always is always active', gate.activationApplies({ activation: 'always' }), true);
   {
