@@ -212,7 +212,7 @@ function loadPersistedAutoClosed() {
       if (typeof v === 'string') return [id, { state: v, at: 0 }];
       return [id, v];
     }).filter(([, v]) => v && typeof v === 'object' &&
-      ['closed', 'unsaved', 'failed'].includes(v.state) && Number.isFinite(v.at)));
+      ['closed', 'unsaved', 'failed', 'unknown'].includes(v.state) && Number.isFinite(v.at)));
   } catch {
     return new Map();
   }
@@ -599,6 +599,10 @@ function parseWorkerRows(d) {
     // readiness-timeout retain ('user_requested' | 'identity_unproven' | null).
     retainedReason: typeof w.retainedReason === 'string' ? w.retainedReason
       : (w.resource && typeof w.resource.retainedReason === 'string' ? w.resource.retainedReason : null),
+    // Orca's own operator-ownership signal — a live 'user_owned' row must never be
+    // auto-closed regardless of retainedReason (review, blocker 2).
+    ownershipState: typeof w.ownershipState === 'string' ? w.ownershipState
+      : (w.resource && typeof w.resource.ownershipState === 'string' ? w.resource.ownershipState : null),
     worktreeIds: [
       w.worktreeId,
       w.resource && w.resource.worktreeId,
@@ -839,7 +843,11 @@ function worktrees() {
         displayName: w.displayName || w.path,
         isMainWorktree: !!w.isMainWorktree,
         isArchived: !!w.isArchived,
-        liveTerminalCount: Number(w.liveTerminalCount) || 0,
+        // Preserve "missing/non-numeric" as-is (do not coerce to 0 here) — a remove-mode
+        // rm must treat that as unknown, never as "0 live terminals" (review, non-blocking
+        // item). Known-numeric readings (including a genuine 0) pass through unchanged.
+        liveTerminalCount: (w.liveTerminalCount === null || w.liveTerminalCount === undefined ||
+          !Number.isFinite(Number(w.liveTerminalCount))) ? w.liveTerminalCount : Number(w.liveTerminalCount),
         // One aggregate timestamp per worktree (not per terminal) — see isWorktreeIdle().
         lastOutputAt: Number(w.lastOutputAt) || 0,
         prState: w.linkedPR ? w.linkedPR.state : null,
@@ -1039,22 +1047,25 @@ function isWorktreeClean(w, git) {
  * Orca's own `resource.retainedReason` distinguishes the cases (review, blocker 4):
  *   - 'identity_unproven': Orca's AUTOMATIC retain on a readiness timeout — not an
  *     operator decision, eligible for auto-close;
- *   - 'user_requested': an explicit `worker-retain`. It blocks auto-close only when it ran
- *     after the worker was first seen done (`ctx.retainedAt >= ctx.doneAt`; the gate
- *     records retainedAt when it marks the group retained). The Kimi readiness recipe
- *     retains mid-run, before any done state, so it stays eligible. Missing timestamps
- *     err on the side of keeping the panel flow (blocked);
- *   - no reason at all (older Orca): only this session's own explicit retain flag blocks.
+ *   - no reason at all (older Orca), and no session-recorded retain flag either: nothing
+ *     is held, eligible for auto-close;
+ *   - anything else — 'user_requested', 'user_takeover', any other current or future
+ *     reason string, or this session's own retain flag with no reason — fails CLOSED:
+ *     the operator may have taken the terminal over, so it blocks auto-close (review,
+ *     blocker 2: a live 'user_takeover' row was being released and closed).
+ * Independently, `w.ownershipState === 'user_owned'` always blocks auto-close, whatever
+ * retainedReason says.
  */
 function isRetainedForReuse(w, ctx = {}) {
+  if (w && w.ownershipState === 'user_owned') return true;
   const reason = ctx.retainedReason !== undefined ? ctx.retainedReason : (w.retainedReason ?? null);
   const held = w.terminalState === 'retained' || !!ctx.retained || reason != null;
   if (!held) return false;
   if (reason === 'identity_unproven') return false;
-  if (reason === 'user_requested') {
-    return !ctx.doneAt || !ctx.retainedAt || ctx.retainedAt >= ctx.doneAt;
-  }
-  return !!ctx.retained;
+  if (reason == null) return !!ctx.retained;
+  // Any other non-null reason (including 'user_requested', 'user_takeover', and unknown
+  // future values) fails closed: blocked.
+  return true;
 }
 
 /**
@@ -1143,7 +1154,9 @@ function autoCloseDoneWorker(w, ctx = {}) {
  */
 function actOnDoneWorktree(w, reason, ctx = {}) {
   const mode = ctx.mode || CLOSE_DONE_WORKTREES_MODE;
-  if (mode === 'remove' && (w.liveTerminalCount || 0) === 0) {
+  const liveTerminalCountKnown = w.liveTerminalCount !== null && w.liveTerminalCount !== undefined &&
+    Number.isFinite(Number(w.liveTerminalCount));
+  if (mode === 'remove' && liveTerminalCountKnown && Number(w.liveTerminalCount) === 0) {
     const runOrca = ctx.runOrca || ((args) => orca(args, 60000));
     const reply = runOrca(['worktree', 'rm', '--worktree', `path:${w.path}`, '--json']);
     if (reply && reply.ok !== false) {

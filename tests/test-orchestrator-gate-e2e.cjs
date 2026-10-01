@@ -3156,6 +3156,32 @@ async function heartbeatWorktreeTests() {
       out.includes('still holding a terminal'), true);
   }
 
+  // 6i-2. Re-review blocker 1: the persisted {state:'unknown'} entry must survive a daemon
+  // restart — dropping it on reload makes `previous` undefined again, which re-fires the
+  // "still holding a terminal" event on every restart (a wake loop). Restart TWICE with the
+  // same shared state file and assert the event fires exactly once in total, across all
+  // three runs.
+  {
+    const rows = [{ dispatchId: 'ctx_unresolvable_restart', taskId: 'task_unresolvable_restart',
+      workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'active',
+      agentTerminalHandle: 'term_unresolvable_restart' }];
+    const terms = [{ handle: 'term_unresolvable_restart', title: 'done worker',
+      lastOutputAt: Date.now() - 65_000 }];
+    const runOpts = {
+      name: 'unresolvable-restart', sessionName: 'unresolvable-restart-shared',
+      dirName: 'hb-unresolvable-restart-shared',
+      worktrees: [], workerRows: rows, terminalRows: terms,
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    };
+    const out1 = await runHeartbeat(runOpts);
+    const out2 = await runHeartbeat(runOpts);
+    const out3 = await runHeartbeat(runOpts);
+    const fireCount = [out1, out2, out3]
+      .filter((out) => out.includes('still holding a terminal')).length;
+    checkBool('the unknown-fallback event fires exactly once across the first run and two restarts',
+      fireCount, 1);
+  }
+
   // 6j. Blocker 2 (review): WORKER DONE BUT UNSAVED fires once per episode, not on every
   // tick or every daemon restart within the same session.
   {

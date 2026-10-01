@@ -680,17 +680,18 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
         r?.kind, 'failed');
     }
 
-    // Blocker 4: Orca's own retainedReason distinguishes an operator retain-for-reuse
-    // (blocks only when it happened after done) from its own automatic readiness-timeout
-    // retain (never blocks).
+    // Blocker 4 (original) / Blocker 2 (re-review): Orca's own retainedReason fails
+    // CLOSED — only its own automatic readiness-timeout retain ('identity_unproven') is
+    // eligible for auto-close. Any other reason, including 'user_requested' and
+    // 'user_takeover', always blocks, whatever the retain/done ordering was.
     check('Orca-automatic identity_unproven retain is eligible for auto-close',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'identity_unproven', doneAt: 1000, retainedAt: 500,
           runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
-    check('user_requested retain recorded BEFORE the done transition (the Kimi readiness recipe) still auto-closes',
+    check('user_requested retain recorded BEFORE the done transition (the Kimi readiness recipe) still blocks (fail closed)',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'user_requested', doneAt: 1000, retainedAt: 500,
-          runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
+          runOrca: recordingOrca().run, git: fakeGit() }), null);
     check('user_requested retain recorded AFTER the done transition blocks auto-close',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'user_requested', doneAt: 500, retainedAt: 1000,
@@ -700,6 +701,16 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
         { retained: true, runOrca: recordingOrca().run, git: fakeGit() }), null);
     check('isRetainedForReuse: missing timestamps on a user_requested retain err toward blocked',
       heartbeat.isRetainedForReuse({ terminalState: 'retained' }, { retainedReason: 'user_requested' }), true);
+    check('isRetainedForReuse: user_takeover always blocks, even with no session retain flag',
+      heartbeat.isRetainedForReuse({ terminalState: 'retained' }, { retainedReason: 'user_takeover' }), true);
+    check('isRetainedForReuse: an unknown future retainedReason also fails closed (blocked)',
+      heartbeat.isRetainedForReuse({ terminalState: 'retained' }, { retainedReason: 'some_future_reason' }), true);
+    check('isRetainedForReuse: ownershipState user_owned blocks regardless of retainedReason or session retain',
+      heartbeat.isRetainedForReuse({ terminalState: 'active', ownershipState: 'user_owned' }, {}), true);
+    check('a real user_takeover row (retainedReason + ownershipState user_owned) is never auto-closed',
+      heartbeat.autoCloseDoneWorker(
+        doneRow({ terminalState: 'retained', retainedReason: 'user_takeover', ownershipState: 'user_owned' }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
 
     // Panel's own terminal (defence in depth) and the lastOutputAt quiet-terminal guard.
     check('the panel\'s own terminal is never auto-closed even if it reports done',
@@ -747,6 +758,38 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       check('a failed worktree rm is reported as rm_failed with a remind fallback, never removed',
         r.kind === 'rm_failed' && r.line.startsWith('WORKTREE RM FAILED') &&
           typeof r.remind === 'string' && r.remind.startsWith('DONE worktree a'), true);
+    }
+    // Non-blocking (review): a missing or non-numeric liveTerminalCount must count as
+    // unknown in remove mode, never as "0 live terminals" — fail closed to remind instead
+    // of risking an rm while a live terminal actually exists but was not reported.
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.actOnDoneWorktree({ ...mergedIdle, liveTerminalCount: undefined }, 'PR #12 merged',
+        { mode: 'remove', runOrca: orcaRec.run });
+      check('remove mode with a missing liveTerminalCount falls back to remind and never runs rm',
+        r.kind === 'remind' && orcaRec.calls.length === 0, true);
+    }
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.actOnDoneWorktree({ ...mergedIdle, liveTerminalCount: null }, 'PR #12 merged',
+        { mode: 'remove', runOrca: orcaRec.run });
+      check('remove mode with a null liveTerminalCount falls back to remind and never runs rm',
+        r.kind === 'remind' && orcaRec.calls.length === 0, true);
+    }
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.actOnDoneWorktree({ ...mergedIdle, liveTerminalCount: 'n/a' }, 'PR #12 merged',
+        { mode: 'remove', runOrca: orcaRec.run });
+      check('remove mode with a non-numeric liveTerminalCount falls back to remind and never runs rm',
+        r.kind === 'remind' && orcaRec.calls.length === 0, true);
+    }
+    {
+      // A genuine numeric 0 must still remove normally — only the unknown case fails closed.
+      const orcaRec = recordingOrca();
+      const r = heartbeat.actOnDoneWorktree({ ...mergedIdle, liveTerminalCount: 0 }, 'PR #12 merged',
+        { mode: 'remove', runOrca: orcaRec.run });
+      check('remove mode with a genuine liveTerminalCount of 0 still removes normally',
+        r.kind === 'removed', true);
     }
 
     // loadPersistedTimestampMap / savePersistedTimestampMap (done-at / rm-failed files).
