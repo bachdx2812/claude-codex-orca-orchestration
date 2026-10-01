@@ -398,6 +398,27 @@ for (const prose of [
   check(`ordinary prose is not approval UI: ${prose}`, approvalPromptFingerprint(prose), null);
 }
 
+// opencode draws its permission prompt inside a box gutter; the exact live screen must be
+// detected, and the `← <target>` line must re-arm the episode when the command changes.
+const opencodeApproval = [
+  '┃  △ Permission required',
+  '┃    ← Access external directory /private/tmp/claude-501/…/scratchpad',
+  '┃   Allow once   Allow always   Reject        ctrl+f fullscreen  ⇆ select  enter confirm',
+].join('\n');
+const opencodeApprovalMoved = opencodeApproval.replace('scratchpad', 'other-scratchpad');
+check('real opencode permission prompt is detected',
+  typeof approvalPromptFingerprint(opencodeApproval), 'string');
+check('the opencode permission target re-arms a new episode',
+  approvalPromptFingerprint(opencodeApproval) ===
+    approvalPromptFingerprint(opencodeApprovalMoved), false);
+check('opencode permission chrome ignored above the prompt',
+  approvalPromptFingerprint(`⏺ Bash result\n${opencodeApproval}`),
+  approvalPromptFingerprint(`⏺ Different result\n${opencodeApproval}`));
+check('prose quoting the opencode permission dialog is inert',
+  approvalPromptFingerprint('The Permission required dialog offers Allow once, Allow always, or Reject.'), null);
+check('prose naming the opencode prompt without options is inert',
+  approvalPromptFingerprint('A worker hit the "Permission required" prompt while reading an external dir.'), null);
+
 const approvalCtx = {
   baseHandles: new Set(), ownHandles: new Set(['term_approval']), retainedHandles: new Set(),
   handleAgent: new Map([['term_approval', 'kimi']]), started: start - 1000,
@@ -422,6 +443,20 @@ check('a terminal with old rate-limit scrollback remains eligible for stall trac
 check('rendered approval UI is still detected when the list preview is working', heartbeat.classifyTerminal({
   handle: 'term_approval', preview: '• Working (45s • esc to interrupt)', lastOutputAt: start,
 }, { ...approvalCtx, approvalText: kimiApproval }).kind, 'approval_waiting');
+check('an opencode permission screen classifies as approval_waiting', heartbeat.classifyTerminal({
+  handle: 'term_opencode', preview: opencodeApproval, lastOutputAt: start,
+}, {
+  ...approvalCtx, ownHandles: new Set(['term_opencode']),
+  handleAgent: new Map([['term_opencode', 'opencode']]),
+}).kind, 'approval_waiting');
+{
+  const opencodeReports = new Map();
+  check('an opencode permission screen emits the exact wake event', heartbeat.reportApprovalWaiting({
+    reported: opencodeReports, handle: 'term_opencode',
+    fingerprint: approvalPromptFingerprint(opencodeApproval),
+    identity: 'ctx_opencode', agent: 'opencode',
+  }), 'WORKER WAITING FOR APPROVAL ctx_opencode (opencode)');
+}
 
 const approvalReports = new Map();
 const approvalFingerprint = approvalPromptFingerprint(kimiApproval);

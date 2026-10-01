@@ -5,6 +5,8 @@ const { normalizeTerminalLine } = require('./worker-progress-fingerprint.cjs');
 const ANSI_ESCAPE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const RATE_LIMIT_MARKER = /(rate.?limit|429\b|quota\s+exceeded|usage\s+limit|too\s+many\s+requests|retry[- ]after|overloaded_error)/i;
 const STRONG_RATE_LIMIT_MARKER = /(HTTP(?:\/\d(?:\.\d)?)?\s+429\b|too\s+many\s+requests|rate_limit_exceeded|you(?:'|’)?ve\s+hit\s+your\s+usage\s+limit|overloaded_error)/i;
+// A leading opencode/box-drawing gutter (`┃`, `│`, `|`) plus any spacing.
+const BOX_GUTTER = /^[┃│|]\s*/u;
 
 function terminalLines(text) {
   return String(text || '').replace(ANSI_ESCAPE, '').split(/\r?\n/);
@@ -108,7 +110,11 @@ function approvalPromptFingerprint(text) {
   const lines = terminalLines(text).flatMap((raw) => {
     const line = raw.trim();
     if (/^(?:```|~~~)/.test(line)) { inFence = !inFence; return []; }
-    return inFence || isSourceExcerpt(line) ? [] : [line];
+    if (inFence) return [];
+    // opencode draws its permission prompt inside a `┃`/`│` gutter; strip it before the
+    // source-excerpt guard so the prompt block is not discarded as a diff line.
+    const gutterStripped = line.replace(BOX_GUTTER, '');
+    return isSourceExcerpt(gutterStripped) ? [] : [line];
   }).filter(Boolean);
   const normalized = lines.map((raw) => ({ raw, text: normalizeTerminalLine(raw).text })).filter((line) => line.text);
   const texts = normalized.map((line) => line.text);
@@ -120,6 +126,12 @@ function approvalPromptFingerprint(text) {
   const trustPattern = /trust\s+this\s+folder|trust\s+the\s+files\s+in\s+this\s+folder|only\s+proceed\s+if\s+you\s+trust\s+this\s+configuration/i;
   const enterConfirmPattern = /^Enter\s+to\s+confirm\s*[·•|]\s*Esc\s+to\s+cancel\.?$/i;
   const permissionPattern = /^Select\s+permission\s+mode\s*$/i;
+  // opencode's tool-permission dialog: a `△ Permission required` header, a `← <target>`
+  // command line, and an `Allow once   Allow always   Reject` options line (trailing
+  // keybinding hints like `ctrl+f fullscreen  ⇆ select  enter confirm` are tolerated).
+  const opencodePermissionHeader = /^△?\s*Permission\s+required\s*$/i;
+  const opencodeTargetPattern = /^←\s+\S/;
+  const opencodeOptionsPattern = /^Allow\s+once\s+Allow\s+always\s+Reject\b/i;
   const codexQuestionPattern = /^Would\s+you\s+like\s+to\s+(?:run|make|apply)\b.*\?$/i;
   const approvalQuestionPattern = /^(?:Do\s+you\s+want\s+to\s+(?:allow|approve|run)\b.*|(?:Allow|Approve)\b.*)\?$/i;
   const codexOptionPattern = /^\d+[.)]\s*(?:Yes,\s*proceed|No,\s*and\s+tell)\b.*$/i;
@@ -129,8 +141,11 @@ function approvalPromptFingerprint(text) {
   const hasTrustDialog = texts.some((line) => trustPattern.test(line));
   const hasEnterConfirm = texts.some((line) => enterConfirmPattern.test(line));
   const hasPermissionMenu = texts.some((line) => permissionPattern.test(line));
+  const hasOpencodePermission = texts.some((line) => opencodePermissionHeader.test(line)) &&
+    texts.some((line) => opencodeOptionsPattern.test(line));
   const hasCodexQuestion = texts.some((line) => codexQuestionPattern.test(line));
   const hasApprovalQuestion = texts.some((line) => approvalQuestionPattern.test(line));
+  const opencodeTarget = texts.find((line) => opencodeTargetPattern.test(line)) || null;
   const numberedOptions = texts.filter((line) => codexOptionPattern.test(line));
   const optionNames = new Set(texts.map((line) => line
     .replace(/^\d+[.)]\s*/, '')
@@ -144,10 +159,12 @@ function approvalPromptFingerprint(text) {
     ? texts.slice(questionIndex + 1).find((line) => commandPattern.test(line))
     : null;
   const structured = hasNavigation || hasConfirmHint || hasEnterConfirm || numberedOptions.length > 0 ||
-    hasOpposingOptions || (hasBox && (hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion)) ||
+    hasOpposingOptions || hasOpencodePermission ||
+    (hasBox && (hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion)) ||
     (hasTrustDialog && (hasEnterConfirm || hasBox));
   const prompt = hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion ||
-    hasOpposingOptions || numberedOptions.length > 0 || hasNavigation || hasTrustDialog || hasEnterConfirm;
+    hasOpposingOptions || numberedOptions.length > 0 || hasNavigation || hasTrustDialog || hasEnterConfirm ||
+    hasOpencodePermission;
 
   if (!structured || !prompt) return null;
 
@@ -156,9 +173,10 @@ function approvalPromptFingerprint(text) {
   const signature = texts
     .filter((line) => permissionPattern.test(line) || codexQuestionPattern.test(line) ||
       approvalQuestionPattern.test(line) || codexOptionPattern.test(line) ||
+      opencodePermissionHeader.test(line) || opencodeOptionsPattern.test(line) ||
       navigationPattern.test(line) || confirmPattern.test(line) ||
       trustPattern.test(line) || enterConfirmPattern.test(line) ||
-      line === promptCommand ||
+      line === promptCommand || line === opencodeTarget ||
       /^(?:\d+[.)]\s*)?(?:allow|deny|approve|never ask|ask when needed)$/i.test(line))
     .map((line) => line.toLowerCase())
     .join('\n')
