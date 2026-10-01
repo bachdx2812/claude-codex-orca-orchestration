@@ -223,10 +223,19 @@ event below rather than going silent. A release or terminal-close call Orca answ
 `ok: false` to (or cannot answer at all) is never logged or persisted as a success: the
 daemon reports `AUTO-CLOSE FAILED <id>` once and retries on a bounded cooldown instead of
 hammering Orca every tick. A worker the panel explicitly `worker-retain`ed for reuse
-*after* it was already done is left alone; Orca's own automatic retain on a readiness
-timeout (`resource.retainedReason: "identity_unproven"`), or an explicit retain that ran
-*before* the done transition (the Kimi readiness-recovery recipe), stays eligible for
-auto-close. The panel's own terminal (`ORCA_TERMINAL_HANDLE`) is never auto-closed. A done
+*after* it was already done is left alone. Orca's `resource.retainedReason` tells an
+automatic retain apart from an operator one, but `"user_requested"` alone is ambiguous: the
+standard Kimi readiness-recovery recipe (`orca terminal send` + `worker-retain`) issues
+that same retain on a worker that has not finished yet, and Orca records the identical
+`"user_requested"` reason for it as for a deliberate "keep this one open" decision. The
+daemon tells them apart by comparing this session's own gate-recorded `retainedAt`
+(written by `worker-retain`) against its own first-seen-done timestamp for that worker:
+`"identity_unproven"` (Orca's automatic readiness-timeout retain) always stays eligible;
+`"user_requested"` is eligible only when the gate recorded a retain that ran strictly
+*before* the done transition (`retainedAt < doneAt`, the recovery recipe's shape) — no
+gate record at all, or one recorded at or after done, fails CLOSED exactly like
+`"user_takeover"` or any other/unknown reason. The panel's own terminal
+(`ORCA_TERMINAL_HANDLE`) is never auto-closed. A done
 worker with uncommitted or unpushed work wakes the panel once, on the transition into that
 state, with `WORKER DONE BUT UNSAVED <id>` and keeps its terminal — re-evaluation
 continues, so a worktree later committed and pushed still closes, but the panel is never

@@ -1044,15 +1044,27 @@ function isWorktreeClean(w, git) {
 
 /**
  * "Retained for reuse AFTER the done state" — the only retain that blocks auto-close.
- * Orca's own `resource.retainedReason` distinguishes the cases (review, blocker 4):
+ * Orca's own `resource.retainedReason` distinguishes the cases (review, blocker 4 and
+ * its 2026-10-01 re-review):
  *   - 'identity_unproven': Orca's AUTOMATIC retain on a readiness timeout — not an
  *     operator decision, eligible for auto-close;
  *   - no reason at all (older Orca), and no session-recorded retain flag either: nothing
  *     is held, eligible for auto-close;
- *   - anything else — 'user_requested', 'user_takeover', any other current or future
- *     reason string, or this session's own retain flag with no reason — fails CLOSED:
- *     the operator may have taken the terminal over, so it blocks auto-close (review,
- *     blocker 2: a live 'user_takeover' row was being released and closed).
+ *   - 'user_requested': ambiguous by itself — the standard Kimi readiness-recovery recipe
+ *     (`orca terminal send` + `worker-retain`, see orchestration-contract.md's "Codex rate
+ *     limits" / Orca-recovery guidance) runs `worker-retain` on a worker that has not
+ *     finished yet, and Orca records that same 'user_requested' reason for it as it would
+ *     for a deliberate "keep this finished worker open" operator decision. The two are told
+ *     apart by WHEN the retain ran relative to WHEN the worker went done, using this
+ *     session's own gate state (`worker.retainedAt`, written by orchestrator-gate.cjs on
+ *     `worker-retain`) against the heartbeat's own first-seen-done timestamp (`ctx.doneAt`):
+ *     a retain that ran strictly before the done transition (`retainedAt < doneAt`) is the
+ *     recovery recipe and stays eligible; no gate record at all, or one that ran at/after
+ *     done, fails CLOSED (an operator decision to keep a finished worker around on purpose
+ *     blocks auto-close, same as 'user_takeover');
+ *   - anything else — 'user_takeover', any other current or future reason string — fails
+ *     CLOSED: the operator may have taken the terminal over, so it blocks auto-close
+ *     (review, blocker 2: a live 'user_takeover' row was being released and closed).
  * Independently, `w.ownershipState === 'user_owned'` always blocks auto-close, whatever
  * retainedReason says.
  */
@@ -1063,8 +1075,16 @@ function isRetainedForReuse(w, ctx = {}) {
   if (!held) return false;
   if (reason === 'identity_unproven') return false;
   if (reason == null) return !!ctx.retained;
-  // Any other non-null reason (including 'user_requested', 'user_takeover', and unknown
-  // future values) fails closed: blocked.
+  if (reason === 'user_requested') {
+    const retainedAt = ctx.retainedAt;
+    const doneAt = ctx.doneAt;
+    if (Number.isFinite(retainedAt) && Number.isFinite(doneAt) && retainedAt < doneAt) {
+      return false; // recovery retain before completion — eligible for auto-close.
+    }
+    return true; // no session record, or retained at/after done — blocked.
+  }
+  // Any other non-null reason ('user_takeover', and unknown future values) fails closed:
+  // blocked.
   return true;
 }
 

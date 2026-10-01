@@ -3289,6 +3289,63 @@ async function heartbeatWorktreeTests() {
       calls.includes('worker-release'), false);
   }
 
+  // 6m-2. 2026-10-01 re-review: the standard Kimi readiness-recovery recipe runs
+  // `worker-retain` BEFORE the worker finishes, which Orca records with the very same
+  // 'user_requested' reason as a deliberate "keep this finished worker" decision (6m). A
+  // retain the gate recorded strictly BEFORE this worker was first seen done stays
+  // eligible for auto-close.
+  {
+    const wt = realWtDir('auto-close-user-requested-before-done');
+    const name = 'auto-close-user-requested-before-done';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const retainedInThePast = Date.now() - 10 * 60 * 1000;
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_user_requested_early', taskId: 'task_user_requested_early',
+        workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'retained',
+        agentTerminalHandle: 'term_user_requested_early', worktreePath: wt,
+        resource: { retainedReason: 'user_requested' } }],
+      terminalRows: [{ handle: 'term_user_requested_early', title: 'done worker',
+        lastOutputAt: Date.now() - 65_000, worktreePath: wt }],
+      seedState: { workers: { ctx_user_requested_early: { status: 'live', retained: true,
+        retainedAt: retainedInThePast, group: 'ctx_user_requested_early', started: Date.now() } } },
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('a user_requested retain recorded before the done transition (readiness-recovery recipe) still auto-closes',
+      out.includes('WORKER CLOSED ctx_user_requested_early'), true);
+    checkBool('the release call ran for the recovery-retained worker',
+      calls.includes('worker-release --dispatch ctx_user_requested_early'), true);
+  }
+
+  // 6m-3. The same shape but with no session gate record of the retain at all (e.g. a
+  // retain issued by a different session, or before this daemon ever started) fails
+  // closed — ambiguous evidence never auto-closes.
+  {
+    const wt = realWtDir('auto-close-user-requested-no-record');
+    const name = 'auto-close-user-requested-no-record';
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      workerRows: [{ dispatchId: 'ctx_user_requested_norecord', taskId: 'task_user_requested_norecord',
+        workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'retained',
+        agentTerminalHandle: 'term_user_requested_norecord', worktreePath: wt,
+        resource: { retainedReason: 'user_requested' } }],
+      terminalRows: [{ handle: 'term_user_requested_norecord', title: 'done worker',
+        lastOutputAt: Date.now() - 65_000, worktreePath: wt }],
+      envOverrides: { STUB_ORCA_CALLS_LOG: callsFile },
+      args: ['--interval', '1', '--idle', '60', '--max', '3'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    checkBool('a user_requested retain with no session gate record never auto-closes',
+      out.includes('WORKER CLOSED'), false);
+    checkBool('the daemon never released a worker it has no retain record for',
+      calls.includes('worker-release'), false);
+  }
+
   // 6n. Blocker 5 (review): remove mode never removes a worktree that still holds a live
   // terminal, even one `isWorktreeIdle` already treats as idle-but-quiet — it falls back
   // to the remind event instead.

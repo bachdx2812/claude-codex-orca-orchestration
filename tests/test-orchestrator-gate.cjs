@@ -680,25 +680,41 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
         r?.kind, 'failed');
     }
 
-    // Blocker 4 (original) / Blocker 2 (re-review): Orca's own retainedReason fails
-    // CLOSED — only its own automatic readiness-timeout retain ('identity_unproven') is
-    // eligible for auto-close. Any other reason, including 'user_requested' and
-    // 'user_takeover', always blocks, whatever the retain/done ordering was.
+    // Blocker 4 (original) / Blocker 2 (re-review) / 2026-10-01 re-review refinement:
+    // Orca's own retainedReason distinguishes an automatic readiness-timeout retain
+    // ('identity_unproven', always eligible) from 'user_requested', which is ambiguous by
+    // itself — the standard Kimi readiness-recovery recipe runs `worker-retain` on a
+    // worker that has not finished yet, and Orca records the very same 'user_requested'
+    // reason for that as for a deliberate "keep this finished worker open" decision. The
+    // two are told apart by comparing this session's own gate-recorded retainedAt against
+    // when the worker went done (doneAt): a recovery retain that ran strictly BEFORE done
+    // stays eligible; no gate record, or one that ran at/after done, fails CLOSED exactly
+    // like 'user_takeover'.
     check('Orca-automatic identity_unproven retain is eligible for auto-close',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'identity_unproven', doneAt: 1000, retainedAt: 500,
           runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
-    check('user_requested retain recorded BEFORE the done transition (the Kimi readiness recipe) still blocks (fail closed)',
+    check('user_requested retain recorded BEFORE the done transition (the Kimi readiness recipe) is eligible for auto-close',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'user_requested', doneAt: 1000, retainedAt: 500,
-          runOrca: recordingOrca().run, git: fakeGit() }), null);
+          runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
     check('user_requested retain recorded AFTER the done transition blocks auto-close',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'user_requested', doneAt: 500, retainedAt: 1000,
           runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('user_requested retain with no session gate record at all blocks auto-close (fails closed)',
+      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
+        { retainedReason: 'user_requested', doneAt: 1000,
+          runOrca: recordingOrca().run, git: fakeGit() }), null);
     check('a worker the panel explicitly retained for reuse (no retainedReason, legacy signal) is never auto-closed',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retained: true, runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('isRetainedForReuse: a user_requested retain recorded before done is eligible (not retained for reuse)',
+      heartbeat.isRetainedForReuse({ terminalState: 'retained' },
+        { retainedReason: 'user_requested', retainedAt: 500, doneAt: 1000 }), false);
+    check('isRetainedForReuse: a user_requested retain recorded at/after done blocks',
+      heartbeat.isRetainedForReuse({ terminalState: 'retained' },
+        { retainedReason: 'user_requested', retainedAt: 1000, doneAt: 1000 }), true);
     check('isRetainedForReuse: missing timestamps on a user_requested retain err toward blocked',
       heartbeat.isRetainedForReuse({ terminalState: 'retained' }, { retainedReason: 'user_requested' }), true);
     check('isRetainedForReuse: user_takeover always blocks, even with no session retain flag',

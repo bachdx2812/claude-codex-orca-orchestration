@@ -412,10 +412,19 @@ retain-or-release event below instead of being silently dropped. A release or
 terminal-close call Orca answers `ok: false` to (or cannot answer at all) is never logged
 or persisted as a success — the daemon reports `AUTO-CLOSE FAILED <id>` once and retries on
 a bounded cooldown. It never touches the panel's own terminal (`ORCA_TERMINAL_HANDLE`); a
-worker the panel explicitly `worker-retain`ed for reuse *after* it was already done
-(Orca's own automatic readiness-timeout retain, `resource.retainedReason:
-"identity_unproven"`, and a retain that ran *before* the done transition — e.g. the Kimi
-readiness-recovery recipe — both stay eligible for auto-close); a failed, stopped, or
+worker the panel explicitly `worker-retain`ed for reuse *after* it was already done stays
+blocked. Orca's `resource.retainedReason` distinguishes an automatic retain from an
+operator one, but `"user_requested"` is ambiguous by itself: the standard Kimi
+readiness-recovery recipe (`orca terminal send` + `worker-retain`) runs that same retain
+call on a worker that has not finished yet, and Orca records the identical
+`"user_requested"` reason for it as for a deliberate "keep this finished worker open"
+decision. The two are told apart by comparing this session's own gate-recorded
+`retainedAt` (written by `worker-retain`) against the heartbeat's own first-seen-done
+timestamp for that worker: `"identity_unproven"` (Orca's automatic readiness-timeout
+retain) is always eligible; `"user_requested"` is eligible only when the gate recorded a
+retain that ran strictly *before* the done transition (`retainedAt < doneAt`) — the
+recovery recipe's shape; no gate record at all, or one that ran at or after done, fails
+CLOSED exactly like `"user_takeover"` or any other/unknown reason; a failed, stopped, or
 cancelled worker (those keep the retain-or-release event below); or one whose worktree is
 dirty or unpushed — the latter wakes the panel once, on the transition into that state,
 with `WORKER DONE BUT UNSAVED <id>` and keeps the terminal open; re-evaluation continues,
