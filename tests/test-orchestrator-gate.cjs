@@ -22,6 +22,7 @@ process.env.ORCH_CODEX_BIN = path.join(__dirname, 'fixtures', 'codex-app-server-
 process.env.ORCH_KIMI_HOME = path.join(STATE_DIR, 'empty-kimi-home');
 process.env.ORCH_KIMI_BIN = path.join(STATE_DIR, 'missing-kimi');
 process.env.ORCH_KIMI_USAGE_URL = 'http://127.0.0.1:9/usages';
+process.env.ORCH_OPENCODE_BIN = path.join(STATE_DIR, 'missing-opencode');
 fs.mkdirSync(process.env.ORCH_KIMI_HOME, { recursive: true });
 
 const gate = require('../hooks/orchestrator-gate.cjs');

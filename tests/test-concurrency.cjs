@@ -51,6 +51,7 @@ const BASE_ENV = {
   ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
   ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
   ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+  ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
 };
 const ENV = {
   ...BASE_ENV,
@@ -60,6 +61,7 @@ const ENV = {
   ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
   ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
   ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+  ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
   ORCA_BIN: STUB, CODEX_BIN: STUB,
 };
 

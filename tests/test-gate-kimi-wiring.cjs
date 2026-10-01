@@ -56,6 +56,7 @@ function fixture(name, options = {}) {
     ORCH_KIMI_HOME: kimiHome,
     ORCH_KIMI_BIN: options.kimi === false ? path.join(root, 'missing-kimi') : KIMI_STUB,
     ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
   };
   const now = Date.now();
   if (options.codex !== false && options.codexUsed !== null) {
@@ -129,7 +130,7 @@ function state(stateDir, sid) {
   const f = fixture('none', { codex: false, kimi: false });
   const out = prompt(f.env, 'none-session').stdout;
   ok('neither usable routes to Sonnet with both reasons',
-    /code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[Codex not installed, Kimi not installed\]/.test(out));
+    /code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[Codex not installed, Kimi not installed, DeepSeek not installed\]/.test(out));
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 

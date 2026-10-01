@@ -33,6 +33,8 @@ const {
   loadConfig, gateDisabled, handoffUsed, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
+  deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
+  maxParallelDeepseekWorkers, reviewModelForCoder,
 } = require('./lib/config.cjs');
 const WG = require('./lib/worker-groups.cjs');
 const PAC = require('./lib/parallel-agent-cap.cjs');
@@ -40,7 +42,7 @@ const HBL = require('./lib/heartbeat-liveness.cjs');
 const OWN = require('./lib/ownership.cjs');
 const OC = require('./lib/ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
-const { hasRateLimitError, hasKimiUsageExhausted, kimiUsageLimitHours } = require('./lib/terminal-signals.cjs');
+const { hasRateLimitError, hasKimiUsageExhausted, kimiUsageLimitHours, hasDeepseekBalanceExhausted } = require('./lib/terminal-signals.cjs');
 const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
 const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const EXEC_QUOTA = require('./lib/exec-route-by-quota.cjs');
@@ -271,8 +273,8 @@ function blank(sid) {
 }
 
 function validPersistedExecAgent(value) {
-  return value === null || value === 'codex' || value === 'kimi' ||
-    (typeof value === 'string' && (/^codex:.+/.test(value) || /^kimi:.+/.test(value) || /^claude:.+/.test(value)));
+  return value === null || value === 'codex' || value === 'kimi' || value === 'deepseek' ||
+    (typeof value === 'string' && (/^codex:.+/.test(value) || /^kimi:.+/.test(value) || /^deepseek:.+/.test(value) || /^claude:.+/.test(value)));
 }
 
 function load(sid) {
@@ -389,6 +391,8 @@ function parseCodeModel(cfg, v) {
   if (x.startsWith('codex:') && x.length > 6) return `codex:${x.slice(6)}`;
   if (x === 'kimi') return 'kimi';
   if (x.startsWith('kimi:') && x.length > 5) return `kimi:${x.slice(5)}`;
+  if (x === 'deepseek' || x === 'opencode') return 'deepseek';
+  if ((x.startsWith('deepseek:') && x.length > 9) || (x.startsWith('opencode:') && x.length > 9)) return `deepseek:${x.slice(x.indexOf(':') + 1)}`;
   if (/^gpt-/.test(x) || (cfg.models.codex.id && x === String(cfg.models.codex.id).toLowerCase())) return `codex:${x}`;
   return 'invalid';
 }
@@ -404,24 +408,32 @@ function describeOverride(cfg, o) {
   if (o.startsWith('codex:')) return `Codex (${o.slice(6)}) in an Orca worker`;
   if (o === 'kimi') return 'Kimi in an Orca worker';
   if (o.startsWith('kimi:')) return `Kimi (${o.slice(5)}, set as default_model in ~/.kimi-code/config.toml; Orca cannot pin it) in an Orca worker`;
+  if (o === 'deepseek') return 'DeepSeek (opencode) in an Orca worker';
+  if (o.startsWith('deepseek:')) return `DeepSeek (${o.slice(9)}, set as model in ~/.config/opencode/opencode.jsonc; Orca cannot pin it) in an Orca worker`;
   return `in-session Agent with model "${o.slice(7)}"`;
+}
+
+/** The pool coder name for a worker agent (opencode runs DeepSeek). */
+function poolCoderForAgent(agent) {
+  return agent === 'opencode' ? 'deepseek' : agent;
 }
 
 function readLastCoder() {
   try {
     const value = JSON.parse(fs.readFileSync(CODER_ROUTE_STATE, 'utf8'));
-    return value && (value.lastCoder === 'codex' || value.lastCoder === 'kimi') ? value.lastCoder : null;
+    return value && ['codex', 'kimi', 'deepseek'].includes(value.lastCoder) ? value.lastCoder : null;
   } catch { return null; }
 }
 
 /** Called only while the shared state lock is held. */
-function writeLastCoder(coder) {
-  if (coder !== 'codex' && coder !== 'kimi') return;
+function writeLastCoder(agent) {
+  const coder = poolCoderForAgent(agent);
+  if (!['codex', 'kimi', 'deepseek'].includes(coder)) return;
   writeJsonAtomic(CODER_ROUTE_STATE, { lastCoder: coder, updatedAt: Date.now() });
 }
 
 function machineWideCoderLive(s, now = Date.now()) {
-  const result = { codex: 0, kimi: 0 };
+  const result = { codex: 0, kimi: 0, deepseek: 0 };
   const currentName = `${String(s.session_id).replace(/[^A-Za-z0-9_-]/g, '_')}.json`;
   for (const file of PAC.recentSessionStateFiles(DIR, now)) {
     if (path.basename(file) === currentName) continue;
@@ -429,9 +441,11 @@ function machineWideCoderLive(s, now = Date.now()) {
     if (!other) continue;
     result.codex += WG.countLiveGroups(other.workers, 'codex');
     result.kimi += WG.countLiveGroups(other.workers, 'kimi');
+    result.deepseek += WG.countLiveGroups(other.workers, 'opencode');
   }
   result.codex += WG.countLiveGroups(s.workers, 'codex');
   result.kimi += WG.countLiveGroups(s.workers, 'kimi');
+  result.deepseek += WG.countLiveGroups(s.workers, 'opencode');
   return result;
 }
 
@@ -439,6 +453,7 @@ function sessionCoderLive(s) {
   return {
     codex: WG.countLiveGroups(s.workers, 'codex'),
     kimi: WG.countLiveGroups(s.workers, 'kimi'),
+    deepseek: WG.countLiveGroups(s.workers, 'opencode'),
   };
 }
 
@@ -449,12 +464,14 @@ function coderPoolRoute(cfg, s, now = Date.now()) {
   const codexInstalled = binOnPath(process.env.ORCH_CODEX_BIN || CODEX_BIN);
   const kimiOverrideMissing = Object.prototype.hasOwnProperty.call(process.env, 'ORCH_KIMI_BIN') &&
     !binOnPath(process.env.ORCH_KIMI_BIN);
+  const opencodeOverrideMissing = Object.prototype.hasOwnProperty.call(process.env, 'ORCH_OPENCODE_BIN') &&
+    !binOnPath(process.env.ORCH_OPENCODE_BIN);
   let availability = CODER_AVAILABILITY.coderAvailability({
     stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
     orcaInstalled, env: process.env, codexAuthState: authState,
-    fresh: !orcaInstalled || !codexInstalled || kimiOverrideMissing,
+    fresh: !orcaInstalled || !codexInstalled || kimiOverrideMissing || opencodeOverrideMissing,
   });
-  const quotas = { codex: null, kimi: null };
+  const quotas = { codex: null, kimi: null, deepseek: null };
   if (availability.codex?.usable) {
     const reading = EXEC_QUOTA.codexQuota(now, { stateDir: DIR, cacheSeconds: codexQuotaCacheSeconds(cfg) });
     if (reading?.authState === 'logged-out') {
@@ -474,14 +491,22 @@ function coderPoolRoute(cfg, s, now = Date.now()) {
     });
     if (reading && !reading.failed) quotas.kimi = reading;
   }
+  if (availability.deepseek?.usable) {
+    const reading = EXEC_QUOTA.deepseekQuota(now, {
+      stateDir: DIR, cacheSeconds: deepseekQuotaCacheSeconds(cfg), env: process.env,
+      dailyCapUsd: deepseekDailySpendCapUsd(cfg),
+    });
+    if (reading && !reading.failed) quotas.deepseek = reading;
+  }
   return CODER_POOL.pickCoderPool({
     availability, quotas,
-    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg) },
+    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg), deepseek: deepseekHandoffUsed(cfg) },
     tieBand: cfg.coderHeadroomTieBand, unknownAssumed: cfg.unknownHeadroomAssumed,
+    roles: { deepseek: deepseekRole(cfg) },
     exhaustion: CODER_AVAILABILITY.readCoderExhaustion(DIR, now),
     live: machineWideCoderLive(s, now),
     sessionLive: sessionCoderLive(s),
-    caps: { codex: maxParallelCodexWorkers(cfg), kimi: maxParallelKimiWorkers(cfg) },
+    caps: { codex: maxParallelCodexWorkers(cfg), kimi: maxParallelKimiWorkers(cfg), deepseek: maxParallelDeepseekWorkers(cfg) },
     lastCoder: readLastCoder(),
     fallbackEnabled: cfg.execFallbackWhenCodexUnavailable === 'sonnet' ? true : null,
   });
@@ -504,14 +529,17 @@ function currentExecRoute(cfg, s) {
   } catch {
     pool = { route: 'external', pick: 'codex', order: ['codex'], coders: {}, why: 'auto: coder pool unreadable, default Codex' };
   }
-  if (a === 'codex' || a === 'kimi' || (typeof a === 'string' && /^(?:codex|kimi):/.test(a))) {
-    const pick = a.startsWith('kimi') ? 'kimi' : 'codex';
+  if (a === 'codex' || a === 'kimi' || a === 'deepseek' ||
+      (typeof a === 'string' && /^(?:codex|kimi|deepseek):/.test(a))) {
+    const pick = a.startsWith('kimi') ? 'kimi' : a.startsWith('deepseek') ? 'deepseek' : 'codex';
+    const pickLabel = pick === 'codex' ? 'Codex' : pick === 'kimi' ? 'Kimi' : 'DeepSeek';
     const state = pool.coders[pick];
-    const warning = state?.state === 'eligible' || !state ? '' : ` WARNING: ${pick === 'codex' ? 'Codex' : 'Kimi'} unusable: ${state.reason || state.state || 'unavailable'}.`;
+    const warning = state?.state === 'eligible' || !state ? '' : ` WARNING: ${pickLabel} unusable: ${state.reason || state.state || 'unavailable'}.`;
     return {
       route: 'external', pick, order: [pick], coders: pool.coders,
       ...(pick === 'codex' && a.startsWith('codex:') ? { codexModel: a.slice(6) } : {}),
       ...(pick === 'kimi' && a.startsWith('kimi:') ? { kimiModel: a.slice(5) } : {}),
+      ...(pick === 'deepseek' && a.startsWith('deepseek:') ? { deepseekModel: a.slice(9) } : {}),
       why: `operator override (${a})${warning}`,
     };
   }
@@ -769,6 +797,7 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
     p, s, cfg, cmd, d,
     deps: {
       hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers, maxParallelKimiWorkers,
+      maxParallelDeepseekWorkers,
       ownershipClaimTtlMinutes, save, load, gateDisabled,
       agentParallelLimit, maxParallelAgents, machineWideLiveUnits: PAC.machineWideLiveUnits,
       formatParallelAgentsRefusal: PAC.formatParallelAgentsRefusal, cores: PAC.cores, parallelCoreFraction,
@@ -855,11 +884,17 @@ function activeOverrideLines(cfg, s) {
     } else if (s.execAgent === 'kimi') {
       target = 'Kimi';
       flag = '--exec-kimi';
+    } else if (s.execAgent === 'deepseek') {
+      target = 'DeepSeek (opencode)';
+      flag = '--exec-deepseek';
     } else if (s.execAgent.startsWith('codex:')) {
       target = `Codex (${s.execAgent.slice(6)})`;
       flag = `--code-model ${s.execAgent}`;
     } else if (s.execAgent.startsWith('kimi:')) {
       target = `Kimi (${s.execAgent.slice(5)}, set as default_model; Orca cannot pin it)`;
+      flag = `--code-model ${s.execAgent}`;
+    } else if (s.execAgent.startsWith('deepseek:')) {
+      target = `DeepSeek (${s.execAgent.slice(9)}, set in ~/.config/opencode/opencode.jsonc; Orca cannot pin it)`;
       flag = `--code-model ${s.execAgent}`;
     } else {
       target = s.execAgent.slice(7);
@@ -878,9 +913,24 @@ function onSessionStart(p, s, cfg) {
   const code = cfg.models.code.alias;
   const codexThreshold = handoffUsed(cfg);
   const kimiThreshold = kimiHandoffUsed(cfg);
+  const deepseekThreshold = deepseekHandoffUsed(cfg);
   const route = currentExecRoute(cfg, s);
   const warnings = (cfg.warnings || []).map((w) => `- CONFIG WARNING: ${w}\n`).join('');
   const overrideWarnings = activeOverrideLines(cfg, s).map((line) => `- ACTIVE OVERRIDE: ${line}\n`).join('');
+  // Every coder is optional: the banner names only the coders usable on THIS machine
+  // (operator decision, 2026-10-01) — a machine with none routes code in-session.
+  const coderLabel = (c) => c === 'codex' ? 'Codex' : c === 'kimi' ? 'Kimi' : 'DeepSeek';
+  const usableCoders = ['codex', 'kimi', 'deepseek'].filter((c) => route.coders?.[c]?.state === 'eligible');
+  const thresholdText = { codex: codexThreshold, kimi: kimiThreshold, deepseek: deepseekThreshold };
+  const peerList = usableCoders.length
+    ? usableCoders.map((c) => `${coderLabel(c)} (handoff >= ${thresholdText[c]}% used${route.coders[c].standby ? ', overflow' : ''})`).join(', ')
+    : 'no external coder usable on this machine';
+  const dispatchLines = [
+    usableCoders.includes('codex') ? '    Codex -> Orca worker: orca orchestration task-create ... && worker-start --agent codex --model ...\n' : '',
+    usableCoders.includes('kimi') ? '    Kimi  -> Orca worker: orca orchestration task-create ... && worker-start --agent kimi (no --model)\n' : '',
+    usableCoders.includes('deepseek') ? '    DeepSeek -> Orca worker: orca orchestration task-create ... && worker-start --agent opencode (no --model)\n' : '',
+    usableCoders.length ? '             then worker-list | worker-read | worker-release\n' : '',
+  ].join('');
   process.stdout.write(
     'ORCHESTRATION CONTRACT (enforced by orchestrator-gate.cjs):\n' +
     warnings +
@@ -888,20 +938,18 @@ function onSessionStart(p, s, cfg) {
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
-    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> Codex + Kimi coder peers -> ${review} reviews.\n` +
+    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> ${usableCoders.map(coderLabel).join(' + ') || 'in-session'} coder${usableCoders.length === 1 ? '' : 's'} -> reviews.\n` +
     `- Planning / red-team / review / verification -> in-session subagent on model ${modelLabel(cfg.models.review)}.\n` +
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
-    '- Every code brief (Codex spec or in-session prompt) names the exact test / build command to run green.\n' +
-    `- Code: split across usable Codex (handoff >= ${codexThreshold}% used) and Kimi (handoff >= ${kimiThreshold}% used); next -> ${route.pick ? (route.pick === 'codex' ? 'Codex' : 'Kimi') : code}.\n` +
-    '    Codex -> Orca worker: orca orchestration task-create ... && worker-start --agent codex --model ...\n' +
-    '    Kimi  -> Orca worker: orca orchestration task-create ... && worker-start --agent kimi (no --model)\n' +
-    '             then worker-list | worker-read | worker-release\n' +
+    '- Every code brief (external spec or in-session prompt) names the exact test / build command to run green.\n' +
+    `- Code: split across ${peerList}; next -> ${route.pick ? coderLabel(route.pick) : code}.\n` +
+    dispatchLines +
     `    ${code[0].toUpperCase()}${code.slice(1)} -> ${codeModelDispatchText(cfg)}.\n` +
-    `  Operator-only override from the main panel: --code-model <${review}|${code}|${lookup}|${escalation}|codex|codex:<model>|kimi|kimi:<model>|auto>\n` +
-    '  (session-scoped, last flag wins; --exec-sonnet / --exec-codex / --exec-kimi are shortcuts, --exec-auto = --code-model auto).\n' +
+    `  Operator-only override from the main panel: --code-model <${review}|${code}|${lookup}|${escalation}|codex|codex:<model>|kimi|kimi:<model>|deepseek|deepseek:<model>|auto>\n` +
+    '  (session-scoped, last flag wins; --exec-sonnet / --exec-codex / --exec-kimi / --exec-deepseek are shortcuts, --exec-auto = --code-model auto).\n' +
     '  If Orca itself is unreachable: `touch ~/.claude/orchestrator-gate/orca-unavailable` (15 min) permits in-session code\n' +
-    `  (even a codex override falls back to "${code}" while that flag is active).\n` +
+    `  (even an external-coder override falls back to "${code}" while that flag is active).\n` +
     `- Poll every live worker at least every ${cfg.heartbeat.idleSeconds}s. Never let one sit IDLE unattended.\n` +
     '- External coder workers get rate limited when run in parallel: on a rate-limit signal, back off and retry\n' +
     `  after ~${RATE_LIMIT_BACKOFF_SECONDS}s instead of abandoning or re-dispatching immediately.\n` +
@@ -1007,16 +1055,17 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   const cm = [...prompt.matchAll(/(^|\s)--code-model(?:=|\s+)(\S+)/gi)].pop();
   const bareCm = !cm && /(^|\s)--code-model(?:=)?\s*$/i.test(prompt);
   if (bareCm) {
-    process.stdout.write(`orchestrator-gate: --code-model needs a value (${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | kimi | kimi:<model> | auto); nothing changed.\n`);
+    process.stdout.write(`orchestrator-gate: --code-model needs a value (${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | kimi | kimi:<model> | deepseek | deepseek:<model> | auto); nothing changed.\n`);
   }
   const cmAt = cm ? cm.index + cm[1].length : -1;
-  const lastFlag = ['--exec-sonnet', '--exec-codex', '--exec-kimi', '--exec-auto']
+  const lastFlag = ['--exec-sonnet', '--exec-codex', '--exec-kimi', '--exec-deepseek', '--exec-auto']
     .map((f) => [f, flagAt(f)]).concat(cm ? [['--code-model', cmAt]] : [])
     .filter(([, i]) => i >= 0).sort((a, b) => b[1] - a[1]).map(([f]) => f)[0];
   let override;
   if (lastFlag === '--exec-sonnet') override = `claude:${cfg.models.code.alias}`;
   else if (lastFlag === '--exec-codex') override = 'codex';
   else if (lastFlag === '--exec-kimi') override = 'kimi';
+  else if (lastFlag === '--exec-deepseek') override = 'deepseek';
   else if (lastFlag === '--exec-auto') override = null;
   else if (lastFlag === '--code-model') override = parseCodeModel(cfg, cm[2]);
   if (override !== undefined && override !== 'invalid') {
@@ -1024,10 +1073,10 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     s.execAgentSince = override === null ? null : new Date().toISOString();
     save(s);
     process.stdout.write(override === null
-      ? `orchestrator-gate: coding model back to automatic (Codex + Kimi load-balanced, "${cfg.models.code.alias}" when neither is eligible).\n`
+      ? `orchestrator-gate: coding model back to automatic (external coders load-balanced, "${cfg.models.code.alias}" when none is eligible).\n`
       : `orchestrator-gate: coding model set by the operator for this session: ${describeOverride(cfg, override)}. Revert with --code-model auto.\n`);
   } else if (override === 'invalid') {
-    process.stdout.write(`orchestrator-gate: ignored --code-model ${cm[2]} (use ${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | kimi | kimi:<model> | auto).\n`);
+    process.stdout.write(`orchestrator-gate: ignored --code-model ${cm[2]} (use ${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | kimi | kimi:<model> | deepseek | deepseek:<model> | auto).\n`);
   }
 
   // Operator-only manual release of a stuck ownership claim (foreground release is
@@ -1073,19 +1122,22 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   parts.push(...activeOverrideLines(cfg, s));
   const ex = currentExecRoute(cfg, s);
   const codexModelShown = ex.codexModel || cfg.models.codex.id;
-  const roleByAlias = (alias) => Object.values(cfg.models).find((m) => m.alias === alias) || { alias, id: null };
+  const coderName = (c) => c === 'codex' ? 'Codex' : c === 'kimi' ? 'Kimi' : 'DeepSeek';
+  const roleByAlias = (alias) => Object.values(cfg.models).find((m) => m && m.alias === alias) || { alias, id: null };
   let codeRoute;
   if (ex.route === 'external' && ex.pick === 'codex') {
     codeRoute = `Codex in an Orca worker${codexModelShown ? ` (worker-start --agent codex --model ${codexModelShown})` : ''}`;
   } else if (ex.route === 'external' && ex.pick === 'kimi') {
     codeRoute = `Kimi in an Orca worker (worker-start --agent kimi, no --model)${ex.kimiModel ? ` (${ex.kimiModel} via default_model; Orca cannot pin it)` : ''}`;
+  } else if (ex.route === 'external' && ex.pick === 'deepseek') {
+    codeRoute = `DeepSeek in an Orca worker (worker-start --agent opencode, no --model)${ex.deepseekModel ? ` (${ex.deepseekModel} via ~/.config/opencode/opencode.jsonc; Orca cannot pin it)` : ''}`;
   } else if (ex.route === 'claude') {
     codeRoute = ex.alias === cfg.models.code.alias
       ? `in-session: ${codeModelDispatchText(cfg)}`
       : `in-session subagent (Agent model ${modelLabel(roleByAlias(ex.alias))})`;
   } else {
     const reasons = ex.coders
-      ? ['codex', 'kimi'].map((coder) => `${coder === 'codex' ? 'Codex' : 'Kimi'} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ')
+      ? ['codex', 'kimi', 'deepseek'].map((coder) => `${coderName(coder)} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ')
       : ex.why;
     codeRoute = `${codeModelDispatchText(cfg)} [${reasons}]`;
   }
@@ -1102,13 +1154,12 @@ function onUserPromptSubmitLocked(p, s, cfg) {
       } else {
         quotaText = `${Math.max(0, Math.round(c.headroom))}% headroom`;
       }
-      return `${coder === 'codex' ? 'Codex' : 'Kimi'} (${liveText}, ${quotaText})`;
+      return `${coderName(coder)} (${liveText}, ${quotaText})`;
     };
-    codeRoute = `split: ${coderText('codex')} + ${coderText('kimi')}; next -> ${ex.pick === 'codex' ? 'Codex' : 'Kimi'}`;
+    codeRoute = `split: ${['codex', 'kimi', 'deepseek'].filter((c) => ex.order.includes(c)).map(coderText).join(' + ')}; next -> ${coderName(ex.pick)}`;
   } else if (ex.route === 'external' && ex.coders) {
-    const other = ex.pick === 'codex' ? 'kimi' : 'codex';
-    const otherState = ex.coders[other];
-    codeRoute += `; ${other === 'codex' ? 'Codex' : 'Kimi'} ${otherState?.reason || otherState?.state || 'unavailable'}; next -> ${ex.pick === 'codex' ? 'Codex' : 'Kimi'}`;
+    const others = ['codex', 'kimi', 'deepseek'].filter((c) => c !== ex.pick);
+    codeRoute += `; ${others.map((c) => `${coderName(c)} ${ex.coders[c]?.standby ? 'overflow standby' : (ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable')}`).join('; ')}; next -> ${coderName(ex.pick)}`;
   }
   parts.push(`Model routing: plan/red-team/review -> model ${modelLabel(cfg.models.review)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);
@@ -1283,6 +1334,12 @@ function onPreToolUse(p, s, cfg) {
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
         additionalContext: 'orchestrator-gate advice: drop --model for --agent kimi; Kimi uses default_model from ~/.kimi-code/config.toml and Orca cannot pin it.' } }));
     }
+    const opencodeInv = orcaInvocations(cmd).find((inv) =>
+      inv.sub === 'orchestration worker-start' && flagValue(inv.args, '--agent') === 'opencode');
+    if (opencodeInv && hasFlag(opencodeInv.args, '--model')) {
+      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
+        additionalContext: 'orchestrator-gate advice: drop --model for --agent opencode; opencode uses the model from ~/.config/opencode/opencode.jsonc and Orca cannot pin it.' } }));
+    }
   }
 
   // Gate: max-parallel-agents — EARLY, READ-ONLY fast-fail. A MACHINE-wide budget (this
@@ -1373,13 +1430,14 @@ function onPreToolUse(p, s, cfg) {
       const inSession = ex.route !== 'external' || orcaFallbackActive();
       const wantAlias = ex.route === 'claude' ? ex.alias : cfg.models.code.alias;
       if (!inSession) {
+        const pickName = ex.pick === 'kimi' ? 'Kimi' : ex.pick === 'deepseek' ? 'DeepSeek (opencode)' : 'Codex';
         d('route-execution-to-codex',
-          `Code goes to an external coder (${ex.pick === 'kimi' ? 'Kimi' : 'Codex'}) in an Orca worker right now [${ex.why}].\n` +
+          `Code goes to an external coder (${pickName}) in an Orca worker right now [${ex.why}].\n` +
           'Use: orca orchestration task-create -> worker-start -> worker-read/worker-list -> worker-release.\n' +
           'If Orca genuinely cannot open a worker, declare the fallback first:\n' +
           '  date -u +%Y-%m-%dT%H:%M:%SZ > ~/.claude/orchestrator-gate/orca-unavailable\n' +
           `That declaration expires after ${Math.round(ORCA_DOWN_TTL_SECONDS / 60)} minutes, on purpose.\n` +
-          'The operator (only) can pick the coding model with --code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>.');
+          'The operator (only) can pick the coding model with --code-model <alias|codex|codex:<model>|kimi|kimi:<model>|deepseek|deepseek:<model>|auto>.');
       }
       if (!model.toLowerCase().includes(String(wantAlias || '').toLowerCase())) {
         const redispatch = wantAlias === cfg.models.code.alias
@@ -2091,6 +2149,29 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
       process.stdout.write(
         'orchestrator-gate: Kimi usage limit detected for the tracked Kimi worker. Route new code to Codex, ' +
         'or Sonnet if Codex is also unavailable; do not retry Kimi until reset.\n'
+      );
+    }
+    const opencodeGroups = new Set(trackedReadWorkers
+      .filter(([, worker]) => worker.agent === 'opencode')
+      .map(([target, worker]) => WG.groupOf(worker, target)));
+    const targetsOpencodeOnly = trackedReadWorkers.length > 0 &&
+      trackedReadWorkers.length === readTargets.length &&
+      trackedReadWorkers.every(([, worker]) => worker.agent === 'opencode');
+    if (readsWorkerOutput && targetsOpencodeOnly && hasDeepseekBalanceExhausted(signalText)) {
+      CODER_AVAILABILITY.markCoderExhausted(DIR, 'deepseek', {
+        now: Date.now(),
+        reason: 'insufficient balance (402)',
+      });
+      const until = Date.now() + RATE_LIMIT_BACKOFF_SECONDS * 1000;
+      for (const [key, worker] of Object.entries(s.workers)) {
+        if (worker.status === 'live' && worker.agent === 'opencode' && opencodeGroups.has(WG.groupOf(worker, key))) {
+          worker.rate_limited_until = until;
+        }
+      }
+      dirty = true;
+      process.stdout.write(
+        'orchestrator-gate: DeepSeek balance exhausted (402 Insufficient Balance) for the tracked opencode worker. ' +
+        'Route new code to another usable coder, or Sonnet if none is eligible; do not retry DeepSeek until the balance is topped up.\n'
       );
     }
     if (readsWorkerOutput && hasRateLimitError(signalText)) {

@@ -253,6 +253,7 @@ function gate(env, payload) {
     ...base, ORCH_STATE_DIR: stateDir, ORCH_CONFIG_PATH: configFile, ORCA_BIN: ORCA_STUB,
     ORCH_CODEX_BIN: CODEX_STUB, CODEX_BIN: CODEX_STUB, ORCH_KIMI_HOME: kimiHome, ORCH_KIMI_BIN: KIMI_STUB,
     ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(stateDir, 'missing-opencode'),
   };
   const now = Date.now();
   const resetsAt = Math.floor(now / 1000) + 3600;
