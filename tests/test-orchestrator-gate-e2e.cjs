@@ -338,7 +338,7 @@ expect('planning on fable with escalation reason is allowed',
 expect('escalation-agent with escalation reason in prompt is allowed',
   dispatch({ subagent_type: 'escalation-agent', description: 'review the diff', prompt: 'Opus could not resolve the race even with ultrathink; review the diff.' }), ALLOW);
 expect('opus for non-review work is refused',
-  dispatch({ subagent_type: 'Explore', description: 'find the config loader', model: 'opus' }), DENY);
+  dispatch({ subagent_type: 'general-purpose', description: 'Update the changelog', model: 'opus' }), DENY);
 expect('opus for execution is refused',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'opus' }), DENY);
 expect('an agent name not in the configured escalation list gets no special treatment',
@@ -550,6 +550,77 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     (() => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor; } catch { return null; } })(), null);
 }
 
+// R1: a verify/test verb coordinated with a later NON-code action is verify-run (sonnet), not
+// code — "Run tests and verify the fix works" runs checks, it does not write code. With Codex
+// eligible, a misclassification as exec would route to Codex and refuse, so ALLOW on sonnet
+// proves the verify rule fired.
+{
+  const dir = path.join(RUN_DIR, 'verify-not-exec');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'verify-not-exec';
+  let seq = 0;
+  for (const row of [
+    { subagent_type: 'general-purpose', description: 'Run tests and verify the fix works' },
+    { subagent_type: 'tester', description: 'Run tests and verify the fix works' },
+    { subagent_type: 'general-purpose', description: 'Verify tests pass, then check the fix' },
+    { subagent_type: 'general-purpose', description: 'Verify the hotfix and the refactor both pass CI' },
+  ]) {
+    expect(`R1 verify-not-exec stays verify (sonnet allowed): ${row.description} (${row.subagent_type})`,
+      dispatch(Object.assign({ model: 'sonnet' }, row), sid, { tool_use_id: `toolu_vne_${++seq}` }), ALLOW, env);
+  }
+}
+
+// Low 2: bare "code"/"branch" are not review nouns — running checks on a branch or checking
+// code compiles stays verify-run (sonnet). With DeepSeek as the last code author (whose review
+// maps to opus), a misclassification as review would refuse sonnet, so ALLOW on sonnet proves
+// these stay verify.
+{
+  const dir = path.join(RUN_DIR, 'verify-not-review');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'verify-not-review';
+  const start = 'orca orchestration worker-start --agent opencode --json';
+  invoke(mainBash(start, { sid, tool_use_id: 'toolu_vnr_start' }), env);
+  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_vnr_deepseek"}}', { sid, tool_use_id: 'toolu_vnr_start' }), env);
+  checkBool('a registered opencode worker records deepseek as the session code author',
+    JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor, 'deepseek');
+  let seq = 0;
+  for (const desc of ['Run tests on the PR branch', 'Verify the code compiles']) {
+    expect(`Low 2 verify-not-review stays verify (sonnet allowed): ${desc}`,
+      dispatch({ subagent_type: 'general-purpose', description: desc, model: 'sonnet' },
+        sid, { tool_use_id: `toolu_vnr_${++seq}` }), ALLOW, env);
+  }
+}
+
 // B2: a reviewer type or a code noun next to a verify verb is review, never verify — so it is
 // allowed on the review model (opus) even with no code author recorded.
 {
@@ -583,7 +654,9 @@ expect('a neutral first verb still classifies code-reviewer as review work',
 }
 
 // Low: a lookup role type (Explore/scout) with a verify verb is advisory lookup work, never
-// verify-run — allowed on the lookup model, and never refused by the verify-model gate.
+// verify-run (and never exec/review) — the dispatch is admitted on opus, sonnet and haiku
+// alike, so this asserts the dispatch itself is allowed, not merely that the verify rule
+// does not fire.
 {
   const dir = path.join(RUN_DIR, 'lookup-never-verify');
   const stateDir = path.join(dir, 'state');
@@ -603,13 +676,11 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     STUB_CODEX_PRIMARY_USED: '5',
   };
   const sid = 'lookup-never-verify';
-  expect('a lookup type with a verify verb is allowed on the lookup model',
-    dispatch({ subagent_type: 'Explore', description: 'Verify where X is defined', model: 'haiku' },
-      sid, { tool_use_id: 'toolu_lnv_1' }), ALLOW, env);
-  const opus = invoke(dispatch({ subagent_type: 'Explore', description: 'Verify where X is defined', model: 'opus' },
-    sid, { tool_use_id: 'toolu_lnv_2' }), env);
-  if (!/verify-model/.test(opus.err) && !/route-verify/.test(opus.err)) pass += 1;
-  else failures.push(`a lookup type with a verify verb must not be classified as verify (opus): exit=${opus.code}, err=${opus.err.slice(0, 120)}`);
+  for (const model of ['haiku', 'sonnet', 'opus']) {
+    expect(`a lookup type with a verify verb is allowed on ${model}`,
+      dispatch({ subagent_type: 'Explore', description: 'Verify where X is defined', model },
+        sid, { tool_use_id: `toolu_lnv_${model}` }), ALLOW, env);
+  }
 }
 
 // A bare `plan` inside a hyphenated word is not a plan object: a review of the

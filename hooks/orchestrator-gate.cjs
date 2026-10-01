@@ -274,17 +274,20 @@ const STRONG_PLANNING_OBJECT = /(?<![\w-])(plan|plans|planning)(?![\w-])|\bred[-
 const PLANNING_TYPE_HINT = /\bred-?team\b|planner|plan[- ]reviewer/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 // A code-review noun in the summary — something you JUDGE rather than run or do: a diff, a
-// PR, commit(s), code, a branch, an implementation. Sitting next to a verify verb it marks
-// the dispatch as review (the stronger model) rather than verify-run, so "Verify the PR
-// diff is correct" is review work, not running existing checks. Deliberately narrower than
-// CODE_WORK_OBJECT: exec verbs (fix/implement) do not count here — they route to the coder.
-const REVIEW_NOUN = /\b(diff|pull\s+request|pr|commits?|code|branch|implementation)\b/i;
+// pull request, commit(s), an implementation. Sitting next to a verify verb it marks the
+// dispatch as review (the stronger model) rather than verify-run, so "Verify the PR diff is
+// correct" is review work, not running existing checks. Deliberately narrower than
+// CODE_WORK_OBJECT: exec verbs (fix/implement) do not count here — they route to the coder,
+// and a bare "code"/"branch" (or the "PR" abbreviation) does not either, so "Verify the code
+// compiles" and "Run tests on the PR branch" stay verify-run (running checks, not judging).
+const REVIEW_NOUN = /\b(diff|pull\s+request|commits?|implementation)\b/i;
 // "Test and fix ...", "Run tests then implement ...", "Verify and fix ..." — a verify/test
 // verb COORDINATED with a later exec action means the user wants code written, not just
 // checks run ("verify the build" runs the build; it does not write code). The coordinator
-// ("and"/"then"/",") is what separates a genuine exec action from the object of a verify
-// verb, so the B1 exec-over-verify rule fires only on this coordinated shape.
-const VERIFY_THEN_EXEC = /\b(?:verify|verification|tests?|checks?|ci)\b[^.;]*?\b(?:and|then|also|,)\b[^.;]*?\b(?:implement|implementation|refactor|migrate|scaffold|fix|write\s+(?:the\s+)?code|codegen|generate)\b/i;
+// ("and"/"then"/"also", with the code verb right after it) is what separates a genuine exec
+// action from the object of a verify verb, so the B1 exec-over-verify rule fires only on this
+// coordinated shape (a bare comma is not a coordinator).
+const VERIFY_THEN_EXEC = /\b(?:verify|verification|test|tests|check|checks|ci)\b[^.;]*?\b(?:and|then|also)\s+(?:then\s+)?(?:implement|refactor|migrate|scaffold|fix|write\s+(?:the\s+)?code|codegen|generate\s+(?:code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
@@ -405,11 +408,12 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   // coder pool, records the author, and requires a verify command — never the verify model.
   // A review first verb still wins over exec. Only a COORDINATED verify-then-exec action
   // counts: "verify the build" is verify-run (the build is the object), "Verify and fix ..."
-  // is code (fix is a coordinated action).
-  const wantsExec = firstIntent === 'exec' ||
+  // is code (fix is a coordinated action). A verifier subagent_type (tester / verifier /
+  // browser-verifier / e2e-runner) is NEVER code, whatever its summary says.
+  const wantsExec = !typeWantsVerify && (firstIntent === 'exec' ||
     (firstIntent !== 'review' && firstIntent !== 'verify' && execAt >= 0 &&
       (firstIntent === 'neutral' || planAt < 0 || execAt < planAt)) ||
-    (firstIntent === 'verify' && VERIFY_THEN_EXEC.test(hay));
+    (firstIntent === 'verify' && VERIFY_THEN_EXEC.test(hay)));
 
   // B2: review beats verify — a reviewer type, a review verb, or a code noun next to a
   // verify verb is review work (the stronger model), never verify. A code noun with a verify
@@ -1634,6 +1638,11 @@ function onPreToolUse(p, s, cfg) {
     const hay = `${type} ${description}`.trim() || String(input.prompt || '').slice(0, 400);
     const { wantsExec, wantsPlanReview, wantsVerify, planning } =
       classifyDispatch(description, type, input.prompt, cfg.agents.lookup);
+    // A lookup role type (agents.lookup, e.g. Explore/scout) or a lookup-intent summary is
+    // advisory lookup work: it never blocks and never runs on the review/verify model, so it
+    // is exempt from review-model-scope below and is merely advised toward the lookup model.
+    const wantsLookup = cfg.agents.lookup.some((n) => n.toLowerCase() === type.toLowerCase())
+      || (LOOKUP_INTENT.test(hay) && !wantsExec && !wantsPlanReview);
     const model = String(input.model || '');
     const reviewAlias = cfg.models.review.alias;
     const escalationAlias = cfg.models.escalation.alias;
@@ -1718,11 +1727,12 @@ function onPreToolUse(p, s, cfg) {
     }
     // The review model is reserved for the work it took over from the escalation model:
     // planning / review — unless the operator explicitly picked it to code. Verify-run work
-    // with an escalation note is allowed on the review model and handled above.
+    // with an escalation note is allowed on the review model and handled above; advisory
+    // lookup work is exempt (it never blocks and may run on any model).
     const exNow = currentExecRoute(cfg, s);
     const operatorPicked = wantsExec && exNow.route === 'claude' && !!exNow.alias &&
       (exNow.alias === escalationAlias ? isEscalation : model.toLowerCase().includes(String(exNow.alias).toLowerCase()));
-    if (isReviewModel && !wantsPlanReview && !wantsVerify && !operatorPicked) {
+    if (isReviewModel && !wantsPlanReview && !wantsVerify && !wantsLookup && !operatorPicked) {
       d('review-model-scope',
         `model "${reviewAlias}" is reserved for planning / review.\n` +
         `Code goes to Codex or "${cfg.models.code.alias}" per the current exec route; other in-session work runs on model "${cfg.models.code.alias}".\n` +
@@ -1818,8 +1828,6 @@ function onPreToolUse(p, s, cfg) {
     }
 
     // Light lookups: advise the lookup model (never blocks).
-    const wantsLookup = cfg.agents.lookup.some((n) => n.toLowerCase() === type.toLowerCase())
-      || (LOOKUP_INTENT.test(hay) && !wantsExec && !wantsPlanReview);
     if (wantsLookup && !new RegExp(escapeRegex(cfg.models.lookup.alias), 'i').test(model) && !isEscalation) {
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
         additionalContext: `orchestrator-gate advice: this looks like a light lookup (find/locate/read logs/explore). ` +

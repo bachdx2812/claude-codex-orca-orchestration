@@ -2396,6 +2396,28 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     const c = gate.classifyDispatch('Verify plan claims against the codebase', 'reviewer', '');
     check('verify over a plan noun is planning', [c.wantsPlanReview, c.planning, c.wantsVerify], [true, true, false]);
   }
+  // R1: a verify/test verb coordinated with a later NON-code action is verify-run, never code.
+  for (const [desc, type] of [
+    ['Run tests and verify the fix works', 'general-purpose'],
+    ['Run tests and verify the fix works', 'tester'],
+    ['Verify tests pass, then check the fix', 'general-purpose'],
+    ['Verify the hotfix and the refactor both pass CI', 'general-purpose'],
+  ]) {
+    const c = gate.classifyDispatch(desc, type, '');
+    check(`R1 verify-not-exec: "${desc}" (${type})`,
+      [c.wantsVerify, c.wantsExec, c.wantsPlanReview], [true, false, false]);
+  }
+  // R1: a verifier subagent_type is NEVER code, even with a coordinated verify-then-fix summary.
+  {
+    const c = gate.classifyDispatch('Test and fix the login flow', 'tester', '');
+    check('a verifier subagent_type is never code', [c.wantsExec, c.wantsVerify], [false, true]);
+  }
+  // Low 2: bare "code"/"branch" are not review nouns; running checks stays verify-run.
+  for (const desc of ['Run tests on the PR branch', 'Verify the code compiles']) {
+    const c = gate.classifyDispatch(desc, 'general-purpose', '');
+    check(`Low 2 verify-not-review: "${desc}"`,
+      [c.wantsVerify, c.wantsPlanReview, c.wantsExec], [true, false, false]);
+  }
   // Low: a lookup role type never becomes verify (advisory lookup work).
   {
     const c = gate.classifyDispatch('Verify where X is defined', 'Explore', '', ['Explore', 'scout']);
