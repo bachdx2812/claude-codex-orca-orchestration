@@ -291,6 +291,16 @@ const VERIFY_THEN_EXEC = /\b(?:verify|verification|test|tests|check|checks|ci)\b
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
+// 'Write' + a CODE OBJECT is code intent, not the operational write (operator decision,
+// 2026-10-02): "Write the payment module", "Write e2e tests for checkout" and "Write the
+// cache layer" route to the coder (verify command + Owns in a shared workspace, author
+// recorded), while "Write" + a document/plan object stays operational ("Write the release
+// notes", "Write a plan for X", "Write docs for the API"). The object is searched anywhere
+// in the description so an intervening word ("Write e2e tests") still counts; only the FIRST
+// verb "write" is code this way, so a later write inside a verify-run summary ("Run tests
+// and write a summary") stays verify-run.
+const CODE_OBJECT = /\b(?:modules?|functions?|classes?|components?|tests?|code|implementations?|endpoints?|handlers?|scripts?|migrations?|hooks?|parsers?|layers?|services?|features?)\b/i;
+const WRITE_FIRST_VERB = /^write\b/i;
 const LOOKUP_INTENT = /\b(find|locate|search|grep|scout|explore|look\s*up|where\s+is|list\s+(all|the)|read\s+(the\s+)?(log|logs|output)|summari[sz]e\s+(the\s+)?(log|logs|output|test\s+results?))\b/i;
 // A code brief must let the coder check itself: a concrete test / build / lint command,
 // or an explicit "verify: n/a <reason>".
@@ -387,9 +397,15 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   const desc = String(description || '').trim();
   const t = String(type || '');
   const hay = `${t} ${desc}`.trim() || String(prompt || '').slice(0, 400);
+  // 'Write' + a code object is a code first verb (operator decision, 2026-10-02): the
+  // verifier type hint must not override it, so "Write the payment module" from a tester /
+  // "Write e2e tests for checkout" from an e2e-runner routes to the coder, never the verify
+  // model. Only the FIRST verb "write" counts, so "Run tests and write a summary" stays
+  // verify-run.
+  const writeCodeFirstVerb = WRITE_FIRST_VERB.test(desc) && CODE_OBJECT.test(desc);
   const firstIntent = PLAN_REVIEW_FIRST_VERB.test(desc) ? 'review'
     : VERIFY_FIRST_VERB.test(desc) ? 'verify'
-      : EXEC_FIRST_VERB.test(desc) ? 'exec'
+      : (EXEC_FIRST_VERB.test(desc) || writeCodeFirstVerb) ? 'exec'
         : NEUTRAL_FIRST_VERB.test(desc) ? 'neutral'
           : null;
   const planAt = hay.search(PLAN_REVIEW_INTENT);

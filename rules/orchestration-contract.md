@@ -108,8 +108,15 @@ over later nouns: `Review ...`/`Plan ...` are review work, `Verify ...`/`Test ..
 `Generate code/assets/components ...` are code work.
 The operational first verbs `commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`,
 `deploy`, `update`, and `write` suppress later `review`, `plan`, or `design` tokens, but later
-code intent still routes to code. Review-oriented `subagent_type` values remain review signals
-unless the description contains code intent, which wins when both signals are present. A
+code intent still routes to code. `Write ...` is the exception: `write` followed by a code
+object — `module`, `function`, `class`, `component`, `test`/`tests`, `code`, `implementation`,
+`endpoint`, `handler`, `script`, `migration`, `hook`, `parser`, `layer`, `service`, `feature` —
+is code intent that routes to the coder (verify command + `Owns:` in a shared workspace, author
+recorded), even from a `tester` / `verifier` / `e2e-runner` type, while `write` followed by a
+document object — `docs`, `plan`, `report`, `README`, `notes`, `summary`, `release notes`,
+`commit message`, `changelog` — stays operational. Review-oriented `subagent_type` values remain
+review signals unless the description contains code intent, which wins when both signals are
+present. A
 `tester` / `verifier` / `browser-verifier` / `e2e-runner` `subagent_type` is verify-run work.
 A brief that both reviews and verifies (`Review and verify X`) counts as review — the stronger
 model — so it is never locked out of the review model. Code intent

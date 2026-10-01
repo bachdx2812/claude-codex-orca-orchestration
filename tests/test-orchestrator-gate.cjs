@@ -2424,6 +2424,31 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     check(`a ${type} type with a code first verb is exec: "${desc}"`,
       [c.wantsExec, c.wantsVerify], [true, false]);
   }
+  // 'Write' + a code object is a code first verb (operator decision, 2026-10-02): it routes
+  // to the coder even from a verifier subagent_type, while 'Write' + a document/plan object
+  // stays operational, and a later write inside a verify-run summary stays verify-run.
+  for (const [desc, type] of [
+    ['Write the payment module', 'tester'],
+    ['Write e2e tests for checkout', 'e2e-runner'],
+    ['Write the cache layer', 'general-purpose'],
+  ]) {
+    const c = gate.classifyDispatch(desc, type, '');
+    check(`Write + a code object is exec: "${desc}" (${type})`,
+      [c.wantsExec, c.wantsVerify, c.wantsPlanReview], [true, false, false]);
+  }
+  for (const [desc, type] of [
+    ['Write the release notes', 'content-creator'],
+    ['Write a plan for X', 'planner'],
+    ['Write docs for the API', 'docs-manager'],
+  ]) {
+    const c = gate.classifyDispatch(desc, type, '');
+    check(`Write + a document object stays non-exec: "${desc}" (${type})`, c.wantsExec, false);
+  }
+  {
+    const c = gate.classifyDispatch('Run tests and write a summary', 'tester', '');
+    check('a later write in a verify-run summary stays verify',
+      [c.wantsVerify, c.wantsExec], [true, false]);
+  }
   // Low 2: bare "code"/"branch" are not review nouns; running checks stays verify-run.
   for (const desc of ['Run tests on the PR branch', 'Verify the code compiles']) {
     const c = gate.classifyDispatch(desc, 'general-purpose', '');

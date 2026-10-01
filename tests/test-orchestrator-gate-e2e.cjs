@@ -588,6 +588,55 @@ expect('a neutral first verb still classifies code-reviewer as review work',
       sid, { tool_use_id: `toolu_vtev_${++seq}` }), ALLOW, env);
 }
 
+// 'Write' + a code object is a code first verb (operator decision, 2026-10-02): it routes to
+// the coder even from a verifier subagent_type, so with Codex eligible the dispatch is refused
+// on sonnet (route-execution-to-codex), never run as verify. 'Write' + a document/plan object
+// stays operational and is allowed on sonnet, and a later write inside a verify-run summary
+// stays verify-run.
+{
+  const dir = path.join(RUN_DIR, 'write-verb-code');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'write-verb-code';
+  let seq = 0;
+  for (const row of [
+    { subagent_type: 'tester', description: 'Write the payment module' },
+    { subagent_type: 'e2e-runner', description: 'Write e2e tests for checkout' },
+    { subagent_type: 'general-purpose', description: 'Write the cache layer' },
+  ]) {
+    const r = invoke(dispatch(Object.assign({ model: 'sonnet' }, row), sid, { tool_use_id: `toolu_wvc_${++seq}` }), env);
+    if (r.code === DENY && /route-execution-to-codex/.test(r.err)) pass += 1;
+    else failures.push(`Write + a code object must route to the coder (${row.description} from ${row.subagent_type}): exit=${r.code}, err=${r.err.slice(0, 120)}`);
+  }
+  checkBool('Write + a code object does not record a code author when refused',
+    (() => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor; } catch { return null; } })(), null);
+  for (const row of [
+    { subagent_type: 'content-creator', description: 'Write the release notes' },
+    { subagent_type: 'planner', description: 'Write a plan for X' },
+    { subagent_type: 'docs-manager', description: 'Write docs for the API' },
+  ]) {
+    expect(`Write + a document object stays operational (sonnet allowed): ${row.description} (${row.subagent_type})`,
+      dispatch(Object.assign({ model: 'sonnet' }, row), sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
+  }
+  expect('a later write in a verify-run summary stays verify (sonnet allowed)',
+    dispatch({ subagent_type: 'tester', description: 'Run tests and write a summary', model: 'sonnet' },
+      sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
+}
+
 // R1: a verify/test verb coordinated with a later NON-code action is verify-run (sonnet), not
 // code — "Run tests and verify the fix works" runs checks, it does not write code. With Codex
 // eligible, a misclassification as exec would route to Codex and refuse, so ALLOW on sonnet
