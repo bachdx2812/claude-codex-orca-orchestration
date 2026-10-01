@@ -560,6 +560,85 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     heartbeat.isWorktreeIdle({ liveTerminalCount: 0, lastOutputAt: 0 }, 1_000_000, 60), true);
   check('isWorktreeIdle is false when lastOutputAt is missing but a terminal is live',
     heartbeat.isWorktreeIdle({ liveTerminalCount: 1, lastOutputAt: 0 }, 1_000_000, 60), false);
+
+  // --- autoCloseDoneWorker / actOnDoneWorktree (auto-close done workers, 2026-10-01) ----
+  {
+    const doneRow = (overrides = {}) => ({
+      dispatchId: 'ctx_done', taskId: 'task_done', workerState: 'succeeded',
+      dispatchStatus: 'completed', terminalState: 'active', agentTerminalHandle: 'term_done',
+      worktreePaths: ['/wt/done'], ...overrides,
+    });
+    const recordingOrca = () => {
+      const calls = [];
+      return { calls, run: (args) => { calls.push(args); return { ok: true }; } };
+    };
+
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.autoCloseDoneWorker(doneRow(), { runOrca: orcaRec.run, git: fakeGit() });
+      check('a done, clean, fully-pushed worker is released and its terminal closed',
+        r && r.kind === 'closed' && r.line === 'WORKER CLOSED ctx_done (done, terminal closed, worktree kept)', true);
+      check('the close path runs worker-release then terminal close',
+        JSON.stringify(orcaRec.calls),
+        JSON.stringify([
+          ['orchestration', 'worker-release', '--dispatch', 'ctx_done'],
+          ['terminal', 'close', '--terminal', 'term_done'],
+        ]));
+    }
+    check('dispatchStatus alone (succeeded/completed) also counts as done',
+      heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'running', dispatchStatus: 'succeeded' }),
+        { runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
+    check('a failed worker is never auto-closed (keeps the panel-decision flow)',
+      heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'failed', dispatchStatus: 'failed' }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('a stopped worker is never auto-closed',
+      heartbeat.autoCloseDoneWorker(doneRow({ workerState: 'stopped', dispatchStatus: 'stopped' }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('a worker the panel explicitly retained for reuse is never auto-closed',
+      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
+        { retained: true, runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('a worker whose terminal is already released is never auto-closed',
+      heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'released' }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
+    check('a done worker with no known worktree path is never auto-closed (uncertainty)',
+      heartbeat.autoCloseDoneWorker(doneRow({ worktreePaths: [] }),
+        { runOrca: recordingOrca().run, git: fakeGit() }), null);
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.autoCloseDoneWorker(doneRow(),
+        { runOrca: orcaRec.run, git: fakeGit({ status: { status: 0, stdout: ' M x\n' } }) });
+      check('a done worker with a dirty worktree is flagged WORKER DONE BUT UNSAVED, never released',
+        r && r.kind === 'unsaved' && r.line.startsWith('WORKER DONE BUT UNSAVED ctx_done') &&
+          orcaRec.calls.length === 0, true);
+    }
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.autoCloseDoneWorker(doneRow(),
+        { runOrca: orcaRec.run, git: fakeGit({ revList: { status: 0, stdout: 'deadbeef\n' } }) });
+      check('a done worker with unpushed commits is flagged WORKER DONE BUT UNSAVED, never released',
+        r && r.kind === 'unsaved' && orcaRec.calls.length === 0, true);
+    }
+    check('a git failure means "not confirmed clean" — unsaved, never released',
+      heartbeat.autoCloseDoneWorker(doneRow(),
+        { runOrca: recordingOrca().run, git: fakeGit({ status: null }) })?.kind, 'unsaved');
+
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.actOnDoneWorktree(mergedIdle, 'PR #12 merged',
+        { mode: 'remove', runOrca: orcaRec.run });
+      check('remove mode runs orca worktree rm on the done worktree itself',
+        r.kind === 'removed' && r.line.startsWith('WORKTREE REMOVED a (PR #12 merged)') &&
+        JSON.stringify(orcaRec.calls) === JSON.stringify([['worktree', 'rm', '--worktree', 'path:/wt/a']]), true);
+    }
+    {
+      const orcaRec = recordingOrca();
+      const r = heartbeat.actOnDoneWorktree(mergedIdle, 'PR #12 merged',
+        { mode: 'remind', runOrca: orcaRec.run });
+      check('remind mode only formats the wake event and never runs orca',
+        r.kind === 'remind' && r.line.startsWith('DONE worktree a (PR #12 merged') &&
+          orcaRec.calls.length === 0, true);
+    }
+  }
 }
 
 // --- config.cjs --------------------------------------------------------------
@@ -627,36 +706,52 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   if (beforeQuotaCache === undefined) delete process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS;
   else process.env.ORCH_CODEX_QUOTA_CACHE_SECONDS = beforeQuotaCache;
 
-  check('default closeDoneWorktrees is true', defaults.closeDoneWorktrees, true);
+  check('default closeDoneWorktrees mode is remind', defaults.closeDoneWorktrees, 'remind');
   check('closeDoneWorktreesEnabled defaults to the config value', config.closeDoneWorktreesEnabled(defaults), true);
+  check('closeDoneWorktreesMode defaults to the config value', config.closeDoneWorktreesMode(defaults), 'remind');
+
+  const wtRemove = withConfig({ closeDoneWorktrees: 'remove' }, () => config.loadConfig());
+  check('closeDoneWorktrees:"remove" is kept as-is with no warning',
+    wtRemove.closeDoneWorktrees === 'remove' && wtRemove.warnings.length === 0, true);
+  check('closeDoneWorktreesMode reads remove from the config', config.closeDoneWorktreesMode(wtRemove), 'remove');
 
   const wtOff = withConfig({ closeDoneWorktrees: false }, () => config.loadConfig());
-  check('closeDoneWorktrees:false is kept as-is with no warning', wtOff.closeDoneWorktrees, false);
-  check('closeDoneWorktreesEnabled respects a false config value', config.closeDoneWorktreesEnabled(wtOff), false);
+  check('legacy closeDoneWorktrees:false maps to off with no warning',
+    wtOff.closeDoneWorktrees === 'off' && wtOff.warnings.length === 0, true);
+  check('closeDoneWorktreesEnabled respects an off config value', config.closeDoneWorktreesEnabled(wtOff), false);
+  const wtLegacyTrue = withConfig({ closeDoneWorktrees: true }, () => config.loadConfig());
+  check('legacy closeDoneWorktrees:true maps to remind', wtLegacyTrue.closeDoneWorktrees, 'remind');
 
   const wtBad = withConfig({ closeDoneWorktrees: 'yes' }, () => config.loadConfig());
-  check('a non-boolean closeDoneWorktrees falls back to the default', wtBad.closeDoneWorktrees, true);
-  check('a non-boolean closeDoneWorktrees produces a warning', wtBad.warnings.length > 0, true);
+  check('an unrecognized closeDoneWorktrees falls back to the default', wtBad.closeDoneWorktrees, 'remind');
+  check('an unrecognized closeDoneWorktrees produces a warning', wtBad.warnings.length > 0, true);
 
   const beforeWt = process.env.ORCH_CLOSE_DONE_WORKTREES;
   process.env.ORCH_CLOSE_DONE_WORKTREES = '0';
-  check('ORCH_CLOSE_DONE_WORKTREES=0 disables it even when config says true',
+  check('ORCH_CLOSE_DONE_WORKTREES=0 disables it even when config says remind',
     config.closeDoneWorktreesEnabled(defaults), false);
   process.env.ORCH_CLOSE_DONE_WORKTREES = 'false';
   check('ORCH_CLOSE_DONE_WORKTREES=false also disables it', config.closeDoneWorktreesEnabled(defaults), false);
   process.env.ORCH_CLOSE_DONE_WORKTREES = '1';
-  check('an explicit "1" override enables it even when config says false', config.closeDoneWorktreesEnabled(wtOff), true);
+  check('an explicit "1" override enables it (remind) even when config says off',
+    config.closeDoneWorktreesMode(wtOff), 'remind');
   process.env.ORCH_CLOSE_DONE_WORKTREES = 'TRUE';
-  check('an explicit "TRUE" override (case-insensitive) enables it even when config says false',
+  check('an explicit "TRUE" override (case-insensitive) enables it even when config says off',
     config.closeDoneWorktreesEnabled(wtOff), true);
-  // Item L2: anything other than an explicit 1/true/0/false — including an empty string —
-  // defers to the config value rather than being read as "set at all, so true".
+  process.env.ORCH_CLOSE_DONE_WORKTREES = 'remove';
+  check('an explicit "remove" override selects remove mode even when config says remind',
+    config.closeDoneWorktreesMode(defaults), 'remove');
+  process.env.ORCH_CLOSE_DONE_WORKTREES = 'off';
+  check('an explicit "off" override disables it even when config says remove',
+    config.closeDoneWorktreesMode(wtRemove), 'off');
+  // Item L2: anything other than an explicit mode/legacy spelling — including an empty
+  // string — defers to the config value rather than being read as "set at all, so true".
   process.env.ORCH_CLOSE_DONE_WORKTREES = '';
-  check('an empty override defers to config (true default)', config.closeDoneWorktreesEnabled(defaults), true);
-  check('an empty override defers to config (false)', config.closeDoneWorktreesEnabled(wtOff), false);
+  check('an empty override defers to config (remind default)', config.closeDoneWorktreesMode(defaults), 'remind');
+  check('an empty override defers to config (off)', config.closeDoneWorktreesMode(wtOff), 'off');
   process.env.ORCH_CLOSE_DONE_WORKTREES = 'garbage';
-  check('a garbage override defers to config (true default)', config.closeDoneWorktreesEnabled(defaults), true);
-  check('a garbage override defers to config (false)', config.closeDoneWorktreesEnabled(wtOff), false);
+  check('a garbage override defers to config (remind default)', config.closeDoneWorktreesMode(defaults), 'remind');
+  check('a garbage override defers to config (off)', config.closeDoneWorktreesMode(wtOff), 'off');
   if (beforeWt === undefined) delete process.env.ORCH_CLOSE_DONE_WORKTREES; else process.env.ORCH_CLOSE_DONE_WORKTREES = beforeWt;
 
   // --- max-parallel-agents config fields (parallelCoreFraction / maxParallelAgents) -----

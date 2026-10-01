@@ -70,7 +70,10 @@ const DEFAULT_CONFIG = {
   maxParallelKimiWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
-  closeDoneWorktrees: true, // heartbeat: remind on a merged/closed-PR worktree with no live terminal
+  // heartbeat done-worktree handling: 'remove' (run `orca worktree rm` itself), 'remind'
+  // (wake the panel with the rm command, never run it) or 'off'. Legacy booleans still
+  // load: true -> 'remind', false -> 'off'.
+  closeDoneWorktrees: 'remind',
   // Machine-wide budget cap on live Orca workers + in-session subagents, MACHINE-wide (summed
   // across every session's state file, not just this one) — the resource being budgeted is
   // this machine's cores, not any one session's own concurrency. `maxParallelAgents: null`
@@ -82,6 +85,21 @@ const DEFAULT_CONFIG = {
 
 const ACTIVATION_VALUES = new Set(['orca-only', 'always', 'off']);
 const EFFORT_VALUES = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+const CLOSE_DONE_WORKTREES_MODES = new Set(['remove', 'remind', 'off']);
+
+/** Normalizes a closeDoneWorktrees value (config or env) to 'remove'|'remind'|'off', or
+ * null when it is not any accepted spelling (legacy booleans included). */
+function normalizeCloseDoneWorktrees(value) {
+  if (value === true) return 'remind';
+  if (value === false) return 'off';
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (CLOSE_DONE_WORKTREES_MODES.has(v)) return v;
+    if (v === '1' || v === 'true') return 'remind';
+    if (v === '0' || v === 'false') return 'off';
+  }
+  return null;
+}
 
 function deepMerge(base, override) {
   if (typeof override !== 'object' || override === null || Array.isArray(override)) {
@@ -329,9 +347,12 @@ function loadConfig() {
   if (!Array.isArray(merged.agents.escalation)) merged.agents.escalation = DEFAULT_CONFIG.agents.escalation;
   if (!Array.isArray(merged.agents.lookup)) merged.agents.lookup = DEFAULT_CONFIG.agents.lookup;
 
-  if (typeof merged.closeDoneWorktrees !== 'boolean') {
-    warnings.push(`closeDoneWorktrees "${merged.closeDoneWorktrees}" is not a boolean; using ${DEFAULT_CONFIG.closeDoneWorktrees}.`);
+  const closeDoneMode = normalizeCloseDoneWorktrees(merged.closeDoneWorktrees);
+  if (!closeDoneMode) {
+    warnings.push(`closeDoneWorktrees "${merged.closeDoneWorktrees}" is not remove|remind|off (or a legacy boolean); using "${DEFAULT_CONFIG.closeDoneWorktrees}".`);
     merged.closeDoneWorktrees = DEFAULT_CONFIG.closeDoneWorktrees;
+  } else {
+    merged.closeDoneWorktrees = closeDoneMode;
   }
 
   // M2: only an actual JSON number is accepted here — `Number("")`/`Number(" ")` coerce to
@@ -509,22 +530,27 @@ function ownershipClaimTtlMinutes(cfg) {
 }
 
 /**
- * Whether the heartbeat should remind about done-but-open Orca worktrees (a linked PR
- * already merged/closed with no live terminal on it). `ORCH_CLOSE_DONE_WORKTREES` only
- * ever forces an explicit answer: `1`/`true` enables it, `0`/`false` disables it (both
- * case-insensitively). Any other value — including an empty string, or the variable being
- * unset entirely — defers to the config rather than silently forcing it on, which is what
- * a bare "anything set at all counts as true" reading would otherwise do to a typo or an
- * accidentally-empty override.
+ * What the heartbeat does about done-but-open Orca worktrees (a linked PR/MR already
+ * merged/closed, idle, clean, no live terminal): 'remove' runs `orca worktree rm` itself,
+ * 'remind' wakes the panel with the exact rm command and never runs it, 'off' does
+ * nothing. `ORCH_CLOSE_DONE_WORKTREES` overrides the mode for one process; it only ever
+ * forces an explicit answer: remove|remind|off (case-insensitively), or the legacy
+ * `1`/`true` (enable = remind) and `0`/`false` (disable = off). Any other value —
+ * including an empty string, or the variable being unset entirely — defers to the config
+ * rather than silently forcing a mode on.
  */
-function closeDoneWorktreesEnabled(cfg) {
+function closeDoneWorktreesMode(cfg) {
   const envOverride = process.env.ORCH_CLOSE_DONE_WORKTREES;
   if (envOverride !== undefined) {
-    const v = envOverride.trim().toLowerCase();
-    if (v === '1' || v === 'true') return true;
-    if (v === '0' || v === 'false') return false;
+    const mode = normalizeCloseDoneWorktrees(envOverride);
+    if (mode) return mode;
   }
-  return !!cfg.closeDoneWorktrees;
+  return normalizeCloseDoneWorktrees(cfg.closeDoneWorktrees) || DEFAULT_CONFIG.closeDoneWorktrees;
+}
+
+/** Backward-compatible boolean view: anything but 'off' is enabled. */
+function closeDoneWorktreesEnabled(cfg) {
+  return closeDoneWorktreesMode(cfg) !== 'off';
 }
 
 /**
@@ -564,6 +590,7 @@ function maxParallelAgents(cfg) {
 module.exports = {
   GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
+  closeDoneWorktreesMode,
   parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
   stallSeconds, autoResumeAfterReset,

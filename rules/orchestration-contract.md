@@ -253,7 +253,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
-  "closeDoneWorktrees": true,
+  "closeDoneWorktrees": "remove",
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null
 }
@@ -334,12 +334,19 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `ownershipClaimTtlMinutes`: integer 1-10080, default 120. How long a background
   in-session Agent's `Owns:` claim survives without an explicit release before it
   auto-expires. Overridable for one process with `ORCH_CLAIM_TTL_MINUTES`.
-- `closeDoneWorktrees`: boolean, default `true`. Whether the heartbeat daemon reminds the
-  panel about a worktree that is idle, accepted, and clean (see "Close finished worker
-  panels" above for the full definition), and that holds no live terminal. Overridable for
-  one process with `ORCH_CLOSE_DONE_WORKTREES` set to `1`/`true` (force on) or `0`/`false`
-  (force off) — any other value, including an empty string or the variable being unset,
-  defers to the config rather than being read as "set at all, so true".
+- `closeDoneWorktrees`: `remove` | `remind` | `off`, default `remind` (this operator's
+  config sets `remove`). What the heartbeat does about a worktree that is idle, accepted,
+  and clean (see "Close finished worker panels" above for the full definition) and holds
+  no live terminal: `remove` runs `orca worktree rm --worktree path:<path>` itself and logs
+  an informational `WORKTREE REMOVED` line (no panel decision needed); `remind` wakes the
+  panel with the exact, quoted rm command and never runs it; `off` does nothing. The
+  never-remove guards are identical in both modes: never an open PR/MR, never uncommitted
+  or unpushed work, never the main worktree, never another session's worktree. Legacy
+  booleans still load (`true` -> `remind`, `false` -> `off`). Overridable for one process
+  with `ORCH_CLOSE_DONE_WORKTREES` set to `remove`/`remind`/`off`, or the legacy
+  `1`/`true` (= remind) and `0`/`false` (= off) — any other value, including an empty
+  string or the variable being unset, defers to the config rather than being read as
+  "set at all, so true".
 - `parallelCoreFraction`: number 0.1-1, default `0.8`. The share of this machine's cores
   (`os.availableParallelism?.() || os.cpus().length`, read fresh at every check) the
   machine-wide `max-parallel-agents` budget derives its limit from when `maxParallelAgents`
@@ -377,12 +384,24 @@ needed.
 The gate prints the exact command to start the heartbeat daemon the moment it sees a
 worker start (built from this install's own `process.execPath` and `__dirname`, so it is
 correct wherever the hooks were installed). The daemon polls Orca and exits the moment
-something needs a decision — a worker changing state, a finished worker still holding a
-terminal, a supervised terminal quiet longer than `heartbeat.idleSeconds`, a Codex session
+something needs a decision — a worker changing state, a failed/stopped worker still
+holding a terminal, a supervised terminal quiet longer than `heartbeat.idleSeconds`, a Codex session
 that lost its app-server connection, a supervised worker making no real progress for its
 stall threshold, an orphaned terminal, or a rate-limit marker. A background process exiting re-invokes the panel, so
 its exit is the wake-up: the panel does not have to remember to poll, and it costs nothing
 while everything is healthy.
+
+A worker Orca reports successfully done (`workerState`/`dispatchStatus`
+succeeded/completed) no longer needs that decision at all (binding operator decision,
+2026-10-01): when its worktree is provably clean (`git status --porcelain` empty) with
+nothing unpushed (`git rev-list @{u}..HEAD` empty, or — with no upstream — HEAD contained
+in the resolved base branch), the daemon itself runs `orca orchestration worker-release
+--dispatch <id>` then `orca terminal close --terminal <handle>` and logs an informational
+`WORKER CLOSED <id> (done, terminal closed, worktree kept)` line without waking the panel.
+It never touches a worker the panel explicitly `worker-retain`ed for reuse, a failed or
+stopped worker (those keep the retain-or-release event below), or one whose worktree is
+dirty or unpushed — the latter wakes the panel once per session with `WORKER DONE BUT
+UNSAVED <id>` and keeps the terminal open.
 
 IDLE, orphan and rate-limit terminal events are limited to this session's own fleet: the
 run-scoped `worker-list` terminal handles plus bare terminals registered in this session's
@@ -571,20 +590,27 @@ many worktrees can never starve that file into looking dead — EXCEPT the very 
 (seeding) pass, which never truncates on that budget: a row the seeding pass could not
 reach in time used to fall through to a later tick's steady-state branch and fire as a
 brand-new wake event, even though it had been part of the original backlog all along.
-The event line, `DONE worktree <name> (<reason>, no live terminal|quiet terminal(s)) — ...
+What happens next depends on `closeDoneWorktrees` (`remove`|`remind`|`off`, default
+`remind`; this operator's config sets `remove`). In `remove` mode the daemon runs
+`orca worktree rm --worktree path:<path>` itself and logs an informational
+`WORKTREE REMOVED <name> (<reason>) — <path>` line — no panel decision is needed, and the
+same never-remove guards above (open PR/MR, uncommitted or unpushed work, the main
+worktree, another session's worktree) still apply before anything is removed. In `remind`
+mode the event line, `DONE worktree <name> (<reason>, no live terminal|quiet terminal(s)) — ...
 orca worktree rm --worktree 'path:<path>'` (control characters stripped, the path
-single-quote-escaped), names which of the above fired and which idle leg actually applied.
-It never removes anything itself — only
+single-quote-escaped), names which of the above fired and which idle leg actually applied,
+and never removes anything itself — only
 the panel decides, after checking `git status` and unpushed commits, same as the manual
 sweep above. Only a worktree that *becomes* done-but-open after the daemon's own
-session-scoped record of what it has already reported wakes the panel; backlog already
+session-scoped record of what it has already reported produces a line; backlog already
 done-but-open at a session's first-ever daemon start is listed once in a startup summary
-instead. A LATER restart within the same session is judged against that same persisted
+instead (in `remove` mode, removed right away). A LATER restart within the same
+session is judged against that same persisted
 record: anything newly done-but-open — it became so while no daemon in this session was
 watching — is reported as a real wake event, not silently re-absorbed as if it had always
-been backlog. Disable it with `closeDoneWorktrees: false` in the config, or
-`ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false` for one process (`1`/`true` forces it on;
-any other value defers to the config).
+been backlog. Disable it with `closeDoneWorktrees: "off"` in the config, or
+`ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false`/`off` for one process (`1`/`true` forces
+remind mode; `remove` forces remove mode; any other value defers to the config).
 
 ## Parallel Codex workers and file ownership
 

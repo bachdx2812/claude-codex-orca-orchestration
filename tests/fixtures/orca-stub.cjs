@@ -45,6 +45,31 @@ const fs = require('fs');
 const args = process.argv.slice(2);
 const handle = process.env.STUB_WORKER_HANDLE;
 
+// Mutating calls (worker-release, terminal close, worktree rm) have no canned reply shape
+// to fake beyond "it worked"; STUB_ORCA_CALLS_LOG records each one (one args-joined line
+// per invocation) so a test can assert the daemon actually ran them.
+function recordCall() {
+  if (process.env.STUB_ORCA_CALLS_LOG) {
+    try { fs.appendFileSync(process.env.STUB_ORCA_CALLS_LOG, `${args.join(' ')}\n`); } catch {}
+  }
+}
+
+if (args[0] === 'orchestration' && args[1] === 'worker-release') {
+  recordCall();
+  process.stdout.write(JSON.stringify({ ok: true, result: {} }));
+  process.exit(0);
+}
+if (args[0] === 'terminal' && args[1] === 'close') {
+  recordCall();
+  process.stdout.write(JSON.stringify({ ok: true, result: {} }));
+  process.exit(0);
+}
+if (args[0] === 'worktree' && args[1] === 'rm') {
+  recordCall();
+  process.stdout.write(JSON.stringify({ ok: true, result: {} }));
+  process.exit(0);
+}
+
 if (args[0] === 'orchestration' && args[1] === 'worker-list') {
   // STUB_WORKERS_OK_FALSE=1 answers `{ ok: false }` — not a real worker list the gate may
   // reconcile against. The reply carries the REAL paging shape: `result.page = {limit,

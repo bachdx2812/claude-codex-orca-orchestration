@@ -60,7 +60,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 review/red-team, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`) or Kimi | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, making no real progress past its configured stall threshold, losing its Codex app-server connection, a finished worker still holding a terminal, this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
+| Orca worker | Codex (`gpt-5.6-sol`) or Kimi | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, making no real progress past its configured stall threshold, losing its Codex app-server connection, a failed/stopped worker still holding a terminal (a successfully-done one is released and its terminal closed by the daemon itself), this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -208,8 +208,15 @@ in 2h`, it gets its own scheduler and orchestration-specific resume message. Set
 turn, so the resumed panel must re-dispatch them; prefer Orca workers for long resumable code
 tasks.
 
-**Close finished worker panels.** After a worker finishes: read its result, then `orca
-orchestration worker-release --dispatch <id>`. Once its PR is merged or closed and the
+**Close finished worker panels.** The heartbeat closes them itself (operator decision,
+2026-10-01): when a worker Orca reports successfully done (succeeded/completed) and its
+worktree is clean with nothing unpushed, the daemon runs `orca orchestration
+worker-release --dispatch <id>` and `orca terminal close --terminal <handle>` on its own
+and logs `WORKER CLOSED <id> (done, terminal closed, worktree kept)` — no panel decision
+needed. A worker the panel explicitly `worker-retain`ed for reuse is left alone; a done
+worker with uncommitted or unpushed work wakes the panel once with `WORKER DONE BUT
+UNSAVED <id>` and keeps its terminal; failed/stopped workers keep the manual flow: read
+the result, then `worker-release` yourself. Once a worker's PR is merged or closed and the
 worktree is clean (`git status --porcelain` empty, nothing unpushed) — close the worktree
 too: `orca worktree rm --worktree path:<path>`. Never remove a worktree with an open PR or
 unsaved work; sweep periodically with `orca worktree ps --json`. `orca-heartbeat.cjs`
@@ -232,8 +239,13 @@ above without ever recording a commit action, so both signals are required); **i
 (no live terminal at all, or `worktree ps`'s own aggregate `lastOutputAt` already past the
 heartbeat's idle threshold); and **clean** (`git status --porcelain` empty and no unpushed
 commits — or, lacking an upstream entirely, HEAD contained in that same resolved base) —
-naming which of these fired in its message, and the exact, quoted `orca worktree rm`
-command, but never running it itself. Every git call only ever runs for a worktree that
+naming which of these fired in its message. What it does then depends on
+`closeDoneWorktrees` (`remove`|`remind`|`off`, default `remind`; this operator's config
+sets `remove`): in `remove` mode it runs `orca worktree rm --worktree path:<path>` itself
+and logs an informational `WORKTREE REMOVED <name> (<reason>) — <path>` line, subject to
+exactly the never-remove guards above (open PR/MR, uncommitted or unpushed work, the main
+worktree, another session's worktree); in `remind` mode it wakes the panel with the exact,
+quoted `orca worktree rm` command and never runs it itself. Every git call only ever runs for a worktree that
 already passed the idle check, each bounded to ~3s, and any git failure or uncertainty
 (unreadable repo, timeout, no resolvable base, empty reflog) means "not a candidate", never
 a guess. The very FIRST (seeding) pass never truncates its evaluation to the per-tick git
@@ -245,8 +257,9 @@ of what it already reported wakes the panel; genuine backlog at a session's firs
 daemon start is listed once in a summary line instead — a LATER restart within the same
 session that finds something newly done-but-open (it became so while no daemon was
 watching) reports it as a real wake event, not silently-reabsorbed backlog. Disable with
-`closeDoneWorktrees: false` or `ORCH_CLOSE_DONE_WORKTREES` set to `1`/`true` (enable) or
-`0`/`false` (disable) — any other value, including empty, defers to the config.
+`closeDoneWorktrees: "off"` or `ORCH_CLOSE_DONE_WORKTREES` set to `remove`/`remind`/`off`
+(or the legacy `1`/`true` = remind, `0`/`false` = off) — any other value, including empty,
+defers to the config.
 
 **Enforced vs advisory.** Enforced: gates apply to the main panel only (subagents and
 Orca-worker sessions are never gated); `Stop` refuses to end the session while a worker is

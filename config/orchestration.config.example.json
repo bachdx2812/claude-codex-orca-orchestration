@@ -35,7 +35,7 @@
   "maxParallelKimiWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
-  "closeDoneWorktrees": true,
+  "closeDoneWorktrees": "remove",
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null
 }
