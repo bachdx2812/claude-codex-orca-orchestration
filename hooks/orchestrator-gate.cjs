@@ -1525,7 +1525,9 @@ function onPreToolUse(p, s, cfg) {
           if (isReviewModel && mapped !== reviewAlias) {
             if (!hasReviewEscalationReason(input, mapped)) {
               d('review-model-follows-coder',
-                `Code here was written by ${author}: review / verify it on model "${mapped}" first, not "${reviewAlias}" ` +
+                `Code here was written by ${author}: review / verify it on model "${mapped}"` +
+                (mapped === codeAlias ? ` at effort ${cfg.models.reviewEffort}` : '') +
+                ` first, not "${reviewAlias}" ` +
                 `(a model never reviews its own output; "${reviewAlias}" is reserved for code "${codeAlias}" wrote).\n` +
                 `Escalate to "${reviewAlias}" only after the "${mapped}" review cannot decide — say so in the dispatch, e.g.\n` +
                 `  "escalation: ${mapped} review could not decide ...".\n` +
@@ -1533,7 +1535,8 @@ function onPreToolUse(p, s, cfg) {
             }
           } else {
             d('route-review',
-              `Review / verify of ${author}-authored code must run on model "${mapped}".\n` +
+              `Review / verify of ${author}-authored code must run on model "${mapped}"` +
+              (mapped === codeAlias ? ` at effort ${cfg.models.reviewEffort}` : '') + '.\n' +
               `Re-dispatch with model: "${mapped}". ` +
               `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
           }
