@@ -40,6 +40,10 @@ const KIMI_LIVE_TIMEOUT_MS = 3500;
 const KIMI_LIVE_CACHE_FILE = 'kimi-quota-live.json';
 const KIMI_LIVE_PROBE_LOCK = '.kimi-quota-probe.lock';
 const KIMI_LIVE_PROBE = path.join(__dirname, 'kimi-quota-probe.cjs');
+const DEEPSEEK_LIVE_TIMEOUT_MS = 4000;
+const DEEPSEEK_LIVE_CACHE_FILE = 'deepseek-quota-live.json';
+const DEEPSEEK_LIVE_PROBE_LOCK = '.deepseek-quota-probe.lock';
+const DEEPSEEK_LIVE_PROBE = path.join(__dirname, 'deepseek-quota-probe.cjs');
 const authStateCache = new Map();
 
 function codexSessionsDir() {
@@ -378,7 +382,7 @@ function cachedKimiResult(entry, now) {
 // window, resetAt per window, readAt — so a later failure can still produce an ESTIMATE:
 // a window whose reset time has passed counts as 0% used, every other window keeps its last
 // reading, and the tightest window wins. Unknown only when a coder was never read at all.
-const LAST_KNOWN_FILE = { codex: 'codex-quota-last-known.json', kimi: 'kimi-quota-last-known.json' };
+const LAST_KNOWN_FILE = { codex: 'codex-quota-last-known.json', kimi: 'kimi-quota-last-known.json', deepseek: 'deepseek-quota-last-known.json' };
 // A persisted window with NO reset time is only trusted for this long; past it the window
 // is dropped (a reading that old says nothing about current usage), and if no windows are
 // left the estimate is unknown rather than pinning a coder as exhausted forever (B1).
@@ -469,6 +473,117 @@ function kimiQuota(now = Date.now(), options = {}) {
 function readFreshKimiCache(stateDir, cacheSeconds, now = Date.now()) {
   return liveCache().readFresh({
     stateDir, cacheFile: KIMI_LIVE_CACHE_FILE, cacheSeconds, now, validate: cachedKimiResult,
+  });
+}
+
+// --- DeepSeek (opencode): daily spend cap + optional balance check -------------
+// DeepSeek is pay-per-use with no 5-hour window (operator decision, 2026-10-01): headroom
+// is the remaining share of a DAILY SPEND CAP (`deepseekDailySpendCapUsd`, 0 = unlimited —
+// only an exhausted balance stops it). Today's spend comes from opencode via the spawned
+// probe; unreadable spend with a positive cap counts as UNKNOWN (ranked
+// `unknownHeadroomAssumed` by the pool), never as exhausted.
+
+function deepseekProbeEnv(env = process.env) {
+  const out = {};
+  for (const key of ['ORCH_OPENCODE_BIN', 'ORCH_DEEPSEEK_BALANCE_URL', 'DEEPSEEK_API_KEY', 'PATH', 'HOME']) {
+    if (Object.prototype.hasOwnProperty.call(env, key)) out[key] = String(env[key]);
+  }
+  return out;
+}
+
+function deepseekLiveResult(now, env) {
+  const probe = spawnSync(process.execPath, [DEEPSEEK_LIVE_PROBE], {
+    encoding: 'utf8',
+    timeout: DEEPSEEK_LIVE_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+    env: deepseekProbeEnv(env),
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const stdout = String(probe.stdout || '').trim();
+  if (probe.error || !stdout) return { failed: true, kind: 'timeout' };
+  try {
+    const reply = JSON.parse(stdout);
+    if (probe.status !== 0 || reply.ok !== true) return { failed: true, kind: 'http' };
+    return {
+      spendUsd: typeof reply.spendUsd === 'number' && Number.isFinite(reply.spendUsd) ? reply.spendUsd : null,
+      balanceExhausted: reply.balanceExhausted === true ? true : reply.balanceExhausted === false ? false : null,
+    };
+  } catch {
+    return { failed: true, kind: 'parse' };
+  }
+}
+
+/** Seconds at which the current local day ends — a spend reading's natural reset time. */
+function nextMidnightSeconds(now) {
+  const d = new Date(now);
+  d.setHours(24, 0, 0, 0);
+  return Math.floor(d.getTime() / 1000);
+}
+
+/**
+ * A cached DeepSeek reading is valid only within the same local day: spend resets at
+ * midnight, so yesterday's cached percentage must never carry into today.
+ */
+function cachedDeepseekResult(entry, now) {
+  if (!entry || typeof entry.fetchedAt !== 'number' || !Number.isFinite(entry.fetchedAt)) return null;
+  if (entry.failed === true) return {
+    failed: true, fetchedAt: entry.fetchedAt,
+    ...(typeof entry.kind === 'string' ? { kind: entry.kind } : {}),
+  };
+  if (typeof entry.usedPercent !== 'number' || !Number.isFinite(entry.usedPercent) ||
+      entry.usedPercent < 0 || entry.usedPercent > 100 ||
+      nextMidnightSeconds(entry.fetchedAt) * 1000 <= now) return null;
+  return {
+    usedPercent: entry.usedPercent, fetchedAt: entry.fetchedAt, source: 'live',
+    limitReached: entry.limitReached === true,
+    ...(entry.unlimited === true ? { unlimited: true } : {}),
+    ...(typeof entry.spendUsd === 'number' ? { spendUsd: entry.spendUsd } : {}),
+  };
+}
+
+function deepseekQuota(now = Date.now(), options = {}) {
+  const stateDir = options.stateDir || process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
+  const cacheSeconds = options.cacheSeconds === undefined ? DEFAULT_CACHE_SECONDS : options.cacheSeconds;
+  const capUsd = typeof options.dailyCapUsd === 'number' && Number.isFinite(options.dailyCapUsd) && options.dailyCapUsd >= 0
+    ? options.dailyCapUsd : 0;
+  const result = liveCache().cachedLiveProbe({
+    stateDir,
+    cacheFile: DEEPSEEK_LIVE_CACHE_FILE,
+    lockName: DEEPSEEK_LIVE_PROBE_LOCK,
+    cacheSeconds,
+    now,
+    probe: () => {
+      const live = deepseekLiveResult(now, options.env || process.env);
+      if (live.failed) return live;
+      // An exhausted balance always reads as fully used, whatever the spend picture is.
+      if (live.balanceExhausted === true) {
+        return { usedPercent: 100, limitReached: true, source: 'balance', spendUsd: live.spendUsd };
+      }
+      // Unlimited cap: no spend-based headroom at all — 0% used, spend recorded when known.
+      if (capUsd === 0) return { usedPercent: 0, unlimited: true, spendUsd: live.spendUsd };
+      if (live.spendUsd === null) return { failed: true, kind: 'spend' };
+      return { usedPercent: Math.min(100, (live.spendUsd / capUsd) * 100), spendUsd: live.spendUsd };
+    },
+    validate: cachedDeepseekResult,
+    probeTimeoutMs: DEEPSEEK_LIVE_TIMEOUT_MS,
+  });
+  if (result && !result.failed) {
+    // Persist with a midnight reset so the estimate ages out daily instead of pinning the
+    // coder exhausted across a day boundary.
+    persistLastKnownQuota(stateDir, 'deepseek', {
+      ...result,
+      windows: [{ usedPercent: result.usedPercent, resetsAt: nextMidnightSeconds(now) }],
+    }, now);
+    return result;
+  }
+  // Live read unavailable: fall back to the reset-aware estimate of the last known reading.
+  return estimatedQuota(stateDir, 'deepseek', now) || result;
+}
+
+/** Cache-only DeepSeek read for handover destination selection. Never starts a probe. */
+function readFreshDeepseekCache(stateDir, cacheSeconds, now = Date.now()) {
+  return liveCache().readFresh({
+    stateDir, cacheFile: DEEPSEEK_LIVE_CACHE_FILE, cacheSeconds, now, validate: cachedDeepseekResult,
   });
 }
 
@@ -638,7 +753,7 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
 module.exports = {
   pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
   parseLiveQuota, parseKimiUsages, kimiWindowResetMs, liveQuotaWindows, kimiQuotaWindows,
-  liveQuota, codexQuota, kimiQuota, codexAuthState,
-  readFreshCache, readFreshKimiCache, formatAge,
+  liveQuota, codexQuota, kimiQuota, deepseekQuota, codexAuthState,
+  readFreshCache, readFreshKimiCache, readFreshDeepseekCache, formatAge,
   persistLastKnownQuota, estimatedQuota, ESTIMATE_RESETLESS_WINDOW_MAX_AGE_MS,
 };
