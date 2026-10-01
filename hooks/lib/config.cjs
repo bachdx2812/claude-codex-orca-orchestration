@@ -30,6 +30,8 @@ const GATE_NAMES = [
   'max-parallel-kimi-workers',
   'max-parallel-deepseek-workers',
   'review-model-follows-coder',
+  'verify-model',
+  'route-verify',
   'code-brief-needs-owns',
   'ownership-overlap',
   'max-parallel-agents',
@@ -46,11 +48,16 @@ const DEFAULT_CONFIG = {
     codex: { alias: null, id: 'gpt-5.6-sol' },
     kimi: { alias: null, id: null },
     deepseek: { alias: null, id: null },
-    // Review model follows the code's author (operator decision, 2026-10-01): code written
-    // by an external coder is reviewed on the code model (a model never reviews its own
-    // output either), code written in-session by the code model is reviewed on the review
-    // model. Values are model aliases; tunable per coder.
-    reviewByCoder: { codex: 'sonnet', kimi: 'sonnet', deepseek: 'sonnet', sonnet: 'opus' },
+    // Verify-run work (running existing checks — CI, screenshots, play-test, post-deploy
+    // smoke — rather than reading code and judging a diff) runs on this model (operator
+    // decision, 2026-10-02): Sonnet runs the checks, Opus reads and judges the diff.
+    verify: { alias: 'sonnet', id: 'claude-sonnet-5-5', effort: 'medium' },
+    // Review model follows the code's author (operator decision, 2026-10-02): reading code
+    // and judging a diff always runs on the review model — Opus — regardless of which coder
+    // wrote it ("code by deepseek/kimi/codex MUST be reviewed by opus"). Verify-run work
+    // does NOT follow the author; it always runs on models.verify. Values are model aliases;
+    // tunable per coder.
+    reviewByCoder: { codex: 'opus', kimi: 'opus', deepseek: 'opus', sonnet: 'opus' },
     // Effort the in-session (code-model) reviewer runs at.
     reviewEffort: 'medium',
   },
@@ -212,6 +219,12 @@ function loadConfig() {
   if (typeof merged.models.code.agentType !== 'string' || !merged.models.code.agentType.trim()) {
     warnings.push(`models.code.agentType must be a non-empty string; using "${DEFAULT_CONFIG.models.code.agentType}".`);
     merged.models.code.agentType = DEFAULT_CONFIG.models.code.agentType;
+  }
+
+  // models.verify carries an effort like models.code does (the verify model runs the checks).
+  if (!EFFORT_VALUES.has(merged.models.verify.effort)) {
+    warnings.push(`models.verify.effort "${merged.models.verify.effort}" is not one of low|medium|high|xhigh|max; using "${DEFAULT_CONFIG.models.verify.effort}".`);
+    merged.models.verify.effort = DEFAULT_CONFIG.models.verify.effort;
   }
 
   // Review-by-coder map: author coder -> review model alias. Values must be model aliases
@@ -682,6 +695,18 @@ function reviewModelForCoder(cfg, author) {
 }
 
 /**
+ * The model alias verify-run work (running existing checks — CI, screenshots, play-test,
+ * post-deploy smoke) runs on. `ORCH_VERIFY_MODEL` overrides the configured alias for one
+ * process (tests, or a one-off operator preference); an empty/blank override counts as
+ * unset and defers to `models.verify.alias`.
+ */
+function verifyModelAlias(cfg) {
+  const envOverride = process.env.ORCH_VERIFY_MODEL;
+  if (envOverride !== undefined && envOverride.trim() !== '') return envOverride.trim();
+  return cfg.models.verify.alias;
+}
+
+/**
  * Minutes a background in-session Agent's `Owns:` claim survives without an explicit
  * release before it auto-expires. `ORCH_CLAIM_TTL_MINUTES` overrides for one process.
  */
@@ -759,6 +784,6 @@ module.exports = {
   parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
   deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
-  maxParallelDeepseekWorkers, reviewModelForCoder,
+  maxParallelDeepseekWorkers, reviewModelForCoder, verifyModelAlias,
   stallSeconds, autoResumeAfterReset,
 };
