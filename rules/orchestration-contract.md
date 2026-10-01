@@ -117,6 +117,16 @@ never code reviews. Only a review of code (`review`/`verify`/`audit`/`critique`/
 no planning object) follows `models.reviewByCoder` for the session's last code author, so a
 plan review can never silently migrate off the review model to the code model.
 
+The planning object is narrowed when the description itself names code work (`diff`,
+`implementation`, `PR`, `commit`, `fix`, `worker output`, `branch`, `code`): the dispatch is a
+review OF CODE that may merely cite a plan / phase / design doc for context, so only a STRONG
+planning object in the description counts — `plan`/`plans`/`plan.md`/a phase file/`red-team` —
+and the prompt body is context, not the task. A bare `phase` or `design` mention is therefore
+not planning: `Review phase 2 implementation diff`, `Review kimi worker output` (prompt cites
+`plans/x/plan.md`), `Verify codex fix` (prompt mentions the design of the cache layer) and
+`Review the PR` (prompt cites `docs/design-guidelines.md`) all stay on the coder-mapped
+reviewer (sonnet for codex/kimi/deepseek code) instead of being refused for the review model.
+
 ## Activation
 
 `config.activation` decides which sessions this gate governs at all:

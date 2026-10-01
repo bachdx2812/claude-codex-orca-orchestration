@@ -448,11 +448,18 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     { subagent_type: 'reviewer', description: 'Audit the implementation plan' },
     { subagent_type: 'reviewer', description: 'Verify plan claims against the codebase' },
     { subagent_type: 'reviewer', description: 'Review phase-2 design doc' },
-    { subagent_type: 'reviewer', description: 'Review the diff', prompt: 'Check the plan at plans/x/plan.md.' },
   ]) {
     expect(`opus plan review stays allowed after external code: ${plan.description}`,
       dispatch(Object.assign({ model: 'opus' }, plan), sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), ALLOW, env);
   }
+  // A review OF CODE that only cites a plan doc for context is not a plan review: it stays on
+  // the coder-mapped reviewer, so opus is refused and sonnet is allowed.
+  expect('a code review citing a plan in the prompt refuses opus after external code',
+    dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'opus', prompt: 'Check the plan at plans/x/plan.md.' },
+      sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), DENY, env);
+  expect('a code review citing a plan in the prompt is allowed on the mapped model',
+    dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'sonnet', prompt: 'Check the plan at plans/x/plan.md.' },
+      sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), ALLOW, env);
   expect('a plan review is not allowed to migrate to the code model after external code',
     dispatch({ subagent_type: 'reviewer', description: 'Review the plan at plans/x/plan.md', model: 'sonnet' },
       sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), DENY, env);

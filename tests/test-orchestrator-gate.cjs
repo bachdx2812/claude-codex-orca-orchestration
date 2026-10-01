@@ -2293,13 +2293,21 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   // planning work and must stay on the review model, never migrate to the code author's model.
   check('a review verb over a plan noun is still planning', gate.isPlanningReview('review the plan', 'planner'), true);
   check('a plan path is planning', gate.isPlanningReview('review the plan at plans/x/plan.md', 'reviewer'), true);
+  check('a red-team review of a phase plan is planning', gate.isPlanningReview('Red-team phase-1 plan', 'reviewer'), true);
   check('an audit of a plan is planning', gate.isPlanningReview('audit the implementation plan', 'reviewer'), true);
-  check('a plan noun in the prompt is planning', gate.isPlanningReview('review the diff', 'reviewer', 'Verify plan claims against the codebase before dispatch.'), true);
+  check('a plan noun in the prompt of a code review is context, not planning', gate.isPlanningReview('review the diff', 'reviewer', 'Verify plan claims against the codebase before dispatch.'), false);
   check('a design doc in the description is planning', gate.isPlanningReview('review phase-2 design doc', 'reviewer'), true);
   check('red-team in the type is planning', gate.isPlanningReview('audit the findings', 'red-team'), true);
   check('a phase file is planning', gate.isPlanningReview('review the phase-3 file', 'reviewer'), true);
   check('a code review with no planning object is not planning', gate.isPlanningReview('review the diff', 'reviewer'), false);
   check('an implementation review is not planning', gate.isPlanningReview('audit the implementation for races', 'reviewer'), false);
+  // A code review that only cites a plan / phase / design doc for context stays on the coder's
+  // mapped reviewer (sonnet for codex/kimi/deepseek code): when the description names code
+  // work, the prompt body is context and a bare "phase"/"design" never counts as planning.
+  check('review of a phase implementation diff is not planning', gate.isPlanningReview('Review phase 2 implementation diff', 'reviewer'), false);
+  check('kimi worker output with a plan path in the prompt is not planning', gate.isPlanningReview('Review kimi worker output', 'reviewer', 'Plan: plans/x/plan.md'), false);
+  check('a codex fix with a design mention in the prompt is not planning', gate.isPlanningReview('Verify codex fix', 'reviewer', 'against the design of the cache layer'), false);
+  check('a PR review citing a design doc in the prompt is not planning', gate.isPlanningReview('Review the PR', 'reviewer', 'Read docs/design-guidelines.md'), false);
 }
 
 {

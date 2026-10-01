@@ -239,6 +239,14 @@ const PLANNING_INTENT = /\b(plan|planning|design|red.?team|architect|architectur
 // and must stay on the review model; only code nouns (diff, implementation, PR, commit,
 // worker output, branch) route by the code's author. Operator decision, 2026-10-01.
 const PLANNING_OBJECT = /\b(plan|planning|design|architecture|architect|phase|phases|red.?team)\b|(?:^|[\s`("'[])(?:plans\/[^\s`"')]+\.md|plan\.md)\b/i;
+// A description that names CODE work is a review OF CODE that may merely cite a plan / phase /
+// design doc for context. Then only a STRONG planning object in the description itself counts —
+// and the prompt body is context, not the task — so a bare "phase"/"design" no longer flips such
+// a review to the review model. It must be paired with plan / plans / plan.md / a phase file /
+// red-team. Without this, a Sonnet review of external-coder code that happens to mention a plan
+// or design doc was refused. Operator decision, 2026-10-01.
+const CODE_WORK_OBJECT = /\b(diff|implementation|implement|pull\s+request|pr|commit|fix|worker\s+output|branch|code)\b/i;
+const STRONG_PLANNING_OBJECT = /\b(plan|plans|planning|red.?team)\b|\bphase[\s-]*(?:\d+[\s-]*)?file\b|(?:^|[\s`("'[])(?:plans\/[^\s`"')]+\.md|plan\.md)\b/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
@@ -288,10 +296,18 @@ function hasReviewEscalationReason(input, reviewerAlias) {
  */
 function isPlanningReview(description, type, prompt) {
   const head = String(prompt || '').slice(0, 400);
-  if (PLANNING_OBJECT.test(description) || PLANNING_OBJECT.test(type) || PLANNING_OBJECT.test(head)) return true;
-  if (PLANNING_FIRST_VERB.test(description)) return true;
-  if (REVIEW_FIRST_VERB.test(description)) return false;
-  return PLANNING_INTENT.test(description) || PLANNING_INTENT.test(type);
+  const desc = String(description || '');
+  // A review of code (the description names a diff, an implementation, a PR, a commit, a fix,
+  // worker output, a branch or code) keeps the coder-mapped reviewer even when it cites a
+  // plan / phase / design doc for context: only a STRONG planning object in the description
+  // counts, and the prompt body is context. A bare "phase"/"design" mention is not planning.
+  if (CODE_WORK_OBJECT.test(desc)) {
+    return STRONG_PLANNING_OBJECT.test(desc) || PLANNING_FIRST_VERB.test(desc);
+  }
+  if (PLANNING_OBJECT.test(desc) || PLANNING_OBJECT.test(type) || PLANNING_OBJECT.test(head)) return true;
+  if (PLANNING_FIRST_VERB.test(desc)) return true;
+  if (REVIEW_FIRST_VERB.test(desc)) return false;
+  return PLANNING_INTENT.test(desc) || PLANNING_INTENT.test(type);
 }
 
 // Markers that an orca command itself failed, which justifies the in-session fallback.
