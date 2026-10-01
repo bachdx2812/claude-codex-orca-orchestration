@@ -2407,10 +2407,22 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     check(`R1 verify-not-exec: "${desc}" (${type})`,
       [c.wantsVerify, c.wantsExec, c.wantsPlanReview], [true, false, false]);
   }
-  // R1: a verifier subagent_type is NEVER code, even with a coordinated verify-then-fix summary.
+  // R1: a verifier subagent_type is never code from a verify-first summary, even with a
+  // coordinated verify-then-fix summary.
   {
     const c = gate.classifyDispatch('Test and fix the login flow', 'tester', '');
     check('a verifier subagent_type is never code', [c.wantsExec, c.wantsVerify], [false, true]);
+  }
+  // F1: a verifier subagent_type whose summary's FIRST verb is a code verb is still code —
+  // the type hint does not override an exec first verb, only a neutral/verify-first summary.
+  for (const [desc, type] of [
+    ['Implement the payment module', 'tester'],
+    ['Fix the flaky checkout test', 'tester'],
+    ['Refactor the auth module', 'verifier'],
+  ]) {
+    const c = gate.classifyDispatch(desc, type, '');
+    check(`a ${type} type with a code first verb is exec: "${desc}"`,
+      [c.wantsExec, c.wantsVerify], [true, false]);
   }
   // Low 2: bare "code"/"branch" are not review nouns; running checks stays verify-run.
   for (const desc of ['Run tests on the PR branch', 'Verify the code compiles']) {

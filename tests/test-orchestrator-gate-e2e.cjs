@@ -550,6 +550,44 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     (() => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor; } catch { return null; } })(), null);
 }
 
+// F1: a tester/verifier-typed dispatch whose summary's FIRST verb is a code verb is still
+// code — the verifier type hint no longer overrides an exec first verb. With Codex eligible,
+// these must route to the coder pool and refuse, never run as verify on sonnet.
+{
+  const dir = path.join(RUN_DIR, 'verifier-type-exec-first-verb');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'verifier-type-exec-first-verb';
+  let seq = 0;
+  for (const row of [
+    { subagent_type: 'tester', description: 'Implement the payment module' },
+    { subagent_type: 'tester', description: 'Fix the flaky checkout test' },
+    { subagent_type: 'verifier', description: 'Refactor the auth module' },
+  ]) {
+    expect(`a ${row.subagent_type} type with a code first verb is still code (sonnet refused): ${row.description}`,
+      dispatch(Object.assign({ model: 'sonnet' }, row), sid, { tool_use_id: `toolu_vtev_${++seq}` }), DENY, env);
+  }
+  // The type hint still wins when the summary is NOT a code first verb: "Test and fix ..."
+  // starts with a verify verb, so a tester type stays verify-run (sonnet allowed).
+  expect('a tester type with a verify first verb is still verify (sonnet allowed)',
+    dispatch({ subagent_type: 'tester', description: 'Test and fix the login flow', model: 'sonnet' },
+      sid, { tool_use_id: `toolu_vtev_${++seq}` }), ALLOW, env);
+}
+
 // R1: a verify/test verb coordinated with a later NON-code action is verify-run (sonnet), not
 // code — "Run tests and verify the fix works" runs checks, it does not write code. With Codex
 // eligible, a misclassification as exec would route to Codex and refuse, so ALLOW on sonnet
@@ -681,6 +719,34 @@ expect('a neutral first verb still classifies code-reviewer as review work',
       dispatch({ subagent_type: 'Explore', description: 'Verify where X is defined', model },
         sid, { tool_use_id: `toolu_lnv_${model}` }), ALLOW, env);
   }
+}
+
+// Low: the lookup exemption from the opus-only rule applies ONLY to a configured lookup
+// subagent_type, not to a general-purpose summary that merely reads like a lookup. On opus,
+// such a dispatch is held to the opus-only rule and refused, exactly as it was before the
+// lookup exemption existed.
+{
+  const dir = path.join(RUN_DIR, 'lookup-wording-not-exempt');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'lookup-wording-not-exempt';
+  expect('a general-purpose lookup-worded summary on opus is refused (opus-only rule)',
+    dispatch({ subagent_type: 'general-purpose', description: 'Find where the config is loaded', model: 'opus' },
+      sid, { tool_use_id: 'toolu_lwne_opus' }), DENY, env);
 }
 
 // A bare `plan` inside a hyphenated word is not a plan object: a review of the
