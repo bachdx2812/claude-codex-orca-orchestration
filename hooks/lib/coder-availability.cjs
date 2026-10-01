@@ -3,9 +3,10 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { cachedLiveProbe } = require('./live-probe-cache.cjs');
 
-const CODERS = ['codex', 'kimi'];
+const CODERS = ['codex', 'kimi', 'deepseek'];
 const AVAILABILITY_FILE = 'coder-availability.json';
 const AVAILABILITY_LOCK = '.coder-availability.lock';
 const EXHAUSTION_FILE = 'coder-exhausted.json';
@@ -49,6 +50,53 @@ function codexBin(env = process.env) {
   return findOnPath('codex', env);
 }
 
+function opencodeBin(env = process.env) {
+  if (hasOwn(env, 'ORCH_OPENCODE_BIN')) return existingFile(String(env.ORCH_OPENCODE_BIN));
+  return findOnPath('opencode', env);
+}
+
+function opencodeConfigPath(env = process.env) {
+  if (hasOwn(env, 'ORCH_OPENCODE_CONFIG')) return path.resolve(String(env.ORCH_OPENCODE_CONFIG));
+  const home = typeof env.HOME === 'string' && env.HOME ? env.HOME : os.homedir();
+  return path.join(home, '.config', 'opencode', 'opencode.jsonc');
+}
+
+function stripJsonComments(text) {
+  return String(text)
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/(^|[^:"'])\/\/[^\n"]*/g, '$1');
+}
+
+/** opencode's configured default model (e.g. "deepseek/deepseek-flash"), or null. */
+function opencodeDefaultModel(env = process.env) {
+  try {
+    const value = JSON.parse(stripJsonComments(fs.readFileSync(opencodeConfigPath(env), 'utf8')));
+    return value && typeof value.model === 'string' && value.model.trim() ? value.model.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when a DeepSeek credential is configured for opencode: the DEEPSEEK_API_KEY env var
+ * is set, or `opencode auth list` names DeepSeek. The key itself is only ever checked for
+ * presence — never read, printed or stored.
+ */
+function hasDeepseekCredentials(env, binPath) {
+  if (typeof env.DEEPSEEK_API_KEY === 'string' && env.DEEPSEEK_API_KEY.trim()) return true;
+  if (!binPath) return false;
+  try {
+    const probe = spawnSync(binPath, ['auth', 'list'], {
+      encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 1024,
+      env: { PATH: env.PATH || '', HOME: env.HOME || os.homedir() },
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return !probe.error && probe.status === 0 && /\bdeepseek\b/i.test(String(probe.stdout || ''));
+  } catch {
+    return false;
+  }
+}
+
 function hasKimiCredentials(env) {
   try {
     const file = path.join(kimiHome(env), 'credentials', 'kimi-code.json');
@@ -65,7 +113,7 @@ function unavailable(coder, binPath, auth, reason) {
 
 function probeCoderAvailability(coder, options = {}) {
   const env = options.env || process.env;
-  if (options.orcaInstalled === false) return unavailable(coder, coder === 'kimi' ? kimiBin(env) : codexBin(env), 'unknown', 'orca not installed');
+  if (options.orcaInstalled === false) return unavailable(coder, binFor(coder, env), 'unknown', 'orca not installed');
   if (coder === 'codex') {
     const binPath = codexBin(env);
     if (!binPath) return unavailable(coder, null, 'unknown', 'not installed');
@@ -80,7 +128,25 @@ function probeCoderAvailability(coder, options = {}) {
     if (!hasKimiCredentials(env)) return unavailable(coder, binPath, 'logged-out', 'not signed in');
     return { coder, installed: true, binPath, auth: 'ok', usable: true, reason: null };
   }
+  if (coder === 'deepseek') {
+    const binPath = opencodeBin(env);
+    if (!binPath) return unavailable(coder, null, 'unknown', 'not installed');
+    if (!hasDeepseekCredentials(env, binPath)) return unavailable(coder, binPath, 'logged-out', 'not signed in');
+    // Orca `worker-start --agent opencode` cannot pin a model — it comes from opencode's
+    // own config. A non-deepseek default would silently run Claude, so it is unusable.
+    const model = opencodeDefaultModel(env);
+    if (!model || !/^deepseek\//i.test(model)) {
+      return unavailable(coder, binPath, 'ok', model
+        ? `default model is not deepseek/* (${model})`
+        : 'no default model configured');
+    }
+    return { coder, installed: true, binPath, auth: 'ok', usable: true, reason: null };
+  }
   throw new Error(`unknown coder: ${coder}`);
+}
+
+function binFor(coder, env) {
+  return coder === 'kimi' ? kimiBin(env) : coder === 'deepseek' ? opencodeBin(env) : codexBin(env);
 }
 
 function validateAvailability(entry, _now, expectedCodexAuth) {
@@ -171,6 +237,7 @@ function clearCoderExhaustion(stateDir, coder) {
 }
 
 module.exports = {
-  CODERS, kimiHome, kimiBin, probeCoderAvailability, coderAvailability,
+  CODERS, kimiHome, kimiBin, opencodeBin, opencodeConfigPath, opencodeDefaultModel,
+  hasDeepseekCredentials, probeCoderAvailability, coderAvailability,
   readCoderExhaustion, markCoderExhausted, clearCoderExhaustion,
 };
