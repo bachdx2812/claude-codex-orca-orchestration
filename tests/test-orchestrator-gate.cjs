@@ -1848,8 +1848,33 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   }
   {
     const s = { workers: {} };
-    check('resolveWorkerStartAgent: --terminal of an UNtracked handle defaults to codex',
-      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_unknown'), s), 'codex');
+    check('resolveWorkerStartAgent: --terminal of an UNtracked handle is unknown, never codex',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_unknown'), s), null);
+  }
+  {
+    const s = { workers: { ctx_oc: { status: 'live', group: 'ctx_oc', agent: 'opencode' } } };
+    check('resolveWorkerStartAgent: --retry-of an opencode group stays opencode',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_oc'), s), 'opencode');
+  }
+  {
+    const s = { workers: { ctx_oc: { status: 'settled', group: 'ctx_oc', agent: 'opencode' } } };
+    check('resolveWorkerStartAgent: --retry-of a settled opencode group still resolves its agent',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_oc'), s), 'opencode');
+  }
+  {
+    const s = { workers: { term_x: { status: 'settled', group: 'ctx_x', agent: 'kimi' } } };
+    check('resolveWorkerStartAgent: --terminal of a settled tracked group still resolves its agent',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_x'), s), 'kimi');
+  }
+  {
+    const s = { workers: {} };
+    check('resolveWorkerStartAgent: --retry-of an UNtracked id is unknown, never codex',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_missing'), s), null);
+  }
+  {
+    const s = { workers: { ctx_a: { status: 'live', group: 'ctx_a', agent: 'codex', taskId: 'task_a' } } };
+    check('resolveWorkerStartAgent: --retry-of a codex group stays codex',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_a'), s), 'codex');
   }
 
   check('liveCodexGroupIds: names distinct live codex groups',

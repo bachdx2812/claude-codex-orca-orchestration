@@ -37,17 +37,27 @@ const OWNS_BRIEF_HELP =
 const SAME_COMMAND_RETRY_AGE_MS = 2000;
 
 /**
- * The agent a `worker-start` invocation targets: the explicit `--agent`, else — only when
- * `--terminal <h>` names a still-live tracked group — that group's own stored agent, else
- * `'codex'` (this harness's default coder, per the contract's "Codex first" rule).
+ * The agent a `worker-start` invocation targets: the explicit `--agent`; else the tracked
+ * agent behind `--retry-of <id>` (any status — a retry commonly targets an already-finished
+ * or rate-limited group) or `--terminal <handle>` (any status); else `'codex'` for a bare
+ * worker-start (this harness's default coder, per the contract's "Codex first" rule).
+ * When `--retry-of`/`--terminal` names an id this session never tracked, return `null`
+ * ("unknown") — NEVER `'codex'`, or an opencode retry would be mislabeled as Codex, counted
+ * against the Codex cap, and raise a false WORKER HANDOVER off Codex's quota. An unknown
+ * agent skips the per-coder caps and the handover quota path entirely.
  */
 function resolveWorkerStartAgent(inv, s, flagValue) {
   const explicit = flagValue(inv.args, '--agent');
   if (explicit) return explicit.toLowerCase();
+  const retryOf = flagValue(inv.args, '--retry-of');
+  if (retryOf) {
+    const g = WG.groupById(s.workers, retryOf);
+    return (g && g.agent) || null;
+  }
   const terminal = flagValue(inv.args, '--terminal');
   if (terminal) {
-    const g = WG.liveGroupByTerminal(s.workers, terminal);
-    if (g) return g.agent || 'codex';
+    const g = WG.groupById(s.workers, terminal);
+    return (g && g.agent) || null;
   }
   return 'codex';
 }
@@ -422,12 +432,15 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   const kimiCap = maxKimiWorkers(cfg);
   const maxDeepseekWorkers = deps.maxParallelDeepseekWorkers || require('./config.cjs').maxParallelDeepseekWorkers;
   const deepseekCap = maxDeepseekWorkers(cfg);
-  const hasKimiDispatch = invs.some((inv) => inv.sub === 'orchestration worker-start' &&
-    (flagValue(inv.args, '--agent') || '').toLowerCase() === 'kimi');
-  const hasDeepseekDispatch = invs.some((inv) => inv.sub === 'orchestration worker-start' &&
-    (flagValue(inv.args, '--agent') || '').toLowerCase() === 'opencode');
-  const hasCodexDispatch = invs.some((inv) => inv.sub === 'orchestration worker-start' &&
-    (flagValue(inv.args, '--agent') || 'codex').toLowerCase() === 'codex');
+  // Resolve each worker-start's target agent the same way the slot accounting does, so a
+  // `--retry-of <id>` (or `--terminal <h>`) dispatch is capped for the coder it actually
+  // retries rather than defaulting to Codex. `null` (an unresolvable id) matches no coder.
+  const dispatchAgents = invs
+    .filter((inv) => inv.sub === 'orchestration worker-start')
+    .map((inv) => resolveWorkerStartAgent(inv, s, flagValue));
+  const hasKimiDispatch = dispatchAgents.includes('kimi');
+  const hasDeepseekDispatch = dispatchAgents.includes('opencode');
+  const hasCodexDispatch = dispatchAgents.includes('codex');
   const ttl = ownershipClaimTtlMinutes(cfg);
   const agentCapActive = !gateDisabled(cfg, 'max-parallel-agents') &&
     Number.isFinite(deps.agentParallelLimit(cfg));
