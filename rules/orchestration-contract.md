@@ -350,8 +350,10 @@ backup precedes their removal. Help and unknown options never enter the install 
   coder pool once it has used this much of its daily spend cap. Overridable for one process
   with `ORCH_DEEPSEEK_HANDOFF_USED`.
 - `deepseekRole`: `"overflow"` (default) or `"peer"`. `overflow` picks DeepSeek only when no
-  subscription coder (Codex, Kimi) is eligible, before the Sonnet fallback; `peer` gives it
-  the same headroom / tie-band / live-count / `lastCoder` rules as Codex and Kimi.
+  subscription coder (Codex, Kimi) is eligible, **or when every eligible subscription coder
+  is already at its own per-session worker cap** (DeepSeek takes the dispatch instead of all
+  coders reporting "all at cap, wait"), before the Sonnet fallback; `peer` gives it the same
+  headroom / tie-band / live-count / `lastCoder` rules as Codex and Kimi.
   Overridable for one process with `ORCH_DEEPSEEK_ROLE`.
 - `deepseekDailySpendCapUsd`: number 0-100000, default `0` (= unlimited). DeepSeek's
   pay-per-use "quota" is the remaining share of this daily cap; at `0` only an exhausted

@@ -118,13 +118,18 @@ function pickCoderPool(options = {}) {
   }
 
   const order = CODERS.filter((coder) => coders[coder].state === 'eligible');
-  // Overflow DeepSeek stands by while any subscription coder can take the dispatch.
+  const freeSlot = (coder) => coders[coder].cap === 0 || coders[coder].sessionLive < coders[coder].cap;
+  // Overflow DeepSeek stands by only while a subscription coder (Codex/Kimi) is ELIGIBLE
+  // AND has a free per-session slot. When every eligible subscription coder is at its own
+  // worker cap, DeepSeek joins the order and takes the dispatch instead of waiting
+  // (operation decision, 2026-10-01).
+  const subscriptionHasFreeSlot = ['codex', 'kimi'].some((coder) =>
+    coders[coder].state === 'eligible' && freeSlot(coder));
   if (deepseekOverflow && coders.deepseek.state === 'eligible' &&
-      (coders.codex.state === 'eligible' || coders.kimi.state === 'eligible')) {
+      (coders.codex.state === 'eligible' || coders.kimi.state === 'eligible') && subscriptionHasFreeSlot) {
     coders.deepseek.standby = true;
     order.splice(order.indexOf('deepseek'), 1);
   }
-  const freeSlot = (coder) => coders[coder].cap === 0 || coders[coder].sessionLive < coders[coder].cap;
   order.sort((a, b) => {
     const aFree = freeSlot(a); const bFree = freeSlot(b);
     if (aFree !== bFree) return aFree ? -1 : 1;

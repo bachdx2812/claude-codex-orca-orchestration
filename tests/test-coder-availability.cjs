@@ -540,6 +540,14 @@ async function run() {
     check('peer mode keeps deepseek in the ranked order', deep({ roles: { deepseek: 'peer' } }).order.includes('deepseek'), true);
     check('an exhausted deepseek leaves the subscription coders',
       deep({ quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 20 }, deepseek: { usedPercent: 95 } } }).pick, 'codex');
+    // Operator decision (2026-10-01): overflow DeepSeek takes the dispatch when every
+    // eligible subscription coder is at its own per-session worker cap.
+    check('overflow DeepSeek stands by while one subscription coder has a free slot',
+      deep({ live: { codex: 1, kimi: 0, deepseek: 0 }, caps: { codex: 1, kimi: 3, deepseek: 3 } }).pick, 'kimi');
+    check('overflow DeepSeek takes over when both subscription coders are at their cap',
+      deep({ live: { codex: 1, kimi: 1, deepseek: 0 }, caps: { codex: 1, kimi: 1, deepseek: 3 } }).pick, 'deepseek');
+    check('an unlimited subscription coder still keeps DeepSeek on standby',
+      deep({ live: { codex: 9, kimi: 0, deepseek: 0 }, caps: { codex: 0, kimi: 0, deepseek: 0 } }).pick, 'kimi');
     check('an exhausted balance (100 used) excludes deepseek',
       deep({ quotas: { codex: { usedPercent: 96 }, kimi: { usedPercent: 96 }, deepseek: { usedPercent: 100 } } }).route, 'code');
   }
