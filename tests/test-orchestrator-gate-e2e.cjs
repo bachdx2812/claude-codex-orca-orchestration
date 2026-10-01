@@ -398,12 +398,12 @@ expect('a neutral first verb still classifies code-reviewer as review work',
   else failures.push(`code intent must override code-reviewer review routing\n    exit=${result.code}, stderr=${result.err.slice(0, 200)}`);
 }
 
-// Review / verify follows the code's author (operator decision, 2026-10-01): code by an
-// external coder is reviewed on the mapped model (the code model), and the review model is
-// reserved for code the code model itself wrote — reachable only by escalating a review
-// whose mapped reviewer already ran.
+// Review reads code and judges the diff on the review model (opus); verify-run work runs
+// existing checks on the verify model (sonnet) — operator decision, 2026-10-02. reviewByCoder
+// maps every author to opus now, so a review of external-coder code on sonnet is refused and
+// on opus is allowed; a verify on opus is refused without an escalation note.
 {
-  const dir = path.join(RUN_DIR, 'review-follows-coder');
+  const dir = path.join(RUN_DIR, 'review-verify-split');
   const stateDir = path.join(dir, 'state');
   fs.mkdirSync(stateDir, { recursive: true });
   const env = {
@@ -420,29 +420,41 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
-  const sid = 'review-follows-coder';
+  const sid = 'review-verify-split';
   const stateOf = () => JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
-  let reviewSeq = 0;
+  let seq = 0;
   const review = (extra) => dispatch(
     Object.assign({ subagent_type: 'reviewer', description: 'review the implementation for correctness' }, extra),
-    sid, { tool_use_id: `toolu_rfc_r${++reviewSeq}` });
+    sid, { tool_use_id: `toolu_rvs_r${++seq}` });
+  const verify = (extra) => dispatch(
+    Object.assign({ subagent_type: 'tester', description: 'verify the build' }, extra),
+    sid, { tool_use_id: `toolu_rvs_v${++seq}` });
 
   const start = 'orca orchestration worker-start --agent kimi --json';
-  invoke(mainBash(start, { sid, tool_use_id: 'toolu_rfc_start' }), env);
-  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_rfc_kimi"}}', { sid, tool_use_id: 'toolu_rfc_start' }), env);
+  invoke(mainBash(start, { sid, tool_use_id: 'toolu_rvs_start' }), env);
+  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_rvs_kimi"}}', { sid, tool_use_id: 'toolu_rvs_start' }), env);
   checkBool('a registered Kimi worker becomes the session code author', stateOf().lastCodeAuthor, 'kimi');
 
-  expect('review of external-coder code runs on the mapped model', review({ model: 'sonnet' }), ALLOW, env);
-  {
-    const r = invoke(review({ model: 'opus' }), env);
-    if (r.code === DENY && /review-model-follows-coder/.test(r.err)) pass += 1;
-    else failures.push(`opus review of external code must be refused with review-model-follows-coder\n    exit=${r.code}, stderr=${r.err.slice(0, 200)}`);
-  }
-  expect('opus review of external code is allowed once it escalates after the mapped review',
-    review({ model: 'opus', prompt: 'escalation: sonnet review could not decide even at high effort' }), ALLOW, env);
+  // Review reads code and judges the diff -> opus (all-opus default), never sonnet.
+  expect('review of external-coder code runs on the review model', review({ model: 'opus' }), ALLOW, env);
+  expect('review of external-coder code on sonnet is refused', review({ model: 'sonnet' }), DENY, env);
+
+  // Verify-run -> sonnet (the verify model), never opus unless escalating.
+  expect('verify-run on the verify model is allowed', verify({ model: 'sonnet' }), ALLOW, env);
+  expect('verify-run on the review model is refused without escalation', verify({ model: 'opus' }), DENY, env);
+  expect('verify-run on a third model is refused', verify({ model: 'haiku' }), DENY, env);
+  expect('verify-run on the review model is allowed once it escalates after the verify model',
+    verify({ model: 'opus', prompt: 'escalation: sonnet verify could not decide' }), ALLOW, env);
+
+  // A brief that both reviews and verifies counts as review (the stronger model).
+  expect('review-and-verify counts as review (opus allowed)',
+    dispatch({ subagent_type: 'reviewer', description: 'Review and verify the fix', model: 'opus' }, sid, { tool_use_id: `toolu_rvs_rv${++seq}` }), ALLOW, env);
+  expect('review-and-verify counts as review (sonnet refused when mapped opus)',
+    dispatch({ subagent_type: 'reviewer', description: 'Review and verify the fix', model: 'sonnet' }, sid, { tool_use_id: `toolu_rvs_rv${++seq}` }), DENY, env);
 
   // Plan/red-team reviews STAY on the review model even after an external coder has run:
-  // a planning object anywhere in the dispatch beats the review first verb.
+  // a planning object anywhere beats the review first verb, and a Verify-first-verb plan
+  // review is planning, never verify-run.
   for (const plan of [
     { subagent_type: 'reviewer', description: 'Review the plan at plans/x/plan.md' },
     { subagent_type: 'reviewer', description: 'Audit the implementation plan' },
@@ -450,36 +462,53 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     { subagent_type: 'reviewer', description: 'Review phase-2 design doc' },
   ]) {
     expect(`opus plan review stays allowed after external code: ${plan.description}`,
-      dispatch(Object.assign({ model: 'opus' }, plan), sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), ALLOW, env);
+      dispatch(Object.assign({ model: 'opus' }, plan), sid, { tool_use_id: `toolu_rvs_plan_${++seq}` }), ALLOW, env);
   }
+  expect('a verify verb over a plan noun is not verify-run (sonnet refused)',
+    dispatch({ subagent_type: 'reviewer', description: 'Verify plan claims against the codebase', model: 'sonnet' },
+      sid, { tool_use_id: `toolu_rvs_plan_${++seq}` }), DENY, env);
   // A review OF CODE that only cites a plan doc for context is not a plan review: it stays on
-  // the coder-mapped reviewer, so opus is refused and sonnet is allowed.
-  expect('a code review citing a plan in the prompt refuses opus after external code',
+  // the review model, so opus is allowed and sonnet is refused (all-opus).
+  expect('a code review citing a plan in the prompt is allowed on the review model',
     dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'opus', prompt: 'Check the plan at plans/x/plan.md.' },
-      sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), DENY, env);
-  expect('a code review citing a plan in the prompt is allowed on the mapped model',
+      sid, { tool_use_id: `toolu_rvs_plan_${++seq}` }), ALLOW, env);
+  expect('a code review citing a plan in the prompt refuses sonnet',
     dispatch({ subagent_type: 'reviewer', description: 'Review the diff', model: 'sonnet', prompt: 'Check the plan at plans/x/plan.md.' },
-      sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), ALLOW, env);
+      sid, { tool_use_id: `toolu_rvs_plan_${++seq}` }), DENY, env);
   expect('a plan review is not allowed to migrate to the code model after external code',
     dispatch({ subagent_type: 'reviewer', description: 'Review the plan at plans/x/plan.md', model: 'sonnet' },
-      sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), DENY, env);
+      sid, { tool_use_id: `toolu_rvs_plan_${++seq}` }), DENY, env);
 
-  invoke(postBash('orca orchestration worker-release --dispatch ctx_rfc_kimi --json', '{"ok":true,"result":{}}', { sid }), env);
+  // tester / verifier / browser-verifier / e2e-runner subagent_types route as verify.
+  for (const t of ['tester', 'verifier', 'browser-verifier', 'e2e-runner']) {
+    expect(`${t} subagent_type routes as verify (sonnet)`,
+      dispatch({ subagent_type: t, description: 'make sure nothing regressed', model: 'sonnet' }, sid, { tool_use_id: `toolu_rvs_ty_${++seq}` }), ALLOW, env);
+    expect(`${t} subagent_type routes as verify (opus refused)`,
+      dispatch({ subagent_type: t, description: 'make sure nothing regressed', model: 'opus' }, sid, { tool_use_id: `toolu_rvs_ty_${++seq}` }), DENY, env);
+  }
+
+  // The per-prompt reminder names the split: review -> opus (coder: kimi); verify -> sonnet.
+  {
+    const r = invoke(promptSubmit(sid, 'status check'), env);
+    if (/review -> opus \(coder: kimi\); verify -> sonnet/.test(r.out)) pass += 1;
+    else failures.push(`reminder must name "review -> opus (coder: kimi); verify -> sonnet"\n    ${r.out.slice(0, 300)}`);
+  }
+
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_rvs_kimi --json', '{"ok":true,"result":{}}', { sid }), env);
   checkBool('releasing the external group does not clear its recorded author', stateOf().lastCodeAuthor, 'kimi');
 
   // In-session code on the code model (no external coder eligible) records "sonnet", whose
   // review the review model owns.
   const sonnetEnv = { ...env, STUB_CODEX_PRIMARY_USED: '97' };
-  // A later gate refuses the in-session code dispatch: the author must NOT flip to sonnet,
-  // or the next Sonnet review of Kimi's code would be wrongly refused (review, blocker 6).
+  // A later gate refuses the in-session code dispatch: the author must NOT flip to sonnet.
   expect('in-session code without Owns is refused by the later owns gate',
     dispatch({ subagent_type: 'fullstack-developer', description: 'implement the parser fix', model: 'sonnet',
-      prompt: 'Verify: npm test' }, sid, { tool_use_id: 'toolu_rfc_sonnet_refused' }), DENY, sonnetEnv);
+      prompt: 'Verify: npm test' }, sid, { tool_use_id: 'toolu_rvs_sonnet_refused' }), DENY, sonnetEnv);
   checkBool('a refused in-session code dispatch does not record sonnet as the author',
     stateOf().lastCodeAuthor, 'kimi');
   expect('in-session code on the code model is admitted when no external coder is eligible',
     dispatch({ subagent_type: 'fullstack-developer', description: 'implement the parser fix', model: 'sonnet',
-      prompt: 'Owns: n/a isolated\nVerify: npm test', isolation: 'worktree' }, sid, { tool_use_id: 'toolu_rfc_sonnet' }),
+      prompt: 'Owns: n/a isolated\nVerify: npm test', isolation: 'worktree' }, sid, { tool_use_id: 'toolu_rvs_sonnet' }),
     ALLOW, sonnetEnv);
   checkBool('in-session code on the code model records sonnet as the author', stateOf().lastCodeAuthor, 'sonnet');
   expect('review of the code model\'s own code runs on the review model', review({ model: 'opus' }), ALLOW, sonnetEnv);
@@ -489,8 +518,7 @@ expect('a neutral first verb still classifies code-reviewer as review work',
 
 // A bare `plan` inside a hyphenated word is not a plan object: a review of the
 // "plan-detection narrowing commit" is a review OF CODE. With DeepSeek as the last code
-// author, it follows the coder-mapped reviewer (sonnet) and refuses the review model
-// (opus) without an escalation note.
+// author, it follows the review model (opus, all-opus default) and refuses the code model.
 {
   const dir = path.join(RUN_DIR, 'plan-detection-code-review');
   const stateDir = path.join(dir, 'state');
@@ -515,12 +543,12 @@ expect('a neutral first verb still classifies code-reviewer as review work',
   invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_pdc_deepseek"}}', { sid, tool_use_id: 'toolu_pdc_start' }), env);
   checkBool('a registered opencode worker records deepseek as the session code author',
     JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor, 'deepseek');
-  expect('a "plan-detection" review of DeepSeek code runs on the mapped reviewer',
-    dispatch({ subagent_type: 'reviewer', description: 'Review plan-detection narrowing commit', model: 'sonnet' },
-      sid, { tool_use_id: 'toolu_pdc_sonnet' }), ALLOW, env);
-  expect('a "plan-detection" review refuses the review model without an escalation note',
+  expect('a "plan-detection" review of DeepSeek code runs on the review model',
     dispatch({ subagent_type: 'reviewer', description: 'Review plan-detection narrowing commit', model: 'opus' },
-      sid, { tool_use_id: 'toolu_pdc_opus' }), DENY, env);
+      sid, { tool_use_id: 'toolu_pdc_opus' }), ALLOW, env);
+  expect('a "plan-detection" review refuses the code model',
+    dispatch({ subagent_type: 'reviewer', description: 'Review plan-detection narrowing commit', model: 'sonnet' },
+      sid, { tool_use_id: 'toolu_pdc_sonnet' }), DENY, env);
 }
 
 // Main panel vs Orca worker terminal, via the deterministic stub (never a live Orca).

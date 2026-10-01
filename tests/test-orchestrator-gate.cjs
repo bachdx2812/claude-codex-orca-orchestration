@@ -2266,13 +2266,18 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
 
 {
   const cfg = config.loadConfig();
-  check('reviewByCoder defaults: external coders -> sonnet, sonnet -> opus',
+  check('reviewByCoder defaults: every author -> opus (review reads and judges the diff)',
     ['codex', 'kimi', 'deepseek', 'sonnet'].map((a) => config.reviewModelForCoder(cfg, a)),
-    ['sonnet', 'sonnet', 'sonnet', 'opus']);
+    ['opus', 'opus', 'opus', 'opus']);
   check('opencode maps to deepseek for the review model',
-    config.reviewModelForCoder(cfg, 'opencode'), 'sonnet');
+    config.reviewModelForCoder(cfg, 'opencode'), 'opus');
   check('an unknown author maps to no review model (fail open)',
     config.reviewModelForCoder(cfg, 'claude'), null);
+  check('verify model defaults to sonnet', config.verifyModelAlias(cfg), 'sonnet');
+  process.env.ORCH_VERIFY_MODEL = 'haiku';
+  check('ORCH_VERIFY_MODEL overrides the verify model alias',
+    config.verifyModelAlias(cfg), 'haiku');
+  delete process.env.ORCH_VERIFY_MODEL;
   process.env.ORCH_REVIEW_MODEL_EXTERNAL = 'haiku';
   check('ORCH_REVIEW_MODEL_EXTERNAL overrides the external mapping',
     config.reviewModelForCoder(cfg, 'kimi'), 'haiku');
@@ -2330,6 +2335,17 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     gate.hasReviewEscalationReason({ description: 'opus review was inconclusive', prompt: '' }, 'sonnet'), false);
   check('no escalation reason does not count',
     gate.hasReviewEscalationReason({ description: 'review the code', prompt: 'please review' }, 'sonnet'), false);
+}
+
+{
+  check('a bare verify escalation marker counts',
+    gate.hasVerifyEscalationReason({ description: 'verify the build', prompt: 'escalation: sonnet could not decide' }, 'sonnet'), true);
+  check('a named verifier that could not decide counts',
+    gate.hasVerifyEscalationReason({ description: 'sonnet verify was inconclusive', prompt: '' }, 'sonnet'), true);
+  check('a different verifier alias does not count',
+    gate.hasVerifyEscalationReason({ description: 'opus verify was inconclusive', prompt: '' }, 'sonnet'), false);
+  check('no escalation reason does not count',
+    gate.hasVerifyEscalationReason({ description: 'verify the build', prompt: 'please verify' }, 'sonnet'), false);
 }
 
 // --- report -----------------------------------------------------------------
