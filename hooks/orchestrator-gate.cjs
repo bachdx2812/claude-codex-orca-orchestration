@@ -295,12 +295,46 @@ const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deplo
 // 2026-10-02): "Write the payment module", "Write e2e tests for checkout" and "Write the
 // cache layer" route to the coder (verify command + Owns in a shared workspace, author
 // recorded), while "Write" + a document/plan object stays operational ("Write the release
-// notes", "Write a plan for X", "Write docs for the API"). The object is searched anywhere
-// in the description so an intervening word ("Write e2e tests") still counts; only the FIRST
-// verb "write" is code this way, so a later write inside a verify-run summary ("Run tests
-// and write a summary") stays verify-run.
-const CODE_OBJECT = /\b(?:modules?|functions?|classes?|components?|tests?|code|implementations?|endpoints?|handlers?|scripts?|migrations?|hooks?|parsers?|layers?|services?|features?)\b/i;
-const WRITE_FIRST_VERB = /^write\b/i;
+// notes", "Write a plan for X", "Write docs for the API"). The object is decided from the
+// NOUN being written — the words right after "write", up to the first preposition (for, of,
+// on, about, in, to, from, with, against) or punctuation — never from any code word anywhere
+// in the description, so a document brief whose modifiers merely mention code words
+// ("Write a summary of the test run", "Write docs for the parser module", "Write a test
+// plan for checkout") stays operational. It is CODE only when the LAST of those noun words
+// is a code word AND none of them is a document word. Only the FIRST verb "write" counts,
+// so a later write inside a verify-run summary ("Run tests and write a summary") stays
+// verify-run.
+const CODE_NOUNS = new Set([
+  'module', 'modules', 'function', 'functions', 'class', 'classes',
+  'component', 'components', 'test', 'tests', 'code', 'implementation', 'implementations',
+  'endpoint', 'endpoints', 'handler', 'handlers', 'script', 'scripts',
+  'migration', 'migrations', 'hook', 'hooks', 'parser', 'parsers',
+  'layer', 'layers', 'service', 'services', 'feature', 'features',
+]);
+const DOC_NOUNS = new Set([
+  'summary', 'summaries', 'docs', 'doc', 'notes', 'note', 'plan', 'plans',
+  'report', 'reports', 'review', 'reviews', 'readme', 'changelog',
+  'message', 'messages', 'design', 'designs', 'spec', 'specs', 'handover',
+]);
+const WRITE_OBJECT_STOP = /^(?:for|of|on|about|in|to|from|with|against)$/i;
+const WRITE_OBJECT_PUNCT = /[,!?;:()[\]{}"'`]/g;
+
+function writeCodeObject(desc) {
+  const text = String(desc || '');
+  if (!/^write\b/i.test(text)) return false;
+  const words = [];
+  for (const token of text.replace(/^write\b/i, '').split(/\s+/)) {
+    if (!token) continue;
+    const bare = token.replace(WRITE_OBJECT_PUNCT, '');
+    const lower = bare.toLowerCase();
+    if (WRITE_OBJECT_STOP.test(lower)) break;
+    words.push(lower);
+    if (bare.length !== token.length) break; // punctuation ends the noun phrase
+  }
+  if (!words.length) return false;
+  const last = words[words.length - 1];
+  return CODE_NOUNS.has(last) && !words.some((w) => DOC_NOUNS.has(w));
+}
 const LOOKUP_INTENT = /\b(find|locate|search|grep|scout|explore|look\s*up|where\s+is|list\s+(all|the)|read\s+(the\s+)?(log|logs|output)|summari[sz]e\s+(the\s+)?(log|logs|output|test\s+results?))\b/i;
 // A code brief must let the coder check itself: a concrete test / build / lint command,
 // or an explicit "verify: n/a <reason>".
@@ -402,7 +436,7 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   // "Write e2e tests for checkout" from an e2e-runner routes to the coder, never the verify
   // model. Only the FIRST verb "write" counts, so "Run tests and write a summary" stays
   // verify-run.
-  const writeCodeFirstVerb = WRITE_FIRST_VERB.test(desc) && CODE_OBJECT.test(desc);
+  const writeCodeFirstVerb = writeCodeObject(desc);
   const firstIntent = PLAN_REVIEW_FIRST_VERB.test(desc) ? 'review'
     : VERIFY_FIRST_VERB.test(desc) ? 'verify'
       : (EXEC_FIRST_VERB.test(desc) || writeCodeFirstVerb) ? 'exec'

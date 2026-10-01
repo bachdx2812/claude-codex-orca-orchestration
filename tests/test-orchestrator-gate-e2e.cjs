@@ -632,9 +632,59 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     expect(`Write + a document object stays operational (sonnet allowed): ${row.description} (${row.subagent_type})`,
       dispatch(Object.assign({ model: 'sonnet' }, row), sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
   }
+  // A code word in a later modifier no longer makes a document brief code: the noun being
+  // written is a document word ("summary", "review", "docs"), so these stay operational /
+  // review even though a later prepositional phrase mentions a code word.
+  expect('tester writing a summary of a test run stays operational (sonnet allowed)',
+    dispatch({ subagent_type: 'tester', description: 'Write a summary of the test run', model: 'sonnet' },
+      sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
+  expect('code-reviewer writing a review of a module stays review (sonnet allowed)',
+    dispatch({ subagent_type: 'code-reviewer', description: 'Write a review of the auth module', model: 'sonnet' },
+      sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
+  expect('code-reviewer writing a review of a module stays review (opus allowed)',
+    dispatch({ subagent_type: 'code-reviewer', description: 'Write a review of the auth module', model: 'opus' },
+      sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
+  expect('docs-manager writing docs for a parser module stays operational (sonnet allowed)',
+    dispatch({ subagent_type: 'docs-manager', description: 'Write docs for the parser module', model: 'sonnet' },
+      sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
+  expect('docs-manager writing docs for a parser module stays operational (haiku allowed)',
+    dispatch({ subagent_type: 'docs-manager', description: 'Write docs for the parser module', model: 'haiku' },
+      sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
   expect('a later write in a verify-run summary stays verify (sonnet allowed)',
     dispatch({ subagent_type: 'tester', description: 'Run tests and write a summary', model: 'sonnet' },
       sid, { tool_use_id: `toolu_wvc_${++seq}` }), ALLOW, env);
+}
+
+// An allowed Write+code dispatch records the code author, exactly like any in-session code
+// dispatch on the code model: the write verb now classifies as code, so once the operator
+// forces the code model with --code-model sonnet the dispatch is admitted (no external coder
+// is used) and lastCodeAuthor flips to sonnet.
+{
+  const dir = path.join(RUN_DIR, 'write-verb-author');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'write-verb-author';
+  const stateOf = () => JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
+  invoke(promptSubmit(sid, 'force the code model --code-model sonnet'), env);
+  expect('an allowed Write+code dispatch on the code model is admitted',
+    dispatch({ subagent_type: 'fullstack-developer', description: 'Write the payment module', model: 'sonnet',
+      prompt: 'Owns: n/a isolated\nVerify: npm test', isolation: 'worktree' }, sid, { tool_use_id: 'toolu_wva_1' }),
+    ALLOW, env);
+  checkBool('an allowed Write+code dispatch records sonnet as the code author', stateOf().lastCodeAuthor, 'sonnet');
 }
 
 // R1: a verify/test verb coordinated with a later NON-code action is verify-run (sonnet), not

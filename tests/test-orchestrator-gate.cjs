@@ -2444,6 +2444,26 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     const c = gate.classifyDispatch(desc, type, '');
     check(`Write + a document object stays non-exec: "${desc}" (${type})`, c.wantsExec, false);
   }
+  // A code word anywhere in the description no longer makes a document brief code: the noun
+  // being written (the words after "write" up to the first preposition/punctuation) decides.
+  // The last noun word is a document word here, so these stay non-exec even though a code
+  // word appears in a later modifier ("test run", "parser module", "cache service").
+  for (const [desc, type] of [
+    ['Write a summary of the test run', 'tester'],
+    ['Write a review of the auth module', 'code-reviewer'],
+    ['Write docs for the parser module', 'docs-manager'],
+    ['Write a test plan for checkout', 'general-purpose'],
+    ['Write release notes for the new feature', 'content-creator'],
+    ['Write a report on hook failures', 'general-purpose'],
+    ['Write a summary of the test results', 'tester'],
+    ['Write the commit message for the migration', 'general-purpose'],
+    ['Write a design doc for the cache service', 'general-purpose'],
+    ['Write README for the scripts', 'docs-manager'],
+  ]) {
+    const c = gate.classifyDispatch(desc, type, '');
+    check(`Write + a document noun stays non-exec even with a code word later: "${desc}" (${type})`,
+      c.wantsExec, false);
+  }
   {
     const c = gate.classifyDispatch('Run tests and write a summary', 'tester', '');
     check('a later write in a verify-run summary stays verify',

@@ -108,13 +108,19 @@ over later nouns: `Review ...`/`Plan ...` are review work, `Verify ...`/`Test ..
 `Generate code/assets/components ...` are code work.
 The operational first verbs `commit`, `push`, `merge`, `publish`, `rebase`, `tag`, `release`,
 `deploy`, `update`, and `write` suppress later `review`, `plan`, or `design` tokens, but later
-code intent still routes to code. `Write ...` is the exception: `write` followed by a code
-object — `module`, `function`, `class`, `component`, `test`/`tests`, `code`, `implementation`,
-`endpoint`, `handler`, `script`, `migration`, `hook`, `parser`, `layer`, `service`, `feature` —
-is code intent that routes to the coder (verify command + `Owns:` in a shared workspace, author
-recorded), even from a `tester` / `verifier` / `e2e-runner` type, while `write` followed by a
-document object — `docs`, `plan`, `report`, `README`, `notes`, `summary`, `release notes`,
-`commit message`, `changelog` — stays operational. Review-oriented `subagent_type` values remain
+code intent still routes to code. `Write ...` is the exception: the noun being written — the
+words right after `write`, up to the first preposition (`for`, `of`, `on`, `about`, `in`, `to`,
+`from`, `with`, `against`) or punctuation — is CODE only when the last of those words is a code
+word (`module`, `function`, `class`, `component`, `test`/`tests`, `code`, `implementation`,
+`endpoint`, `handler`, `script`, `migration`, `hook`, `parser`, `layer`, `service`, `feature`)
+and none of them is a document word (`summary`, `docs`, `doc`, `notes`, `note`, `plan`, `report`,
+`review`, `readme`, `changelog`, `message`, `design`, `spec`, `handover`). `Write the payment
+module`, `Write e2e tests for checkout` and `Write the cache layer` therefore route to the coder
+(verify command + `Owns:` in a shared workspace, author recorded), even from a `tester` /
+`verifier` / `e2e-runner` type, while `Write a summary of the test run`, `Write a review of the
+auth module`, `Write docs for the parser module`, `Write a test plan for checkout`, `Write
+release notes for the new feature` and `Write README for the scripts` stay operational.
+Review-oriented `subagent_type` values remain
 review signals unless the description contains code intent, which wins when both signals are
 present. A
 `tester` / `verifier` / `browser-verifier` / `e2e-runner` `subagent_type` is verify-run work.
