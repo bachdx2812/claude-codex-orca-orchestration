@@ -14,9 +14,10 @@ fs.writeFileSync(configFile, '{}');
 
 const config = require('../hooks/lib/config.cjs');
 const heartbeat = require('../hooks/orca-heartbeat.cjs');
+const SIGNALS = require('../hooks/lib/terminal-signals.cjs');
 const {
   approvalPromptFingerprint, hasCodexUsageExhausted,
-} = require('../hooks/lib/terminal-signals.cjs');
+} = SIGNALS;
 const handover = require('../hooks/lib/worker-quota-handover.cjs');
 const resume = require('../hooks/lib/quota-reset-resume.cjs');
 const resumeScheduler = require('../hooks/orca-resume-scheduler.cjs');
@@ -495,6 +496,24 @@ check('an echoed command line is NOT a shell prompt',
   }, approvalCtx).kind, 'working');
 check('an exited verdict is never stall-tracked',
   heartbeat.shouldTrackWorkerProgress('exited', 'running'), false);
+
+// Two-line powerline zsh prompt (`╭╴…` header / `╰─󰍟`): the operator's shell, and the
+// shape every exited agent lands in on this machine. Fixture: the live 27eac40a screen
+// (Claude gone, dead TUI chrome still visible above the shell prompt).
+const powerlineScreen = fs.readFileSync(
+  path.join(__dirname, 'fixtures', 'screen-27eac40a-exited-claude.txt'), 'utf8');
+check('the live 27eac40a powerline screen ends at a shell prompt despite leftover TUI chrome',
+  SIGNALS.endsAtShellPrompt(powerlineScreen), true);
+check('the powerline screen classifies as exited for a tracked worker',
+  heartbeat.classifyTerminal({
+    handle: 'term_approval', preview: powerlineScreen, lastOutputAt: start,
+  }, approvalCtx).kind, 'exited');
+check('a powerline prompt with a typed char is still a shell prompt',
+  SIGNALS.endsAtShellPrompt('(base)\n╭╴ bachdx …/repo main\n╰─󰍟 c'), true);
+check('a bare ╰─ line without a ╭/┌ header nearby is NOT a shell prompt',
+  SIGNALS.endsAtShellPrompt('some output\n╰─󰍟'), false);
+check('an agent input-box bottom border is NOT a shell prompt',
+  SIGNALS.endsAtShellPrompt('╭──────────────────────────────────────╮\n│ >                                  │\n╰──────────────────────────────────────╯'), false);
 
 const exitedReports = new Map();
 check('the first exit episode emits the WORKER EXITED event', heartbeat.reportWorkerExited({

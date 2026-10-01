@@ -445,6 +445,7 @@ function terminals() {
   return list.map((t) => ({
     handle: t.handle,
     title: t.title || '',
+    agentIdentity: typeof t.agentIdentity === 'string' ? t.agentIdentity : '',
     preview: t.preview || '',
     lastOutputAt: Number(t.lastOutputAt) || 0,
     orphaned: !!t.orphaned,
@@ -642,14 +643,17 @@ function machineTerminalAgents(stateDir = DIR) {
 /**
  * RT-3 scope guard for terminals OUTSIDE this session's fleet: such a terminal may mark
  * Kimi exhausted only when positively identified as a Kimi terminal — via another
- * session's worker records or a Kimi-identifying title. An absent agent is never enough:
- * it could be another session's Codex/Claude pane, the operator panel, or a plain shell.
+ * session's worker records or Orca's own `terminal list` agentIdentity. An absent
+ * identity is never enough: it could be another session's Codex/Claude pane, the
+ * operator panel, or a plain shell. The terminal title is deliberately NOT a signal:
+ * Claude Code titles itself after its conversation topic, so a Claude session working
+ * on Kimi would false-positive (RT-3 again).
  */
-function isNonOwnKimiTerminal({ handle, title, ownHandles, panelHandle, machineAgents }) {
+function isNonOwnKimiTerminal({ handle, ownHandles, panelHandle, machineAgents, orcaAgents }) {
   if (!handle || (ownHandles && ownHandles.has(handle)) || handle === panelHandle) return false;
   const agent = machineAgents && machineAgents.get(handle);
   if (agent) return agent === 'kimi';
-  return /kimi/i.test(String(title || ''));
+  return !!(orcaAgents && orcaAgents.get(handle) === 'kimi');
 }
 
 /** A worker still consuming machine resources, whatever its task status says. */
@@ -1294,6 +1298,7 @@ function main() {
         handleAgent,
       };
       const machineAgents = machineTerminalAgents();
+      const orcaAgents = new Map(ts.map((t) => [t.handle, t.agentIdentity]));
       const panelHandle = process.env.ORCA_TERMINAL_HANDLE || '';
       let panelLimited = false;
       let panelAvailable = false;
@@ -1371,16 +1376,17 @@ function main() {
         // Kimi exhaustion is a machine-wide fact: a Kimi terminal showing the limit marks
         // the coder exhausted even when it is not a tracked worker of this session. But a
         // terminal OUTSIDE this session's fleet only ever marks it when positively
-        // identified as Kimi (another session's worker records or a Kimi title) — never
-        // on an absent agent, which could be another session's Codex/Claude pane, the
-        // operator panel, or a plain shell quoting the error (RT-3). The marker is
+        // identified as Kimi (another session's worker records or Orca's own
+        // agentIdentity) — never on an absent identity or a Kimi-mentioning title,
+        // which could be another session's Codex/Claude pane, the operator panel, or
+        // a plain shell quoting the error (RT-3). The marker is
         // written without a wake event: wake events stay scoped to this session's fleet.
         const terminalAgent = handleAgent.get(t.handle);
         if (verdict.kind !== 'usage_exhausted' && !terminalAgent &&
             hasKimiUsageExhausted(t.preview || '') &&
             isNonOwnKimiTerminal({
-              handle: t.handle, title: t.title, ownHandles: ownTerminalHandles,
-              panelHandle, machineAgents,
+              handle: t.handle, ownHandles: ownTerminalHandles,
+              panelHandle, machineAgents, orcaAgents,
             })) {
           reportUsageExhausted({
             reported: reportedUsageExhausted, handle: t.handle, label, coder: 'kimi',

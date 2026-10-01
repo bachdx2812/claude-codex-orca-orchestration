@@ -164,10 +164,19 @@ function endsAtShellPrompt(text) {
   const lines = terminalLines(text).map((line) => line.trimEnd()).filter((line) => line.trim());
   if (!lines.length) return false;
   const last = lines[lines.length - 1].trim();
-  if (!last || last.length > 160 || !SHELL_PROMPT_END.test(last)) return false;
-  if (/[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]/u.test(last)) return false;
+  if (!last || last.length > 160) return false;
+  // Two-line powerline prompt (zsh powerline/p10k-style): a short last line starting
+  // with `╰─`/`└─` right below a `╭`/`┌` header line is the shell waiting for input.
+  // Dead-agent TUI chrome ("shift+tab to cycle" etc.) often remains on screen ABOVE
+  // the shell prompt, so the tail TUI-hint check must not reject this shape; an agent
+  // input box never matches because its bottom border is wide and ends in ╯/┘.
+  if (/^[╰└]─/u.test(last) && last.length <= 60 && !/[╯┘]\s*$/u.test(last)) {
+    return lines.slice(-3, -1).some((line) => /^[╭┌]/u.test(line.trim()));
+  }
   const tail = lines.slice(-12).join('\n');
   if (AGENT_TUI_HINT.test(tail)) return false;
+  if (!SHELL_PROMPT_END.test(last)) return false;
+  if (/[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]/u.test(last)) return false;
   return true;
 }
 

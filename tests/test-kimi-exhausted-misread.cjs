@@ -145,29 +145,46 @@ check('the billing-cycle form has no window length',
 {
   const own = new Set(['term_mine']);
   const machineAgents = new Map([['term_other_kimi', 'kimi'], ['term_other_codex', 'codex']]);
+  const orcaAgents = new Map([
+    ['term_orca_kimi', 'kimi'], ['term_orca_codex', 'codex'], ['term_orca_claude', 'claude'],
+  ]);
   check('an untracked terminal recorded as another session\'s Kimi worker counts',
     heartbeat.isNonOwnKimiTerminal({
-      handle: 'term_other_kimi', title: 'worker', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+      handle: 'term_other_kimi', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
     }), true);
   check('an untracked terminal recorded as Codex does NOT count',
     heartbeat.isNonOwnKimiTerminal({
-      handle: 'term_other_codex', title: 'worker', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+      handle: 'term_other_codex', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
     }), false);
-  check('an unknown terminal with a Kimi title counts',
+  check('an untracked terminal Orca identifies as Kimi counts',
     heartbeat.isNonOwnKimiTerminal({
-      handle: 'term_unknown', title: 'Kimi CLI', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+      handle: 'term_orca_kimi', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
     }), true);
-  check('an unknown terminal with a plain title does NOT count',
+  check('a terminal Orca identifies as Codex/Claude does NOT count',
+    [
+      heartbeat.isNonOwnKimiTerminal({
+        handle: 'term_orca_codex', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
+      }),
+      heartbeat.isNonOwnKimiTerminal({
+        handle: 'term_orca_claude', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
+      }),
+    ], [false, false]);
+  check('an unknown terminal is NEVER identified by its title (RT-3: Claude titles itself after its topic)',
     heartbeat.isNonOwnKimiTerminal({
-      handle: 'term_unknown', title: 'zsh', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+      handle: 'term_unknown', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
+    }), false);
+  check('a Kimi-titled terminal with no identity record does NOT count',
+    heartbeat.isNonOwnKimiTerminal({
+      handle: 'term_unknown', ownHandles: own, panelHandle: 'term_panel',
+      machineAgents: new Map(), orcaAgents: new Map(),
     }), false);
   check('an own terminal is never handled by the non-own path',
     heartbeat.isNonOwnKimiTerminal({
-      handle: 'term_mine', title: 'Kimi CLI', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+      handle: 'term_mine', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
     }), false);
   check('the operator panel is never handled by the non-own path',
     heartbeat.isNonOwnKimiTerminal({
-      handle: 'term_panel', title: 'Kimi CLI', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+      handle: 'term_panel', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
     }), false);
 
   // machineTerminalAgents rebuilds the cross-session map from gate state files.
@@ -194,7 +211,7 @@ check('the billing-cycle form has no window length',
   const reported = new Map();
   const now = Date.now();
   if (heartbeat.isNonOwnKimiTerminal({
-    handle: 'term_other_codex', title: 'worker', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+    handle: 'term_other_codex', ownHandles: own, panelHandle: 'term_panel', machineAgents, orcaAgents,
   })) {
     heartbeat.reportUsageExhausted({ reported, handle: 'term_other_codex', label: 'x', coder: 'kimi', windowHours: 5, now, silent: true });
   }
