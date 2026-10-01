@@ -3296,6 +3296,11 @@ async function heartbeatWorktreeTests() {
   // 'user_requested' reason as a deliberate "keep this finished worker" decision (6m). A
   // retain the gate recorded strictly BEFORE this worker was first seen done stays
   // eligible for auto-close.
+  // 6m-2 (updated by the fc07377 follow-up): the same shape now fails CLOSED when the
+  // daemon never saw the worker running and the row carries no Orca completion time —
+  // there is no evidence the retain ran before the done transition, so it is treated as
+  // retain-after-done and blocks auto-close. (A daemon that DID see the worker running
+  // stamps first-seen-done itself, and a strictly-earlier retainedAt stays eligible.)
   {
     const wt = realWtDir('auto-close-user-requested-before-done');
     const name = 'auto-close-user-requested-before-done';
@@ -3316,10 +3321,10 @@ async function heartbeatWorktreeTests() {
     });
     let calls = '';
     try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
-    checkBool('a user_requested retain recorded before the done transition (readiness-recovery recipe) still auto-closes',
-      out.includes('WORKER CLOSED ctx_user_requested_early'), true);
-    checkBool('the release call ran for the recovery-retained worker',
-      calls.includes('worker-release --dispatch ctx_user_requested_early'), true);
+    checkBool('a past retain the daemon cannot prove ran before the done transition never auto-closes',
+      out.includes('WORKER CLOSED ctx_user_requested_early'), false);
+    checkBool('the release call never ran for the ambiguous-retained worker',
+      calls.includes('worker-release --dispatch ctx_user_requested_early'), false);
   }
 
   // 6m-3. The same shape but with no session gate record of the retain at all (e.g. a

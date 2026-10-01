@@ -549,9 +549,11 @@ check('destination selection can read both quota caches without live probes',
   heartbeat.cachedCoderQuotas(start, {
     readCodexCache: () => ({ usedPercent: 30, source: 'cache' }),
     readKimiCache: () => ({ usedPercent: 97, source: 'cache' }),
+    readDeepseekCache: () => ({ failed: true }),
   }), {
     codex: { usedPercent: 30, source: 'cache' },
     kimi: { usedPercent: 97, source: 'cache' },
+    deepseek: null,
   });
 
 const bothEligiblePool = {

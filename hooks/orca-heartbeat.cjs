@@ -52,10 +52,13 @@ const path = require('path');
 const {
   loadConfig, stateDir, closeDoneWorktreesEnabled, closeDoneWorktreesMode, stallSeconds, handoffUsed, kimiHandoffUsed,
   codexQuotaCacheSeconds, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds,
+  deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
+  maxParallelDeepseekWorkers,
   autoResumeAfterReset,
 } = require('./lib/config.cjs');
 const {
   hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
+  hasDeepseekBalanceExhausted,
   approvalPromptFingerprint, endsAtShellPrompt,
 } = require('./lib/terminal-signals.cjs');
 const {
@@ -449,10 +452,10 @@ function reportUsageExhausted({ reported, handle, label, coder, windowHours, now
     windowHours: Number.isFinite(windowHours) ? windowHours : null, until,
   });
   if (silent) return null;
-  const name = coder === 'codex' ? 'Codex' : 'Kimi';
-  const other = coder === 'codex' ? 'Kimi' : 'Codex';
+  const name = coder === 'codex' ? 'Codex' : coder === 'kimi' ? 'Kimi' : 'DeepSeek';
+  const other = coder === 'codex' ? 'Kimi or DeepSeek' : coder === 'kimi' ? 'Codex or DeepSeek' : 'Codex or Kimi';
   return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
-    `route new code to ${other} (or Sonnet if ${other} is also out); follow the WORKER HANDOVER recipe ` +
+    `route new code to ${other} (or Sonnet if none is eligible); follow the WORKER HANDOVER recipe ` +
     'to commit WIP and HANDOVER.md before stopping/releasing this worker; do not retry it until reset';
 }
 
@@ -477,10 +480,15 @@ function spawnResumeScheduler(file) {
   } catch { return 0; }
 }
 
+/** The pool/quota coder key for a worker agent (opencode runs DeepSeek). */
+function quotaKeyForAgent(agent) {
+  return agent === 'opencode' ? 'deepseek' : agent;
+}
+
 /** Probe only coders with live supervised workers. The existing quota helpers own the
  * shared cache and single-flight lock, so a fresh gate reading makes this effectively free. */
 function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
-  const result = { codex: null, kimi: null };
+  const result = { codex: null, kimi: null, deepseek: null };
   if (agents.has('codex')) {
     const reading = (deps.codexQuota || QUOTA.codexQuota)(now, {
       stateDir: DIR, cacheSeconds: codexQuotaCacheSeconds(cfg),
@@ -493,6 +501,13 @@ function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
     });
     if (reading && !reading.failed) result.kimi = reading;
   }
+  if (agents.has('deepseek') || agents.has('opencode')) {
+    const reading = (deps.deepseekQuota || QUOTA.deepseekQuota)(now, {
+      stateDir: DIR, cacheSeconds: deepseekQuotaCacheSeconds(cfg), env: process.env,
+      dailyCapUsd: deepseekDailySpendCapUsd(cfg),
+    });
+    if (reading && !reading.failed) result.deepseek = reading;
+  }
   return result;
 }
 
@@ -501,9 +516,11 @@ function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
 function cachedCoderQuotas(now = Date.now(), deps = {}) {
   const codex = (deps.readCodexCache || QUOTA.readFreshCache)(DIR, codexQuotaCacheSeconds(cfg), now);
   const kimi = (deps.readKimiCache || QUOTA.readFreshKimiCache)(DIR, kimiQuotaCacheSeconds(cfg), now);
+  const deepseek = (deps.readDeepseekCache || QUOTA.readFreshDeepseekCache)(DIR, deepseekQuotaCacheSeconds(cfg), now);
   return {
     codex: codex && !codex.failed ? codex : null,
     kimi: kimi && !kimi.failed ? kimi : null,
+    deepseek: deepseek && !deepseek.failed ? deepseek : null,
   };
 }
 
@@ -517,9 +534,10 @@ function buildHandoverPool(quotas, now = Date.now(), deps = {}) {
   });
   return (deps.pickCoderPool || CODER_POOL.pickCoderPool)({
     availability, quotas,
-    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg) },
+    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg), deepseek: deepseekHandoffUsed(cfg) },
+    roles: { deepseek: deepseekRole(cfg) },
     exhaustion: (deps.readCoderExhaustion || CODER_AVAILABILITY.readCoderExhaustion)(DIR, now),
-    live: { codex: 0, kimi: 0 }, caps: { codex: 0, kimi: 0 },
+    live: { codex: 0, kimi: 0, deepseek: 0 }, caps: { codex: 0, kimi: 0, deepseek: 0 },
     // Handover must never recommend an unavailable destination. The legacy null fallback
     // mode applies only to default new-work routing, not recovery of an in-flight task.
     fallbackEnabled: true,
@@ -583,6 +601,22 @@ function workers() {
   return parseWorkerRows(orca(['orchestration', 'worker-list', '--json']));
 }
 
+/** Orca's own completion time on a worker row (epoch ms or ISO), or null. */
+function workerRowCompletedAt(w) {
+  const candidates = [w.completedAt, w.finishedAt, w.endedAt,
+    w.resource && (w.resource.completedAt || w.resource.finishedAt || w.resource.endedAt)];
+  for (const value of candidates) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value < 1e12 ? value * 1000 : value;
+    if (typeof value === 'string') {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric) && value.trim() !== '') return numeric < 1e12 ? numeric * 1000 : numeric;
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return null;
+}
+
 function parseWorkerRows(d) {
   if (!d || d.ok === false) return null;
   const r = d.result ?? d;
@@ -595,6 +629,9 @@ function parseWorkerRows(d) {
     terminalState: w.terminalState,
     agent: w.agent || '',
     agentTerminalHandle: w.agentTerminalHandle || '',
+    // Orca's own completion time (epoch ms or ISO), when the row carries one: the
+    // authoritative done timestamp, preferred over this daemon's first-seen-done time.
+    completedAt: workerRowCompletedAt(w),
     // Orca's own distinction between an explicit operator retain and its automatic
     // readiness-timeout retain ('user_requested' | 'identity_unproven' | null).
     retainedReason: typeof w.retainedReason === 'string' ? w.retainedReason
@@ -787,19 +824,23 @@ function machineTerminalAgents(stateDir = DIR) {
 }
 
 /**
- * RT-3 scope guard for terminals OUTSIDE this session's fleet: such a terminal may mark
- * Kimi exhausted only when positively identified as a Kimi terminal — via another
+ * RT-3 scope guard for terminals OUTSIDE this session's fleet: such a terminal may mark a
+ * coder exhausted only when positively identified as that coder's terminal — via another
  * session's worker records or Orca's own `terminal list` agentIdentity. An absent
  * identity is never enough: it could be another session's Codex/Claude pane, the
  * operator panel, or a plain shell. The terminal title is deliberately NOT a signal:
  * Claude Code titles itself after its conversation topic, so a Claude session working
  * on Kimi would false-positive (RT-3 again).
  */
-function isNonOwnKimiTerminal({ handle, ownHandles, panelHandle, machineAgents, orcaAgents }) {
+function isNonOwnAgentTerminal({ handle, ownHandles, panelHandle, machineAgents, orcaAgents, agent }) {
   if (!handle || (ownHandles && ownHandles.has(handle)) || handle === panelHandle) return false;
-  const agent = machineAgents && machineAgents.get(handle);
-  if (agent) return agent === 'kimi';
-  return !!(orcaAgents && orcaAgents.get(handle) === 'kimi');
+  const recorded = machineAgents && machineAgents.get(handle);
+  if (recorded) return recorded === agent;
+  return !!(orcaAgents && orcaAgents.get(handle) === agent);
+}
+
+function isNonOwnKimiTerminal(ctx) {
+  return isNonOwnAgentTerminal({ ...ctx, agent: 'kimi' });
 }
 
 /** A worker still consuming machine resources, whatever its task status says. */
@@ -1433,6 +1474,10 @@ function classifyTerminal(t, ctx) {
       hasKimiUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'kimi' };
   if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'codex' &&
       hasCodexUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'codex' };
+  // DeepSeek's 402 "Insufficient Balance" is terminal until the account is topped up —
+  // the pay-per-use equivalent of the billing-cycle limits above (same RT-3 scoping).
+  if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'opencode' &&
+      hasDeepseekBalanceExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'deepseek' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
   // A terminal whose tracked agent dropped back to a shell prompt (agent process gone)
@@ -1540,6 +1585,15 @@ function main() {
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
   const baseOrphans = new Set((baseTerms || []).filter((t) => t.orphaned).map((t) => t.handle));
+  // Every dispatch id this daemon has ever seen NOT done. A done row first seen done whose
+  // gate record shows a retain already set must be treated as retain-AFTER-done (blocks
+  // auto-close) — the daemon never saw the worker running, so the retain could not have
+  // been the mid-run recovery recipe.
+  const isDoneRow = (w) => DONE_WORKER_STATES.has(w && w.workerState) || DONE_WORKER_STATES.has(w && w.dispatchStatus) ||
+    isFailedWorker(w);
+  const everSeenRunningIds = new Set((baseWorkers || [])
+    .filter((w) => w && w.dispatchId && !isDoneRow(w))
+    .map((w) => w.dispatchId));
 
   const deadline = started + MAX_SECONDS * 1000;
 
@@ -1577,6 +1631,7 @@ function main() {
     beat(started); // item L1: refresh liveness between round trips at a short --interval
     if (ws) {
       settleOrcaReleasedSessionGroups(ws);
+      for (const w of ws) if (w && w.dispatchId && !isDoneRow(w)) everSeenRunningIds.add(w.dispatchId);
       for (const worktreePath of workerWorktreePaths(ws)) ownedWorktreePaths.add(worktreePath);
       for (const handle of sessionTerminalHandles(ws)) ownTerminalHandles.add(handle);
       for (const handle of retainedTerminalHandles(ws)) explicitRetainedHandles.add(handle);
@@ -1587,6 +1642,21 @@ function main() {
         else if (before !== state) events.push(`worker ${id} changed: ${before} -> ${state}`);
       }
       prevWorkers = cur;
+      // Bound the persisted done/auto-close maps: entries for workers Orca no longer lists
+      // at all, older than a week, are dead weight from long-gone dispatches.
+      const PRUNE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+      const listedDispatchIds = new Set(ws.map((w) => w && w.dispatchId).filter(Boolean));
+      let doneAtPruned = false;
+      for (const [id, ts] of doneAtMap) {
+        if (!listedDispatchIds.has(id) && now - ts > PRUNE_AGE_MS) { doneAtMap.delete(id); doneAtPruned = true; }
+      }
+      if (doneAtPruned) savePersistedTimestampMap(DONE_AT_FILE, doneAtMap);
+      let autoClosedPruned = false;
+      for (const [id, v] of autoClosed) {
+        const at = Number.isFinite(v && v.at) ? v.at : 0;
+        if (!listedDispatchIds.has(id) && now - at > PRUNE_AGE_MS) { autoClosed.delete(id); autoClosedPruned = true; }
+      }
+      if (autoClosedPruned) savePersistedAutoClosed(autoClosed);
     }
 
     if (CLOSE_DONE_WORKTREES) {
@@ -1640,11 +1710,21 @@ function main() {
         const previous = autoClosed.get(w.dispatchId);
         if (previous && previous.state === 'closed') continue;
         if (previous && previous.state === 'failed' && now - previous.at < MUTATION_RETRY_MS) continue;
+        const gateWorker = stateWorkerForRow(w, tickState);
         if (!doneAtMap.has(w.dispatchId)) {
-          doneAtMap.set(w.dispatchId, now);
+          // Prefer Orca's own completion time over this daemon's first-seen-done time. When
+          // Orca carries none and the gate record shows a retain already set even though
+          // this daemon never saw the worker RUNNING, treat it as retain-after-done: stamp
+          // doneAt at the retain itself so `retainedAt < doneAt` is false and auto-close
+          // stays blocked (the retain could not have been the mid-run recovery recipe).
+          let doneAt = Number.isFinite(w.completedAt) ? w.completedAt : now;
+          if (!Number.isFinite(w.completedAt) && Number.isFinite(gateWorker?.retainedAt) &&
+              !everSeenRunningIds.has(w.dispatchId)) {
+            doneAt = gateWorker.retainedAt;
+          }
+          doneAtMap.set(w.dispatchId, doneAt);
           savePersistedTimestampMap(DONE_AT_FILE, doneAtMap);
         }
-        const gateWorker = stateWorkerForRow(w, tickState);
         const result = autoCloseDoneWorker(w, {
           retained: !!gateWorker?.retained,
           retainedAt: Number.isFinite(gateWorker?.retainedAt) ? gateWorker.retainedAt : null,
@@ -1744,10 +1824,10 @@ function main() {
       const activeResumeHandles = new Set(ts.filter((terminal) =>
         ownTerminalHandles.has(terminal.handle) &&
         liveWorkerHandles.has(terminal.handle) &&
-        ['codex', 'kimi', 'claude'].includes(handleAgent.get(terminal.handle))
+        ['codex', 'kimi', 'opencode', 'claude'].includes(handleAgent.get(terminal.handle))
       ).map((terminal) => terminal.handle));
       const activeCoderHandles = new Set([...activeResumeHandles]
-        .filter((handle) => ['codex', 'kimi'].includes(handleAgent.get(handle))));
+        .filter((handle) => ['codex', 'kimi', 'opencode'].includes(handleAgent.get(handle))));
       const authorizedResumeHandles = new Set(activeResumeHandles);
       if (panelHandle && ts.some((terminal) => terminal.handle === panelHandle)) {
         authorizedResumeHandles.add(panelHandle);
@@ -1756,10 +1836,11 @@ function main() {
       const liveCoderAgents = new Set([...activeCoderHandles].map((handle) => handleAgent.get(handle)));
       const liveQuotas = probeLiveCoderQuotas(liveCoderAgents, now);
       beat(started);
-      const cachedQuotas = liveCoderAgents.size ? cachedCoderQuotas(now) : { codex: null, kimi: null };
+      const cachedQuotas = liveCoderAgents.size ? cachedCoderQuotas(now) : { codex: null, kimi: null, deepseek: null };
       const routingQuotas = {
         codex: liveQuotas.codex || cachedQuotas.codex,
         kimi: liveQuotas.kimi || cachedQuotas.kimi,
+        deepseek: liveQuotas.deepseek || cachedQuotas.deepseek,
       };
       const handoverPool = liveCoderAgents.size ? buildHandoverPool(routingQuotas, now) : null;
       let handoverChanged = false;
@@ -1800,6 +1881,18 @@ function main() {
           reportUsageExhausted({
             reported: reportedUsageExhausted, handle: t.handle, label, coder: 'kimi',
             windowHours: kimiUsageLimitHours(t.preview || ''), now, silent: true,
+          });
+        }
+        // Same machine-wide fact, same RT-3 scoping, for DeepSeek's 402 balance signal.
+        if (verdict.kind !== 'usage_exhausted' && !terminalAgent &&
+            hasDeepseekBalanceExhausted(t.preview || '') &&
+            isNonOwnAgentTerminal({
+              handle: t.handle, ownHandles: ownTerminalHandles,
+              panelHandle, machineAgents, orcaAgents, agent: 'opencode',
+            })) {
+          reportUsageExhausted({
+            reported: reportedUsageExhausted, handle: t.handle, label, coder: 'deepseek',
+            windowHours: null, now, silent: true,
           });
         }
         if (verdict.kind === 'usage_exhausted') {
@@ -1889,12 +1982,13 @@ function main() {
           }
         }
         if (activeCoderHandles.has(t.handle)) {
-          const quota = liveQuotas[agent];
+          const quota = liveQuotas[quotaKeyForAgent(agent)];
           const exhausted = verdict.kind === 'usage_exhausted';
           // An unknown/failed probe is absence of evidence, not recovery. Preserve an
           // existing episode until a known below-margin reading or worker completion.
           if (exhausted || typeof quota?.usedPercent === 'number') {
-            const threshold = agent === 'kimi' ? kimiHandoffUsed(cfg) : handoffUsed(cfg);
+            const threshold = agent === 'kimi' ? kimiHandoffUsed(cfg)
+              : agent === 'opencode' ? deepseekHandoffUsed(cfg) : handoffUsed(cfg);
             let target = HANDOVER.pickNextCoder(agent, handoverPool);
             const limited = exhausted || quota.usedPercent >= 100;
             // Sonnet lives inside the panel. If that panel is itself quota-limited, there
@@ -1989,7 +2083,7 @@ module.exports = {
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
-  machineTerminalAgents, isNonOwnKimiTerminal, exhaustionUntilMs,
+  machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
   loadPersistedExitedReports, savePersistedExitedReports, reportWorkerExited,
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
