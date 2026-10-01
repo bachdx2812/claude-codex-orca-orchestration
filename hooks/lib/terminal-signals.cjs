@@ -8,6 +8,13 @@ const STRONG_RATE_LIMIT_MARKER = /(HTTP(?:\/\d(?:\.\d)?)?\s+429\b|too\s+many\s+r
 // A leading opencode/box-drawing gutter (`┃`, `│`, `|`) plus any spacing.
 const BOX_GUTTER = /^[┃│|]\s*/u;
 
+// opencode's prompt-box placeholder when no turn is in flight: `Ask anything…` (or the
+// three-dot spelling). It disappears while a turn runs, so its presence means idle input.
+const OPENCODE_ASK_ANYTHING = /ask\s+anything/i;
+// opencode marks each step of a turn with a `▣` glyph (`▣  Build · 3.2s · 21 tokens`).
+// The welcome/home screen never shows one; its absence is the "no turn ever ran" signal.
+const OPENCODE_TURN_MARKER = /▣/u;
+
 function terminalLines(text) {
   return String(text || '').replace(ANSI_ESCAPE, '').split(/\r?\n/);
 }
@@ -216,7 +223,32 @@ function endsAtShellPrompt(text) {
   return true;
 }
 
+/** True when the rendered screen shows an opencode turn marker (a `▣` step status), i.e.
+ * at least one turn has started (or is running). Stripped of ANSI so repaints stay inert. */
+function opencodeTurnMarker(text) {
+  return terminalLines(text).some((line) => OPENCODE_TURN_MARKER.test(line));
+}
+
+/**
+ * True when the rendered screen is opencode's welcome/home screen with no turn marker: the
+ * input box still shows the `Ask anything…` placeholder and no `▣  Build ·`-style status has
+ * appeared, so no turn ever ran. Any tool output implies a `▣` step marker in the same
+ * rendered frame, so the single marker check covers both "no turn marker" and "no tool
+ * output". A screen that has started a turn therefore never matches, which is what lets the
+ * caller re-arm the never-started episode once the brief actually lands.
+ */
+function opencodeWelcomeScreen(text) {
+  const lines = terminalLines(text)
+    .map((line) => line.replace(BOX_GUTTER, '').trim())
+    .filter(Boolean);
+  if (!lines.length) return false;
+  if (!lines.some((line) => OPENCODE_ASK_ANYTHING.test(line))) return false;
+  if (lines.some((line) => OPENCODE_TURN_MARKER.test(line))) return false;
+  return true;
+}
+
 module.exports = {
   hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
   hasDeepseekBalanceExhausted, approvalPromptFingerprint, endsAtShellPrompt,
+  opencodeWelcomeScreen, opencodeTurnMarker,
 };

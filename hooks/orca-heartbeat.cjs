@@ -60,6 +60,7 @@ const {
   hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
   hasDeepseekBalanceExhausted,
   approvalPromptFingerprint, endsAtShellPrompt,
+  opencodeWelcomeScreen, opencodeTurnMarker,
 } = require('./lib/terminal-signals.cjs');
 const {
   workerProgressSample, observeWorkerProgress, recordsFromJSON,
@@ -132,6 +133,11 @@ const APPROVAL_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-approval-rep
 // (handle -> lastOutputAt at report time; fresh output afterwards re-arms it), surviving
 // daemon restarts like the idle report.
 const EXITED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-exited-reported.json`);
+// An opencode worker whose rendered screen is still the welcome/home screen with no turn
+// marker for this long after it was first seen has never had its brief delivered. Reported
+// once per episode (persisted like other episodes) and re-armed when a turn marker appears.
+const NEVER_STARTED_SECONDS = 90;
+const NEVER_STARTED_FILE = path.join(DIR, `heartbeat-${SESSION}-never-started.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -394,6 +400,57 @@ function reportWorkerExited({ reported, handle, lastOutputAt, identity, agent })
   return `WORKER EXITED ${identity || handle} (${agent || 'unknown'} process gone, terminal at shell prompt) - ` +
     'read the terminal for the cause (e.g. Claude Code\'s trust dialog defaulting to exit in an ' +
     'untrusted worktree), then re-dispatch: Kimi/Codex, or headless `claude -p` launched via worker-start';
+}
+
+function loadPersistedNeverStarted() {
+  try {
+    const pairs = JSON.parse(fs.readFileSync(NEVER_STARTED_FILE, 'utf8'));
+    if (!Array.isArray(pairs)) return new Map();
+    return new Map(pairs.filter((pair) => Array.isArray(pair) && pair.length === 2 &&
+      typeof pair[0] === 'string' && pair[1] && typeof pair[1] === 'object' &&
+      Number.isFinite(pair[1].firstSeenAt) && typeof pair[1].reported === 'boolean'));
+  } catch {
+    return new Map();
+  }
+}
+
+function savePersistedNeverStarted(map) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${NEVER_STARTED_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...map]));
+    fs.renameSync(tmp, NEVER_STARTED_FILE);
+  } catch {}
+}
+
+/**
+ * The opencode "never started" report: a live opencode worker whose rendered screen is still
+ * the welcome/home screen (no turn marker) for >= NEVER_STARTED_SECONDS after it was first
+ * seen emits once per episode. The episode starts on the first welcome-screen observation
+ * (`firstSeenAt`), and the report is persisted before emitting so a daemon restart never
+ * re-fires mid-episode. Returns null while the grace window is still open or the episode is
+ * already reported.
+ */
+function reportNeverStarted({ reported, handle, now = Date.now(), identity }) {
+  const previous = reported.get(handle);
+  if (!previous) {
+    reported.set(handle, { firstSeenAt: now, reported: false });
+    savePersistedNeverStarted(reported);
+    return null;
+  }
+  if (previous.reported || now - previous.firstSeenAt < NEVER_STARTED_SECONDS * 1000) return null;
+  reported.set(handle, { firstSeenAt: previous.firstSeenAt, reported: true });
+  savePersistedNeverStarted(reported);
+  return `WORKER NEVER STARTED ${identity || handle} (opencode, brief not delivered) - resend the brief: ` +
+    `orca terminal send --terminal ${handle} --text '<one-line brief>' --enter`;
+}
+
+/** Re-arm a reported episode when a turn marker appears: the worker is running, so a later
+ * return to the welcome screen is a fresh episode, not a continuation of this one. */
+function rearmNeverStarted({ reported, handle }) {
+  if (!reported.has(handle)) return;
+  reported.delete(handle);
+  savePersistedNeverStarted(reported);
 }
 
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
@@ -1607,6 +1664,7 @@ function main() {
     .map(([handle, record]) => [handle, record.screenText]));
   const reportedApproval = loadPersistedApprovalReports();
   const reportedExited = loadPersistedExitedReports();
+  const reportedNeverStarted = loadPersistedNeverStarted();
   const autoClosed = loadPersistedAutoClosed();
   const doneAtMap = loadPersistedTimestampMap(DONE_AT_FILE);
   const rmFailed = loadPersistedTimestampMap(RM_FAILED_FILE);
@@ -1986,6 +2044,21 @@ function main() {
         }
 
         const agent = handleAgent.get(t.handle) || 'unknown';
+        // opencode "never started": a live opencode worker whose rendered screen is still
+        // the welcome/home screen (no `▣` turn marker) has never had its brief delivered.
+        // Fires once per episode after NEVER_STARTED_SECONDS on the welcome screen, and
+        // re-arms when a turn marker appears (the brief finally landed and a turn ran).
+        if (agent === 'opencode' && !TERMINAL_WORKER_STATES.has(workerState)) {
+          if (opencodeWelcomeScreen(screenText)) {
+            const neverStarted = reportNeverStarted({
+              reported: reportedNeverStarted, handle: t.handle, now,
+              identity: handleDispatch.get(t.handle) || t.handle,
+            });
+            if (neverStarted) events.push(neverStarted);
+          } else if (opencodeTurnMarker(screenText)) {
+            rearmNeverStarted({ reported: reportedNeverStarted, handle: t.handle });
+          }
+        }
         if (agent === 'claude' && activeResumeHandles.has(t.handle)) {
           const claudeLimit = RESUME.claudeLimitInfo(screenText, now);
           if (claudeLimit.limited && AUTO_RESUME) {
@@ -2107,6 +2180,7 @@ module.exports = {
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
   machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
   loadPersistedExitedReports, savePersistedExitedReports, reportWorkerExited,
+  loadPersistedNeverStarted, savePersistedNeverStarted, reportNeverStarted, rearmNeverStarted, NEVER_STARTED_SECONDS,
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
   shouldTrackWorkerProgress,

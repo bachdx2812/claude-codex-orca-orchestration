@@ -78,7 +78,9 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
    at Claude Code's "trust this folder?" dialog (default `No, exit`). Prefer Kimi/Codex
    workers in new worktrees, or a headless `claude -p --dangerously-skip-permissions`
    brief launched via `worker-start` (a bare `orca terminal create` terminal is gated as
-   a main panel, not a worker).
+   a main panel, not a worker). It also reports an opencode worker whose terminal sits on
+   its welcome screen with no `▣` turn marker for 90 seconds as `WORKER NEVER STARTED`
+   (brief not delivered) — resend the brief with `orca terminal send`.
 7. **Codex rate-limits under parallel load.** On a rate-limit signal the correct response
    is to back off and retry the *same* dispatch (`worker-start --retry-of <id>`), never to
    re-dispatch immediately or start a replacement.
@@ -646,6 +648,20 @@ prose that merely mentions those words is not a match. Only normalized prompt-bl
 form the persisted signature, including the normalized question and command, so surrounding
 tips, spinners, timers, and ordinary output do not create new episodes while consecutive
 prompts for different commands remain distinct. It is re-armed when the prompt disappears.
+
+A `worker-start --agent opencode --spec` can report `input_accepted` while its terminal never
+runs a turn: the rendered screen stays on the opencode welcome/home screen (the `Ask
+anything…` input placeholder, a `● Tip ...` line, and the version footer) with no
+`▣  Build ·` turn marker and no tool output. After 90 seconds of that, the heartbeat emits,
+once per episode (persisted across daemon restarts like the other episodes):
+
+```text
+WORKER NEVER STARTED <dispatch|terminal> (opencode, brief not delivered) - resend the brief: orca terminal send --terminal <terminalHandle> --text '<one-line brief>' --enter
+```
+
+The episode starts when the welcome screen is first observed and is re-armed when a `▣` turn
+marker appears, so a worker that actually starts a turn is not reported again until it
+returns to a fresh welcome screen.
 
 For every live supervised Codex or Kimi worker, the heartbeat reuses the existing cached,
 single-flight quota probe. It warns once at `handoverWarnMarginPercent` below that coder's

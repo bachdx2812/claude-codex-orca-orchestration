@@ -80,7 +80,7 @@ Two kinds of workers do the actual work; only Orca workers need supervision:
 | Kind | Examples | Where it runs | How the panel learns it finished |
 |---|---|---|---|
 | In-session subagent | Opus 5.5 planning/red-team and review, Sonnet verify-run, Sonnet code (handoff), Haiku lookups | Inside the Claude Code session, via the `Agent` tool | The `Agent` call returns its result to the panel when it completes. These hooks never track or gate subagents, so no heartbeat is needed. |
-| Orca worker | Codex (`gpt-5.6-sol`), Kimi, or DeepSeek (`opencode`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, making no real progress past its configured stall threshold, losing its Codex app-server connection, a failed/stopped worker still holding a terminal (a successfully-done one is released and its terminal closed by the daemon itself), this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
+| Orca worker | Codex (`gpt-5.6-sol`), Kimi, or DeepSeek (`opencode`) | A separate session in its own Orca-managed terminal/worktree | `orca-heartbeat.cjs` polls Orca and exits — waking the panel — on a worker state change, this session's own worker terminal going IDLE past `heartbeat.idleSeconds`, making no real progress past its configured stall threshold, losing its Codex app-server connection, an opencode worker still sitting on its welcome screen with no turn marker (brief never delivered), a failed/stopped worker still holding a terminal (a successfully-done one is released and its terminal closed by the daemon itself), this session's terminal becoming orphaned, a rate-limit signal, or one of this session's worktrees whose PR already merged/closed with no live terminal on it (see "Close finished worker panels" below). Context-only `unsupervised` rows, other sessions' worktrees, and the panel's own terminal are excluded. |
 
 **Parallel work.** These hooks gate the main panel's writes and model routing, not task
 scheduling, so running things in parallel is the operator's call, not something the gate
@@ -177,6 +177,20 @@ re-armed by fresh terminal output. This catches the recurring failure where an O
 `worker-start` still reported success. Prefer Kimi/Codex workers in new worktrees, or a
 headless `claude -p --dangerously-skip-permissions ...` launched via `worker-start`; a
 bare `orca terminal create` terminal is treated as a main panel, not a worker.
+
+**opencode worker never started.** A `worker-start --agent opencode --spec ...` can report
+`input_accepted` while its terminal never runs a turn — the rendered screen stays on the
+opencode welcome/home screen (`Ask anything…` placeholder, a `● Tip ...` line, the version
+footer) with no `▣  Build ·` turn marker and no tool output. After 90 seconds of that, the
+heartbeat emits, once per episode (persisted across daemon restarts):
+
+```text
+WORKER NEVER STARTED <dispatch|terminal> (opencode, brief not delivered) - resend the brief: orca terminal send --terminal <terminalHandle> --text '<one-line brief>' --enter
+```
+
+The episode starts when the welcome screen is first observed and re-arms when a `▣` turn
+marker appears, so a worker that later starts a turn is not reported again until it returns
+to a fresh welcome screen.
 
 **Mid-task quota handover.** While a supervised Codex, Kimi or DeepSeek worker is live, the
 heartbeat
