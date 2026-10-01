@@ -2242,8 +2242,17 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   check('a planning noun in the type is planning', gate.isPlanningReview('draft it', 'architect'), true);
   check('a review first verb is review', gate.isPlanningReview('review the diff', 'code-reviewer'), false);
   check('a verify first verb is review', gate.isPlanningReview('verify the fix', 'reviewer'), false);
-  check('a review verb governing a plan noun is review', gate.isPlanningReview('review the plan', 'planner'), false);
   check('a neutral verb with a planning noun is planning', gate.isPlanningReview('update the design doc', 'docs-manager'), true);
+  // A planning object anywhere beats the first verb: review/audit/verify of a plan is still
+  // planning work and must stay on the review model, never migrate to the code author's model.
+  check('a review verb over a plan noun is still planning', gate.isPlanningReview('review the plan', 'planner'), true);
+  check('a plan path is planning', gate.isPlanningReview('review the plan at plans/x/plan.md', 'reviewer'), true);
+  check('an audit of a plan is planning', gate.isPlanningReview('audit the implementation plan', 'reviewer'), true);
+  check('a plan noun in the prompt is planning', gate.isPlanningReview('review the diff', 'reviewer', 'Verify plan claims against the codebase before dispatch.'), true);
+  check('a design doc in the description is planning', gate.isPlanningReview('review phase-2 design doc', 'reviewer'), true);
+  check('red-team in the type is planning', gate.isPlanningReview('audit the findings', 'red-team'), true);
+  check('a code review with no planning object is not planning', gate.isPlanningReview('review the diff', 'reviewer'), false);
+  check('an implementation review is not planning', gate.isPlanningReview('audit the implementation for races', 'reviewer'), false);
 }
 
 {

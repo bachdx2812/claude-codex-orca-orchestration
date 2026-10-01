@@ -227,12 +227,18 @@ function redirectTargets(cmd) {
 // Intent of a dispatched task. Generic English verbs — not tied to any operator's roster.
 const PLAN_REVIEW_INTENT = /\b(plan|planning|design|review|reviewer|verify|verification|audit|red.?team|critique|assess|architect)\b/i;
 // Review / verify of code follows the code's author's mapped reviewer; planning and
-// red-team stay on the review model (operator decision, 2026-10-01). These two regexes
-// tell those apart: a planning first verb (or a planning noun with no review first verb)
-// is planning work, everything else in PLAN_REVIEW_INTENT is review work.
+// red-team stay on the review model (operator decision, 2026-10-01). A planning object
+// anywhere in the dispatch is planning work whatever the first verb; only code nouns
+// route by the code's author. See PLANNING_OBJECT and isPlanningReview.
 const PLANNING_FIRST_VERB = /^(plan|planning|design|architect|red.?team)\b/i;
 const REVIEW_FIRST_VERB = /^(review|reviewer|verify|verification|audit|critique|assess)\b/i;
 const PLANNING_INTENT = /\b(plan|planning|design|red.?team|architect|architecture)\b/i;
+// A planning object ANYWHERE in the dispatch — a planning noun, or a `plans/**.md` / `plan.md`
+// path — makes it planning work whatever the governing first verb. "Review the plan at
+// plans/x/plan.md", "Audit the implementation plan" and "Verify plan claims" are plan reviews
+// and must stay on the review model; only code nouns (diff, implementation, PR, commit,
+// worker output, branch) route by the code's author. Operator decision, 2026-10-01.
+const PLANNING_OBJECT = /\b(plan|planning|design|architecture|architect|red.?team)\b|(?:^|[\s`("'[])(?:plans\/[^\s`"')]+\.md|plan\.md)\b/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
@@ -275,11 +281,14 @@ function hasReviewEscalationReason(input, reviewerAlias) {
 
 /**
  * True when a plan/review-intent dispatch is PLANNING or red-team work (always the review
- * model) rather than a review of code (which follows the code's author). The governing
- * first verb wins; a review first verb beats a planning noun later in the text, and a
- * planning noun in the subagent_type only counts when no review verb governs.
+ * model) rather than a review of code (which follows the code's author). A planning object
+ * (a planning noun, or a plans/**.md path) ANYWHERE in the description, subagent_type or
+ * prompt head wins over the first verb, so a "Review / Audit / Verify the plan" dispatch
+ * stays on the review model. With no planning object, the governing first verb decides.
  */
-function isPlanningReview(description, type) {
+function isPlanningReview(description, type, prompt) {
+  const head = String(prompt || '').slice(0, 400);
+  if (PLANNING_OBJECT.test(description) || PLANNING_OBJECT.test(type) || PLANNING_OBJECT.test(head)) return true;
   if (PLANNING_FIRST_VERB.test(description)) return true;
   if (REVIEW_FIRST_VERB.test(description)) return false;
   return PLANNING_INTENT.test(description) || PLANNING_INTENT.test(type);
@@ -1506,7 +1515,7 @@ function onPreToolUse(p, s, cfg) {
     // never blocked just because the gate cannot tell who wrote the code.
     const codeAlias = cfg.models.code.alias;
     const isCodeModel = new RegExp(escapeRegex(codeAlias), 'i').test(model);
-    const planning = isPlanningReview(description, type);
+    const planning = isPlanningReview(description, type, input.prompt);
     const author = s.lastCodeAuthor || null;
     if (wantsPlanReview && !isEscalation) {
       if (planning || !author) {

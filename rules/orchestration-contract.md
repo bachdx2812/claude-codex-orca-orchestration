@@ -108,10 +108,14 @@ unless the description contains code intent, which wins when both signals are pr
 inside ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` counts; only review-style
 prefixes such as `review-fix` are excluded, so `Commit review-fix round` remains operational.
 
-A review-intent dispatch is then routed by author: `plan`/`planning`/`design`/`red-team`/
-`architect` stay on the review model, while `review`/`verify`/`audit`/`critique`/`assess`
-follow `models.reviewByCoder` for the session's last code author (a planning noun only counts
-as planning when no review verb governs the text).
+A review-intent dispatch is then routed by author. Plan, red-team and design work — a
+planning noun (`plan`/`planning`/`design`/`architecture`/`architect`/`red-team`) or a
+`plans/**.md` / `plan.md` path, ANYWHERE in the description, `subagent_type` or prompt head —
+always stays on the review model, whatever the first verb: `Review the plan at
+plans/x/plan.md`, `Audit the implementation plan` and `Verify plan claims` are plan reviews,
+never code reviews. Only a review of code (`review`/`verify`/`audit`/`critique`/`assess` with
+no planning object) follows `models.reviewByCoder` for the session's last code author, so a
+plan review can never silently migrate off the review model to the code model.
 
 ## Activation
 

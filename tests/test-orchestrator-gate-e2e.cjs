@@ -441,6 +441,22 @@ expect('a neutral first verb still classifies code-reviewer as review work',
   expect('opus review of external code is allowed once it escalates after the mapped review',
     review({ model: 'opus', prompt: 'escalation: sonnet review could not decide even at high effort' }), ALLOW, env);
 
+  // Plan/red-team reviews STAY on the review model even after an external coder has run:
+  // a planning object anywhere in the dispatch beats the review first verb.
+  for (const plan of [
+    { subagent_type: 'reviewer', description: 'Review the plan at plans/x/plan.md' },
+    { subagent_type: 'reviewer', description: 'Audit the implementation plan' },
+    { subagent_type: 'reviewer', description: 'Verify plan claims against the codebase' },
+    { subagent_type: 'reviewer', description: 'Review phase-2 design doc' },
+    { subagent_type: 'reviewer', description: 'Review the diff', prompt: 'Check the plan at plans/x/plan.md.' },
+  ]) {
+    expect(`opus plan review stays allowed after external code: ${plan.description}`,
+      dispatch(Object.assign({ model: 'opus' }, plan), sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), ALLOW, env);
+  }
+  expect('a plan review is not allowed to migrate to the code model after external code',
+    dispatch({ subagent_type: 'reviewer', description: 'Review the plan at plans/x/plan.md', model: 'sonnet' },
+      sid, { tool_use_id: `toolu_rfc_plan_${++reviewSeq}` }), DENY, env);
+
   invoke(postBash('orca orchestration worker-release --dispatch ctx_rfc_kimi --json', '{"ok":true,"result":{}}', { sid }), env);
   checkBool('releasing the external group does not clear its recorded author', stateOf().lastCodeAuthor, 'kimi');
 
