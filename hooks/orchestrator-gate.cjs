@@ -34,7 +34,7 @@ const {
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
   deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
-  maxParallelDeepseekWorkers, reviewModelForCoder,
+  maxParallelDeepseekWorkers, reviewModelForCoder, verifyModelAlias,
 } = require('./lib/config.cjs');
 const WG = require('./lib/worker-groups.cjs');
 const PAC = require('./lib/parallel-agent-cap.cjs');
@@ -225,13 +225,30 @@ function redirectTargets(cmd) {
 }
 
 // Intent of a dispatched task. Generic English verbs — not tied to any operator's roster.
-const PLAN_REVIEW_INTENT = /\b(plan|planning|design|review|reviewer|verify|verification|audit|red.?team|critique|assess|architect)\b/i;
-// Review / verify of code follows the code's author's mapped reviewer; planning and
-// red-team stay on the review model (operator decision, 2026-10-01). A planning object
-// anywhere in the dispatch is planning work whatever the first verb; only code nouns
-// route by the code's author. See PLANNING_OBJECT and isPlanningReview.
+const PLAN_REVIEW_INTENT = /\b(plan|planning|design|review|reviewer|audit|red.?team|critique|assess|architect)\b/i;
+// Review of code follows the code's author's mapped reviewer; planning and red-team stay on
+// the review model (operator decision, 2026-10-01). Verify-run work (running existing
+// checks) is a SEPARATE intent that runs on the verify model, not the review model (operator
+// decision, 2026-10-02). A planning object anywhere in the dispatch is planning work whatever
+// the first verb; only code nouns route by the code's author. See PLANNING_OBJECT,
+// isPlanningReview and the VERIFY_* patterns below.
 const PLANNING_FIRST_VERB = /^(plan|planning|design|architect|red.?team)\b/i;
-const REVIEW_FIRST_VERB = /^(review|reviewer|verify|verification|audit|critique|assess)\b/i;
+const REVIEW_FIRST_VERB = /^(review|reviewer|audit|critique|assess)\b/i;
+// A pure review verb (reading code and judging a diff) — distinct from planning nouns and
+// from verify-run verbs. Used for the review-beats-verify rule: a dispatch that both reviews
+// and verifies counts as review (the stronger model).
+const REVIEW_VERB = /\b(review|reviewer|audit|critique|assess)\b/i;
+// Verify-run work (operator decision, 2026-10-02): running checks that already exist — the
+// CI gate (check-pr-ci / CI gate), UI screenshots (screenshot / capture UI), play-testing
+// (play-test / playtest / play through), post-deploy smoke — rather than reading code and
+// judging a diff. Routes to the verify model (models.verify, default sonnet), never the
+// review model, which reads code and judges diffs. Only a dispatch that is NOT a plan review
+// counts; a brief that both reviews and verifies is review (REVIEW_VERB wins).
+const VERIFY_FIRST_VERB = /^(verify|verification|test|run\s+(?:the\s+)?(?:verify|tests?|ci)|smoke|re.?run|check[- ]?(?:pr[- ]?)?ci|screenshot|capture|play[- ]?(?:test|through)|playtest)\b/i;
+const VERIFY_INTENT = /\b(verify|verification|smoke|re.?run|play[- ]?test|playtest|play\s+through|post[- ]?deploy|deploy\s+verification|browser\s+verify|screenshot|capture\s+ui|check[- ]?pr[- ]?ci|ci\s+gate|run\s+(?:the\s+)?(?:verify|tests?|ci))\b/i;
+// A subagent_type that is a verifier makes a dispatch verify-run even when its description
+// has no verify verb: the declared role is running checks, not judging code.
+const VERIFY_TYPE_HINT = /\b(?:tester|verifier|browser[- ]?verifier|e2e[- ]?runner)\b/i;
 const PLANNING_INTENT = /\b(plan|planning|design|red.?team|architect|architecture)\b/i;
 // A planning object ANYWHERE in the dispatch — a planning noun, or a `plans/**.md` / `plan.md`
 // path — makes it planning work whatever the governing first verb. "Review the plan at
@@ -256,7 +273,7 @@ const STRONG_PLANNING_OBJECT = /(?<![\w-])(plan|plans|planning)(?![\w-])|\bred[-
 // when its description names code work: the type is the operator's declared role, so it wins.
 const PLANNING_TYPE_HINT = /\bred-?team\b|planner|plan[- ]reviewer/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
-const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|verify|audit|red.?team|critique|assess|architect)\b/i;
+const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
 const LOOKUP_INTENT = /\b(find|locate|search|grep|scout|explore|look\s*up|where\s+is|list\s+(all|the)|read\s+(the\s+)?(log|logs|output)|summari[sz]e\s+(the\s+)?(log|logs|output|test\s+results?))\b/i;
@@ -289,6 +306,21 @@ function hasReviewEscalationReason(input, reviewerAlias) {
   const alias = escapeRegex(reviewerAlias || 'sonnet');
   const marker = new RegExp(
     `\\bescalation:\\s*\\S|\\b${alias}\\s+(?:review\\s+)?(?:was\\s+)?(?:failed|could\\s*n[o'’]t|cannot|can[’']t|unable|undecided|inconclusive|stuck)\\b`,
+    'i'
+  );
+  const text = `${input.description || ''} ${String(input.prompt || '').slice(0, 300)}`;
+  return marker.test(text);
+}
+
+/**
+ * True when a verify-run dispatch escalates to the review model after the verify model could
+ * not decide — the same "say why in the dispatch" shape as hasReviewEscalationReason, so an
+ * Opus verify of a check the Sonnet verify already ran and could not conclude is allowed.
+ */
+function hasVerifyEscalationReason(input, verifyAlias) {
+  const alias = escapeRegex(verifyAlias || 'sonnet');
+  const marker = new RegExp(
+    `\\bescalation:\\s*\\S|\\b${alias}\\s+(?:verify\\s+)?(?:was\\s+)?(?:failed|could\\s*n[o'’]t|cannot|can[’']t|unable|undecided|inconclusive|stuck)\\b`,
     'i'
   );
   const text = `${input.description || ''} ${String(input.prompt || '').slice(0, 300)}`;
@@ -1077,8 +1109,8 @@ function onSessionStart(p, s, cfg) {
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
-    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> ${usableCoders.map(coderLabel).join(' + ') || 'in-session'} coder${usableCoders.length === 1 ? '' : 's'} -> reviews.\n` +
-    `- Planning / red-team -> in-session subagent on model ${modelLabel(cfg.models.review)}. Review / verify -> model ${reviewRouteText(cfg, s)} (review model follows the code's author).\n` +
+    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> ${usableCoders.map(coderLabel).join(' + ') || 'in-session'} coder${usableCoders.length === 1 ? '' : 's'} -> reviews; verify -> ${verifyModelAlias(cfg)}.\n` +
+    `- Planning / red-team -> in-session subagent on model ${modelLabel(cfg.models.review)}. Review -> model ${reviewRouteText(cfg, s)} (review model follows the code's author). Verify -> model ${verifyModelAlias(cfg)}.\n` +
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (external spec or in-session prompt) names the exact test / build command to run green.\n' +
@@ -1300,7 +1332,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     const others = ['codex', 'kimi', 'deepseek'].filter((c) => c !== ex.pick);
     codeRoute += `; ${others.map((c) => `${coderName(c)} ${ex.coders[c]?.standby ? 'overflow standby' : (ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable')}`).join('; ')}; next -> ${coderName(ex.pick)}`;
   }
-  parts.push(`Model routing: plan/red-team -> model ${modelLabel(cfg.models.review)}; review -> ${reviewRouteText(cfg, s)}; code -> ${codeRoute} [${ex.why}].`);
+  parts.push(`Model routing: plan/red-team -> model ${modelLabel(cfg.models.review)}; review -> ${reviewRouteText(cfg, s)}; verify -> ${verifyModelAlias(cfg)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);
   const activeHandoverIds = new Set(live.flatMap(([key, worker]) => [
     key, worker.group, worker.dispatchId, worker.taskId, worker.terminalHandle,
@@ -1512,24 +1544,42 @@ function onPreToolUse(p, s, cfg) {
   // Gates 3 and 4: role routing for dispatched work.
   if (tool === 'Agent' || tool === 'Task') {
     // Classify by the verb that governs the task, not by mere presence of a keyword:
-    // "plan the refactor" is planning, "implement the plan" is execution. Whichever
-    // intent word appears first in the task's own summary wins.
+    // "plan the refactor" is planning, "implement the plan" is execution, "verify the
+    // build" is verify-run. Whichever intent word appears first in the task's own summary
+    // wins — except that a review verb anywhere beats verify (the stronger model).
     const description = String(input.description || '').trim();
     const type = String(input.subagent_type || '');
     const hay = `${type} ${description}`.trim() || String(input.prompt || '').slice(0, 400);
     const firstIntent = PLAN_REVIEW_FIRST_VERB.test(description) ? 'review'
-      : EXEC_FIRST_VERB.test(description) ? 'exec'
-        : NEUTRAL_FIRST_VERB.test(description) ? 'neutral'
-          : null;
+      : VERIFY_FIRST_VERB.test(description) ? 'verify'
+        : EXEC_FIRST_VERB.test(description) ? 'exec'
+          : NEUTRAL_FIRST_VERB.test(description) ? 'neutral'
+            : null;
     const planAt = hay.search(PLAN_REVIEW_INTENT);
+    const verifyAt = hay.search(VERIFY_INTENT);
     const execAt = hay.search(EXEC_INTENT);
     const wantsExec = firstIntent === 'exec' ||
-      (firstIntent !== 'review' && execAt >= 0 &&
+      (firstIntent !== 'review' && firstIntent !== 'verify' && execAt >= 0 &&
         (firstIntent === 'neutral' || planAt < 0 || execAt < planAt));
     const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(type);
-    const wantsPlanReview = !wantsExec && (firstIntent === 'review' ||
-      (firstIntent !== 'exec' && typeWantsPlanReview) ||
-      (!firstIntent && planAt >= 0 && (execAt < 0 || planAt < execAt)));
+    const typeWantsVerify = VERIFY_TYPE_HINT.test(type);
+    // Planning / red-team is always the review model (never verify), whatever the first verb.
+    const planning = isPlanningReview(description, type, input.prompt);
+    // Review beats verify (operator decision, 2026-10-02): a brief that both reviews and
+    // verifies counts as review (the stronger model), so it is never locked out of the
+    // review model by the verify rule.
+    const reviewVerbPresent = REVIEW_VERB.test(description);
+    const wantsPlanReview = !wantsExec && (
+      firstIntent === 'review' ||
+      (firstIntent === 'verify' && (planning || reviewVerbPresent)) ||
+      (firstIntent !== 'exec' && firstIntent !== 'verify' && typeWantsPlanReview) ||
+      (!firstIntent && planAt >= 0 && (execAt < 0 || planAt < execAt))
+    );
+    const wantsVerify = !planning && !wantsExec && !wantsPlanReview && (
+      firstIntent === 'verify' ||
+      (firstIntent !== 'review' && typeWantsVerify) ||
+      (!firstIntent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt) && (planAt < 0 || verifyAt < planAt))
+    );
     const model = String(input.model || '');
     const reviewAlias = cfg.models.review.alias;
     const escalationAlias = cfg.models.escalation.alias;
@@ -1537,24 +1587,25 @@ function onPreToolUse(p, s, cfg) {
       || cfg.agents.escalation.some((n) => n.toLowerCase() === type.toLowerCase());
     const isReviewModel = new RegExp(escapeRegex(reviewAlias), 'i').test(model);
 
-    // Review / verify follows the code's author (operator decision, 2026-10-01): code by an
-    // external coder (codex/kimi/deepseek) is reviewed on the mapped model (default the code
-    // model, sonnet), code by the code model itself on the review model. Planning and
-    // red-team stay on the review model. An unknown author allows either, so a review is
-    // never blocked just because the gate cannot tell who wrote the code.
+    // Review of code follows the code's author (operator decision, 2026-10-01): code by an
+    // external coder (codex/kimi/deepseek) is reviewed on the mapped model (all opus by
+    // default, operator decision 2026-10-02), code by the code model itself on the review
+    // model. Planning and red-team stay on the review model. Verify-run work is separate:
+    // it always runs on the verify model (sonnet), never on the review model without an
+    // escalation note. An unknown author allows either review model, so a review is never
+    // blocked just because the gate cannot tell who wrote the code.
     const codeAlias = cfg.models.code.alias;
     const isCodeModel = new RegExp(escapeRegex(codeAlias), 'i').test(model);
     // Set by the exec branch when this is in-session code on the code model; the author is
     // recorded ONLY after every refusing gate below has run (review, blocker 6).
     let recordSonnetAuthor = false;
-    const planning = isPlanningReview(description, type, input.prompt);
     const author = s.lastCodeAuthor || null;
     if (wantsPlanReview && !isEscalation) {
       if (planning || !author) {
         const allowed = isReviewModel || (!planning && isCodeModel);
         if (!allowed) {
           d('route-review',
-            `Planning / red-team / review / verification must run on model "${reviewAlias}"` +
+            `Planning / red-team / review must run on model "${reviewAlias}"` +
             (planning ? '' : ` (or "${codeAlias}" when the code was written by an external coder)`) + '.\n' +
             `Re-dispatch with model: "${reviewAlias}". ` +
             `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
@@ -1566,7 +1617,7 @@ function onPreToolUse(p, s, cfg) {
           if (isReviewModel && mapped !== reviewAlias) {
             if (!hasReviewEscalationReason(input, mapped)) {
               d('review-model-follows-coder',
-                `Code here was written by ${author}: review / verify it on model "${mapped}"` +
+                `Code here was written by ${author}: review it on model "${mapped}"` +
                 (mapped === codeAlias ? ` at effort ${cfg.models.reviewEffort}` : '') +
                 ` first, not "${reviewAlias}" ` +
                 `(a model never reviews its own output; "${reviewAlias}" is reserved for code "${codeAlias}" wrote).\n` +
@@ -1576,7 +1627,7 @@ function onPreToolUse(p, s, cfg) {
             }
           } else {
             d('route-review',
-              `Review / verify of ${author}-authored code must run on model "${mapped}"` +
+              `Review of ${author}-authored code must run on model "${mapped}"` +
               (mapped === codeAlias ? ` at effort ${cfg.models.reviewEffort}` : '') + '.\n' +
               `Re-dispatch with model: "${mapped}". ` +
               `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
@@ -1584,14 +1635,42 @@ function onPreToolUse(p, s, cfg) {
         }
       }
     }
+    // Verify-run work (CI, screenshots, play-test, post-deploy smoke) runs on the verify
+    // model (sonnet), NOT the review model (opus) — operator decision, 2026-10-02. Opus may
+    // run a verify only after the verify model already ran and could not decide, the same
+    // "say why in the dispatch" escalation shape as review-follows-coder.
+    if (wantsVerify && !isEscalation) {
+      const verifyAlias = verifyModelAlias(cfg);
+      const onVerify = new RegExp(escapeRegex(verifyAlias), 'i').test(model);
+      if (!onVerify) {
+        if (isReviewModel) {
+          if (!hasVerifyEscalationReason(input, verifyAlias)) {
+            d('verify-model',
+              `Verify-run work must run on model "${verifyAlias}"` +
+              ` at effort ${cfg.models.verify.effort || 'medium'} first, not "${reviewAlias}" ` +
+              `(the review model reads code and judges diffs; it does not run checks).\n` +
+              `Escalate to "${reviewAlias}" only after the "${verifyAlias}" verify cannot decide — say so in the dispatch, e.g.\n` +
+              `  "escalation: ${verifyAlias} verify could not decide ...".\n` +
+              `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
+          }
+        } else {
+          d('route-verify',
+            `Verify-run work (CI, screenshots, play-test, post-deploy smoke) must run on model "${verifyAlias}"` +
+            ` at effort ${cfg.models.verify.effort || 'medium'}.\n` +
+            `Re-dispatch with model: "${verifyAlias}". ` +
+            `Current dispatch: subagent_type="${type}" model="${model || 'inherited'}".`);
+        }
+      }
+    }
     // The review model is reserved for the work it took over from the escalation model:
-    // planning / review / verification — unless the operator explicitly picked it to code.
+    // planning / review — unless the operator explicitly picked it to code. Verify-run work
+    // with an escalation note is allowed on the review model and handled above.
     const exNow = currentExecRoute(cfg, s);
     const operatorPicked = wantsExec && exNow.route === 'claude' && !!exNow.alias &&
       (exNow.alias === escalationAlias ? isEscalation : model.toLowerCase().includes(String(exNow.alias).toLowerCase()));
-    if (isReviewModel && !wantsPlanReview && !operatorPicked) {
+    if (isReviewModel && !wantsPlanReview && !wantsVerify && !operatorPicked) {
       d('review-model-scope',
-        `model "${reviewAlias}" is reserved for planning / review / verification.\n` +
+        `model "${reviewAlias}" is reserved for planning / review.\n` +
         `Code goes to Codex or "${cfg.models.code.alias}" per the current exec route; other in-session work runs on model "${cfg.models.code.alias}".\n` +
         `Current dispatch: subagent_type="${type}" description="${String(input.description || '').slice(0, 80)}".`);
     }
@@ -2602,5 +2681,5 @@ module.exports = {
   shellSyntaxOnly, redirectTargets, isExemptPath, movesOnlyExemptPaths, shellSegments,
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
   hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds,
-  isPlanningReview, hasReviewEscalationReason,
+  isPlanningReview, hasReviewEscalationReason, hasVerifyEscalationReason,
 };
