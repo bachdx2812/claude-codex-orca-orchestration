@@ -485,7 +485,7 @@ function readFreshKimiCache(stateDir, cacheSeconds, now = Date.now()) {
 
 function deepseekProbeEnv(env = process.env) {
   const out = {};
-  for (const key of ['ORCH_OPENCODE_BIN', 'ORCH_DEEPSEEK_BALANCE_URL', 'DEEPSEEK_API_KEY', 'PATH', 'HOME']) {
+  for (const key of ['ORCH_OPENCODE_BIN', 'ORCH_OPENCODE_DB', 'ORCH_DEEPSEEK_BALANCE_URL', 'DEEPSEEK_API_KEY', 'XDG_DATA_HOME', 'PATH', 'HOME']) {
     if (Object.prototype.hasOwnProperty.call(env, key)) out[key] = String(env[key]);
   }
   return out;

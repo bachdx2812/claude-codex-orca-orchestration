@@ -228,8 +228,13 @@ DeepSeek, or `DEEPSEEK_API_KEY` is set), and opencode's default `model` is a `de
 model — otherwise a worker would silently run Claude. DeepSeek is pay-per-use with no
 rate-limit window: its headroom is the remaining share of a **daily spend cap**
 (`deepseekDailySpendCapUsd`, default `0` = unlimited, env `ORCH_DEEPSEEK_DAILY_CAP_USD`),
-computed from today's DeepSeek spend read from opencode; when that spend cannot be read the
-reading is quota-unknown (ranked `unknownHeadroomAssumed`). An optional balance check
+computed from today's DeepSeek spend read from what opencode really exposes — first its
+sqlite store (`~/.local/share/opencode/opencode.db`, rows with `providerID = deepseek`
+created since local midnight; `ORCH_OPENCODE_DB` overrides the path), then the `deepseek/*`
+model blocks of `opencode stats --days 1 --models` (opencode 1.18 has no `stats --json`).
+When neither can be read the spend is not computable, so with a **non-zero** cap DeepSeek
+reads quota-unknown (ranked `unknownHeadroomAssumed`, never exhausted) and the cap stops
+nothing; the default unlimited cap is unaffected. An optional balance check
 `GET https://api.deepseek.com/user/balance` (the API key travels only in the spawned probe's
 header, never in output, state, or logs) treats a zero balance or `is_available: false` as
 exhausted. A worker whose output shows DeepSeek's 402 `Insufficient Balance` (error-shaped

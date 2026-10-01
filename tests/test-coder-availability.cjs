@@ -185,6 +185,65 @@ async function run() {
     fs.rmSync(root, { recursive: true, force: true });
   }
 
+  // DeepSeek (opencode) availability: binary + credentials + a deepseek/* default model.
+  {
+    const root = temp('coder-deepseek-'); const home = path.join(root, 'home');
+    const authStub = path.join(root, 'opencode-with-deepseek.cjs');
+    fs.writeFileSync(authStub,
+      '#!/usr/bin/env node\nif (process.argv[2] === "auth" && process.argv[3] === "list") ' +
+      'process.stdout.write("\\u25cf deepseek\\n");\n');
+    fs.chmodSync(authStub, 0o755);
+    const noAuthStub = path.join(root, 'opencode-no-deepseek.cjs');
+    fs.writeFileSync(noAuthStub,
+      '#!/usr/bin/env node\nif (process.argv[2] === "auth" && process.argv[3] === "list") ' +
+      'process.stdout.write("\\u25cf anthropic\\n");\n');
+    fs.chmodSync(noAuthStub, 0o755);
+    const configFor = (value) => {
+      const file = path.join(root, `opencode-${value ? 'model' : 'none'}.jsonc`);
+      fs.writeFileSync(file, value ? JSON.stringify({ model: value }) : '{}');
+      return file;
+    };
+    // The stub is a node script with a shebang, so its PATH must contain node for
+    // `/usr/bin/env node` to resolve (the real opencode is a self-contained binary).
+    const nodeDir = path.dirname(process.execPath);
+    const deepseekEnv = (extra) => envFor(home, {
+      PATH: nodeDir, ORCH_OPENCODE_BIN: authStub, ...extra,
+    });
+
+    let result = availability.probeCoderAvailability('deepseek', {
+      env: deepseekEnv({ ORCH_OPENCODE_CONFIG: configFor('deepseek/deepseek-flash') }),
+    });
+    check('an opencode with a DeepSeek credential and model is usable',
+      [result.installed, result.usable, result.reason], [true, true, null]);
+    result = availability.probeCoderAvailability('deepseek', {
+      env: deepseekEnv({ ORCH_OPENCODE_CONFIG: configFor('anthropic/claude-sonnet-4') }),
+    });
+    check('a non-deepseek default model is unusable and named',
+      [result.usable, /not deepseek/.test(result.reason), /anthropic/.test(result.reason)], [false, true, true]);
+    result = availability.probeCoderAvailability('deepseek', {
+      env: deepseekEnv({ ORCH_OPENCODE_CONFIG: configFor(null) }),
+    });
+    check('no default model configured is unusable', [result.usable, result.reason], [false, 'no default model configured']);
+    result = availability.probeCoderAvailability('deepseek', {
+      env: envFor(home, { PATH: nodeDir, ORCH_OPENCODE_BIN: noAuthStub, ORCH_OPENCODE_CONFIG: configFor('deepseek/deepseek-flash') }),
+    });
+    check('a DeepSeek with no credential is not signed in',
+      [result.installed, result.usable, result.reason], [true, false, 'not signed in']);
+    result = availability.probeCoderAvailability('deepseek', {
+      env: envFor(home, { PATH: nodeDir, ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
+        ORCH_OPENCODE_CONFIG: configFor('deepseek/deepseek-flash') }),
+    });
+    check('a missing opencode override is authoritative', result.reason, 'not installed');
+    // DEEPSEEK_API_KEY alone satisfies the credential check even with an empty auth list.
+    result = availability.probeCoderAvailability('deepseek', {
+      env: envFor(home, { PATH: nodeDir, ORCH_OPENCODE_BIN: noAuthStub,
+        ORCH_OPENCODE_CONFIG: configFor('deepseek/deepseek-chat'), DEEPSEEK_API_KEY: 'fixture-key' }),
+    });
+    check('a DEEPSEEK_API_KEY credential alone is usable',
+      [result.usable, result.reason], [true, null]);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
   // Kimi live quota parsing and controlled failure kinds.
   {
     const now = Date.now();
@@ -446,6 +505,43 @@ async function run() {
       quotas: { codex: null, kimi: null }, fallbackEnabled: null,
     }).order, ['codex']);
     check('formatter reports unknown available quota', pool.formatCoderState('kimi', { state: 'eligible', leftPct: null }), 'Kimi (quota unknown, available)');
+
+    // DeepSeek as the third coder: overflow (default) vs peer, and the 0/1/2/3-coder matrix.
+    const deep = (overrides = {}) => pool.pickCoderPool({
+      availability: {
+        codex: { usable: true }, kimi: { usable: true }, deepseek: { usable: true }, ...(overrides.availability || {}),
+      },
+      quotas: { codex: { usedPercent: 20 }, kimi: { usedPercent: 0 }, deepseek: { usedPercent: 0 }, ...(overrides.quotas || {}) },
+      thresholds: { codex: 95, kimi: 95, deepseek: 95, ...(overrides.thresholds || {}) }, exhaustion: {},
+      live: { codex: 0, kimi: 0, deepseek: 0, ...(overrides.live || {}) },
+      caps: { codex: 3, kimi: 3, deepseek: 3, ...(overrides.caps || {}) },
+      fallbackEnabled: true, roles: overrides.roles,
+    });
+    check('0 usable coders route to in-session code', deep({
+      availability: { codex: { usable: false, reason: 'not installed' }, kimi: { usable: false, reason: 'not installed' }, deepseek: { usable: false, reason: 'not installed' } },
+    }).route, 'code');
+    check('1 eligible coder is picked alone', deep({
+      availability: { kimi: { usable: false, reason: 'not installed' }, deepseek: { usable: false, reason: 'not installed' } },
+    }).order, ['codex']);
+    check('2 eligible subscription coders rank by headroom, deepseek stands by',
+      [deep().order, deep().coders.deepseek.standby], [['kimi', 'codex'], true]);
+    check('3 eligible coders with overflow keep deepseek on standby',
+      deep().order.includes('deepseek'), false);
+    check('overflow prefers deepseek only when both subscription coders are exhausted', deep({
+      quotas: { codex: { usedPercent: 96 }, kimi: { usedPercent: 96 }, deepseek: { usedPercent: 0 } },
+    }).pick, 'deepseek');
+    check('overflow prefers deepseek when both subscription coders are unusable', deep({
+      availability: { codex: { usable: false, reason: 'not installed' }, kimi: { usable: false, reason: 'not installed' }, deepseek: { usable: true } },
+    }).pick, 'deepseek');
+    check('peer mode ranks deepseek with the subscription coders (best headroom wins)', deep({
+      roles: { deepseek: 'peer' },
+      quotas: { codex: { usedPercent: 40 }, kimi: { usedPercent: 40 }, deepseek: { usedPercent: 0 } },
+    }).pick, 'deepseek');
+    check('peer mode keeps deepseek in the ranked order', deep({ roles: { deepseek: 'peer' } }).order.includes('deepseek'), true);
+    check('an exhausted deepseek leaves the subscription coders',
+      deep({ quotas: { codex: { usedPercent: 10 }, kimi: { usedPercent: 20 }, deepseek: { usedPercent: 95 } } }).pick, 'codex');
+    check('an exhausted balance (100 used) excludes deepseek',
+      deep({ quotas: { codex: { usedPercent: 96 }, kimi: { usedPercent: 96 }, deepseek: { usedPercent: 100 } } }).route, 'code');
   }
 
   // Fix 6: persisted last-known quota + reset-aware estimate. Stubs only: the reading is

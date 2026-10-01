@@ -500,7 +500,10 @@ The file is plain JSON — no comments — parsed as-is:
 threshold (default 95) — all are
 used for new routing and live-worker handover. `deepseekRole` (`overflow` default, or
 `peer`) and `deepseekDailySpendCapUsd` (`0` = unlimited) control DeepSeek's pay-per-use
-routing. `models.reviewByCoder` maps the code's author to its review model (defaults shown);
+routing; the cap reads today's DeepSeek spend from opencode's sqlite store
+(`~/.local/share/opencode/opencode.db`, `ORCH_OPENCODE_DB` overrides it) or the `deepseek/*`
+blocks of `opencode stats --days 1 --models`, and when neither is readable a non-zero cap
+makes DeepSeek quota-unknown rather than exhausted. `models.reviewByCoder` maps the code's author to its review model (defaults shown);
 `models.reviewEffort` sets the in-session reviewer's effort. `handoverWarnMarginPercent` warns that many
 percentage points before either threshold (default 5; set 0 to disable the early warning).
 tunable via this file or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED` /
