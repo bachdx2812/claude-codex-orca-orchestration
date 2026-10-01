@@ -601,7 +601,16 @@ function workers() {
   return parseWorkerRows(orca(['orchestration', 'worker-list', '--json']));
 }
 
-/** Orca's own completion time on a worker row (epoch ms or ISO), or null. */
+/**
+ * Orca's own completion time on a worker row (epoch ms or ISO), or null.
+ *
+ * SPECULATIVE: live `worker-list` rows carry none of `completedAt`/`finishedAt`/`endedAt`
+ * (nor `resource.completedAt`), so in practice this returns null and the daemon falls back
+ * to its own first-seen-done time. It is kept only so a future Orca that starts sending one
+ * is preferred automatically. Deliberately does NOT read `resource.releaseCompletedAt` — a
+ * release time is when the worker was released, not when it finished, and using it would
+ * misdate the retain-after-done heuristic.
+ */
 function workerRowCompletedAt(w) {
   const candidates = [w.completedAt, w.finishedAt, w.endedAt,
     w.resource && (w.resource.completedAt || w.resource.finishedAt || w.resource.endedAt)];
@@ -1109,6 +1118,26 @@ function isWorktreeClean(w, git) {
  * Independently, `w.ownershipState === 'user_owned'` always blocks auto-close, whatever
  * retainedReason says.
  */
+/**
+ * Bound the persisted done-at / auto-close maps: drop every entry for a dispatch Orca no
+ * longer lists (it is not a live row any more, so nothing can act on it) whose timestamp is
+ * older than `ageMs` (7 days). Entries for dispatches still listed are always kept — Orca
+ * still reports them and the retain/auto-close logic still needs them. Mutates in place and
+ * reports whether either map changed, so the caller only rewrites the files it must.
+ */
+function pruneBoundedMaps({ doneAtMap, autoClosed, listedDispatchIds, now, ageMs }) {
+  let doneAtPruned = false;
+  for (const [id, ts] of doneAtMap) {
+    if (!listedDispatchIds.has(id) && now - Number(ts) > ageMs) { doneAtMap.delete(id); doneAtPruned = true; }
+  }
+  let autoClosedPruned = false;
+  for (const [id, value] of autoClosed) {
+    const at = Number.isFinite(value && value.at) ? value.at : 0;
+    if (!listedDispatchIds.has(id) && now - at > ageMs) { autoClosed.delete(id); autoClosedPruned = true; }
+  }
+  return { doneAtPruned, autoClosedPruned };
+}
+
 function isRetainedForReuse(w, ctx = {}) {
   if (w && w.ownershipState === 'user_owned') return true;
   const reason = ctx.retainedReason !== undefined ? ctx.retainedReason : (w.retainedReason ?? null);
@@ -1646,16 +1675,9 @@ function main() {
       // at all, older than a week, are dead weight from long-gone dispatches.
       const PRUNE_AGE_MS = 7 * 24 * 60 * 60 * 1000;
       const listedDispatchIds = new Set(ws.map((w) => w && w.dispatchId).filter(Boolean));
-      let doneAtPruned = false;
-      for (const [id, ts] of doneAtMap) {
-        if (!listedDispatchIds.has(id) && now - ts > PRUNE_AGE_MS) { doneAtMap.delete(id); doneAtPruned = true; }
-      }
+      const { doneAtPruned, autoClosedPruned } =
+        pruneBoundedMaps({ doneAtMap, autoClosed, listedDispatchIds, now, ageMs: PRUNE_AGE_MS });
       if (doneAtPruned) savePersistedTimestampMap(DONE_AT_FILE, doneAtMap);
-      let autoClosedPruned = false;
-      for (const [id, v] of autoClosed) {
-        const at = Number.isFinite(v && v.at) ? v.at : 0;
-        if (!listedDispatchIds.has(id) && now - at > PRUNE_AGE_MS) { autoClosed.delete(id); autoClosedPruned = true; }
-      }
       if (autoClosedPruned) savePersistedAutoClosed(autoClosed);
     }
 
@@ -2091,7 +2113,7 @@ module.exports = {
   clearMissingPendingJobsForTick,
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
   parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen,
-  parseWorkerRows,
+  parseWorkerRows, workerRowCompletedAt, pruneBoundedMaps,
   probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
   pidAlive, spawnResumeScheduler,
   DONE_WORKER_STATES, FAILED_WORKER_STATES, isFailedWorker, autoCloseDoneWorker, actOnDoneWorktree, isRetainedForReuse,

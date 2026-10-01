@@ -1281,6 +1281,56 @@ resume.sweepJobs(stateDir, 'event-test', resetNow);
 check('orphaned resume lock directories older than one day are swept',
   fs.existsSync(orphanLock), false);
 
+// --- done-time carry-over: real Orca row shapes, retain-after-done, bounded maps -------
+{
+  // Real worker-list rows carry none of completedAt/finishedAt/endedAt, and
+  // resource.releaseCompletedAt is a RELEASE time, not a completion — it must never be
+  // picked up as the done timestamp (review, High 8).
+  check('a real Orca row with only releaseCompletedAt has no completion time',
+    heartbeat.workerRowCompletedAt({ dispatchId: 'ctx_a', workerState: 'done',
+      resource: { releaseCompletedAt: 1_700_000_000 } }), null);
+  check('parseWorkerRows pins that a release-only row reads completedAt null',
+    heartbeat.parseWorkerRows({ ok: true, result: [{ dispatchId: 'ctx_a', workerState: 'done',
+      resource: { releaseCompletedAt: 1_700_000_000 } }] })[0].completedAt, null);
+  check('a real Orca completion time is preferred when present',
+    heartbeat.parseWorkerRows({ ok: true, result: [{ dispatchId: 'ctx_b',
+      workerState: 'done', completedAt: 1_700_000_000 }] })[0].completedAt, 1_700_000_000_000);
+
+  // Retain-after-done vs the Kimi readiness recovery recipe: retainedAt vs doneAt.
+  check('a retain strictly before done is the mid-run recovery recipe (eligible)',
+    heartbeat.isRetainedForReuse({ retainedReason: 'user_requested' },
+      { retained: true, retainedAt: 100, doneAt: 200 }), false);
+  check('a retain at/after done blocks auto-close (operator kept it)',
+    heartbeat.isRetainedForReuse({ retainedReason: 'user_requested' },
+      { retained: true, retainedAt: 300, doneAt: 200 }), true);
+  check('an automatic identity_unproven retain never blocks',
+    heartbeat.isRetainedForReuse({ retainedReason: 'identity_unproven' },
+      { retained: true, retainedAt: 300, doneAt: 200 }), false);
+  check('a user_owned row always blocks, whatever the reason',
+    heartbeat.isRetainedForReuse({ ownershipState: 'user_owned', retainedReason: 'identity_unproven' },
+      { retained: true, retainedAt: 100, doneAt: 200 }), true);
+
+  // 7-day pruning of the persisted done-at / auto-close maps.
+  const DAY = 24 * 60 * 60 * 1000;
+  const now = 10 * DAY;
+  const seen = new Map([['ctx_listed_old', now - 30 * DAY]]);
+  const auto = new Map([['ctx_listed_old', { state: 'closed', at: now - 30 * DAY }]]);
+  check('a listed dispatch is never pruned however old',
+    heartbeat.pruneBoundedMaps({ doneAtMap: seen, autoClosed: auto,
+      listedDispatchIds: new Set(['ctx_listed_old']), now, ageMs: 7 * DAY }),
+    { doneAtPruned: false, autoClosedPruned: false });
+  check('a pruned listed entry survives', [seen.has('ctx_listed_old'), auto.has('ctx_listed_old')], [true, true]);
+  seen.set('ctx_gone_old', now - 8 * DAY); auto.set('ctx_gone_old', { state: 'closed', at: now - 8 * DAY });
+  seen.set('ctx_gone_new', now - 2 * DAY); auto.set('ctx_gone_new', { state: 'closed', at: now - 2 * DAY });
+  check('unlisted entries older than 7 days are pruned, newer ones kept',
+    heartbeat.pruneBoundedMaps({ doneAtMap: seen, autoClosed: auto,
+      listedDispatchIds: new Set(['ctx_listed_old']), now, ageMs: 7 * DAY }),
+    { doneAtPruned: true, autoClosedPruned: true });
+  check('only the stale unlisted entries were dropped and the files must be rewritten', [
+    [...seen.keys()].sort(), [...auto.keys()].sort(),
+  ], [['ctx_gone_new', 'ctx_listed_old'], ['ctx_gone_new', 'ctx_listed_old']]);
+}
+
 if (failures.length) {
   console.error(`${failures.length} failure(s), ${pass} passed`);
   for (const failure of failures) console.error(`\nFAIL: ${failure}`);

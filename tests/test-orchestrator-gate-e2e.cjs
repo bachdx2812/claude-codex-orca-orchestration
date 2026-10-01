@@ -1052,6 +1052,18 @@ rmState(`${SID}-hard-off`);
   checkBool('retained readiness: worker-retain marks the tracked group explicit and cap-exempt',
     retainedState.workers[dispatchId].retained === true && retainedState.workers[dispatchId].capExempt === true, true);
 
+  // A SECOND retain must re-stamp retainedAt past the first, so a post-completion retain
+  // still blocks auto-close even when an earlier mid-run retain already set the field.
+  {
+    const file = path.join(STATE_DIR, `${sid}.json`);
+    const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+    stored.workers[dispatchId].retainedAt = 12345;
+    fs.writeFileSync(file, JSON.stringify(stored));
+    invoke(postBash(`orca orchestration worker-retain --dispatch ${dispatchId} --json`, '{"ok":true}', { sid }), env);
+    checkBool('a second worker-retain re-stamps retainedAt past the earlier value',
+      readState(sid).workers[dispatchId].retainedAt > 12345, true);
+  }
+
   const retainedEnv = { ...env, STUB_WORKERS_JSON: JSON.stringify([{
     dispatchId,
     agentTerminalHandle: terminalHandle,
