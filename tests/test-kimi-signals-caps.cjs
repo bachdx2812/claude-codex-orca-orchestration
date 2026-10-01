@@ -275,7 +275,7 @@ check('without agent info the sentence is only a generic rate limit',
 {
   const calls = [];
   heartbeat.setOnCoderExhausted((coder) => calls.push(coder));
-  const reported = new Set();
+  const reported = new Map();
   const event = heartbeat.reportUsageExhausted({ reported, handle: 'term_k1', label: 'term_k1 (Kimi worker)', coder: 'kimi' });
   check('the first usage-exhausted report emits the KIMI USAGE LIMIT event',
     typeof event === 'string' && event.startsWith('KIMI USAGE LIMIT on term_k1'), true);

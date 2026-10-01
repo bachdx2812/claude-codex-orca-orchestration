@@ -308,17 +308,24 @@ function parseKimiUsages(body, now = Date.now()) {
 }
 
 /**
- * When the Kimi window of the given length next resets, from the last cached /usages
- * reading (epoch ms), or null when no such future reset is known. Cache-only: never probes.
+ * When the Kimi window of the given length next resets (epoch ms), or null when no such
+ * future reset is known. Cache-only: never probes. Reads the live cache first, then the
+ * persisted last-known reading — the live cache is usually a `{failed:...}` entry (the
+ * token expires whenever no Kimi CLI runs), while the last SUCCESSFUL reading still
+ * carries the real window resets.
  */
 function kimiWindowResetMs(stateDir, durationMinutes, now = Date.now()) {
-  try {
-    const entry = JSON.parse(fs.readFileSync(path.join(stateDir, KIMI_LIVE_CACHE_FILE), 'utf8'));
-    const resets = (Array.isArray(entry.windows) ? entry.windows : [])
-      .filter((w) => w && w.durationMinutes === durationMinutes && typeof w.resetsAt === 'number' && w.resetsAt * 1000 > now)
-      .map((w) => w.resetsAt * 1000);
-    return resets.length ? Math.max(...resets) : null;
-  } catch { return null; }
+  const futureResets = (file) => {
+    try {
+      const entry = JSON.parse(fs.readFileSync(path.join(stateDir, file), 'utf8'));
+      return (Array.isArray(entry.windows) ? entry.windows : [])
+        .filter((w) => w && w.durationMinutes === durationMinutes &&
+          typeof w.resetsAt === 'number' && w.resetsAt * 1000 > now)
+        .map((w) => w.resetsAt * 1000);
+    } catch { return []; }
+  };
+  const resets = [...futureResets(KIMI_LIVE_CACHE_FILE), ...futureResets(LAST_KNOWN_FILE.kimi)];
+  return resets.length ? Math.max(...resets) : null;
 }
 
 function kimiProbeEnv(env = process.env) {
@@ -393,7 +400,13 @@ function persistLastKnownQuota(stateDir, coder, quota, now = Date.now()) {
     ? quota.windows
     : [{ usedPercent: quota.usedPercent, resetsAt: quota.resetsAt || 0 }];
   const windows = raw.filter(validKnownWindow)
-    .map((w) => ({ usedPercent: w.usedPercent, resetsAt: w.resetsAt || 0 }));
+    .map((w) => ({
+      usedPercent: w.usedPercent, resetsAt: w.resetsAt || 0,
+      // durationMinutes lets kimiWindowResetMs match this window to a "5-hour limit"
+      // terminal signal even when the live cache only holds a failed reading.
+      ...(typeof w.durationMinutes === 'number' && Number.isFinite(w.durationMinutes) && w.durationMinutes > 0
+        ? { durationMinutes: w.durationMinutes } : {}),
+    }));
   if (!windows.length) return;
   const readAt = typeof quota.fetchedAt === 'number' && Number.isFinite(quota.fetchedAt) ? quota.fetchedAt : now;
   try {

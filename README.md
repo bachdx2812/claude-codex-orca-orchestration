@@ -139,11 +139,24 @@ such as `Select permission mode`, `Allow`/`Deny`, or `↑↓ navigate · Enter s
 shape—such as numbered choices, confirm/cancel key help, selection navigation, or a prompt
 box—rather than isolated keywords, so normal output discussing “allow”, “deny”, or “approve”
 is ignored. Codex's `Would you like to run the following command?` / `make the following
-edits?` confirmations are included. Only the normalized prompt block, including the
+edits?` confirmations and Claude Code's folder-trust dialogs (`Do you trust the files in
+this folder?`, `Only proceed if you trust this configuration`, with the `Enter to confirm ·
+Esc to cancel` hint) are included. Only the normalized prompt block, including the
 question and command, forms the episode
 signature, so rotating tips, timers, and spinners cannot re-fire it. Reports persist once
 per unchanged prompt episode across heartbeat restarts and re-arm after the prompt
 disappears; the heartbeat never answers automatically.
+
+**Worker exited back to a shell prompt.** When a supervised worker's terminal ends at a
+shell prompt with no agent TUI visible, the agent process is gone — the heartbeat emits
+`WORKER EXITED <dispatch|terminal> (<agent> process gone, terminal at shell prompt)`
+immediately (no stall threshold), once per episode, persisted across daemon restarts and
+re-armed by fresh terminal output. This catches the recurring failure where an Orca
+`--agent claude` worker started in an untrusted worktree stops at Claude Code's
+"trust this folder?" dialog (default `No, exit`) and drops to the shell while
+`worker-start` still reported success. Prefer Kimi/Codex workers in new worktrees, or a
+headless `claude -p --dangerously-skip-permissions ...` launched via `worker-start`; a
+bare `orca terminal create` terminal is treated as a main panel, not a worker.
 
 **Mid-task quota handover.** While a supervised Codex or Kimi worker is live, the heartbeat
 reuses that coder's cached single-flight quota probe. At

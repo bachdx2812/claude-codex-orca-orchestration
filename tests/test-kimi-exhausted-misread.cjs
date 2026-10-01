@@ -92,12 +92,22 @@ check('the billing-cycle form has no window length',
   check('the cached 5h window reset is found', QUOTA.kimiWindowResetMs(STATE_DIR, 300, now), resetsAt * 1000);
   heartbeat.setOnCoderExhausted(null);
   const event = heartbeat.reportUsageExhausted({
-    reported: new Set(), handle: 'term_untracked_kimi', label: 'term_untracked_kimi (Kimi)',
-    coder: 'kimi', windowHours: kimiUsageLimitHours(FIVE_HOUR_403),
+    reported: new Map(), handle: 'term_untracked_kimi', label: 'term_untracked_kimi (Kimi)',
+    coder: 'kimi', windowHours: kimiUsageLimitHours(FIVE_HOUR_403), now,
   });
   check('the exhausted event is emitted', typeof event === 'string' && event.startsWith('KIMI USAGE LIMIT'), true);
   const marker = AVAIL.readCoderExhaustion(STATE_DIR, now).kimi;
   check('a machine-wide marker is written until the window reset', marker && marker.until, resetsAt * 1000);
+  check('the same handle does not re-mark mid-episode',
+    heartbeat.reportUsageExhausted({
+      reported: heartbeat.loadPersistedUsageExhaustedReports(), handle: 'term_untracked_kimi',
+      label: 'term_untracked_kimi (Kimi)', coder: 'kimi', windowHours: 5, now,
+    }), null);
+  check('the handle re-arms once its episode ends',
+    typeof heartbeat.reportUsageExhausted({
+      reported: heartbeat.loadPersistedUsageExhaustedReports(), handle: 'term_untracked_kimi',
+      label: 'term_untracked_kimi (Kimi)', coder: 'kimi', windowHours: 5, now: resetsAt * 1000 + 1000,
+    }) === 'string', true);
 
   const pool = pickCoderPool({
     availability: { codex: { usable: true }, kimi: { usable: true } },
@@ -108,6 +118,96 @@ check('the billing-cycle form has no window length',
   });
   check('the pool treats Kimi as exhausted while the marker is valid', pool.coders.kimi.state, 'exhausted');
   check('with Codex also over threshold the pool routes to the in-session model', [pool.route, pool.pick], ['code', null]);
+}
+
+// --- last-known fallback for the window reset + durationMinutes persistence ---
+
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimi-last-known-'));
+  const now = Date.now();
+  const resetsAt = Math.floor(now / 1000) + 3 * 3600;
+  // The live cache holds only a failed reading (the usual case once the token expires).
+  fs.writeFileSync(path.join(dir, 'kimi-quota-live.json'), JSON.stringify({ failed: true, kind: 'expired', fetchedAt: now }));
+  QUOTA.persistLastKnownQuota(dir, 'kimi', {
+    usedPercent: 100, resetsAt, fetchedAt: now,
+    windows: [{ usedPercent: 58, resetsAt: resetsAt + 86400 }, { usedPercent: 100, resetsAt, durationMinutes: 300 }],
+  }, now);
+  const persisted = JSON.parse(fs.readFileSync(path.join(dir, 'kimi-quota-last-known.json'), 'utf8'));
+  check('the last-known reading keeps the window duration',
+    persisted.windows[1].durationMinutes, 300);
+  check('the window reset is found via the last-known file when the live cache is failed',
+    QUOTA.kimiWindowResetMs(dir, 300, now), resetsAt * 1000);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// --- RT-3: untracked terminals never mark Kimi without positive Kimi identity ---
+
+{
+  const own = new Set(['term_mine']);
+  const machineAgents = new Map([['term_other_kimi', 'kimi'], ['term_other_codex', 'codex']]);
+  check('an untracked terminal recorded as another session\'s Kimi worker counts',
+    heartbeat.isNonOwnKimiTerminal({
+      handle: 'term_other_kimi', title: 'worker', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+    }), true);
+  check('an untracked terminal recorded as Codex does NOT count',
+    heartbeat.isNonOwnKimiTerminal({
+      handle: 'term_other_codex', title: 'worker', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+    }), false);
+  check('an unknown terminal with a Kimi title counts',
+    heartbeat.isNonOwnKimiTerminal({
+      handle: 'term_unknown', title: 'Kimi CLI', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+    }), true);
+  check('an unknown terminal with a plain title does NOT count',
+    heartbeat.isNonOwnKimiTerminal({
+      handle: 'term_unknown', title: 'zsh', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+    }), false);
+  check('an own terminal is never handled by the non-own path',
+    heartbeat.isNonOwnKimiTerminal({
+      handle: 'term_mine', title: 'Kimi CLI', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+    }), false);
+  check('the operator panel is never handled by the non-own path',
+    heartbeat.isNonOwnKimiTerminal({
+      handle: 'term_panel', title: 'Kimi CLI', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+    }), false);
+
+  // machineTerminalAgents rebuilds the cross-session map from gate state files.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kimi-machine-agents-'));
+  fs.writeFileSync(path.join(dir, 'other-session.json'), JSON.stringify({
+    workers: {
+      term_foreign_kimi: { agent: 'kimi', kind: 'terminal', status: 'live' },
+      ctx_no_terminal: { agent: 'kimi' },
+    },
+  }));
+  fs.writeFileSync(path.join(dir, 'kimi-quota-live.json'), JSON.stringify({ failed: true }));
+  check('the machine-wide agent map reads other sessions\' terminal workers',
+    heartbeat.machineTerminalAgents(dir).get('term_foreign_kimi'), 'kimi');
+  check('non-terminal worker rows are not terminal agents',
+    heartbeat.machineTerminalAgents(dir).has('ctx_no_terminal'), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+
+  // An untracked NON-Kimi terminal showing the indented 403 (a displayed log/fixture)
+  // must not mark; another session's Kimi terminal marks silently (no event).
+  const indented403 = '    403 You\'ve reached your 5-hour usage limit';
+  check('the indented 403 line still matches the exhausted signal', hasKimiUsageExhausted(indented403), true);
+  const calls = [];
+  heartbeat.setOnCoderExhausted((coder, info) => calls.push([coder, info]));
+  const reported = new Map();
+  const now = Date.now();
+  if (heartbeat.isNonOwnKimiTerminal({
+    handle: 'term_other_codex', title: 'worker', ownHandles: own, panelHandle: 'term_panel', machineAgents,
+  })) {
+    heartbeat.reportUsageExhausted({ reported, handle: 'term_other_codex', label: 'x', coder: 'kimi', windowHours: 5, now, silent: true });
+  }
+  check('an untracked non-Kimi terminal showing an indented 403 marks nothing', [calls.length, reported.size], [0, 0]);
+  const silent = heartbeat.reportUsageExhausted({
+    reported, handle: 'term_other_kimi', label: 'term_other_kimi (worker)', coder: 'kimi',
+    windowHours: kimiUsageLimitHours(indented403), now, silent: true,
+  });
+  check('another session\'s Kimi terminal marks WITHOUT an event', silent, null);
+  check('the exhaustion marker hook still fired for the other session\'s Kimi terminal',
+    calls.map(([coder]) => coder), ['kimi']);
+  check('the silent episode is persisted', reported.get('term_other_kimi').until > now, true);
+  heartbeat.setOnCoderExhausted(null);
 }
 
 // --- gate: sonnet dispatch allowed when nothing external is eligible ----------

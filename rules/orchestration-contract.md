@@ -48,7 +48,13 @@ review/red-team/verify on **Opus 5.5** (`claude-opus-5-5`), escalation on **Fabl
    `--spec` or an in-session code prompt whose intent reads as implementation work must
    let the coder check its own output before reporting done.
 6. **A continuous heartbeat daemon supervises live Orca workers.** `Stop` refuses to end
-   the session while a worker is live and unwatched.
+   the session while a worker is live and unwatched. The daemon reports a worker whose
+   agent process vanished back to a shell prompt immediately as `WORKER EXITED` — the
+   common cause is an `--agent claude` worker started in an untrusted worktree stopping
+   at Claude Code's "trust this folder?" dialog (default `No, exit`). Prefer Kimi/Codex
+   workers in new worktrees, or a headless `claude -p --dangerously-skip-permissions`
+   brief launched via `worker-start` (a bare `orca terminal create` terminal is gated as
+   a main panel, not a worker).
 7. **Codex rate-limits under parallel load.** On a rate-limit signal the correct response
    is to back off and retry the *same* dispatch (`worker-start --retry-of <id>`), never to
    re-dispatch immediately or start a replacement.
@@ -173,7 +179,12 @@ with the access token sent only as an `Authorization` header inside the spawned 
 403 ("You've reached your usage limit for this billing cycle", error-shaped lines only, and
 only for terminals whose tracked agent is `kimi`) is recorded in `coder-exhausted.json` with
 an `until` time (the reported reset, else 6 hours); that coder is excluded from routing
-until the marker expires or a fresh quota reading shows it below its threshold. No state
+until the marker expires or a fresh quota reading shows it below its threshold. A terminal
+**outside** the session's own fleet marks Kimi exhausted only when positively identified as
+a Kimi terminal (another session's worker records or a Kimi-identifying title) — never on an
+absent agent — and writes the marker silently, without a wake event. A reported terminal
+re-arms once its episode's `until` passes, so a Kimi terminal re-used after the window reset
+marks again on the next limit. No state
 file ever contains a token.
 
 The gate checks `orca`/`codex` reachability itself (an absolute `ORCA_BIN`/`ORCH_CODEX_BIN`

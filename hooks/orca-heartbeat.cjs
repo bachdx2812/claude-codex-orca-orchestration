@@ -46,7 +46,7 @@ const {
 } = require('./lib/config.cjs');
 const {
   hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
-  approvalPromptFingerprint,
+  approvalPromptFingerprint, endsAtShellPrompt,
 } = require('./lib/terminal-signals.cjs');
 const {
   workerProgressSample, observeWorkerProgress, recordsFromJSON,
@@ -109,6 +109,10 @@ const USAGE_EXHAUSTED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-usage
 // This survives daemon restarts because emitting any wake event intentionally exits.
 const STALL_PROGRESS_FILE = path.join(DIR, `heartbeat-${SESSION}-stall-progress.json`);
 const APPROVAL_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-approval-reported.json`);
+// A worker whose agent process died back to a shell prompt is reported once per episode
+// (handle -> lastOutputAt at report time; fresh output afterwards re-arms it), surviving
+// daemon restarts like the idle report.
+const EXITED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-exited-reported.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -195,18 +199,26 @@ function savePersistedDisconnectReports(set) {
 
 function loadPersistedUsageExhaustedReports() {
   try {
-    const handles = JSON.parse(fs.readFileSync(USAGE_EXHAUSTED_REPORTED_FILE, 'utf8'));
-    return new Set(Array.isArray(handles) ? handles.filter((handle) => typeof handle === 'string') : []);
+    const data = JSON.parse(fs.readFileSync(USAGE_EXHAUSTED_REPORTED_FILE, 'utf8'));
+    if (!Array.isArray(data)) return new Map();
+    // Legacy format: a bare array of handle strings — those handles stay reported
+    // forever, exactly as the old once-per-session semantics had it.
+    if (data.every((entry) => typeof entry === 'string')) {
+      return new Map(data.map((handle) => [handle, { coder: null, until: Number.MAX_SAFE_INTEGER }]));
+    }
+    return new Map(data.filter((pair) =>
+      Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' &&
+      pair[1] && Number.isFinite(pair[1].until)));
   } catch {
-    return new Set();
+    return new Map();
   }
 }
 
-function savePersistedUsageExhaustedReports(set) {
+function savePersistedUsageExhaustedReports(map) {
   try {
     fs.mkdirSync(DIR, { recursive: true });
     const tmp = `${USAGE_EXHAUSTED_REPORTED_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify([...set]));
+    fs.writeFileSync(tmp, JSON.stringify([...map]));
     fs.renameSync(tmp, USAGE_EXHAUSTED_REPORTED_FILE);
   } catch {}
 }
@@ -252,19 +264,60 @@ function reportApprovalWaiting({ reported, handle, fingerprint, identity, agent 
   return `WORKER WAITING FOR APPROVAL ${identity || handle} (${agent || 'unknown'})`;
 }
 
+function loadPersistedExitedReports() {
+  try {
+    const pairs = JSON.parse(fs.readFileSync(EXITED_REPORTED_FILE, 'utf8'));
+    if (!Array.isArray(pairs)) return new Map();
+    return new Map(pairs.filter((pair) => Array.isArray(pair) && pair.length === 2 &&
+      typeof pair[0] === 'string' && Number.isFinite(pair[1])));
+  } catch {
+    return new Map();
+  }
+}
+
+function savePersistedExitedReports(map) {
+  try {
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${EXITED_REPORTED_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify([...map]));
+    fs.renameSync(tmp, EXITED_REPORTED_FILE);
+  } catch {}
+}
+
+/** Once-per-episode report for a worker whose agent process is gone from its terminal. */
+function reportWorkerExited({ reported, handle, lastOutputAt, identity, agent }) {
+  if (reported.get(handle) === lastOutputAt) return null;
+  reported.set(handle, lastOutputAt);
+  savePersistedExitedReports(reported);
+  return `WORKER EXITED ${identity || handle} (${agent || 'unknown'} process gone, terminal at shell prompt) - ` +
+    'read the terminal for the cause (e.g. Claude Code\'s trust dialog defaulting to exit in an ' +
+    'untrusted worktree), then re-dispatch: Kimi/Codex, or headless `claude -p` launched via worker-start';
+}
+
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
-// exhaustion marker the routing code reads to exclude that coder until reset. The module
-// providing it may not exist yet (it lands with the routing lane) — a missing/failing
-// marker write degrades to a no-op; the report event itself is still emitted.
+// exhaustion marker the routing code reads to exclude that coder until reset. A
+// missing/failing marker write degrades to a no-op; the report event itself is still emitted.
+/**
+ * The exhaustion episode's end time: a windowed limit lasts until that window's known
+ * reset (else one window length from now); the billing-cycle form keeps the long default.
+ * Shared by the marker write and the report de-duplication so both agree on when an
+ * episode is over and a re-used terminal may re-mark.
+ */
+function exhaustionUntilMs(coder, windowHours, now) {
+  const hours = Number.isFinite(windowHours) ? windowHours : null;
+  if (coder === 'kimi' && hours) {
+    return QUOTA.kimiWindowResetMs(DIR, hours * 60, now) || now + hours * 60 * 60 * 1000;
+  }
+  if (hours) return now + hours * 60 * 60 * 1000;
+  return now + 6 * 60 * 60 * 1000;
+}
+
 let onCoderExhausted = defaultOnCoderExhausted;
 function defaultOnCoderExhausted(coder, info = {}) {
   try {
     const now = Date.now();
     const hours = Number.isFinite(info.windowHours) ? info.windowHours : null;
-    // A windowed limit lasts until that window's reported reset (else one window length);
-    // the billing-cycle form keeps the long default.
-    const windowReset = hours ? QUOTA.kimiWindowResetMs(DIR, hours * 60, now) : null;
-    const until = hours ? (windowReset || now + hours * 60 * 60 * 1000) : now + 6 * 60 * 60 * 1000;
+    const until = Number.isFinite(info.until) ? info.until : exhaustionUntilMs(coder, info.windowHours, now);
     require('./lib/coder-availability.cjs').markCoderExhausted(DIR, coder, {
       now, until,
       reason: hours ? `${hours}-hour usage limit reached (worker output)`
@@ -279,17 +332,24 @@ function setOnCoderExhausted(fn) {
 }
 
 /**
- * The once-per-terminal-per-session usage-exhausted report: persists the handle BEFORE
- * emitting so a daemon restart never re-marks or re-reports, calls the (injectable)
- * exhaustion-marker hook, and returns the event text — or null when this handle was
- * already reported. Pure apart from that one persisted set, so tests can drive it
- * directly with a synthetic handle.
+ * The usage-exhausted report: persists the handle with its episode end BEFORE emitting so
+ * a daemon restart never re-marks or re-reports mid-episode, calls the (injectable)
+ * exhaustion-marker hook, and returns the event text. A handle re-arms once its episode
+ * ends (`until` passes), so a Kimi terminal re-used after the window reset marks again on
+ * the next limit. `silent` writes the marker without an event — for terminals outside
+ * this session's fleet, whose exhaustion is a machine-wide fact but not this session's
+ * wake event. Returns null when the handle's episode is still open.
  */
-function reportUsageExhausted({ reported, handle, label, coder, windowHours }) {
-  if (reported.has(handle)) return null;
-  reported.add(handle);
+function reportUsageExhausted({ reported, handle, label, coder, windowHours, now = Date.now(), silent = false }) {
+  const until = exhaustionUntilMs(coder, windowHours, now);
+  const previous = reported.get(handle);
+  if (previous && previous.until > now) return null;
+  reported.set(handle, { coder, until });
   savePersistedUsageExhaustedReports(reported);
-  onCoderExhausted(coder, { windowHours: Number.isFinite(windowHours) ? windowHours : null });
+  onCoderExhausted(coder, {
+    windowHours: Number.isFinite(windowHours) ? windowHours : null, until,
+  });
+  if (silent) return null;
   const name = coder === 'codex' ? 'Codex' : 'Kimi';
   const other = coder === 'codex' ? 'Kimi' : 'Codex';
   return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
@@ -554,6 +614,42 @@ function sessionTerminalHandles(workerRows, state = loadSessionState()) {
     }
   } catch {}
   return handles;
+}
+
+/**
+ * Machine-wide terminal-handle -> agent map from EVERY session's gate state file
+ * (~/.claude/orchestrator-gate/<session>.json), so a terminal this session does not own
+ * can still be attributed to the agent another session registered for it.
+ */
+function machineTerminalAgents(stateDir = DIR) {
+  const agents = new Map();
+  let files = [];
+  try { files = fs.readdirSync(stateDir); } catch { return agents; }
+  for (const file of files) {
+    if (!file.endsWith('.json') || file.startsWith('heartbeat-')) continue;
+    let state;
+    try { state = JSON.parse(fs.readFileSync(path.join(stateDir, file), 'utf8')); } catch { continue; }
+    for (const [id, worker] of Object.entries(state && state.workers || {})) {
+      if (worker && typeof worker.agent === 'string' && worker.agent &&
+          (worker.kind === 'terminal' || /^term_/.test(id))) {
+        agents.set(id, worker.agent);
+      }
+    }
+  }
+  return agents;
+}
+
+/**
+ * RT-3 scope guard for terminals OUTSIDE this session's fleet: such a terminal may mark
+ * Kimi exhausted only when positively identified as a Kimi terminal — via another
+ * session's worker records or a Kimi-identifying title. An absent agent is never enough:
+ * it could be another session's Codex/Claude pane, the operator panel, or a plain shell.
+ */
+function isNonOwnKimiTerminal({ handle, title, ownHandles, panelHandle, machineAgents }) {
+  if (!handle || (ownHandles && ownHandles.has(handle)) || handle === panelHandle) return false;
+  const agent = machineAgents && machineAgents.get(handle);
+  if (agent) return agent === 'kimi';
+  return /kimi/i.test(String(title || ''));
 }
 
 /** A worker still consuming machine resources, whatever its task status says. */
@@ -993,9 +1089,15 @@ function classifyTerminal(t, ctx) {
       hasCodexUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'codex' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
-  const approvalFingerprint = approvalPromptFingerprint(
-    ctx.approvalText !== undefined ? ctx.approvalText : (t.preview || '')
-  );
+  // A terminal whose tracked agent dropped back to a shell prompt (agent process gone)
+  // takes precedence over the approval detector: the scrollback can still SHOW a dialog
+  // (e.g. Claude's trust prompt) the worker already died on, and a live dialog never
+  // ends at a shell prompt.
+  const screenText = ctx.approvalText !== undefined ? ctx.approvalText : (t.preview || '');
+  if (ctx.handleAgent && ctx.handleAgent.has(t.handle) && endsAtShellPrompt(screenText)) {
+    return { kind: 'exited' };
+  }
+  const approvalFingerprint = approvalPromptFingerprint(screenText);
   if (approvalFingerprint) return { kind: 'approval_waiting', fingerprint: approvalFingerprint };
   if (t.orphaned) return { kind: 'orphaned' };
   const supervised = (ctx.retainedHandles && ctx.retainedHandles.has(t.handle)) ||
@@ -1084,6 +1186,7 @@ function main() {
     .filter(([, record]) => record && typeof record.screenText === 'string')
     .map(([handle, record]) => [handle, record.screenText]));
   const reportedApproval = loadPersistedApprovalReports();
+  const reportedExited = loadPersistedExitedReports();
   const handoverRecords = HANDOVER.loadRecords(DIR, SESSION);
   const reportedRateLimit = new Set();
   const reportedOrphans = new Set();
@@ -1190,6 +1293,7 @@ function main() {
         retainedHandles: explicitRetainedHandles, started, now, idleSeconds: IDLE_SECONDS,
         handleAgent,
       };
+      const machineAgents = machineTerminalAgents();
       const panelHandle = process.env.ORCA_TERMINAL_HANDLE || '';
       let panelLimited = false;
       let panelAvailable = false;
@@ -1264,12 +1368,24 @@ function main() {
         }
         let verdict = classifyTerminal(t, { ...ctx, approvalText: screenText });
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
-        // Kimi exhaustion is a machine-wide fact: a Kimi terminal showing the limit marks the
-        // coder exhausted even when it is not a tracked worker of this session.
+        // Kimi exhaustion is a machine-wide fact: a Kimi terminal showing the limit marks
+        // the coder exhausted even when it is not a tracked worker of this session. But a
+        // terminal OUTSIDE this session's fleet only ever marks it when positively
+        // identified as Kimi (another session's worker records or a Kimi title) — never
+        // on an absent agent, which could be another session's Codex/Claude pane, the
+        // operator panel, or a plain shell quoting the error (RT-3). The marker is
+        // written without a wake event: wake events stay scoped to this session's fleet.
         const terminalAgent = handleAgent.get(t.handle);
-        if (verdict.kind !== 'usage_exhausted' && (!terminalAgent || terminalAgent === 'kimi') &&
-            hasKimiUsageExhausted(t.preview || '')) {
-          verdict = { kind: 'usage_exhausted', coder: 'kimi' };
+        if (verdict.kind !== 'usage_exhausted' && !terminalAgent &&
+            hasKimiUsageExhausted(t.preview || '') &&
+            isNonOwnKimiTerminal({
+              handle: t.handle, title: t.title, ownHandles: ownTerminalHandles,
+              panelHandle, machineAgents,
+            })) {
+          reportUsageExhausted({
+            reported: reportedUsageExhausted, handle: t.handle, label, coder: 'kimi',
+            windowHours: kimiUsageLimitHours(t.preview || ''), now, silent: true,
+          });
         }
         if (verdict.kind === 'usage_exhausted') {
           const event = reportUsageExhausted({
@@ -1294,6 +1410,20 @@ function main() {
               `WORKER STUCK on ${label}: Codex session lost its app-server connection - ` +
               'its work since the last commit may be lost; release and re-dispatch'
             );
+          }
+        } else if (verdict.kind === 'exited') {
+          // A finished worker at a shell prompt is normal — only a LIVE worker whose
+          // agent process vanished is an event. Report it immediately (no stall grace):
+          // the worker is already gone, so waiting buys nothing.
+          if (TERMINAL_WORKER_STATES.has(workerState)) {
+            if (reportedExited.delete(t.handle)) savePersistedExitedReports(reportedExited);
+          } else {
+            const event = reportWorkerExited({
+              reported: reportedExited, handle: t.handle, lastOutputAt: t.lastOutputAt,
+              identity: handleDispatch.get(t.handle) || t.handle,
+              agent: handleAgent.get(t.handle) || 'unknown',
+            });
+            if (event) events.push(event);
           }
         } else if (verdict.kind === 'approval_waiting') {
           if (TERMINAL_WORKER_STATES.has(workerState)) {
@@ -1444,6 +1574,8 @@ module.exports = {
   resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
+  machineTerminalAgents, isNonOwnKimiTerminal, exhaustionUntilMs,
+  loadPersistedExitedReports, savePersistedExitedReports, reportWorkerExited,
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
   shouldTrackWorkerProgress,

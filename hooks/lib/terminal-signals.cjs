@@ -97,6 +97,11 @@ function approvalPromptFingerprint(text) {
   const texts = normalized.map((line) => line.text);
   const navigationPattern = /^[↑↓]+\s*navigate\s*[·•|]\s*Enter\s+select(?:\s*[·•|]\s*Esc\s+cancel)?\s*$/i;
   const confirmPattern = /^Press\s+enter\s+to\s+confirm\s+or\s+esc\s+to\s+cancel\.?$/i;
+  // Claude Code's trust dialog ("Quick safety check … Do you trust the files in this
+  // folder?", "⚠ This folder pre-approves N tool permissions … Only proceed if you trust
+  // this configuration") uses a different hint line than the permission prompts.
+  const trustPattern = /trust\s+this\s+folder|trust\s+the\s+files\s+in\s+this\s+folder|only\s+proceed\s+if\s+you\s+trust\s+this\s+configuration/i;
+  const enterConfirmPattern = /^Enter\s+to\s+confirm\s*[·•|]\s*Esc\s+to\s+cancel\.?$/i;
   const permissionPattern = /^Select\s+permission\s+mode\s*$/i;
   const codexQuestionPattern = /^Would\s+you\s+like\s+to\s+(?:run|make|apply)\b.*\?$/i;
   const approvalQuestionPattern = /^(?:Do\s+you\s+want\s+to\s+(?:allow|approve|run)\b.*|(?:Allow|Approve)\b.*)\?$/i;
@@ -104,6 +109,8 @@ function approvalPromptFingerprint(text) {
   const commandPattern = /^\$\s+\S.+$/;
   const hasNavigation = texts.some((line) => navigationPattern.test(line));
   const hasConfirmHint = texts.some((line) => confirmPattern.test(line));
+  const hasTrustDialog = texts.some((line) => trustPattern.test(line));
+  const hasEnterConfirm = texts.some((line) => enterConfirmPattern.test(line));
   const hasPermissionMenu = texts.some((line) => permissionPattern.test(line));
   const hasCodexQuestion = texts.some((line) => codexQuestionPattern.test(line));
   const hasApprovalQuestion = texts.some((line) => approvalQuestionPattern.test(line));
@@ -119,10 +126,11 @@ function approvalPromptFingerprint(text) {
   const promptCommand = questionIndex >= 0
     ? texts.slice(questionIndex + 1).find((line) => commandPattern.test(line))
     : null;
-  const structured = hasNavigation || hasConfirmHint || numberedOptions.length > 0 ||
-    hasOpposingOptions || (hasBox && (hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion));
+  const structured = hasNavigation || hasConfirmHint || hasEnterConfirm || numberedOptions.length > 0 ||
+    hasOpposingOptions || (hasBox && (hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion)) ||
+    (hasTrustDialog && (hasEnterConfirm || hasBox));
   const prompt = hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion ||
-    hasOpposingOptions || numberedOptions.length > 0 || hasNavigation;
+    hasOpposingOptions || numberedOptions.length > 0 || hasNavigation || hasTrustDialog || hasEnterConfirm;
 
   if (!structured || !prompt) return null;
 
@@ -132,6 +140,7 @@ function approvalPromptFingerprint(text) {
     .filter((line) => permissionPattern.test(line) || codexQuestionPattern.test(line) ||
       approvalQuestionPattern.test(line) || codexOptionPattern.test(line) ||
       navigationPattern.test(line) || confirmPattern.test(line) ||
+      trustPattern.test(line) || enterConfirmPattern.test(line) ||
       line === promptCommand ||
       /^(?:\d+[.)]\s*)?(?:allow|deny|approve|never ask|ask when needed)$/i.test(line))
     .map((line) => line.toLowerCase())
@@ -140,7 +149,29 @@ function approvalPromptFingerprint(text) {
   return signature || 'selection-prompt';
 }
 
+// A shell waiting for input: the last visible line ENDS in a prompt character. `%`, `$`
+// and `#` count bare; `❯`/`›` need a prompt-prefix before them so Claude's bare input
+// caret ("❯ ") and Codex's composer prompt can never look like a shell.
+const SHELL_PROMPT_END = /[%$#]\s*$|^\S.{2,}\s[❯›]\s*$/;
+const AGENT_TUI_HINT = /esc\s+to\s+interrupt|bypass\s+permissions|accept\s+edits|shift\s*\+\s*tab\s+to\s+cycle|⏵⏵/i;
+
+/**
+ * True when the screen's last meaningful line is a shell prompt and no agent TUI chrome
+ * shows nearby — the shape of a worker whose agent process exited back to the shell
+ * (e.g. Claude Code's trust dialog defaulting to "No, exit" in an untrusted worktree).
+ */
+function endsAtShellPrompt(text) {
+  const lines = terminalLines(text).map((line) => line.trimEnd()).filter((line) => line.trim());
+  if (!lines.length) return false;
+  const last = lines[lines.length - 1].trim();
+  if (!last || last.length > 160 || !SHELL_PROMPT_END.test(last)) return false;
+  if (/[┌┐└┘├┤┬┴┼─━│┃╭╮╯╰═║╔╗╚╝]/u.test(last)) return false;
+  const tail = lines.slice(-12).join('\n');
+  if (AGENT_TUI_HINT.test(tail)) return false;
+  return true;
+}
+
 module.exports = {
   hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
-  approvalPromptFingerprint,
+  approvalPromptFingerprint, endsAtShellPrompt,
 };

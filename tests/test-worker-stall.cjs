@@ -442,6 +442,77 @@ check('clearing the disappeared prompt re-arms the same future prompt', heartbea
   identity: 'ctx_approval', agent: 'kimi',
 }), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
 
+// --- Claude trust dialog + WORKER EXITED ---------------------------------------
+
+const trustDialog = [
+  ' Claude Code v2.0',
+  '',
+  ' Quick safety check: Claude Code wants to use the folder /repo/worktree-1.',
+  ' Do you trust the files in this folder?',
+  '',
+  ' ❯ 1. Yes, proceed',
+  '   2. No, exit',
+  '',
+  ' Enter to confirm · Esc to cancel',
+].join('\n');
+const trustConfigDialog = [
+  ' ⚠ This folder pre-approves 109 tool permissions in .claude/settings.json.',
+  ' Only proceed if you trust this configuration.',
+  '',
+  ' ❯ 1. Yes, proceed',
+  '   2. No, exit',
+  '',
+  ' Enter to confirm · Esc to cancel',
+].join('\n');
+check('the trust-this-folder dialog is an approval prompt',
+  typeof approvalPromptFingerprint(trustDialog), 'string');
+check('the trust-this-configuration dialog is an approval prompt',
+  typeof approvalPromptFingerprint(trustConfigDialog), 'string');
+check('the Enter-to-confirm hint alone is an approval prompt',
+  typeof approvalPromptFingerprint('Enter to confirm · Esc to cancel'), 'string');
+check('prose quoting the trust wording without prompt chrome is inert',
+  approvalPromptFingerprint('I answered the "Do you trust the files in this folder?" dialog for the worker.'), null);
+
+const exitedScreen = [
+  trustDialog,
+  'macos@host worktree-1 % ',
+].join('\n');
+check('a shell prompt after the trust dialog classifies as exited, not approval',
+  heartbeat.classifyTerminal({
+    handle: 'term_approval', preview: exitedScreen, lastOutputAt: start,
+  }, approvalCtx).kind, 'exited');
+check('a plain zsh prompt classifies as exited for a tracked worker',
+  heartbeat.classifyTerminal({
+    handle: 'term_approval', preview: 'some last output\nmacos@host repo % ', lastOutputAt: start,
+  }, approvalCtx).kind, 'exited');
+check('a bare agent input caret is NOT a shell prompt',
+  heartbeat.classifyTerminal({
+    handle: 'term_approval', preview: '⏵⏵ accept edits on (shift+tab to cycle)\n❯ ', lastOutputAt: start,
+  }, approvalCtx).kind, 'working');
+check('an echoed command line is NOT a shell prompt',
+  heartbeat.classifyTerminal({
+    handle: 'term_approval', preview: '$ npm test\nTests passed', lastOutputAt: start,
+  }, approvalCtx).kind, 'working');
+check('an exited verdict is never stall-tracked',
+  heartbeat.shouldTrackWorkerProgress('exited', 'running'), false);
+
+const exitedReports = new Map();
+check('the first exit episode emits the WORKER EXITED event', heartbeat.reportWorkerExited({
+  reported: exitedReports, handle: 'term_approval', lastOutputAt: start,
+  identity: 'ctx_exited', agent: 'claude',
+}), 'WORKER EXITED ctx_exited (claude process gone, terminal at shell prompt) - read the terminal for the cause (e.g. Claude Code\'s trust dialog defaulting to exit in an untrusted worktree), then re-dispatch: Kimi/Codex, or headless `claude -p` launched via worker-start');
+check('the exit report is persisted for daemon restart',
+  heartbeat.loadPersistedExitedReports().get('term_approval'), start);
+check('the same exit episode is not re-reported', heartbeat.reportWorkerExited({
+  reported: heartbeat.loadPersistedExitedReports(), handle: 'term_approval', lastOutputAt: start,
+  identity: 'ctx_exited', agent: 'claude',
+}), null);
+check('fresh output after the report re-arms the episode',
+  typeof heartbeat.reportWorkerExited({
+    reported: heartbeat.loadPersistedExitedReports(), handle: 'term_approval', lastOutputAt: start + 5000,
+    identity: 'ctx_exited', agent: 'claude',
+  }) === 'string', true);
+
 // Live quota handover is symmetric, cached-probe friendly, and persisted per episode.
 let codexProbeCalls = 0;
 let kimiProbeCalls = 0;
@@ -579,7 +650,7 @@ check('the same aliased record is dropped once no worker alias remains live',
   handover.reminder(stateDir, 'aliased-handover', new Set()), '');
 
 const usageReport = heartbeat.reportUsageExhausted({
-  reported: new Set(), handle: 'term_usage_recipe', label: 'term_usage_recipe', coder: 'kimi',
+  reported: new Map(), handle: 'term_usage_recipe', label: 'term_usage_recipe', coder: 'kimi',
 });
 check('usage-limit report points to committing WIP and HANDOVER.md before release',
   usageReport.includes('follow the WORKER HANDOVER recipe') &&
