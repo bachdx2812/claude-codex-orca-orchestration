@@ -457,6 +457,18 @@ check('an opencode permission screen classifies as approval_waiting', heartbeat.
     identity: 'ctx_opencode', agent: 'opencode',
   }), 'WORKER WAITING FOR APPROVAL ctx_opencode (opencode)');
 }
+// A tracked opencode 402 balance screen is DeepSeek usage exhaustion (RT-3: only for a
+// terminal whose tracked agent is opencode).
+check('an opencode 402 balance screen classifies as usage_exhausted for deepseek',
+  heartbeat.classifyTerminal({ handle: 'term_opencode', preview: '■ 402 Insufficient Balance', lastOutputAt: start },
+    { ...approvalCtx, ownHandles: new Set(['term_opencode']),
+      handleAgent: new Map([['term_opencode', 'opencode']]) }),
+  { kind: 'usage_exhausted', coder: 'deepseek' });
+check('the same 402 from a non-opencode terminal is not DeepSeek exhaustion',
+  heartbeat.classifyTerminal({ handle: 'term_opencode', preview: '■ 402 Insufficient Balance', lastOutputAt: start },
+    { ...approvalCtx, ownHandles: new Set(['term_opencode']),
+      handleAgent: new Map([['term_opencode', 'codex']]) }).kind === 'usage_exhausted',
+  false);
 
 const approvalReports = new Map();
 const approvalFingerprint = approvalPromptFingerprint(kimiApproval);
