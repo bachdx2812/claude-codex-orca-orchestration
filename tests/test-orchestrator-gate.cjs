@@ -2289,6 +2289,27 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
 }
 
 {
+  // Low: a null models block (or null models.verify) must fall back to defaults, never throw.
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-cfg-null-'));
+  const cfgFile = path.join(tmp, 'config.json');
+  const saved = process.env.ORCH_CONFIG_PATH;
+  try {
+    fs.writeFileSync(cfgFile, JSON.stringify({ models: null }));
+    process.env.ORCH_CONFIG_PATH = cfgFile;
+    const c = config.loadConfig();
+    check('models: null falls back to the default models block',
+      [c.models.review.alias, c.models.verify.alias, c.models.verify.effort], ['opus', 'sonnet', 'medium']);
+    fs.writeFileSync(cfgFile, JSON.stringify({ models: { verify: null } }));
+    const c2 = config.loadConfig();
+    check('models.verify: null falls back to the default verify model',
+      [c2.models.verify.alias, c2.models.verify.effort], ['sonnet', 'medium']);
+  } finally {
+    process.env.ORCH_CONFIG_PATH = saved;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+{
   check('a planning first verb is planning', gate.isPlanningReview('plan the refactor', 'planner'), true);
   check('a planning noun in the type is planning', gate.isPlanningReview('draft it', 'architect'), true);
   check('a review first verb is review', gate.isPlanningReview('review the diff', 'code-reviewer'), false);
@@ -2324,6 +2345,71 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   // `design doc` and `architecture` are strong planning objects; a bare `design` stays excluded.
   check('a design doc over code work is planning', gate.isPlanningReview('Review phase-2 design doc for the implementation', 'reviewer'), true);
   check('an architecture review over code work is planning', gate.isPlanningReview('Review the architecture of the fix', 'reviewer'), true);
+}
+
+// --- classifyDispatch: exec / review / verify precedence --------------------
+
+{
+  // B1: exec intent behind a verify/test first verb routes to the coder, never verify.
+  for (const desc of ['Test and fix the login flow', 'Run tests then implement the fix', 'Verify and fix the failing parser test']) {
+    const c = gate.classifyDispatch(desc, 'general-purpose', '');
+    check(`B1 exec behind a verify first verb -> exec: "${desc}"`,
+      [c.wantsExec, c.wantsVerify, c.wantsPlanReview], [true, false, false]);
+  }
+  // B2: a reviewer type or a code noun next to a verify verb is review, never verify.
+  for (const [desc, type] of [
+    ['Verify the PR diff is correct', 'code-reviewer'],
+    ['Verify DeepSeek commits against spec', 'code-reviewer'],
+    ['Check the PR diff; verify tests pass', 'general-purpose'],
+  ]) {
+    const c = gate.classifyDispatch(desc, type, '');
+    check(`B2 review beats verify: "${desc}" (${type})`,
+      [c.wantsPlanReview, c.wantsVerify, c.wantsExec], [true, false, false]);
+  }
+  // A verify-run stays verify.
+  {
+    const c = gate.classifyDispatch('verify the build', 'tester', '');
+    check('a verify-run brief is verify', [c.wantsVerify, c.wantsPlanReview, c.wantsExec], [true, false, false]);
+  }
+  // A tester type routes as verify even with a neutral description.
+  {
+    const c = gate.classifyDispatch('make sure nothing regressed', 'tester', '');
+    check('a tester type routes as verify', c.wantsVerify, true);
+  }
+  // Review and verify counts as review (the stronger model).
+  {
+    const c = gate.classifyDispatch('Review and verify the fix', 'reviewer', '');
+    check('review-and-verify is review', [c.wantsPlanReview, c.wantsVerify], [true, false]);
+  }
+  // An exec first verb stays exec.
+  {
+    const c = gate.classifyDispatch('implement the plan', 'fullstack-developer', '');
+    check('an exec first verb is exec', c.wantsExec, true);
+  }
+  // A planning first verb stays planning/review.
+  {
+    const c = gate.classifyDispatch('plan the refactor', 'planner', '');
+    check('a planning first verb is planning', [c.wantsPlanReview, c.planning], [true, true]);
+  }
+  // A verify verb over a plan noun is planning, never verify-run.
+  {
+    const c = gate.classifyDispatch('Verify plan claims against the codebase', 'reviewer', '');
+    check('verify over a plan noun is planning', [c.wantsPlanReview, c.planning, c.wantsVerify], [true, true, false]);
+  }
+  // Low: a lookup role type never becomes verify (advisory lookup work).
+  {
+    const c = gate.classifyDispatch('Verify where X is defined', 'Explore', '', ['Explore', 'scout']);
+    check('a lookup type never becomes verify', [c.wantsVerify, c.wantsExec, c.wantsPlanReview], [false, false, false]);
+  }
+  // Low: a bare "capture" is not a verify first verb (aligned with VERIFY_INTENT's "capture ui").
+  {
+    const c = gate.classifyDispatch('Capture the architecture diagram', 'general-purpose', '');
+    check('bare "capture" is not verify', [c.wantsVerify, c.wantsExec], [false, false]);
+  }
+  {
+    const c = gate.classifyDispatch('capture ui for the landing page', 'general-purpose', '');
+    check('"capture ui" is verify', [c.wantsVerify, c.wantsPlanReview], [true, false]);
+  }
 }
 
 {

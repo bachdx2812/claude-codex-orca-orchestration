@@ -244,7 +244,7 @@ const REVIEW_VERB = /\b(review|reviewer|audit|critique|assess)\b/i;
 // judging a diff. Routes to the verify model (models.verify, default sonnet), never the
 // review model, which reads code and judges diffs. Only a dispatch that is NOT a plan review
 // counts; a brief that both reviews and verifies is review (REVIEW_VERB wins).
-const VERIFY_FIRST_VERB = /^(verify|verification|test|run\s+(?:the\s+)?(?:verify|tests?|ci)|smoke|re.?run|check[- ]?(?:pr[- ]?)?ci|screenshot|capture|play[- ]?(?:test|through)|playtest)\b/i;
+const VERIFY_FIRST_VERB = /^(verify|verification|test|run\s+(?:the\s+)?(?:verify|tests?|ci)|smoke|re.?run|check[- ]?(?:pr[- ]?)?ci|screenshot|capture\s+ui|play[- ]?(?:test|through)|playtest)\b/i;
 const VERIFY_INTENT = /\b(verify|verification|smoke|re.?run|play[- ]?test|playtest|play\s+through|post[- ]?deploy|deploy\s+verification|browser\s+verify|screenshot|capture\s+ui|check[- ]?pr[- ]?ci|ci\s+gate|run\s+(?:the\s+)?(?:verify|tests?|ci))\b/i;
 // A subagent_type that is a verifier makes a dispatch verify-run even when its description
 // has no verify verb: the declared role is running checks, not judging code.
@@ -273,6 +273,18 @@ const STRONG_PLANNING_OBJECT = /(?<![\w-])(plan|plans|planning)(?![\w-])|\bred[-
 // when its description names code work: the type is the operator's declared role, so it wins.
 const PLANNING_TYPE_HINT = /\bred-?team\b|planner|plan[- ]reviewer/i;
 const EXEC_INTENT = /(?<!\w)(?<!\b(?:review|plan|design|audit|verify|red.?team)-)(implement|implementation|build|refactor|migrate|scaffold|execute|fix\s|write\s+(the\s+)?code|codegen|generate\s+(code|assets|components))\b/i;
+// A code-review noun in the summary — something you JUDGE rather than run or do: a diff, a
+// PR, commit(s), code, a branch, an implementation. Sitting next to a verify verb it marks
+// the dispatch as review (the stronger model) rather than verify-run, so "Verify the PR
+// diff is correct" is review work, not running existing checks. Deliberately narrower than
+// CODE_WORK_OBJECT: exec verbs (fix/implement) do not count here — they route to the coder.
+const REVIEW_NOUN = /\b(diff|pull\s+request|pr|commits?|code|branch|implementation)\b/i;
+// "Test and fix ...", "Run tests then implement ...", "Verify and fix ..." — a verify/test
+// verb COORDINATED with a later exec action means the user wants code written, not just
+// checks run ("verify the build" runs the build; it does not write code). The coordinator
+// ("and"/"then"/",") is what separates a genuine exec action from the object of a verify
+// verb, so the B1 exec-over-verify rule fires only on this coordinated shape.
+const VERIFY_THEN_EXEC = /\b(?:verify|verification|tests?|checks?|ci)\b[^.;]*?\b(?:and|then|also|,)\b[^.;]*?\b(?:implement|implementation|refactor|migrate|scaffold|fix|write\s+(?:the\s+)?code|codegen|generate)\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
@@ -351,6 +363,75 @@ function isPlanningReview(description, type, prompt) {
   if (PLANNING_FIRST_VERB.test(desc)) return true;
   if (REVIEW_FIRST_VERB.test(desc)) return false;
   return PLANNING_INTENT.test(desc) || PLANNING_INTENT.test(type);
+}
+
+/**
+ * Classify a dispatched Agent/Task into one routing intent. Precedence is deliberate and
+ * matches the routing gates that consume the result:
+ *
+ *   1. EXEC — even behind a verify/test first verb. "Test and fix the login flow" /
+ *      "Run tests then implement the fix" / "Verify and fix the failing parser test" all
+ *      carry code intent and must route to the coder pool, never the verify model (B1).
+ *   2. REVIEW — a reviewer subagent_type, a review verb, or a code noun (diff / PR /
+ *      commit(s) / code) next to a verify verb beats verify (the stronger model): "Verify
+ *      the PR diff is correct" is judging a diff, not running checks (B2).
+ *   3. VERIFY — running existing checks on the verify model, never a lookup role type
+ *      (agents.lookup), which is advisory lookup work and never blocks.
+ *
+ * Returns { firstIntent, wantsExec, wantsPlanReview, wantsVerify, planning }.
+ */
+function classifyDispatch(description, type, prompt, lookupTypes) {
+  const desc = String(description || '').trim();
+  const t = String(type || '');
+  const hay = `${t} ${desc}`.trim() || String(prompt || '').slice(0, 400);
+  const firstIntent = PLAN_REVIEW_FIRST_VERB.test(desc) ? 'review'
+    : VERIFY_FIRST_VERB.test(desc) ? 'verify'
+      : EXEC_FIRST_VERB.test(desc) ? 'exec'
+        : NEUTRAL_FIRST_VERB.test(desc) ? 'neutral'
+          : null;
+  const planAt = hay.search(PLAN_REVIEW_INTENT);
+  const verifyAt = hay.search(VERIFY_INTENT);
+  const execAt = hay.search(EXEC_INTENT);
+  const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(t);
+  const typeWantsVerify = VERIFY_TYPE_HINT.test(t);
+  const typeIsLookup = Array.isArray(lookupTypes) &&
+    lookupTypes.some((n) => String(n).toLowerCase() === t.toLowerCase());
+  // Planning / red-team is always the review model (never verify), whatever the first verb.
+  const planning = isPlanningReview(desc, t, prompt);
+  const reviewVerbPresent = REVIEW_VERB.test(desc);
+  const reviewNounPresent = REVIEW_NOUN.test(desc);
+
+  // B1: exec intent behind a verify/test first verb is still execution, so it routes to the
+  // coder pool, records the author, and requires a verify command — never the verify model.
+  // A review first verb still wins over exec. Only a COORDINATED verify-then-exec action
+  // counts: "verify the build" is verify-run (the build is the object), "Verify and fix ..."
+  // is code (fix is a coordinated action).
+  const wantsExec = firstIntent === 'exec' ||
+    (firstIntent !== 'review' && firstIntent !== 'verify' && execAt >= 0 &&
+      (firstIntent === 'neutral' || planAt < 0 || execAt < planAt)) ||
+    (firstIntent === 'verify' && VERIFY_THEN_EXEC.test(hay));
+
+  // B2: review beats verify — a reviewer type, a review verb, or a code noun next to a
+  // verify verb is review work (the stronger model), never verify. A code noun with a verify
+  // verb but no governing first verb is also review ("Check the PR diff; verify tests pass").
+  const wantsPlanReview = !wantsExec && (
+    firstIntent === 'review' ||
+    (firstIntent === 'verify' && (planning || reviewVerbPresent || typeWantsPlanReview || reviewNounPresent)) ||
+    (firstIntent !== 'exec' && firstIntent !== 'verify' && typeWantsPlanReview) ||
+    (!firstIntent && planAt >= 0 && (execAt < 0 || planAt < execAt)) ||
+    (!firstIntent && reviewNounPresent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt))
+  );
+
+  // A lookup role type is advisory lookup work, never verify (and never exec/review): the
+  // operator declared a find/locate role, so a verify verb in its summary must not force the
+  // verify model.
+  const wantsVerify = !typeIsLookup && !planning && !wantsExec && !wantsPlanReview && (
+    firstIntent === 'verify' ||
+    (firstIntent !== 'review' && typeWantsVerify) ||
+    (!firstIntent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt) && (planAt < 0 || verifyAt < planAt))
+  );
+
+  return { firstIntent, wantsExec, wantsPlanReview, wantsVerify, planning };
 }
 
 // Markers that an orca command itself failed, which justifies the in-session fallback.
@@ -1545,41 +1626,14 @@ function onPreToolUse(p, s, cfg) {
   if (tool === 'Agent' || tool === 'Task') {
     // Classify by the verb that governs the task, not by mere presence of a keyword:
     // "plan the refactor" is planning, "implement the plan" is execution, "verify the
-    // build" is verify-run. Whichever intent word appears first in the task's own summary
-    // wins — except that a review verb anywhere beats verify (the stronger model).
+    // build" is verify-run. Precedence: execution (even behind a verify/test first verb),
+    // then review (a review verb / reviewer type / code noun beats a verify verb), then
+    // verify. See classifyDispatch.
     const description = String(input.description || '').trim();
     const type = String(input.subagent_type || '');
     const hay = `${type} ${description}`.trim() || String(input.prompt || '').slice(0, 400);
-    const firstIntent = PLAN_REVIEW_FIRST_VERB.test(description) ? 'review'
-      : VERIFY_FIRST_VERB.test(description) ? 'verify'
-        : EXEC_FIRST_VERB.test(description) ? 'exec'
-          : NEUTRAL_FIRST_VERB.test(description) ? 'neutral'
-            : null;
-    const planAt = hay.search(PLAN_REVIEW_INTENT);
-    const verifyAt = hay.search(VERIFY_INTENT);
-    const execAt = hay.search(EXEC_INTENT);
-    const wantsExec = firstIntent === 'exec' ||
-      (firstIntent !== 'review' && firstIntent !== 'verify' && execAt >= 0 &&
-        (firstIntent === 'neutral' || planAt < 0 || execAt < planAt));
-    const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(type);
-    const typeWantsVerify = VERIFY_TYPE_HINT.test(type);
-    // Planning / red-team is always the review model (never verify), whatever the first verb.
-    const planning = isPlanningReview(description, type, input.prompt);
-    // Review beats verify (operator decision, 2026-10-02): a brief that both reviews and
-    // verifies counts as review (the stronger model), so it is never locked out of the
-    // review model by the verify rule.
-    const reviewVerbPresent = REVIEW_VERB.test(description);
-    const wantsPlanReview = !wantsExec && (
-      firstIntent === 'review' ||
-      (firstIntent === 'verify' && (planning || reviewVerbPresent)) ||
-      (firstIntent !== 'exec' && firstIntent !== 'verify' && typeWantsPlanReview) ||
-      (!firstIntent && planAt >= 0 && (execAt < 0 || planAt < execAt))
-    );
-    const wantsVerify = !planning && !wantsExec && !wantsPlanReview && (
-      firstIntent === 'verify' ||
-      (firstIntent !== 'review' && typeWantsVerify) ||
-      (!firstIntent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt) && (planAt < 0 || verifyAt < planAt))
-    );
+    const { wantsExec, wantsPlanReview, wantsVerify, planning } =
+      classifyDispatch(description, type, input.prompt, cfg.agents.lookup);
     const model = String(input.model || '');
     const reviewAlias = cfg.models.review.alias;
     const escalationAlias = cfg.models.escalation.alias;
@@ -2681,5 +2735,5 @@ module.exports = {
   shellSyntaxOnly, redirectTargets, isExemptPath, movesOnlyExemptPaths, shellSegments,
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
   hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds,
-  isPlanningReview, hasReviewEscalationReason, hasVerifyEscalationReason,
+  isPlanningReview, hasReviewEscalationReason, hasVerifyEscalationReason, classifyDispatch,
 };

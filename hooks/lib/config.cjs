@@ -187,6 +187,14 @@ function loadConfig() {
     warnings.push('config must be a JSON object; using defaults.');
   }
 
+  // A `models: null` (or any non-object `models`) would crash the first `.alias` read off a
+  // role below; reset the whole block to defaults and keep going, same as every other bad
+  // field (never throw on bad config).
+  if (!isPlainObject(merged.models)) {
+    warnings.push('models must be an object; using the defaults.');
+    merged.models = deepMerge({}, DEFAULT_CONFIG.models);
+  }
+
   // Each models.<role> must be a {alias, id} object; a role that isn't (e.g. a bare
   // string) would otherwise crash the first place that reads `.alias` off it deeper in
   // the gate (onSessionStart building a banner, currentExecRoute, ...). Falls back to
@@ -222,6 +230,13 @@ function loadConfig() {
   }
 
   // models.verify carries an effort like models.code does (the verify model runs the checks).
+  // The role loop above guarantees `models.verify` is a plain object, but guard again here
+  // anyway (belt-and-suspenders, mirroring the reviewByCoder fallback below) so a null/array
+  // value can never make the `.effort` read throw.
+  if (!isPlainObject(merged.models.verify)) {
+    warnings.push('models.verify must be an object with "alias"/"id"/"effort"; using the default.');
+    merged.models.verify = { ...DEFAULT_CONFIG.models.verify };
+  }
   if (!EFFORT_VALUES.has(merged.models.verify.effort)) {
     warnings.push(`models.verify.effort "${merged.models.verify.effort}" is not one of low|medium|high|xhigh|max; using "${DEFAULT_CONFIG.models.verify.effort}".`);
     merged.models.verify.effort = DEFAULT_CONFIG.models.verify.effort;

@@ -516,6 +516,102 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     review({ model: 'sonnet' }), DENY, sonnetEnv);
 }
 
+// B1: code intent behind a verify/test first verb routes to the coder pool, never the verify
+// model. "Test and fix ..." / "Run tests then implement ..." / "Verify and fix ..." all carry
+// coordinated exec intent and must hit route-execution-to-codex while Codex is eligible, and
+// must not record an author (a refused exec dispatch never sets lastCodeAuthor).
+{
+  const dir = path.join(RUN_DIR, 'exec-behind-verify');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'exec-behind-verify';
+  let seq = 0;
+  for (const desc of ['Test and fix the login flow', 'Run tests then implement the fix', 'Verify and fix the failing parser test']) {
+    const r = invoke(dispatch({ subagent_type: 'general-purpose', description: desc, model: 'sonnet' },
+      sid, { tool_use_id: `toolu_ebv_${++seq}` }), env);
+    if (r.code === DENY && /route-execution-to-codex/.test(r.err)) pass += 1;
+    else failures.push(`exec intent behind a verify first verb must route to the coder (${desc}): exit=${r.code}, err=${r.err.slice(0, 120)}`);
+  }
+  checkBool('exec behind a verify first verb does not record a code author',
+    (() => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor; } catch { return null; } })(), null);
+}
+
+// B2: a reviewer type or a code noun next to a verify verb is review, never verify — so it is
+// allowed on the review model (opus) even with no code author recorded.
+{
+  const dir = path.join(RUN_DIR, 'review-beats-verify');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'review-beats-verify';
+  let seq = 0;
+  for (const row of [
+    { subagent_type: 'code-reviewer', description: 'Verify the PR diff is correct' },
+    { subagent_type: 'code-reviewer', description: 'Verify DeepSeek commits against spec' },
+    { subagent_type: 'general-purpose', description: 'Check the PR diff; verify tests pass' },
+  ]) {
+    expect(`a reviewer/code-noun dispatch that starts "Verify" is review (opus allowed): ${row.description}`,
+      dispatch(Object.assign({ model: 'opus' }, row), sid, { tool_use_id: `toolu_rbv_${++seq}` }), ALLOW, env);
+  }
+}
+
+// Low: a lookup role type (Explore/scout) with a verify verb is advisory lookup work, never
+// verify-run — allowed on the lookup model, and never refused by the verify-model gate.
+{
+  const dir = path.join(RUN_DIR, 'lookup-never-verify');
+  const stateDir = path.join(dir, 'state');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const env = {
+    ...BASE_ENV,
+    ORCA_DOWN_FLAG_PATH: FLAG,
+    ORCH_STATE_DIR: stateDir,
+    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
+    CODEX_BIN: CODEX_APP_SERVER_STUB,
+    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
+    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
+    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
+    ORCA_BIN: STUB,
+    STUB_CODEX_PRIMARY_USED: '5',
+  };
+  const sid = 'lookup-never-verify';
+  expect('a lookup type with a verify verb is allowed on the lookup model',
+    dispatch({ subagent_type: 'Explore', description: 'Verify where X is defined', model: 'haiku' },
+      sid, { tool_use_id: 'toolu_lnv_1' }), ALLOW, env);
+  const opus = invoke(dispatch({ subagent_type: 'Explore', description: 'Verify where X is defined', model: 'opus' },
+    sid, { tool_use_id: 'toolu_lnv_2' }), env);
+  if (!/verify-model/.test(opus.err) && !/route-verify/.test(opus.err)) pass += 1;
+  else failures.push(`a lookup type with a verify verb must not be classified as verify (opus): exit=${opus.code}, err=${opus.err.slice(0, 120)}`);
+}
+
 // A bare `plan` inside a hyphenated word is not a plan object: a review of the
 // "plan-detection narrowing commit" is a review OF CODE. With DeepSeek as the last code
 // author, it follows the review model (opus, all-opus default) and refuses the code model.
