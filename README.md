@@ -163,9 +163,10 @@ edits?` confirmations and Claude Code's folder-trust dialogs (`Do you trust the 
 this folder?`, `Only proceed if you trust this configuration`, with the `Enter to confirm ·
 Esc to cancel` hint) are included. Only the normalized prompt block, including the
 question and command, forms the episode
-signature, so rotating tips, timers, and spinners cannot re-fire it. Reports persist once
-per unchanged prompt episode across heartbeat restarts and re-arm after the prompt
-disappears; the heartbeat never answers automatically.
+signature, so rotating tips, timers, and spinners cannot re-fire it. The same approval
+prompt is reported at most once per 120s (the report time is persisted, so it survives
+daemon restarts); while it is still showing it is reported again after 120s, and a prompt
+that disappears re-arms immediately. The heartbeat never answers automatically.
 
 **Worker exited back to a shell prompt.** When a supervised worker's terminal ends at a
 shell prompt with no agent TUI visible, the agent process is gone — the heartbeat emits

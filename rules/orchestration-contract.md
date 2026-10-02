@@ -647,7 +647,9 @@ Allow/Deny options, and `↑↓ navigate · Enter select` (optionally `· Esc ca
 prose that merely mentions those words is not a match. Only normalized prompt-block lines
 form the persisted signature, including the normalized question and command, so surrounding
 tips, spinners, timers, and ordinary output do not create new episodes while consecutive
-prompts for different commands remain distinct. It is re-armed when the prompt disappears.
+prompts for different commands remain distinct. The same approval prompt is reported at most
+once per 120s (the report time is persisted, so it survives daemon restarts); while it is
+still showing it is reported again after 120s, and a prompt that disappears re-arms immediately.
 
 A `worker-start --agent opencode --spec` can report `input_accepted` while its terminal never
 runs a turn: the rendered screen stays on the opencode welcome/home screen (the `Ask
