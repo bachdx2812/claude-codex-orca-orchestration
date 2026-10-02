@@ -191,10 +191,13 @@ WORKER NEVER STARTED <dispatch|terminal> (opencode, brief not delivered) - resen
 
 The placeholder only counts when it starts its line, so quoted "Ask anything" text (grep
 output, this repo's README) is inert; the home screen must also show a `● Tip ...` line or the
-`opencode v<digit>` version footer, and an `esc interrupt` footer (a turn is running) rejects
-the match. The 90 seconds must be continuous — any non-welcome screen clears an unreported
-episode. A `▣  Build ·` line marks the end of a message and the brief as delivered: once one
-has been seen for a worker it is never reported again, even after a `/new` back to home.
+`opencode v<digit>` version footer, and the real running footer (a line carrying both
+`esc interrupt` and `ctrl+p`) rejects the match — a `● Tip` line that only mentions
+esc/interrupt does not. Real opencode screens indent the box gutter, so the gutter is stripped
+after the line is trimmed. The 90 seconds must be continuous — any non-welcome screen clears
+an unreported episode. A `▣  Build ·` line marks the end of a message and the brief as
+delivered: once one has been seen for a worker it is never reported again, even after a `/new`
+back to home.
 
 **Mid-task quota handover.** While a supervised Codex, Kimi or DeepSeek worker is live, the
 heartbeat

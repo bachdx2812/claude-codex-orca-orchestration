@@ -50,6 +50,11 @@ check('a screen after a turn started is NOT the welcome screen',
   opencodeWelcomeScreen(turnStarted), false);
 check('a screen after a turn started has a turn marker', opencodeTurnMarker(turnStarted), true);
 
+// Real opencode screens indent the box gutter (2 spaces, then the box char, then 2 spaces);
+// the gutter must be stripped AFTER trimming so the anchored placeholder match still fires.
+check('the indented box gutter (2 spaces + ┃ + 2 spaces) still matches',
+  opencodeWelcomeScreen('  ┃  Ask anything…\n  ┃  ● Tip: hello\n  ┃  opencode v1.0.0'), true);
+
 // The three-dot spelling of the placeholder matches the same as the ellipsis.
 check('the three-dot "Ask anything..." placeholder also matches',
   opencodeWelcomeScreen('│  Ask anything...\n│  ● Tip: hello'), true);
@@ -69,8 +74,10 @@ check('README grep output mentioning "Ask anything" is NOT welcome',
   opencodeWelcomeScreen(readmeGrep), false);
 check('"Ask anything" not at the start of its line is NOT welcome',
   opencodeWelcomeScreen('│  the placeholder says "Ask anything…" when idle\n│  ● Tip: hello'), false);
-check('an esc-interrupt footer rejects the welcome screen even with a placeholder',
-  opencodeWelcomeScreen('│  Ask anything…\n│  ● Tip: Press esc to interrupt'), false);
+check('a ● Tip line mentioning esc/interrupt does NOT suppress the welcome signal',
+  opencodeWelcomeScreen('│  Ask anything…\n│  ● Tip: Press esc to interrupt'), true);
+check('a real running footer (esc interrupt + ctrl+p) rejects the welcome screen',
+  opencodeWelcomeScreen('│  Ask anything…\n│  ● Tip: hello\n│  esc interrupt · ctrl+p model'), false);
 check('the placeholder alone (no version footer / tip line) is NOT welcome',
   opencodeWelcomeScreen('│  Ask anything…'), false);
 

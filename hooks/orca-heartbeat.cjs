@@ -348,9 +348,21 @@ function savePersistedStallProgress(records) {
 function loadPersistedApprovalReports() {
   try {
     const pairs = JSON.parse(fs.readFileSync(APPROVAL_REPORTED_FILE, 'utf8'));
-    return new Map(Array.isArray(pairs) ? pairs.filter((pair) =>
-      Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' &&
-      typeof pair[1] === 'string') : []);
+    if (!Array.isArray(pairs)) return new Map();
+    const map = new Map();
+    for (const pair of pairs) {
+      if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== 'string') continue;
+      const value = pair[1];
+      if (typeof value === 'string') {
+        // Legacy entries persisted only the signature (no time): count them as reported NOW,
+        // so the same prompt re-arms after the re-report window instead of staying suppressed.
+        map.set(pair[0], { fingerprint: value, at: Date.now() });
+      } else if (value && typeof value === 'object' &&
+          typeof value.fingerprint === 'string' && Number.isFinite(value.at)) {
+        map.set(pair[0], { fingerprint: value.fingerprint, at: value.at });
+      }
+    }
+    return map;
   } catch {
     return new Map();
   }
@@ -365,9 +377,18 @@ function savePersistedApprovalReports(reported) {
   } catch {}
 }
 
-function reportApprovalWaiting({ reported, handle, fingerprint, identity, agent }) {
-  if (reported.get(handle) === fingerprint) return null;
-  reported.set(handle, fingerprint);
+// An identical approval prompt is suppressed only inside this window; after it, the same
+// prompt (same path, after "Allow once") is reported again rather than silently stalling the
+// worker forever.
+const APPROVAL_REPORT_WINDOW_MS = 120 * 1000;
+
+function reportApprovalWaiting({ reported, handle, fingerprint, identity, agent, now = Date.now() }) {
+  const previous = reported.get(handle);
+  if (previous && previous.fingerprint === fingerprint &&
+      now - previous.at < APPROVAL_REPORT_WINDOW_MS) {
+    return null;
+  }
+  reported.set(handle, { fingerprint, at: now });
   savePersistedApprovalReports(reported);
   return `WORKER WAITING FOR APPROVAL ${identity || handle} (${agent || 'unknown'})`;
 }

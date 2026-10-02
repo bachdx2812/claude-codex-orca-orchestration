@@ -503,21 +503,44 @@ const approvalReports = new Map();
 const approvalFingerprint = approvalPromptFingerprint(kimiApproval);
 check('first approval episode emits the exact wake event', heartbeat.reportApprovalWaiting({
   reported: approvalReports, handle: 'term_approval', fingerprint: approvalFingerprint,
-  identity: 'ctx_approval', agent: 'kimi',
+  identity: 'ctx_approval', agent: 'kimi', now: start,
 }), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
-check('approval report is persisted for daemon restart',
-  heartbeat.loadPersistedApprovalReports().get('term_approval'), approvalFingerprint);
+const persistedApproval = heartbeat.loadPersistedApprovalReports().get('term_approval');
+check('approval report persists the signature and report time for a daemon restart',
+  persistedApproval && persistedApproval.fingerprint === approvalFingerprint && persistedApproval.at === start,
+  true);
 const approvalAfterRestart = heartbeat.loadPersistedApprovalReports();
-check('same approval episode reports only once across restart', heartbeat.reportApprovalWaiting({
+check('the same approval inside the 120s window is silent across restart', heartbeat.reportApprovalWaiting({
   reported: approvalAfterRestart, handle: 'term_approval', fingerprint: approvalFingerprint,
-  identity: 'ctx_approval', agent: 'kimi',
+  identity: 'ctx_approval', agent: 'kimi', now: start + 60 * 1000,
 }), null);
+check('the same approval after the 120s window is reported again', heartbeat.reportApprovalWaiting({
+  reported: approvalAfterRestart, handle: 'term_approval', fingerprint: approvalFingerprint,
+  identity: 'ctx_approval', agent: 'kimi', now: start + 121 * 1000,
+}), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
 approvalAfterRestart.delete('term_approval');
 heartbeat.savePersistedApprovalReports(approvalAfterRestart);
 check('clearing the disappeared prompt re-arms the same future prompt', heartbeat.reportApprovalWaiting({
   reported: approvalAfterRestart, handle: 'term_approval', fingerprint: approvalFingerprint,
-  identity: 'ctx_approval', agent: 'kimi',
+  identity: 'ctx_approval', agent: 'kimi', now: start + 121 * 1000,
 }), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
+
+// Legacy bare-signature entries (no persisted time) load as "reported now": still silent
+// inside the 120s window but re-armed after it, so a prompt that waited through the old
+// once-per-session suppression can no longer stall the worker forever.
+heartbeat.savePersistedApprovalReports(new Map([['term_legacy', 'legacy-signature']]));
+const legacyLoaded = heartbeat.loadPersistedApprovalReports();
+const legacyEntry = legacyLoaded.get('term_legacy');
+check('a legacy bare signature loads with a finite report time',
+  legacyEntry && legacyEntry.fingerprint === 'legacy-signature' && Number.isFinite(legacyEntry.at), true);
+check('a legacy signature is still silent inside the window', heartbeat.reportApprovalWaiting({
+  reported: legacyLoaded, handle: 'term_legacy', fingerprint: 'legacy-signature',
+  identity: 'ctx_legacy', agent: 'kimi', now: legacyEntry.at + 1000,
+}), null);
+check('a legacy signature re-arms after the window', heartbeat.reportApprovalWaiting({
+  reported: legacyLoaded, handle: 'term_legacy', fingerprint: 'legacy-signature',
+  identity: 'ctx_legacy', agent: 'kimi', now: legacyEntry.at + 121 * 1000,
+}), 'WORKER WAITING FOR APPROVAL ctx_legacy (kimi)');
 
 // --- Claude trust dialog + WORKER EXITED ---------------------------------------
 

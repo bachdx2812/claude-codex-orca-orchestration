@@ -19,8 +19,13 @@ const OPENCODE_ASK_ANYTHING = /^ask\s+anything(?:\s*…|\.{3})/i;
 const OPENCODE_VERSION_FOOTER = /^opencode\s+v\d/i;
 const OPENCODE_TIP_LINE = /^●\s*tip\b/i;
 // The esc-interrupt footer (`esc interrupt` / `esc to interrupt`) only appears while a turn
-// is running; its presence means this is NOT the idle welcome screen.
+// is running. Used by the approval detector's bottom-line "is this a live run" check.
 const ESC_INTERRUPT_FOOTER = /esc\s+(?:to\s+)?interrupt/i;
+// The real opencode running footer line carries BOTH the esc-interrupt hint and the ctrl+p
+// hint on the same line (`esc interrupt · ctrl+p ...`). A `● Tip` line that only mentions
+// esc/interrupt (a tip, not the footer) must not suppress the welcome signal, so the welcome
+// classifier requires both hints on one line instead of using the loose footer above.
+const OPENCODE_RUNNING_FOOTER = /esc\s+(?:to\s+)?interrupt.*ctrl\s*\+\s*p|ctrl\s*\+\s*p.*esc\s+(?:to\s+)?interrupt/i;
 // A live progress spinner (braille or clock-face glyphs) in a screen's tail means the worker
 // is mid-run, so a permission prompt described above it is not a live waiting dialog.
 const SPINNER_GLYPH = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⏳⌛⣾⣽⣻⢿⡿⣟⣯⣷]/u;
@@ -142,7 +147,7 @@ function approvalPromptFingerprint(text) {
   // "thinking/working" indicator, or the esc-interrupt footer there means the worker is
   // mid-run, so prose describing a permission prompt above it is not a real waiting dialog.
   const rawLastNonEmpty = terminalLines(text)
-    .map((line) => line.replace(BOX_GUTTER, '').trim())
+    .map((line) => line.trim().replace(BOX_GUTTER, '').trim())
     .filter(Boolean)
     .pop() || '';
   const lastLineIsLive = SPINNER_GLYPH.test(rawLastNonEmpty) ||
@@ -283,20 +288,24 @@ function opencodeTurnMarker(text) {
  * input box still shows the `Ask anything…` placeholder and no `▣  Build ·`-style status has
  * appeared, so no turn ever ran. The placeholder must START its line (so quoted text, grep
  * output and this repo's README never count), the home screen must also carry a version
- * footer or `● Tip` line, and an esc-interrupt footer (a turn is running) rejects the match.
- * Any tool output implies a `▣` step marker in the same rendered frame, so the single marker
+ * footer or `● Tip` line, and the real running footer (a line with both `esc interrupt` and
+ * `ctrl+p`) rejects the match. A `● Tip` line that only mentions esc/interrupt is NOT a
+ * footer and never suppresses the signal. Any tool output implies a `▣` step marker in the
+ * same rendered frame, so the single marker
  * check covers both "no turn marker" and "no tool output". A screen that has started a turn
  * therefore never matches, which is what lets the caller mark the brief as delivered.
  */
 function opencodeWelcomeScreen(text) {
   const lines = terminalLines(text)
-    .map((line) => line.replace(BOX_GUTTER, '').trim())
+    .map((line) => line.trim().replace(BOX_GUTTER, '').trim())
     .filter(Boolean);
   if (!lines.length) return false;
   if (!lines.some((line) => OPENCODE_ASK_ANYTHING.test(line))) return false;
   if (lines.some((line) => OPENCODE_TURN_MARKER.test(line))) return false;
-  // A turn running under the input box (esc-interrupt footer) is not the idle home screen.
-  if (lines.some((line) => ESC_INTERRUPT_FOOTER.test(line))) return false;
+  // A turn running under the input box (the real footer line with both `esc interrupt` and
+  // `ctrl+p`) is not the idle home screen. A `● Tip` line that merely mentions esc/interrupt
+  // must not suppress the welcome signal.
+  if (lines.some((line) => OPENCODE_RUNNING_FOOTER.test(line))) return false;
   // The home screen carries a version footer or a ● Tip line; require one so a lone quoted
   // "Ask anything" (grep output, docs) can never count.
   if (!lines.some((line) => OPENCODE_VERSION_FOOTER.test(line) || OPENCODE_TIP_LINE.test(line))) return false;
