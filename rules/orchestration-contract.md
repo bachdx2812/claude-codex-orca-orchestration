@@ -652,16 +652,20 @@ prompts for different commands remain distinct. It is re-armed when the prompt d
 A `worker-start --agent opencode --spec` can report `input_accepted` while its terminal never
 runs a turn: the rendered screen stays on the opencode welcome/home screen (the `Ask
 anything…` input placeholder, a `● Tip ...` line, and the version footer) with no
-`▣  Build ·` turn marker and no tool output. After 90 seconds of that, the heartbeat emits,
-once per episode (persisted across daemon restarts like the other episodes):
+`▣  Build ·` turn marker and no tool output. After 90 seconds of continuous welcome-screen
+time, the heartbeat emits, once per episode (persisted across daemon restarts like the other
+episodes):
 
 ```text
 WORKER NEVER STARTED <dispatch|terminal> (opencode, brief not delivered) - resend the brief: orca terminal send --terminal <terminalHandle> --text '<one-line brief>' --enter
 ```
 
-The episode starts when the welcome screen is first observed and is re-armed when a `▣` turn
-marker appears, so a worker that actually starts a turn is not reported again until it
-returns to a fresh welcome screen.
+The placeholder only counts when it starts its line, so quoted "Ask anything" text (grep
+output, this repo's README) is inert; the home screen must also show a `● Tip ...` line or the
+`opencode v<digit>` version footer, and an `esc interrupt` footer (a turn is running) rejects
+the match. The 90 seconds must be continuous — any non-welcome screen clears an unreported
+episode. A `▣  Build ·` line marks the end of a message and the brief as delivered: once one
+has been seen for a worker it is never reported again, even after a `/new` back to home.
 
 For every live supervised Codex or Kimi worker, the heartbeat reuses the existing cached,
 single-flight quota probe. It warns once at `handoverWarnMarginPercent` below that coder's

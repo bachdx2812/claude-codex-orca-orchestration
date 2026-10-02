@@ -1,0 +1,6 @@
+│  I need approval to run the tests. The permission dialog will show:
+│  △ Permission required
+│  ← Run bash "npm test"
+│  Allow once   Allow always   Reject
+│
+│  ⠋  npm test

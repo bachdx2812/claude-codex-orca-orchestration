@@ -10,7 +10,20 @@ const BOX_GUTTER = /^[┃│|]\s*/u;
 
 // opencode's prompt-box placeholder when no turn is in flight: `Ask anything…` (or the
 // three-dot spelling). It disappears while a turn runs, so its presence means idle input.
-const OPENCODE_ASK_ANYTHING = /ask\s+anything/i;
+// Anchored to the START of the line (after the box gutter is stripped) so quoted text, grep
+// output, or this repo's README mentioning the phrase can never look like the input box —
+// only a line that literally begins with `Ask anything…`/`Ask anything...` counts.
+const OPENCODE_ASK_ANYTHING = /^ask\s+anything(?:\s*…|\.{3})/i;
+// The welcome/home screen always carries at least one of these: the `opencode v<digit>`
+// version footer, or a `● Tip ...` line.
+const OPENCODE_VERSION_FOOTER = /^opencode\s+v\d/i;
+const OPENCODE_TIP_LINE = /^●\s*tip\b/i;
+// The esc-interrupt footer (`esc interrupt` / `esc to interrupt`) only appears while a turn
+// is running; its presence means this is NOT the idle welcome screen.
+const ESC_INTERRUPT_FOOTER = /esc\s+(?:to\s+)?interrupt/i;
+// A live progress spinner (braille or clock-face glyphs) in a screen's tail means the worker
+// is mid-run, so a permission prompt described above it is not a live waiting dialog.
+const SPINNER_GLYPH = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⏳⌛⣾⣽⣻⢿⡿⣟⣯⣷]/u;
 // opencode marks each step of a turn with a `▣` glyph (`▣  Build · 3.2s · 21 tokens`).
 // The welcome/home screen never shows one; its absence is the "no turn ever ran" signal.
 const OPENCODE_TURN_MARKER = /▣/u;
@@ -125,6 +138,16 @@ function approvalPromptFingerprint(text) {
   }).filter(Boolean);
   const normalized = lines.map((raw) => ({ raw, text: normalizeTerminalLine(raw).text })).filter((line) => line.text);
   const texts = normalized.map((line) => line.text);
+  // The screen's last non-empty raw line (gutter stripped): a live spinner, a
+  // "thinking/working" indicator, or the esc-interrupt footer there means the worker is
+  // mid-run, so prose describing a permission prompt above it is not a real waiting dialog.
+  const rawLastNonEmpty = terminalLines(text)
+    .map((line) => line.replace(BOX_GUTTER, '').trim())
+    .filter(Boolean)
+    .pop() || '';
+  const lastLineIsLive = SPINNER_GLYPH.test(rawLastNonEmpty) ||
+    ESC_INTERRUPT_FOOTER.test(rawLastNonEmpty) ||
+    /^(?:thinking|working|running|processing|loading)\b[\s….]*$/i.test(rawLastNonEmpty);
   const navigationPattern = /^[↑↓]+\s*navigate\s*[·•|]\s*Enter\s+select(?:\s*[·•|]\s*Esc\s+cancel)?\s*$/i;
   const confirmPattern = /^Press\s+enter\s+to\s+confirm\s+or\s+esc\s+to\s+cancel\.?$/i;
   // Claude Code's trust dialog ("Quick safety check … Do you trust the files in this
@@ -148,11 +171,37 @@ function approvalPromptFingerprint(text) {
   const hasTrustDialog = texts.some((line) => trustPattern.test(line));
   const hasEnterConfirm = texts.some((line) => enterConfirmPattern.test(line));
   const hasPermissionMenu = texts.some((line) => permissionPattern.test(line));
-  const hasOpencodePermission = texts.some((line) => opencodePermissionHeader.test(line)) &&
-    texts.some((line) => opencodeOptionsPattern.test(line));
+  let opencodeTriple = null;
+  const hasOpencodePermission = (() => {
+    // The live prompt needs the header, the `← <target>` line and the options line ADJACENT
+    // in that order (each within 4 lines of the next) and inside the last 12 non-empty
+    // lines — prose describing the dialog is spread out, scrolled off, or sits above a
+    // running spinner, so it never forms this triple.
+    if (lastLineIsLive) return false;
+    const headerIdx = [];
+    const targetIdx = [];
+    const optionsIdx = [];
+    texts.forEach((line, i) => {
+      if (opencodePermissionHeader.test(line)) headerIdx.push(i);
+      if (opencodeTargetPattern.test(line)) targetIdx.push(i);
+      if (opencodeOptionsPattern.test(line)) optionsIdx.push(i);
+    });
+    for (const i of headerIdx) {
+      if (texts.length - i > 12) continue;
+      for (const j of targetIdx) {
+        if (j <= i || j - i > 4) continue;
+        for (const k of optionsIdx) {
+          if (k <= j || k - j > 4) continue;
+          opencodeTriple = { header: i, target: j, options: k };
+          return true;
+        }
+      }
+    }
+    return false;
+  })();
   const hasCodexQuestion = texts.some((line) => codexQuestionPattern.test(line));
   const hasApprovalQuestion = texts.some((line) => approvalQuestionPattern.test(line));
-  const opencodeTarget = texts.find((line) => opencodeTargetPattern.test(line)) || null;
+  const opencodeTarget = opencodeTriple ? texts[opencodeTriple.target] : null;
   const numberedOptions = texts.filter((line) => codexOptionPattern.test(line));
   const optionNames = new Set(texts.map((line) => line
     .replace(/^\d+[.)]\s*/, '')
@@ -232,10 +281,12 @@ function opencodeTurnMarker(text) {
 /**
  * True when the rendered screen is opencode's welcome/home screen with no turn marker: the
  * input box still shows the `Ask anything…` placeholder and no `▣  Build ·`-style status has
- * appeared, so no turn ever ran. Any tool output implies a `▣` step marker in the same
- * rendered frame, so the single marker check covers both "no turn marker" and "no tool
- * output". A screen that has started a turn therefore never matches, which is what lets the
- * caller re-arm the never-started episode once the brief actually lands.
+ * appeared, so no turn ever ran. The placeholder must START its line (so quoted text, grep
+ * output and this repo's README never count), the home screen must also carry a version
+ * footer or `● Tip` line, and an esc-interrupt footer (a turn is running) rejects the match.
+ * Any tool output implies a `▣` step marker in the same rendered frame, so the single marker
+ * check covers both "no turn marker" and "no tool output". A screen that has started a turn
+ * therefore never matches, which is what lets the caller mark the brief as delivered.
  */
 function opencodeWelcomeScreen(text) {
   const lines = terminalLines(text)
@@ -244,6 +295,11 @@ function opencodeWelcomeScreen(text) {
   if (!lines.length) return false;
   if (!lines.some((line) => OPENCODE_ASK_ANYTHING.test(line))) return false;
   if (lines.some((line) => OPENCODE_TURN_MARKER.test(line))) return false;
+  // A turn running under the input box (esc-interrupt footer) is not the idle home screen.
+  if (lines.some((line) => ESC_INTERRUPT_FOOTER.test(line))) return false;
+  // The home screen carries a version footer or a ● Tip line; require one so a lone quoted
+  // "Ask anything" (grep output, docs) can never count.
+  if (!lines.some((line) => OPENCODE_VERSION_FOOTER.test(line) || OPENCODE_TIP_LINE.test(line))) return false;
   return true;
 }
 

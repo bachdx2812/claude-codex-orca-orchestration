@@ -428,29 +428,59 @@ function savePersistedNeverStarted(map) {
  * the welcome/home screen (no turn marker) for >= NEVER_STARTED_SECONDS after it was first
  * seen emits once per episode. The episode starts on the first welcome-screen observation
  * (`firstSeenAt`), and the report is persisted before emitting so a daemon restart never
- * re-fires mid-episode. Returns null while the grace window is still open or the episode is
- * already reported.
+ * re-fires mid-episode. Returns null while the grace window is still open, the episode is
+ * already reported, or the worker's brief has already been delivered (`delivered`: a `▣`
+ * turn marker / finished message was seen) — a `/new` back to the home screen after delivery
+ * is not "brief not delivered".
  */
 function reportNeverStarted({ reported, handle, now = Date.now(), identity }) {
   const previous = reported.get(handle);
+  if (previous && previous.delivered) return null;
   if (!previous) {
-    reported.set(handle, { firstSeenAt: now, reported: false });
+    reported.set(handle, { firstSeenAt: now, reported: false, delivered: false });
     savePersistedNeverStarted(reported);
     return null;
   }
   if (previous.reported || now - previous.firstSeenAt < NEVER_STARTED_SECONDS * 1000) return null;
-  reported.set(handle, { firstSeenAt: previous.firstSeenAt, reported: true });
+  reported.set(handle, { firstSeenAt: previous.firstSeenAt, reported: true, delivered: false });
   savePersistedNeverStarted(reported);
   return `WORKER NEVER STARTED ${identity || handle} (opencode, brief not delivered) - resend the brief: ` +
     `orca terminal send --terminal ${handle} --text '<one-line brief>' --enter`;
 }
 
-/** Re-arm a reported episode when a turn marker appears: the worker is running, so a later
- * return to the welcome screen is a fresh episode, not a continuation of this one. */
-function rearmNeverStarted({ reported, handle }) {
-  if (!reported.has(handle)) return;
+/** Clear an UNREPORTED never-started episode: the screen has left the welcome screen, so the
+ * NEVER_STARTED_SECONDS window is no longer continuous. A delivered record is left alone —
+ * once a finished message has been seen the worker is never reported again until it is
+ * pruned. */
+function clearNeverStartedEpisode({ reported, handle }) {
+  const previous = reported.get(handle);
+  if (!previous || previous.delivered || previous.reported) return false;
   reported.delete(handle);
   savePersistedNeverStarted(reported);
+  return true;
+}
+
+/** Record that the worker's brief was delivered (a `▣` turn marker / finished message has
+ * appeared): the worker is running, so it must never emit WORKER NEVER STARTED again — even
+ * after a later `/new` back to the welcome screen. */
+function markNeverStartedDelivered({ reported, handle }) {
+  const previous = reported.get(handle);
+  if (previous && previous.delivered) return false;
+  reported.set(handle, { firstSeenAt: 0, reported: true, delivered: true });
+  savePersistedNeverStarted(reported);
+  return true;
+}
+
+/** Drop never-started records for handles this tick no longer supervises (worker done,
+ * released, terminal gone, or agent no longer opencode), so a later re-use of the terminal
+ * starts a fresh episode. */
+function pruneNeverStarted({ reported, keepHandles }) {
+  let changed = false;
+  for (const handle of reported.keys()) {
+    if (!keepHandles.has(handle)) { reported.delete(handle); changed = true; }
+  }
+  if (changed) savePersistedNeverStarted(reported);
+  return changed;
 }
 
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
@@ -1908,6 +1938,14 @@ function main() {
       ).map((terminal) => terminal.handle));
       const activeCoderHandles = new Set([...activeResumeHandles]
         .filter((handle) => ['codex', 'kimi', 'opencode'].includes(handleAgent.get(handle))));
+      // Handles this tick still supervises for the "never started" signal: an opencode
+      // terminal whose worker has not reached a terminal state. Anything else (done,
+      // released, gone, re-purposed) is pruned so a later re-use starts a fresh episode.
+      const supervisedNeverStartedHandles = new Set(ts.filter((terminal) =>
+        handleAgent.get(terminal.handle) === 'opencode' &&
+        !TERMINAL_WORKER_STATES.has(handleWorkerState.get(terminal.handle))
+      ).map((terminal) => terminal.handle));
+      pruneNeverStarted({ reported: reportedNeverStarted, keepHandles: supervisedNeverStartedHandles });
       const authorizedResumeHandles = new Set(activeResumeHandles);
       if (panelHandle && ts.some((terminal) => terminal.handle === panelHandle)) {
         authorizedResumeHandles.add(panelHandle);
@@ -2046,8 +2084,10 @@ function main() {
         const agent = handleAgent.get(t.handle) || 'unknown';
         // opencode "never started": a live opencode worker whose rendered screen is still
         // the welcome/home screen (no `▣` turn marker) has never had its brief delivered.
-        // Fires once per episode after NEVER_STARTED_SECONDS on the welcome screen, and
-        // re-arms when a turn marker appears (the brief finally landed and a turn ran).
+        // Fires once per episode after NEVER_STARTED_SECONDS of CONTINUOUS welcome-screen
+        // time. Any non-welcome screen clears an unreported episode (the 90s must be
+        // continuous), and a `▣` turn marker marks the brief delivered for good — a later
+        // `/new` back to home is never reported again.
         if (agent === 'opencode' && !TERMINAL_WORKER_STATES.has(workerState)) {
           if (opencodeWelcomeScreen(screenText)) {
             const neverStarted = reportNeverStarted({
@@ -2056,7 +2096,9 @@ function main() {
             });
             if (neverStarted) events.push(neverStarted);
           } else if (opencodeTurnMarker(screenText)) {
-            rearmNeverStarted({ reported: reportedNeverStarted, handle: t.handle });
+            markNeverStartedDelivered({ reported: reportedNeverStarted, handle: t.handle });
+          } else {
+            clearNeverStartedEpisode({ reported: reportedNeverStarted, handle: t.handle });
           }
         }
         if (agent === 'claude' && activeResumeHandles.has(t.handle)) {
@@ -2180,7 +2222,8 @@ module.exports = {
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
   machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
   loadPersistedExitedReports, savePersistedExitedReports, reportWorkerExited,
-  loadPersistedNeverStarted, savePersistedNeverStarted, reportNeverStarted, rearmNeverStarted, NEVER_STARTED_SECONDS,
+  loadPersistedNeverStarted, savePersistedNeverStarted, reportNeverStarted, clearNeverStartedEpisode,
+  markNeverStartedDelivered, pruneNeverStarted, NEVER_STARTED_SECONDS,
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
   shouldTrackWorkerProgress,

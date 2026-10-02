@@ -419,6 +419,35 @@ check('prose quoting the opencode permission dialog is inert',
 check('prose naming the opencode prompt without options is inert',
   approvalPromptFingerprint('A worker hit the "Permission required" prompt while reading an external dir.'), null);
 
+// The header + `← target` + options must be ADJACENT in order and the screen's last
+// non-empty line must not be a spinner or esc-interrupt footer: doc text describing the
+// prompt while the worker runs npm test is not a waiting dialog.
+const opencodePermissionDocSpinner = fs.readFileSync(
+  path.join(__dirname, 'fixtures', 'screen-opencode-permission-doc-spinner.txt'), 'utf8');
+check('doc text describing the permission prompt above a live spinner is not approval',
+  approvalPromptFingerprint(opencodePermissionDocSpinner), null);
+check('doc text describing the prompt above an esc-interrupt footer is not approval',
+  approvalPromptFingerprint([
+    '┃  The dialog asks:',
+    '┃  △ Permission required',
+    '┃  ← Run bash "npm test"',
+    '┃  Allow once   Allow always   Reject',
+    '┃  ● Tip: Press esc to interrupt',
+  ].join('\n')), null);
+check('a real live opencode permission prompt at the bottom is approval',
+  typeof approvalPromptFingerprint([
+    '┃  △ Permission required',
+    '┃  ← Run bash "npm test"',
+    '┃  Allow once   Allow always   Reject',
+  ].join('\n')), 'string');
+check('the opencode prompt scrolled more than 12 lines up is not approval',
+  approvalPromptFingerprint([
+    '┃  △ Permission required',
+    '┃  ← Run bash "npm test"',
+    '┃  Allow once   Allow always   Reject',
+    ...Array.from({ length: 13 }, (_, i) => `┃  output line ${i}`),
+  ].join('\n')), null);
+
 const approvalCtx = {
   baseHandles: new Set(), ownHandles: new Set(['term_approval']), retainedHandles: new Set(),
   handleAgent: new Map([['term_approval', 'kimi']]), started: start - 1000,
