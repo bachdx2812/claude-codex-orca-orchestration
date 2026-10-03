@@ -165,8 +165,17 @@ const ghUnavailable = runCase('gh-unavailable', worktree(), {
   STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000) + 60),
   STUB_GIT_REFLOG_HAS_COMMIT: '1',
 });
-check('missing or unauthenticated gh falls back to ancestor and reflog acceptance',
-  ghUnavailable.calls.includes(`worktree rm --worktree path:${ghUnavailable.worktreePath} --json`), true);
+check('a gh command error is uncertain and keeps the worktree',
+  ghUnavailable.calls.includes('worktree rm'), false);
+
+const ghMissing = runCase('gh-missing', worktree(), {
+  ORCH_GH_BIN: path.join(ROOT, 'missing-gh'),
+  STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_ANCESTOR: '1',
+  STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000) + 60),
+  STUB_GIT_REFLOG_HAS_COMMIT: '1',
+});
+check('a missing gh binary keeps the Git-only ancestor and reflog fallback',
+  ghMissing.calls.includes(`worktree rm --worktree path:${ghMissing.worktreePath} --json`), true);
 
 const disabledDir = path.join(ROOT, 'disabled');
 fs.mkdirSync(disabledDir, { recursive: true });
@@ -204,8 +213,10 @@ const gateEnv = {
   ORCH_CONFIG_PATH: gateConfig,
   ORCA_BIN: ORCA,
 };
-function invokeGate(payload) {
-  return spawnSync(process.execPath, [GATE], { input: JSON.stringify(payload), encoding: 'utf8', env: gateEnv });
+function invokeGate(payload, envOverrides = {}) {
+  return spawnSync(process.execPath, [GATE], {
+    input: JSON.stringify(payload), encoding: 'utf8', env: { ...gateEnv, ...envOverrides },
+  });
 }
 function hookContext(result) {
   try { return JSON.parse(result.stdout).hookSpecificOutput?.additionalContext || ''; } catch { return ''; }
@@ -266,6 +277,60 @@ check('SessionStart compact preserves background shell tracking',
   !!afterCompact.backgroundShells?.toolu_heartbeat_1, true);
 check('SessionStart compact preserves the original session cutoff',
   afterCompact.sessionStartedAt, beforeCompact.sessionStartedAt);
+
+afterCompact.backgroundShells.toolu_heartbeat_1.started = Date.now();
+fs.writeFileSync(staleStatePath, JSON.stringify(afterCompact));
+fs.writeFileSync(path.join(gateEnv.ORCH_STATE_DIR, `heartbeat-${shellSession}.json`), JSON.stringify({
+  pid: 999_999_999, started: Date.now() - 60_000, last_tick: Date.now() - 60_000, interval: 20,
+}));
+const withStalePriorRecord = invokeGate({
+  hook_event_name: 'PreToolUse', session_id: shellSession, tool_name: 'Bash',
+  tool_use_id: 'toolu_heartbeat_3', cwd: gateDir,
+  tool_input: { command: heartbeatCommand, run_in_background: true },
+});
+check('a stale prior liveness record does not bypass grace for a new heartbeat launch',
+  /stop previous heartbeat shell toolu_heartbeat_1/.test(hookContext(withStalePriorRecord)), true);
+const currentHeartbeatState = JSON.parse(fs.readFileSync(staleStatePath, 'utf8'));
+currentHeartbeatState.backgroundShells.toolu_heartbeat_1.heartbeatPid = 999_999_999;
+fs.writeFileSync(staleStatePath, JSON.stringify(currentHeartbeatState));
+const afterExitedHeartbeat = invokeGate({
+  hook_event_name: 'PreToolUse', session_id: shellSession, tool_name: 'Bash',
+  tool_use_id: 'toolu_heartbeat_4', cwd: gateDir,
+  tool_input: { command: heartbeatCommand, run_in_background: true },
+});
+check('a recorded dead heartbeat bypasses startup grace and no longer triggers duplicate advice',
+  /stop previous heartbeat shell/.test(hookContext(afterExitedHeartbeat)), false);
+const prunedHeartbeatState = JSON.parse(fs.readFileSync(staleStatePath, 'utf8'));
+check('an exited heartbeat shell is removed from persisted tracking',
+  !!prunedHeartbeatState.backgroundShells?.toolu_heartbeat_1, false);
+
+const noticeSession = 'janitor-pretool-notices';
+const pendingStarted = Date.now() - 11 * 60 * 1000;
+const pendingKey = `pending-${pendingStarted}-0`;
+const noticeStatePath = path.join(gateEnv.ORCH_STATE_DIR, `${noticeSession}.json`);
+fs.writeFileSync(noticeStatePath, JSON.stringify({
+  session_id: noticeSession, created: new Date().toISOString(), bypass: false,
+  execAgent: 'invalid-route', execAgentSince: Date.now(), sessionStartedAt: pendingStarted,
+  workers: { [pendingKey]: { status: 'live', started: pendingStarted, agent: 'codex', group: pendingKey } },
+  backgroundShells: { toolu_notice_heartbeat: {
+    command: heartbeatCommand, started: Date.now(), heartbeat: true,
+  } },
+  reservations: {}, agentClaims: {}, agents: {}, tasks: {},
+}));
+const combinedNotices = invokeGate({
+  hook_event_name: 'PreToolUse', session_id: noticeSession, tool_name: 'Bash',
+  tool_use_id: 'toolu_notice_second', cwd: gateDir,
+  tool_input: { command: heartbeatCommand, run_in_background: true },
+}, { STUB_WORKERS_JSON: '[]' });
+const combinedContext = hookContext(combinedNotices);
+check('PreToolUse notices remain one valid JSON hook response',
+  (() => { try { JSON.parse(combinedNotices.stdout); return true; } catch { return false; } })(), true);
+check('invalid execAgent repair is included in the combined hook advisory',
+  /invalid persisted execAgent/.test(combinedContext), true);
+check('placeholder reconciliation is included in the combined hook advisory',
+  /placeholder pending-.* settled/.test(combinedContext), true);
+check('the regular duplicate-heartbeat advice survives alongside maintenance notices',
+  /stop previous heartbeat shell toolu_notice_heartbeat/.test(combinedContext), true);
 
 invokeGate({ hook_event_name: 'SessionStart', session_id: shellSession, source: 'resume' });
 const afterSessionStart = invokeGate({ hook_event_name: 'UserPromptSubmit', session_id: shellSession, prompt: 'continue' });

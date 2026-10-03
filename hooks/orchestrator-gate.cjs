@@ -62,6 +62,7 @@ const CODEX_BIN = process.env.ORCH_CODEX_BIN || process.env.CODEX_BIN || 'codex'
 // --- tunables ---------------------------------------------------------------
 const RATE_LIMIT_BACKOFF_SECONDS = 120; // wait before retrying a rate-limited worker
 const ORCA_DOWN_TTL_SECONDS = 900;      // how long an "Orca is down" declaration stays valid
+const BACKGROUND_SHELL_STARTUP_GRACE_MS = 10 * 1000;
 // Review round 3, item 2: file-lock's own stale-lock detection (staleMs, default 10s) only
 // ever fires for a caller whose OWN acquire attempt is still retrying when the lock crosses
 // that age. The max-parallel-agents cap paths used to acquire with the library's 2s default
@@ -77,6 +78,13 @@ const hookAdditionalContext = [];
 
 function addHookContext(text) {
   if (text) hookAdditionalContext.push(text);
+}
+
+function emitHookNotice(text, eventName) {
+  const line = String(text || '').replace(/\n$/, '');
+  if (!line) return;
+  if (eventName === 'PreToolUse') addHookContext(line);
+  else process.stdout.write(`${line}\n`);
 }
 
 function flushHookContext(eventName) {
@@ -530,7 +538,7 @@ function blank(sid) {
     agents: {},             // toolUseId -> { ts, background, type, model } — EVERY main-panel
                              // Agent/Task dispatch (not only code briefs), for the machine-wide
                              // max-parallel-agents budget; see lib/parallel-agent-cap.cjs
-    backgroundShells: {},   // toolUseId -> { command, started, heartbeat } for Bash
+    backgroundShells: {},   // toolUseId -> { command, started, heartbeat, heartbeatPid } for Bash
                             // run_in_background launches still awaiting completion notice
     sessionStartedAt: Date.now(),
     tasks: {},              // taskId -> { owns, ws } — recorded when `task-create` resolves its id
@@ -578,7 +586,7 @@ function load(sid) {
   }
 }
 
-function repairInvalidPersistedExecAgent(sid) {
+function repairInvalidPersistedExecAgent(sid, eventName) {
   let candidate;
   try { candidate = JSON.parse(fs.readFileSync(stateFile(sid), 'utf8')); } catch { return; }
   if (!Object.prototype.hasOwnProperty.call(candidate, 'execAgent') || validPersistedExecAgent(candidate.execAgent)) return;
@@ -594,7 +602,9 @@ function repairInvalidPersistedExecAgent(sid) {
     fresh.execAgent = null;
     fresh.execAgentSince = null;
     writeJsonAtomic(stateFile(sid), fresh);
-    process.stdout.write(`orchestrator-gate: invalid persisted execAgent ${JSON.stringify(invalid)}; using automatic quota routing.\n`);
+    emitHookNotice(
+      `orchestrator-gate: invalid persisted execAgent ${JSON.stringify(invalid)}; using automatic quota routing.`,
+      eventName);
   } finally {
     releaseLock(lockDir);
   }
@@ -1144,7 +1154,7 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
  * placeholder TTL (worker-groups.cjs) remains the backstop in that case.
  */
 const PENDING_RECONCILE_INTERVAL_MS = 60 * 1000;
-function maybeReconcilePendingPlaceholders(sessionId) {
+function maybeReconcilePendingPlaceholders(sessionId, eventName) {
   const snapshot = load(sessionId);
   const hasPending = Object.entries(snapshot.workers || {})
     .some(([k, w]) => k.startsWith('pending-') && w.status === 'live');
@@ -1161,12 +1171,13 @@ function maybeReconcilePendingPlaceholders(sessionId) {
     if (fetched !== null) {
       const res = PARALLEL_OWNERSHIP.reconcilePendingPlaceholders(fresh, fetched.rows, now);
       for (const line of res.adopted) {
-        process.stdout.write(`orchestrator-gate: resolved placeholder ${line} against orca worker-list.\n`);
+        emitHookNotice(`orchestrator-gate: resolved placeholder ${line} against orca worker-list.`, eventName);
       }
       for (const key of res.settled) {
-        process.stdout.write(
+        emitHookNotice(
           `orchestrator-gate: placeholder ${key} never matched a real dispatch within ` +
-          `${Math.round(WG.PENDING_PLACEHOLDER_TTL_MS / 60000)}m; settled, releasing its Owns: claim and cap slot.\n`);
+          `${Math.round(WG.PENDING_PLACEHOLDER_TTL_MS / 60000)}m; settled, releasing its Owns: claim and cap slot.`,
+          eventName);
       }
     }
     save(fresh);
@@ -1333,12 +1344,22 @@ function formatBackgroundShellReminder(shells, now = Date.now()) {
     'stop finished/idle ones (TaskStop)';
 }
 
+function processAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
 function pruneBackgroundShells(s, now = Date.now()) {
   const cutoff = Math.max(now - BACKGROUND_SHELL_TTL_MS,
     Number.isFinite(s.sessionStartedAt) ? s.sessionStartedAt : 0);
   let changed = false;
   for (const [id, shell] of Object.entries(s.backgroundShells || {})) {
-    if (!shell || !Number.isFinite(shell.started) || shell.started < cutoff) {
+    const trackedHeartbeatExited = shell?.heartbeat && Number.isInteger(shell.heartbeatPid) &&
+      !processAlive(shell.heartbeatPid);
+    const untrackedHeartbeatExpired = shell?.heartbeat && !Number.isInteger(shell.heartbeatPid) &&
+      shell.started <= now - BACKGROUND_SHELL_STARTUP_GRACE_MS && !heartbeatAlive(s.session_id);
+    const exitedHeartbeat = trackedHeartbeatExited || untrackedHeartbeatExpired;
+    if (!shell || !Number.isFinite(shell.started) || shell.started < cutoff || exitedHeartbeat) {
       delete s.backgroundShells[id];
       changed = true;
     }
@@ -1352,7 +1373,7 @@ function remindBackgroundShells(s) {
 }
 
 function onUserPromptSubmit(p, s, cfg) {
-  maybeReconcilePendingPlaceholders(p.session_id);
+  maybeReconcilePendingPlaceholders(p.session_id, p.hook_event_name);
   // CRITICAL: reload fresh under the lock, same reasoning as onPostToolUse — this handler
   // both reads and mutates (bypass, code-model override, --release-claims, task-notification
   // release) and must never operate on a stale pre-lock snapshot.
@@ -1641,7 +1662,7 @@ function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
 function onPreToolUse(p, s, cfg) {
   if (s.bypass) return;
   if (!isMainPanel(p)) return; // subagents do the real work; never gate them (Orca workers: see deny())
-  maybeReconcilePendingPlaceholders(p.session_id);
+  maybeReconcilePendingPlaceholders(p.session_id, p.hook_event_name);
   const tool = p.tool_name;
   const input = p.tool_input || {};
   const d = (gate, reason) => { if (!gateDisabled(cfg, gate)) deny(s, gate, reason); };
@@ -1721,8 +1742,19 @@ function onPreToolUse(p, s, cfg) {
     }
 
     if (input.run_in_background && /(?:^|[\s/])orca-heartbeat\.cjs(?:[\s"']|$)/.test(cmd)) {
-      const fresh = load(p.session_id);
-      pruneBackgroundShells(fresh);
+      let fresh = load(p.session_id);
+      if (pruneBackgroundShells(fresh)) {
+        const lockDir = path.join(DIR, '.lock');
+        const locked = acquireLock(lockDir, {});
+        if (locked) {
+          try {
+            fresh = load(p.session_id);
+            if (pruneBackgroundShells(fresh)) save(fresh);
+          } finally {
+            releaseLock(lockDir);
+          }
+        }
+      }
       const previous = Object.entries(fresh.backgroundShells || {}).find(([, shell]) => shell?.heartbeat);
       if (previous) {
         addHookContext(`orchestrator-gate: stop previous heartbeat shell ${previous[0]} with TaskStop before starting another; only one heartbeat may run per session.`);
@@ -2458,10 +2490,13 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
 
     if (input.run_in_background && toolUseId) {
       pruneBackgroundShells(s);
+      const heartbeat = /(?:^|[\s/])orca-heartbeat\.cjs(?:[\s"']|$)/.test(cmd);
+      const liveHeartbeat = heartbeat ? heartbeatAlive(s.session_id) : null;
       s.backgroundShells[toolUseId] = {
         command: commandHead(cmd),
         started: Date.now(),
-        heartbeat: /(?:^|[\s/])orca-heartbeat\.cjs(?:[\s"']|$)/.test(cmd),
+        heartbeat,
+        heartbeatPid: Number.isInteger(liveHeartbeat?.pid) ? liveHeartbeat.pid : null,
       };
       dirty = true;
     }
@@ -2862,7 +2897,7 @@ function onStop(p, s, cfg) {
 function main(p) {
   const cfg = loadConfig();
   if (!activationApplies(cfg)) return;
-  repairInvalidPersistedExecAgent(p.session_id);
+  repairInvalidPersistedExecAgent(p.session_id, p.hook_event_name);
   const s = load(p.session_id);
   switch (p.hook_event_name) {
     case 'SessionStart': return onSessionStart(p, s, cfg);
