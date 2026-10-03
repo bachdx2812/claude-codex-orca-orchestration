@@ -2542,6 +2542,12 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
     // recognised the same way there.
     if (registerDispatchReplies(s, p, cmd, out, { assumeDispatched: true })) dirty = true;
 
+    // A successful worker-release/worker-abandon reply is authoritative even when Orca's
+    // worker-list row remains `retained` (including `no_owned_resource`). Conversely, a
+    // structured `ok:false` reply must not settle anything just because Bash itself exited
+    // zero. A non-JSON success preserves the historical exit-zero behavior.
+    const releaseReplyOutcome = WG.releaseReplyOutcome(out);
+
     // `terminal create`'s own max-parallel-agents reservation (see
     // handleTerminalCreateAgentCap) is a lightweight, separately-keyed placeholder that
     // only needs to survive the PreToolUse -> PostToolUse gap: by the time this event
@@ -2566,6 +2572,7 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
     for (const inv of orcaInvocations(cmd)) {
       const target = WG.releaseTarget(inv, flagValue);
       if (!target) continue;
+      if (releaseReplyOutcome === false) continue;
       if (s.workers[target]) {
         if (settleCodeGroup(s, WG.groupOf(s.workers[target], target))) dirty = true;
       } else {

@@ -368,9 +368,26 @@ function replyShowsWorkerStopped(text) {
   return STOPPED_REPLY_MARKERS.some((m) => t.includes(m));
 }
 
+/**
+ * Whether structured output explicitly confirms every mutation reply succeeded. null means
+ * there was no attributable JSON envelope (for example, a successful non-JSON CLI call),
+ * so callers may retain their existing exit-zero behavior. A real `{ok:false}` must never
+ * be mistaken for a successful release merely because the surrounding shell exited zero.
+ */
+function releaseReplyOutcome(text) {
+  const outcomes = splitJsonReplies(text)
+    .map((reply) => {
+      if (typeof reply.ok === 'boolean') return reply.ok;
+      if (reply.result && typeof reply.result.ok === 'boolean') return reply.result.ok;
+      return null;
+    })
+    .filter((value) => value !== null);
+  return outcomes.length ? outcomes.every(Boolean) : null;
+}
+
 module.exports = {
   idsFromOutput, idsFromReply, fieldValuesFromReply,
-  replyShowsWorkerStopped,
+  replyShowsWorkerStopped, releaseReplyOutcome,
   splitJsonReplies, splitConcatenatedJson, isDispatchReply, kindOf,
   PENDING_PLACEHOLDER_TTL_MS, isPendingPlaceholderKey, pendingPlaceholderExpired,
   canonicalGroup, groupOf, countLiveGroups, liveGroupByTerminal, groupById, settleGroup,
