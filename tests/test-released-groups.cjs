@@ -135,6 +135,23 @@ function stateWithOldGroup() {
     changed === true && s.workers.ctx_g.status === 'settled');
 }
 {
+  const s = { workers: {
+    ctx_new: { status: 'live', group: 'ctx_new', started: Date.now() },
+    task_new: { status: 'live', group: 'ctx_new', started: Date.now() },
+    term_reused: { status: 'live', group: 'ctx_new', started: Date.now() },
+  } };
+  const rows = [{ dispatchId: 'ctx_old', taskId: 'task_old', agentTerminalHandle: 'term_reused',
+    workerState: 'failed', dispatchStatus: 'failed', terminalState: 'retained',
+    resource: { retainedReason: 'no_owned_resource' } }];
+  const holderChanged = GATES.applyOwnershipHolderReconciliation(
+    s, rows, ['ctx_new'], Date.now(), false, new Set(['term_reused']));
+  const capChanged = GATES.applyOrcaReconciliation(
+    s, rows, false, new Set(['term_reused']));
+  check('a foreign row on a reused terminal is not evidence for the new group',
+    holderChanged === false && capChanged === false && s.workers.ctx_new.status === 'live' &&
+      s.workers.task_new.status === 'live' && s.workers.term_reused.status === 'live');
+}
+{
   check('rowReportsReleased: released/closed only',
     GATES.rowReportsReleased({ terminalState: 'released' }) === true &&
     GATES.rowReportsReleased({ terminalState: 'closed' }) === true &&

@@ -241,7 +241,7 @@ function applyOwnershipHolderReconciliation(
       .filter((k) => s.workers[k].status === 'live' && WG.groupOf(s.workers[k], k) === group);
     if (!keys.length) continue;
     const groupRows = (rows || []).filter((row) =>
-      keys.includes(row.dispatchId) || keys.includes(row.taskId) || keys.includes(row.agentTerminalHandle));
+      keys.includes(row.dispatchId) || keys.includes(row.taskId));
     if (groupRows.length > 0) {
       if (groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles)) &&
           WG.settleGroup(s.workers, group)) changed = true;
@@ -284,7 +284,7 @@ function applyOrcaReconciliation(s, rows, exhaustive = true, terminalHandles = n
   // live group that now owns the same `term_*` key.
   for (const [group, keys] of groups) {
     const groupRows = (rows || []).filter((row) =>
-      keys.includes(row.dispatchId) || keys.includes(row.taskId) || keys.includes(row.agentTerminalHandle));
+      keys.includes(row.dispatchId) || keys.includes(row.taskId));
     if (groupRows.length) {
       if (groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles))) {
         if (WG.settleGroup(s.workers, group)) changed = true;

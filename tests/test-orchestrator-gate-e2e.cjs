@@ -1584,6 +1584,29 @@ rmState(`${SID}-hard-off`);
     rmState(sid);
   }
 
+  // A partial worker-list can expose only the old row for a reused terminal while the new
+  // dispatch's own row has not appeared yet. The old row is not evidence about the new
+  // group, so Stop must continue treating the new worker as live.
+  {
+    const sid = `${SID}-terminal-reused-missing-new`;
+    rmState(sid);
+    seed(sid, {
+      ctx_resource_new: workerEntry('ctx_resource_new'),
+      task_resource_new: workerEntry('ctx_resource_new'),
+      term_resource: workerEntry('ctx_resource_new', Date.now(), { kind: 'terminal' }),
+    });
+    const old = row({ resource: { id: 'resource_old', retainedReason: 'no_owned_resource' } });
+    const result = invoke(stop(sid), { ...env, STUB_WORKERS_JSON: JSON.stringify([old]),
+      STUB_WORKERS_PAGE_HAS_MORE: '1',
+      STUB_TERMINALS_JSON: JSON.stringify([{ handle: 'term_resource' }]) });
+    const state = readState(sid);
+    checkBool('terminal reconcile: missing new row on reused handle keeps the new group live',
+      result.code === DENY && /workers-unwatched/.test(result.err) &&
+        /ctx_resource_new/.test(result.err) && state.workers.ctx_resource_new.status === 'live' &&
+        state.workers.task_resource_new.status === 'live' && state.workers.term_resource.status === 'live', true);
+    rmState(sid);
+  }
+
   // `no_owned_resource` never overrides a running status.
   {
     const sid = `${SID}-running-no-owned`;
