@@ -45,6 +45,10 @@
  * (each =1) make the matching mutating call answer `{ ok: false }` instead of succeeding —
  * auto-close-done-workers blocker 3: a failed mutation must never be logged or persisted as
  * a success. The call is still recorded via STUB_ORCA_CALLS_LOG either way.
+ *
+ * STUB_TERMINALS_OK_FALSE / STUB_TERMINALS_NO_ARRAY / STUB_TERMINALS_TRUNCATED model
+ * non-authoritative terminal-list replies. Callers must treat all three as unknown, not as
+ * proof that every omitted terminal closed.
  */
 const fs = require('fs');
 const args = process.argv.slice(2);
@@ -130,11 +134,20 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
   process.exit(0);
 }
 if (args[0] === 'terminal' && args[1] === 'list') {
+  if (process.env.STUB_TERMINALS_OK_FALSE === '1') {
+    process.stdout.write(JSON.stringify({ ok: false }));
+    process.exit(0);
+  }
+  if (process.env.STUB_TERMINALS_NO_ARRAY === '1') {
+    process.stdout.write(JSON.stringify({ ok: true, result: {} }));
+    process.exit(0);
+  }
   let terminals = [];
   if (process.env.STUB_TERMINALS_JSON) {
     try { terminals = JSON.parse(process.env.STUB_TERMINALS_JSON); } catch { terminals = []; }
   }
-  process.stdout.write(JSON.stringify({ result: { terminals } }));
+  const truncated = process.env.STUB_TERMINALS_TRUNCATED === '1';
+  process.stdout.write(JSON.stringify({ result: { terminals, truncated } }));
   process.exit(0);
 }
 if (args[0] === 'worktree' && args[1] === 'ps') {

@@ -4418,6 +4418,40 @@ async function heartbeatWorktreeTests() {
       !!st && st.workers.ctx_hb_retry && st.workers.ctx_hb_retry.status === 'live' &&
         st.workers.task_hb_retry.status === 'live', true);
   }
+
+  // A failed terminal-list reply is unknown, not an authoritative empty inventory. In
+  // particular it must not settle a completed worker explicitly retained for reuse while
+  // that terminal may still be open.
+  {
+    const name = 'retained-group-terminal-list-failed';
+    const started = Date.now();
+    const seedState = { workers: {
+      ctx_hb_retained: { role: 'claude-exec', status: 'live', group: 'ctx_hb_retained',
+        started, agent: 'claude', retained: true },
+      task_hb_retained: { role: 'claude-exec', status: 'live', group: 'ctx_hb_retained',
+        started, agent: 'claude', retained: true },
+      term_hb_retained: { role: 'claude-exec', status: 'live', group: 'ctx_hb_retained',
+        started, agent: 'claude', retained: true, kind: 'terminal' },
+    } };
+    await runHeartbeat({
+      name, worktrees: [], seedState, terminalRows: [],
+      envOverrides: { STUB_TERMINALS_OK_FALSE: '1' },
+      workerRows: [{ dispatchId: 'ctx_hb_retained', taskId: 'task_hb_retained',
+        workerState: 'succeeded', dispatchStatus: 'completed',
+        agentTerminalHandle: 'term_hb_retained', terminalState: 'retained',
+        resource: { id: 'resource_hb_retained', retainedReason: 'user_requested' } }],
+      args: ['--interval', '1', '--idle', '60', '--max', '2'],
+    });
+    let st = null;
+    try {
+      st = JSON.parse(fs.readFileSync(
+        path.join(RUN_DIR, `hb-${name}`, `hb-${name}-${process.pid}.json`), 'utf8'));
+    } catch {}
+    checkBool('failed terminal list keeps a user-requested retained worker live',
+      !!st && st.workers.ctx_hb_retained.status === 'live' &&
+        st.workers.task_hb_retained.status === 'live' &&
+        st.workers.term_hb_retained.status === 'live', true);
+  }
 }
 
 // --- H1 (real git, no stub): a fresh worktree with zero new commits must never be reported

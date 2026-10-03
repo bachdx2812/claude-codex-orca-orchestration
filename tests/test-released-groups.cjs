@@ -32,7 +32,8 @@ function check(name, cond) {
 const STUB_VARS = [
   'STUB_WORKER_HANDLE', 'STUB_WORKERS_JSON', 'STUB_WORKERS_OK_FALSE',
   'STUB_WORKERS_PAGE_HAS_MORE', 'STUB_WORKERS_PAGE_CURSOR', 'STUB_WORKERS_PAGE2_JSON',
-  'STUB_TERMINALS_JSON',
+  'STUB_TERMINALS_JSON', 'STUB_TERMINALS_OK_FALSE', 'STUB_TERMINALS_NO_ARRAY',
+  'STUB_TERMINALS_TRUNCATED',
 ];
 function stubEnv(vars) {
   for (const k of STUB_VARS) delete process.env[k];
@@ -73,6 +74,17 @@ stubEnv({ STUB_WORKERS_OK_FALSE: '1' });
 {
   const r = GATES.fetchOrcaWorkerRows(STUB);
   check('an ok:false reply degrades to null', r === null);
+}
+
+for (const [name, vars] of [
+  ['ok:false', { STUB_TERMINALS_OK_FALSE: '1' }],
+  ['missing terminal array', { STUB_TERMINALS_NO_ARRAY: '1' }],
+  ['truncated', { STUB_TERMINALS_JSON: '[]', STUB_TERMINALS_TRUNCATED: '1' }],
+]) {
+  stubEnv({ STUB_WORKERS_JSON: JSON.stringify([ROW_A]), ...vars });
+  const r = GATES.fetchOrcaWorkerRows(STUB);
+  check(`a ${name} terminal list cannot prove handles closed`,
+    !!r && r.exhaustive === true && r.terminalHandles === null);
 }
 
 stubEnv({});

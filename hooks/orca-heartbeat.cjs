@@ -668,9 +668,10 @@ function orca(args, timeoutMs = 20000) {
 
 function terminals() {
   const d = orca(['terminal', 'list', '--json']);
-  if (!d) return null;
+  if (!d || d.ok === false) return null;
   const r = d.result ?? d;
-  const list = Array.isArray(r) ? r : r.terminals || [];
+  const list = Array.isArray(r) ? r : (r && Array.isArray(r.terminals) ? r.terminals : null);
+  if (!list || (!Array.isArray(r) && r.truncated === true)) return null;
   return list.map((t) => ({
     handle: t.handle,
     title: t.title || '',

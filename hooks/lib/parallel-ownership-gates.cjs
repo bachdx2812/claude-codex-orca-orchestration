@@ -164,7 +164,9 @@ function fetchOrcaWorkerRows(orcaBin) {
       if (parsed.ok !== false) {
         const r = parsed.result ?? parsed;
         const terminals = Array.isArray(r) ? r : (r && Array.isArray(r.terminals) ? r.terminals : null);
-        if (terminals) terminalHandles = new Set(terminals.map((t) => t && t.handle).filter(Boolean));
+        if (terminals && (!r || r.truncated !== true)) {
+          terminalHandles = new Set(terminals.map((t) => t && t.handle).filter(Boolean));
+        }
       }
     } catch { /* terminal liveness stays unknown */ }
   }
