@@ -11,10 +11,21 @@ const {
 
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
 const LOG_FILE = path.join(stateDir(), 'janitor.log');
+const MAX_LOG_BYTES = 1024 * 1024;
+
+function rotateLog() {
+  try {
+    if (fs.statSync(LOG_FILE).size < MAX_LOG_BYTES) return;
+    const previous = `${LOG_FILE}.1`;
+    fs.rmSync(previous, { force: true });
+    fs.renameSync(LOG_FILE, previous);
+  } catch {}
+}
 
 function appendLog(message) {
   try {
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
+    rotateLog();
     fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${message}\n`);
   } catch {}
 }
@@ -141,6 +152,6 @@ function main() {
 if (require.main === module) main();
 
 module.exports = {
-  appendLog, runOrca, worktrees, workerRows, workerWorktreeKeys, blockedWorktreeKeys,
+  appendLog, rotateLog, runOrca, worktrees, workerRows, workerWorktreeKeys, blockedWorktreeKeys,
   isBlocked, runJanitor,
 };

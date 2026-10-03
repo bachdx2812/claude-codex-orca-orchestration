@@ -340,18 +340,25 @@ macOS LaunchAgent that runs every `janitor.intervalMinutes` (default 10). Unlike
 session-owned heartbeat, it evaluates every local Orca worktree, so cleanup continues after
 the panel that created a worktree exits. It removes only a non-main, non-archived worktree
 whose `liveTerminalCount` is the known number `0`, which has no unreleased or retained Orca
-worker row, is clean with nothing unpushed (or a configured upstream deleted after the work
-was accepted), and is accepted. Acceptance includes Orca's
-linked PR/MR state, a bounded `gh pr list` lookup by origin repository and branch for
-squash-merged or closed GitHub PRs that Orca did not link (5-second timeout, 10-minute
-cache), or the existing ancestor plus reflog proof. An open GitHub PR vetoes removal even
-if Git alone looks merged. Missing or unauthenticated `gh` falls back to the Git-only rules.
-Results are appended to `<stateDir>/janitor.log`; set `janitor.enabled` to `false` or
-`ORCH_JANITOR=0` to disable it.
+worker row, has no tracked/untracked changes or non-rebuildable ignored files, and has
+nothing unpushed. A deleted upstream is safe only when Git reports exactly `[gone]` and a
+merged GitHub PR's `headRefOid` exactly equals local `HEAD`. `janitor.rebuildableIgnored`
+configures the ignored-path allowlist (defaults cover dependency, build, cache, and coverage
+outputs only). Acceptance includes Orca's linked PR/MR state, a bounded `gh pr list` lookup
+by origin repository and branch (5-second timeout, 100-row limit; accepted results cached
+for at most two minutes), or the existing ancestor plus reflog proof. Any open GitHub PR
+for the head vetoes removal, including when Orca links an older closed PR. Missing or
+unauthenticated `gh` falls back to the Git-only rules, but can never prove a deleted upstream
+safe. Terminal state is checked again immediately before removal. Results are appended to
+`<stateDir>/janitor.log` and rotate near 1 MB. Set `janitor.enabled` to `false` to disable
+scheduled runs at execution time; `ORCH_JANITOR=0` affects manual runs (or use
+`launchctl setenv ORCH_JANITOR 0`). Changing `janitor.intervalMinutes` requires reinstalling
+so the LaunchAgent plist is regenerated; run `node install.mjs --check` after reinstalling.
 
-**Background shell hygiene.** The gate records this session's `Bash` launches with
-`run_in_background: true` until their completion notification arrives. At
-`UserPromptSubmit` and `Stop`, more than three still-running shells produces one reminder
+**Background shell hygiene.** After a successful `PostToolUse`, the gate records this
+session's `Bash` launches with `run_in_background: true` until their completion notification
+arrives. Tracking clears at `SessionStart` and entries expire after six hours. At
+`UserPromptSubmit`, more than three still-running shells produces one reminder
 naming the oldest command and age and asking for `TaskStop`. Starting a second heartbeat
 also identifies the previous heartbeat shell to stop: keep only one heartbeat per session.
 Never leave `sleep`/`until` polling loops running; use the heartbeat instead of ad-hoc wait

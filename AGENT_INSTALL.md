@@ -74,11 +74,14 @@ a real reminder rather than silently folding it into pre-existing backlog. See
 The installer also registers a machine-wide macOS LaunchAgent for
 `hooks/orca-janitor.cjs`. It runs every `janitor.intervalMinutes` (default 10) and safely
 removes accepted, clean, fully pushed non-main worktrees with a known zero live-terminal
-count and no unreleased or retained worker row, even after the owning panel exits. For
-GitHub branches without an Orca-linked PR, it uses a 5-second `gh pr list` lookup cached
-for 10 minutes so squash-merged or closed PRs count while open PRs remain protected.
-Disable it with `janitor.enabled: false` or `ORCH_JANITOR=0`; activity is logged to
-`<stateDir>/janitor.log`.
+count and no unreleased or retained worker row, even after the owning panel exits. Ignored
+files block removal unless `janitor.rebuildableIgnored` allowlists them. Deleted upstreams
+require Git's exact `[gone]` marker plus a merged GitHub PR `headRefOid` equal to `HEAD`.
+The five-second `gh pr list --limit 100` check also vetoes stale linked PR data when any PR
+for the head is open; accepted results cache for at most two minutes. Set
+`janitor.enabled: false` to disable scheduled runs. `ORCH_JANITOR=0` affects manual runs
+unless applied to launchd with `launchctl setenv`; interval changes require reinstalling.
+Activity is logged to `<stateDir>/janitor.log` and rotates near 1 MB.
 
 ## 1. Prerequisite checks
 
@@ -243,7 +246,9 @@ worktree was created, is never mistaken for done-but-open work) and clean, with 
 terminal on it; disable with `false` or `ORCH_CLOSE_DONE_WORKTREES`
 set to `0`/`false` (`1`/`true` forces it on; anything else, including empty, defers to the
 config). `janitor.enabled` (default `true`) and `janitor.intervalMinutes` (default `10`)
-control the machine-wide cleanup schedule; `ORCH_JANITOR=0` disables janitor runs. The
+control the machine-wide cleanup schedule; change the interval by editing config and
+reinstalling. `ORCH_JANITOR=0` disables a manual run; use `janitor.enabled: false` for the
+LaunchAgent (or `launchctl setenv ORCH_JANITOR 0`). The
 gate also reminds the panel when more than three `run_in_background` Bash shells remain,
 and requires one heartbeat per session: stop finished or idle tasks with `TaskStop` and
 never leave `sleep`/`until` wait loops behind. `parallelCoreFraction`/`maxParallelAgents`'s env overrides treat an empty or

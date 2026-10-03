@@ -135,8 +135,22 @@ check('the janitor LaunchAgent uses the default ten-minute interval', process.pl
   fs.readFileSync(janitorPlist, 'utf8').includes('<integer>600</integer>'), true);
 check('the janitor LaunchAgent preserves an executable search path for orca and gh', process.platform !== 'darwin' ||
   fs.readFileSync(janitorPlist, 'utf8').includes('<key>PATH</key>'), true);
+check('the janitor LaunchAgent captures stderr in the bounded janitor log', process.platform !== 'darwin' ||
+  fs.readFileSync(janitorPlist, 'utf8').includes('<key>StandardErrorPath</key>'), true);
 check('install registers the janitor with launchctl', process.platform !== 'darwin' ||
   fs.readFileSync(launchctlLog, 'utf8').includes(`bootstrap gui/${process.getuid()} ${janitorPlist}`), true);
+
+if (process.platform === 'darwin') {
+  const clampedHome = path.join(root, 'janitor-clamped');
+  fs.mkdirSync(path.join(clampedHome, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(clampedHome, '.claude', 'orchestration.config.json'),
+    JSON.stringify({ janitor: { intervalMinutes: 5000 } }));
+  const clamped = run([], 'janitor-clamped');
+  const clampedPlist = fs.readFileSync(path.join(clamped.home, 'Library', 'LaunchAgents',
+    'com.orca.claude-codex-orchestration.janitor.plist'), 'utf8');
+  check('the janitor LaunchAgent uses the validated 1-1440 interval', clamped.status, 0);
+  check('an out-of-range interval falls back to the validated default', clampedPlist.includes('<integer>600</integer>'), true);
+}
 const missingManifest = JSON.parse(fs.readFileSync(
   path.join(installedForMissing.home, '.claude', 'hooks', 'orchestration', 'install-manifest.json'), 'utf8'));
 fs.unlinkSync(path.join(installedForMissing.home, '.claude', 'hooks', 'orchestration', missingManifest.files[0]));

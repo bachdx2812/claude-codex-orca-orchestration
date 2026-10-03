@@ -164,6 +164,22 @@ const ghUnavailable = runCase('gh-unavailable', worktree(), {
 check('missing or unauthenticated gh falls back to ancestor and reflog acceptance',
   ghUnavailable.calls.includes(`worktree rm --worktree path:${ghUnavailable.worktreePath} --json`), true);
 
+const disabledDir = path.join(ROOT, 'disabled');
+fs.mkdirSync(disabledDir, { recursive: true });
+const disabledConfig = path.join(disabledDir, 'config.json');
+fs.writeFileSync(disabledConfig, JSON.stringify({ janitor: { enabled: false } }));
+const disabled = runCase('disabled', worktree(), { ORCH_CONFIG_PATH: disabledConfig });
+check('janitor.enabled false disables a scheduled-style run at execution time', disabled.calls, '');
+
+const rotateName = 'rotate-log';
+const rotateState = path.join(ROOT, rotateName, 'state');
+fs.mkdirSync(rotateState, { recursive: true });
+fs.writeFileSync(path.join(rotateState, 'janitor.log'), 'x'.repeat(1024 * 1024));
+const rotated = runCase(rotateName, worktree());
+check('the janitor rotates its log at approximately one megabyte',
+  fs.existsSync(path.join(rotateState, 'janitor.log.1')), true);
+check('the active log remains small after rotation', Buffer.byteLength(rotated.log) < 4096, true);
+
 process.env.ORCH_STATE_DIR = path.join(ROOT, 'format-state');
 const { formatBackgroundShellReminder } = require('../hooks/orchestrator-gate.cjs');
 const now = 1_000_000;

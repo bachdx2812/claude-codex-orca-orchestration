@@ -822,23 +822,27 @@ LaunchAgent. Every `janitor.intervalMinutes` (default 10), it inspects the compl
 worktree and worker inventories. It removes a worktree only when all of these facts are
 positive: it is neither main nor archived; `liveTerminalCount` is the numeric value `0`;
 no worker row for the worktree remains unreleased or retained; the worktree is clean and
-has nothing unpushed (or its configured upstream was deleted after acceptance); and its
-work was accepted. Ownership by the currently running panel
+has no tracked/untracked changes or ignored files outside `janitor.rebuildableIgnored`; has
+nothing unpushed (a deleted upstream additionally requires Git's exact `[gone]` marker and a
+merged GitHub PR `headRefOid` equal to `HEAD`); and its work was accepted. Ownership by the currently running panel
 is not required.
 
-For a GitHub branch with no Orca-linked PR, acceptance additionally runs `gh pr list
---repo <origin-repo> --head <branch> --state all --json state`, bounded to five seconds and
-cached for ten minutes per repository/branch. `MERGED` or `CLOSED` accepts a squash-merged
-branch; `OPEN` explicitly keeps it. Missing `gh`, missing authentication, non-GitHub
-origins, and query failures fall back to the existing ancestor plus reflog rule. Every
-successful or failed removal is appended to `<stateDir>/janitor.log`. Configure with
-`janitor.enabled` and `janitor.intervalMinutes`; `ORCH_JANITOR=0` disables a run.
+For a GitHub branch, acceptance also runs `gh pr list --repo <origin-repo> --head <branch>
+--state all --limit 100 --json state,headRefOid`, bounded to five seconds. Any `OPEN` result
+keeps the worktree even when Orca links an older closed PR. Accepted results cache for no
+more than two minutes. Missing `gh`, missing authentication, non-GitHub origins, and query
+failures fall back to the existing ancestor plus reflog rule, but never prove a deleted
+upstream safe. Orca's live-terminal count is re-read immediately before removal. Logs rotate
+near 1 MB. `janitor.enabled: false` disables LaunchAgent runs at execution time;
+`ORCH_JANITOR=0` is process-local unless set through launchd. Interval changes require an
+installer rerun so the plist is regenerated.
 
 ### Background shell hygiene
 
-The gate tracks every main-panel `Bash` launch with `run_in_background: true` by tool-use
-id, command head, and start time until a matching completion notification arrives. On
-`UserPromptSubmit` and `Stop`, more than three outstanding shells emits one line naming the
+After successful `PostToolUse`, the gate tracks each main-panel `Bash` launch with
+`run_in_background: true` by tool-use id, command head, and start time until a matching
+completion notification arrives. Tracking clears at `SessionStart` and expires after six
+hours. On `UserPromptSubmit`, more than three outstanding shells emits one line naming the
 oldest command and age and asks the panel to stop finished or idle ones with `TaskStop`.
 Before a new `orca-heartbeat.cjs` background launch, the gate names any previous heartbeat
 shell that is still tracked and tells the panel to stop it; one session needs only one

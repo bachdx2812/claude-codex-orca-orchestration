@@ -214,15 +214,17 @@ function installJanitor(prevManifest) {
   if (process.platform !== 'darwin') return { supported: false, installed: false };
   const existed = fs.existsSync(JANITOR_PLIST);
   let backedUpAt = prevManifest?.janitor?.backedUpAt || null;
-  const cfg = readJSONSafe(CONFIG_FILE, null) || readJSONSafe(path.join(REPO_ROOT, 'config', 'orchestration.config.example.json'), {});
-  const interval = Number.isInteger(cfg?.janitor?.intervalMinutes) && cfg.janitor.intervalMinutes > 0
-    ? cfg.janitor.intervalMinutes : 10;
+  const cfgLib = require(path.join(REPO_ROOT, 'hooks', 'lib', 'config.cjs'));
+  const cfg = cfgLib.loadConfig();
+  const interval = cfg.janitor.intervalMinutes;
+  const janitorLog = path.join(cfgLib.stateDir(), 'janitor.log');
   const text = `<?xml version="1.0" encoding="UTF-8"?>\n` +
     `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n` +
     `<plist version="1.0"><dict>\n` +
     `  <key>Label</key><string>${JANITOR_LABEL}</string>\n` +
     `  <key>ProgramArguments</key><array><string>${xmlEscape(NODE_PATH)}</string><string>${xmlEscape(path.join(HOOKS_DIR, 'orca-janitor.cjs'))}</string></array>\n` +
     `  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xmlEscape(process.env.PATH || '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin')}</string></dict>\n` +
+    `  <key>StandardErrorPath</key><string>${xmlEscape(janitorLog)}</string>\n` +
     `  <key>StartInterval</key><integer>${interval * 60}</integer>\n` +
     `  <key>RunAtLoad</key><true/>\n` +
     `</dict></plist>\n`;
