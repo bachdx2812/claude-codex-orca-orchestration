@@ -4501,6 +4501,59 @@ async function heartbeatWorktreeTests() {
         st.workers.task_hb_retained.status === 'live' &&
         st.workers.term_hb_retained.status === 'live', true);
   }
+
+  // A truncated terminal list is not authoritative enough for reconciliation, but its
+  // returned rows still carry useful supervision signals. Keep inspecting those rows and
+  // request a deliberately large page so ordinary fleets rarely truncate in the first place.
+  {
+    const name = 'truncated-terminal-supervision';
+    const started = Date.now();
+    const callsFile = path.join(RUN_DIR, `hb-${name}`, 'orca-calls.log');
+    const out = await runHeartbeat({
+      name, worktrees: [],
+      seedState: { workers: {
+        ctx_truncated_retained: { status: 'live', group: 'ctx_truncated_retained', started,
+          agent: 'claude', retained: true },
+        task_truncated_retained: { status: 'live', group: 'ctx_truncated_retained', started,
+          agent: 'claude', retained: true },
+        term_truncated_retained: { status: 'live', group: 'ctx_truncated_retained', started,
+          agent: 'claude', retained: true, kind: 'terminal' },
+      } },
+      workerRows: [
+        { dispatchId: 'ctx_truncated_terminal', taskId: 'task_truncated_terminal',
+          workerState: 'running', dispatchStatus: 'running', terminalState: 'active', agent: 'opencode',
+          agentTerminalHandle: 'term_truncated_terminal' },
+        { dispatchId: 'ctx_truncated_retained', taskId: 'task_truncated_retained',
+          workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'retained', agent: 'claude',
+          agentTerminalHandle: 'term_truncated_retained',
+          resource: { id: 'resource_truncated_retained', retainedReason: 'user_requested' } },
+      ],
+      terminalRows: [{ handle: 'term_truncated_terminal', title: 'approval worker',
+        agentIdentity: 'opencode', lastOutputAt: Date.now(), preview: [
+          '┃  △ Permission required',
+          '┃  ← Run bash "npm test"',
+          '┃  Allow once   Allow always   Reject',
+        ].join('\n') }],
+      envOverrides: { STUB_TERMINALS_TRUNCATED: '1', STUB_ORCA_CALLS_LOG: callsFile },
+      args: ['--interval', '1', '--idle', '60', '--max', '2'],
+    });
+    let calls = '';
+    try { calls = fs.readFileSync(callsFile, 'utf8'); } catch {}
+    let st = null;
+    try {
+      st = JSON.parse(fs.readFileSync(
+        path.join(RUN_DIR, `hb-${name}`, `hb-${name}-${process.pid}.json`), 'utf8'));
+    } catch {}
+    const terminalListCalls = calls.split('\n').filter((line) => line.startsWith('terminal list '));
+    checkBool('a truncated terminal list still supervises the partial rows',
+      out.includes('WORKER WAITING FOR APPROVAL ctx_truncated_terminal (opencode)'), true);
+    checkBool('a truncated terminal list cannot settle an omitted retained terminal',
+      !!st && st.workers.ctx_truncated_retained.status === 'live' &&
+        st.workers.task_truncated_retained.status === 'live' &&
+        st.workers.term_truncated_retained.status === 'live', true);
+    checkBool('heartbeat terminal-list calls request an explicit 10000-row page',
+      terminalListCalls.length > 0 && terminalListCalls.every((line) => line.includes('--limit 10000')), true);
+  }
 }
 
 // --- H1 (real git, no stub): a fresh worktree with zero new commits must never be reported

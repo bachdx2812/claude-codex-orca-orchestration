@@ -667,22 +667,25 @@ function orca(args, timeoutMs = 20000) {
 }
 
 function terminals() {
-  const d = orca(['terminal', 'list', '--json']);
+  const d = orca(['terminal', 'list', '--limit', '10000', '--json']);
   if (!d || d.ok === false) return null;
   const r = d.result ?? d;
   const list = Array.isArray(r) ? r : (r && Array.isArray(r.terminals) ? r.terminals : null);
-  if (!list || (!Array.isArray(r) && r.truncated === true)) return null;
-  return list.map((t) => ({
-    handle: t.handle,
-    title: t.title || '',
-    agentIdentity: typeof t.agentIdentity === 'string' ? t.agentIdentity : '',
-    preview: t.preview || '',
-    lastOutputAt: Number(t.lastOutputAt) || 0,
-    orphaned: !!t.orphaned,
-    connected: !!t.connected,
-    worktreePath: t.worktreePath || '',
-    worktreeId: t.worktreeId || '',
-  }));
+  if (!list) return null;
+  return {
+    rows: list.map((t) => ({
+      handle: t.handle,
+      title: t.title || '',
+      agentIdentity: typeof t.agentIdentity === 'string' ? t.agentIdentity : '',
+      preview: t.preview || '',
+      lastOutputAt: Number(t.lastOutputAt) || 0,
+      orphaned: !!t.orphaned,
+      connected: !!t.connected,
+      worktreePath: t.worktreePath || '',
+      worktreeId: t.worktreeId || '',
+    })),
+    truncated: !Array.isArray(r) && r.truncated === true,
+  };
 }
 
 function parseTerminalScreen(reply) {
@@ -1837,7 +1840,8 @@ function main() {
   beat(started);
   process.on('exit', unbeat);
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(sig, () => process.exit(0));
-  const baseTerms = terminals();
+  const baseTerminalInventory = terminals();
+  const baseTerms = baseTerminalInventory && baseTerminalInventory.rows;
   const baseWorkers = workers();
   const sessionState = loadSessionState();
 
@@ -1943,8 +1947,10 @@ function main() {
       beat(started); // item L1
     }
 
-    const ts = terminals();
-    if (ws) settleOrcaReleasedSessionGroups(ws, ts);
+    const terminalInventory = terminals();
+    const ts = terminalInventory && terminalInventory.rows;
+    if (ws) settleOrcaReleasedSessionGroups(
+      ws, terminalInventory && !terminalInventory.truncated ? ts : null);
     if (ts) {
       // Re-read gate state each tick so a bare terminal created after daemon startup joins
       // this session's set even though it has no worker-list row.

@@ -47,8 +47,8 @@
  * a success. The call is still recorded via STUB_ORCA_CALLS_LOG either way.
  *
  * STUB_TERMINALS_OK_FALSE / STUB_TERMINALS_NO_ARRAY / STUB_TERMINALS_TRUNCATED model
- * non-authoritative terminal-list replies. Callers must treat all three as unknown, not as
- * proof that every omitted terminal closed.
+ * non-authoritative terminal-list replies. Callers must never treat omitted terminals as
+ * closed; rows returned with a truncated reply remain useful for positive supervision.
  */
 const fs = require('fs');
 const args = process.argv.slice(2);
@@ -134,6 +134,7 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
   process.exit(0);
 }
 if (args[0] === 'terminal' && args[1] === 'list') {
+  recordCall();
   if (process.env.STUB_TERMINALS_OK_FALSE === '1') {
     process.stdout.write(JSON.stringify({ ok: false }));
     process.exit(0);
