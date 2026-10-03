@@ -1473,7 +1473,7 @@ rmState(`${SID}-hard-off`);
     terminalState: 'retained',
     workerState: 'succeeded',
     dispatchStatus: 'completed',
-  }]) };
+  }]), STUB_TERMINALS_JSON: JSON.stringify([{ handle: terminalHandle }]) };
   const beatFile = path.join(STATE_DIR, `heartbeat-${sid}.json`);
   fs.writeFileSync(beatFile, JSON.stringify({ pid: process.pid, last_tick: Date.now(), interval: 20 }));
   expect('retained readiness: Stop is allowed while the heartbeat supervises the retained terminal',
@@ -1497,6 +1497,154 @@ rmState(`${SID}-hard-off`);
       !/0 worker\(s\) still running/.test(unwatched.err),
     true);
   rmState(sid);
+}
+
+// Terminal dispatches that no longer own a resource are already reconciled even when Orca
+// keeps their historical worker-list row retained. Terminal status is mandatory: a running
+// row never settles, and an explicit user-requested retain with a live terminal is unchanged.
+{
+  const env = quotaEnv('terminal-resource-reconcile', 10, 30, {});
+  const stop = (sid) => ({ session_id: sid, hook_event_name: 'Stop', effort: 'high', stop_hook_active: false });
+  const row = (overrides = {}) => ({
+    dispatchId: 'ctx_resource_old', taskId: 'task_resource_old', runId: 'run_resource_old',
+    workerState: 'failed', dispatchStatus: 'failed', agentTerminalHandle: 'term_resource',
+    terminalState: 'retained',
+    resource: { id: null, retainedReason: 'no_owned_resource' },
+    projection: {
+      id: 'ctx_resource_old', dispatchId: 'ctx_resource_old', taskId: 'task_resource_old',
+      stage: { worker: 'failed', dispatch: 'failed', detail: 'failed', activity: 'idle' },
+      outcome: 'failed', liveness: { verdict: 'exited', observedAt: Date.now(), source: 'agent_status' },
+      resource: { state: 'retained', retainedReason: 'no_owned_resource' },
+    },
+    ...overrides,
+  });
+  const workerEntry = (group, started = Date.now(), overrides = {}) => ({
+    role: 'codex-exec', started, status: 'live', last_seen: started, rate_limited_until: 0,
+    group, kind: 'worker', agent: 'codex', ...overrides,
+  });
+  const seed = (sid, workers) => fs.writeFileSync(path.join(STATE_DIR, `${sid}.json`), JSON.stringify({
+    session_id: sid, created: new Date().toISOString(), bypass: false, execAgent: null,
+    workers, reservations: {}, agentClaims: {}, tasks: {}, last_heartbeat: 0, rate_limit_hits: 0,
+  }));
+
+  // Failed + retained + no_owned_resource is terminal and requires no release loop.
+  {
+    const sid = `${SID}-terminal-no-owned`;
+    rmState(sid);
+    seed(sid, {
+      ctx_resource_old: workerEntry('ctx_resource_old'),
+      task_resource_old: workerEntry('ctx_resource_old'),
+      term_resource: workerEntry('ctx_resource_old', Date.now(), { kind: 'terminal' }),
+    });
+    const result = invoke(stop(sid), { ...env, STUB_WORKERS_JSON: JSON.stringify([row()]),
+      STUB_TERMINALS_JSON: '[]' });
+    const state = readState(sid);
+    checkBool('terminal reconcile: failed retained no_owned_resource allows Stop',
+      result.code === ALLOW && state.workers.ctx_resource_old.status === 'settled' &&
+        state.workers.task_resource_old.status === 'settled' &&
+        state.workers.term_resource.status === 'settled', true);
+    rmState(sid);
+  }
+
+  // The old dispatch is terminal, while the same terminal now belongs to a newer running
+  // dispatch. Only the old group settles; Stop still refuses for the unwatched new worker.
+  {
+    const sid = `${SID}-terminal-reused`;
+    rmState(sid);
+    seed(sid, {
+      ctx_resource_old: workerEntry('ctx_resource_old'),
+      task_resource_old: workerEntry('ctx_resource_old'),
+      ctx_resource_new: workerEntry('ctx_resource_new'),
+      task_resource_new: workerEntry('ctx_resource_new'),
+      term_resource: workerEntry('ctx_resource_new', Date.now(), { kind: 'terminal' }),
+    });
+    const old = row({ resource: { id: 'resource_old', retainedReason: 'user_requested' } });
+    const newer = row({
+      dispatchId: 'ctx_resource_new', taskId: 'task_resource_new', runId: 'run_resource_new',
+      workerState: 'running', dispatchStatus: 'running', terminalState: 'active',
+      resource: { id: 'resource_new' },
+      projection: {
+        id: 'ctx_resource_new', dispatchId: 'ctx_resource_new', taskId: 'task_resource_new',
+        stage: { worker: 'running', dispatch: 'running', detail: 'running', activity: 'active' },
+        liveness: { verdict: 'live', observedAt: Date.now(), source: 'agent_status' },
+        resource: { state: 'active' },
+      },
+    });
+    const result = invoke(stop(sid), { ...env, STUB_WORKERS_JSON: JSON.stringify([newer, old]),
+      STUB_TERMINALS_JSON: JSON.stringify([{ handle: 'term_resource' }]) });
+    const state = readState(sid);
+    checkBool('terminal reconcile: reused handle settles only old dispatch and still refuses new unwatched worker',
+      result.code === DENY && /workers-unwatched/.test(result.err) &&
+        /ctx_resource_new/.test(result.err) && !/ctx_resource_old/.test(result.err) &&
+        state.workers.ctx_resource_old.status === 'settled' &&
+        state.workers.task_resource_old.status === 'settled' &&
+        state.workers.ctx_resource_new.status === 'live' &&
+        state.workers.task_resource_new.status === 'live' &&
+        state.workers.term_resource.status === 'live', true);
+    rmState(sid);
+  }
+
+  // `no_owned_resource` never overrides a running status.
+  {
+    const sid = `${SID}-running-no-owned`;
+    rmState(sid);
+    seed(sid, {
+      ctx_resource_old: workerEntry('ctx_resource_old'),
+      task_resource_old: workerEntry('ctx_resource_old'),
+      term_resource: workerEntry('ctx_resource_old', Date.now(), { kind: 'terminal' }),
+    });
+    const running = row({ workerState: 'running', dispatchStatus: 'running' });
+    const result = invoke(stop(sid), { ...env, STUB_WORKERS_JSON: JSON.stringify([running]),
+      STUB_TERMINALS_JSON: '[]' });
+    const state = readState(sid);
+    checkBool('terminal reconcile: running no_owned_resource remains live and unwatched',
+      result.code === DENY && /workers-unwatched/.test(result.err) &&
+        state.workers.ctx_resource_old.status === 'live' &&
+        state.workers.task_resource_old.status === 'live' &&
+        state.workers.term_resource.status === 'live', true);
+    rmState(sid);
+  }
+
+  // A user-requested retained terminal remains available for reuse after successful work.
+  {
+    const sid = `${SID}-user-retained-live`;
+    rmState(sid);
+    seed(sid, {
+      ctx_resource_old: workerEntry('ctx_resource_old', Date.now(), { retained: true }),
+      task_resource_old: workerEntry('ctx_resource_old', Date.now(), { retained: true }),
+      term_resource: workerEntry('ctx_resource_old', Date.now(), { kind: 'terminal', retained: true }),
+    });
+    const retained = row({ workerState: 'succeeded', dispatchStatus: 'completed',
+      resource: { id: 'resource_live', retainedReason: 'user_requested' } });
+    const result = invoke(stop(sid), { ...env, STUB_WORKERS_JSON: JSON.stringify([retained]),
+      STUB_TERMINALS_JSON: JSON.stringify([{ handle: 'term_resource' }]) });
+    const state = readState(sid);
+    checkBool('terminal reconcile: user-requested retained live terminal remains reusable',
+      result.code === ALLOW && state.workers.ctx_resource_old.status === 'live' &&
+        state.workers.task_resource_old.status === 'live' &&
+        state.workers.term_resource.status === 'live', true);
+    rmState(sid);
+  }
+
+  // Successful release and abandon replies settle immediately even when worker-list would
+  // continue to report the no-owned-resource retained shape.
+  {
+    const sid = `${SID}-release-no-owned`;
+    for (const sub of ['worker-release', 'worker-abandon']) {
+      rmState(sid);
+      seed(sid, {
+        ctx_resource_old: workerEntry('ctx_resource_old'),
+        task_resource_old: workerEntry('ctx_resource_old'),
+      });
+      invoke(postBash(`orca orchestration ${sub} --dispatch ctx_resource_old --json`,
+        '{"ok":true,"result":{}}', { sid }), env);
+      const state = readState(sid);
+      checkBool(`terminal reconcile: ok ${sub} reply settles the matching group immediately`,
+        state.workers.ctx_resource_old.status === 'settled' &&
+          state.workers.task_resource_old.status === 'settled', true);
+    }
+    rmState(sid);
+  }
 }
 
 // A failed readiness probe can still leave a usable terminal behind. The PostToolUse hook

@@ -32,6 +32,7 @@ function check(name, cond) {
 const STUB_VARS = [
   'STUB_WORKER_HANDLE', 'STUB_WORKERS_JSON', 'STUB_WORKERS_OK_FALSE',
   'STUB_WORKERS_PAGE_HAS_MORE', 'STUB_WORKERS_PAGE_CURSOR', 'STUB_WORKERS_PAGE2_JSON',
+  'STUB_TERMINALS_JSON',
 ];
 function stubEnv(vars) {
   for (const k of STUB_VARS) delete process.env[k];
@@ -139,6 +140,51 @@ function stateWithOldGroup() {
     GATES.rowReportsReleased({ terminalState: 'closed' }) === true &&
     GATES.rowReportsReleased({ terminalState: 'active' }) === false &&
     GATES.rowReportsReleased({}) === false);
+}
+
+// --- 3. terminal rows with no remaining owned resource ---
+
+const terminalRow = (overrides = {}) => ({
+  dispatchId: 'ctx_terminal', taskId: 'task_terminal', runId: 'run_terminal',
+  workerState: 'failed', dispatchStatus: 'failed', agentTerminalHandle: 'term_terminal',
+  terminalState: 'retained',
+  resource: { id: null, retainedReason: 'no_owned_resource' },
+  projection: {
+    id: 'ctx_terminal', stage: { worker: 'failed', dispatch: 'failed' }, outcome: 'failed',
+    resource: { state: 'retained', retainedReason: 'no_owned_resource' },
+  },
+  ...overrides,
+});
+
+{
+  const row = terminalRow();
+  check('terminal no_owned_resource row reconciles',
+    GATES.rowReportsReconciled(row, [row], new Set()) === true);
+}
+{
+  const row = terminalRow({ workerState: 'running', dispatchStatus: 'running' });
+  check('running no_owned_resource row never reconciles',
+    GATES.rowReportsReconciled(row, [row], new Set()) === false);
+}
+{
+  const row = terminalRow({ workerState: 'succeeded', dispatchStatus: 'completed',
+    resource: { id: 'resource_live', retainedReason: 'user_requested' } });
+  check('user-requested retained row with a live terminal remains unreconciled',
+    GATES.rowReportsReconciled(row, [row], new Set(['term_terminal'])) === false);
+}
+{
+  const old = terminalRow({ resource: { id: 'resource_old', retainedReason: 'user_requested' } });
+  const newer = terminalRow({ dispatchId: 'ctx_newer', taskId: 'task_newer',
+    workerState: 'running', dispatchStatus: 'running', terminalState: 'active',
+    resource: { id: 'resource_newer' } });
+  check('terminal row reconciles when a newer dispatch owns its handle',
+    GATES.rowReportsReconciled(old, [newer, old], new Set(['term_terminal'])) === true &&
+    GATES.rowReportsReconciled(newer, [newer, old], new Set(['term_terminal'])) === false);
+}
+{
+  const closed = terminalRow({ resource: { id: 'resource_closed', retainedReason: 'user_requested' } });
+  check('terminal row reconciles when terminal-list confirms its handle closed',
+    GATES.rowReportsReconciled(closed, [closed], new Set()) === true);
 }
 
 stubEnv({});
