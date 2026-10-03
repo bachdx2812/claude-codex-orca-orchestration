@@ -1234,16 +1234,18 @@ function activeOverrideLines(cfg, s) {
 }
 
 function onSessionStart(p, s, cfg) {
-  const lockDir = path.join(DIR, '.lock');
-  const locked = acquireLock(lockDir, {});
-  if (locked) {
-    try {
-      s = load(p.session_id);
-      s.backgroundShells = {};
-      s.sessionStartedAt = Date.now();
-      save(s);
-    } finally {
-      releaseLock(lockDir);
+  if (p.source === 'startup' || p.source === 'resume') {
+    const lockDir = path.join(DIR, '.lock');
+    const locked = acquireLock(lockDir, {});
+    if (locked) {
+      try {
+        s = load(p.session_id);
+        s.backgroundShells = {};
+        s.sessionStartedAt = Date.now();
+        save(s);
+      } finally {
+        releaseLock(lockDir);
+      }
     }
   }
   const review = cfg.models.review.alias;

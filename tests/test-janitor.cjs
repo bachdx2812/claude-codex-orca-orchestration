@@ -259,6 +259,14 @@ const secondHeartbeat = invokeGate({ hook_event_name: 'PreToolUse', session_id: 
 check('starting a second heartbeat identifies the previous shell in parsed hook context',
   /stop previous heartbeat shell toolu_heartbeat_1 with TaskStop/.test(hookContext(secondHeartbeat)), true);
 
+const beforeCompact = JSON.parse(fs.readFileSync(staleStatePath, 'utf8'));
+invokeGate({ hook_event_name: 'SessionStart', session_id: shellSession, source: 'compact' });
+const afterCompact = JSON.parse(fs.readFileSync(staleStatePath, 'utf8'));
+check('SessionStart compact preserves background shell tracking',
+  !!afterCompact.backgroundShells?.toolu_heartbeat_1, true);
+check('SessionStart compact preserves the original session cutoff',
+  afterCompact.sessionStartedAt, beforeCompact.sessionStartedAt);
+
 invokeGate({ hook_event_name: 'SessionStart', session_id: shellSession, source: 'resume' });
 const afterSessionStart = invokeGate({ hook_event_name: 'UserPromptSubmit', session_id: shellSession, prompt: 'continue' });
 check('SessionStart clears background shell tracking from the previous process',
