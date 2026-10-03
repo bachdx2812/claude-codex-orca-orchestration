@@ -1306,7 +1306,9 @@ function isWorktreeClean(w, git, ctx = {}) {
   // `--no-optional-locks`: a plain status read must never contend with, or be blocked by,
   // another concurrent git process's lock on this worktree's index — this daemon polls
   // repeatedly and runs alongside the user's own git/IDE activity.
-  const status = git(['--no-optional-locks', 'status', '--porcelain', '--ignored', '-z'], w.path);
+  const status = git([
+    '--no-optional-locks', 'status', '--porcelain', '--ignored', '--untracked-files=normal', '-z',
+  ], w.path);
   if (!status || status.status !== 0 || !cleanStatus(status.stdout,
     ctx.rebuildableIgnored || cfg.janitor.rebuildableIgnored, ctx.onBlockedIgnored)) return false;
   const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], w.path);

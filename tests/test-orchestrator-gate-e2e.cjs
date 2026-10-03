@@ -4276,6 +4276,23 @@ async function heartbeatH1RealGitTests() {
   const origin = setupRealGitOrigin('h1');
   const now = Date.now();
 
+  // A local or global status.showUntrackedFiles=no setting must not hide files from the
+  // janitor's destructive clean check. The status probe explicitly overrides that setting,
+  // so this otherwise accepted linked-PR worktree is kept because untracked.txt exists.
+  const hiddenUntrackedPath = addRealWorktree(origin, 'hidden-untracked', now);
+  sh('git', ['config', 'status.showUntrackedFiles', 'no'], hiddenUntrackedPath, REAL_GIT_ENV);
+  fs.writeFileSync(path.join(hiddenUntrackedPath, 'untracked.txt'), 'must keep worktree\n');
+  const outHiddenUntracked = await runHeartbeat({
+    name: 'status-config-hidden-untracked',
+    dirName: 'hb-status-config-hidden-untracked',
+    worktrees: [{ path: hiddenUntrackedPath, displayName: 'hidden-untracked', isMainWorktree: false,
+      isArchived: false, liveTerminalCount: 0, linkedPR: { state: 'merged', number: 1 } }],
+    envOverrides: { ORCH_GIT_BIN: 'git' },
+    args: ['--interval', '1', '--idle', '60', '--max', '1'],
+  });
+  checkBool('clean check overrides status.showUntrackedFiles=no and keeps an untracked worktree',
+    outHiddenUntracked.includes('pre-existing') || outHiddenUntracked.includes('DONE worktree'), false);
+
   // Negative: zero new commits. Forcing the `.git` marker's mtime an hour into the FUTURE
   // relative to the (real, wall-clock) seed commit means this worktree is unambiguously
   // "created after its own HEAD commit" regardless of how fast or slow this machine is —
