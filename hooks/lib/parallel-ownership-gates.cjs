@@ -244,6 +244,12 @@ function rowReportsReconciled(row, rows = [], terminalHandles = null) {
   });
 }
 
+function handleRowVetoesSettlement(keys, rows, terminalHandles) {
+  return (rows || []).some((row) =>
+    keys.includes(row.agentTerminalHandle) &&
+    !rowReportsReconciled(row, rows, terminalHandles));
+}
+
 /**
  * Pure apply for the ownership-overlap path: settle the HOLDER groups of overlapping claims
  * that a fresh worker-list shows are actually gone, so a released/stopped worker's group
@@ -269,8 +275,10 @@ function applyOwnershipHolderReconciliation(
     if (!keys.length) continue;
     const groupRows = (rows || []).filter((row) =>
       keys.includes(row.dispatchId) || keys.includes(row.taskId));
+    const handleVeto = handleRowVetoesSettlement(keys, rows, terminalHandles);
     if (groupRows.length > 0) {
-      if (groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles)) &&
+      if (!handleVeto &&
+          groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles)) &&
           WG.settleGroup(s.workers, group)) changed = true;
       continue;
     }
@@ -278,7 +286,8 @@ function applyOwnershipHolderReconciliation(
       const started = s.workers[k].started;
       return Number.isFinite(started) ? started : now;
     }));
-    if (exhaustive && oldest < tenMinAgo && WG.settleGroup(s.workers, group)) changed = true;
+    if (exhaustive && !handleVeto && oldest < tenMinAgo &&
+        WG.settleGroup(s.workers, group)) changed = true;
   }
   return changed;
 }
@@ -312,8 +321,10 @@ function applyOrcaReconciliation(s, rows, exhaustive = true, terminalHandles = n
   for (const [group, keys] of groups) {
     const groupRows = (rows || []).filter((row) =>
       keys.includes(row.dispatchId) || keys.includes(row.taskId));
+    const handleVeto = handleRowVetoesSettlement(keys, rows, terminalHandles);
     if (groupRows.length) {
-      if (groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles))) {
+      if (!handleVeto &&
+          groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles))) {
         if (WG.settleGroup(s.workers, group)) changed = true;
       } else if (groupRows.every(rowHasTerminalStatus)) {
         for (const [key, w] of Object.entries(s.workers || {})) {
@@ -327,7 +338,8 @@ function applyOrcaReconciliation(s, rows, exhaustive = true, terminalHandles = n
     }
     const oldest = Math.min(...keys.map((key) => Number.isFinite(s.workers[key].started)
       ? s.workers[key].started : Date.now()));
-    if (exhaustive && oldest < tenMinAgo && WG.settleGroup(s.workers, group)) changed = true;
+    if (exhaustive && !handleVeto && oldest < tenMinAgo &&
+        WG.settleGroup(s.workers, group)) changed = true;
   }
 
   for (const [key, w] of Object.entries(s.workers || {})) {

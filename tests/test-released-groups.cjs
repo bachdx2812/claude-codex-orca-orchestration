@@ -164,6 +164,22 @@ function stateWithOldGroup() {
       s.workers.task_new.status === 'live' && s.workers.term_reused.status === 'live');
 }
 {
+  const stateWithOldTerminalGroup = () => ({ workers: {
+    term_Y: { status: 'live', group: 'term_Y', kind: 'terminal', started: OLD },
+  } });
+  const rows = [{ dispatchId: 'ctx_y', taskId: 'task_y', agentTerminalHandle: 'term_Y',
+    workerState: 'running', dispatchStatus: 'running', terminalState: 'active' }];
+  const holderState = stateWithOldTerminalGroup();
+  const capState = stateWithOldTerminalGroup();
+  const holderChanged = GATES.applyOwnershipHolderReconciliation(
+    holderState, rows, ['term_Y'], Date.now(), true, new Set(['term_Y']));
+  const capChanged = GATES.applyOrcaReconciliation(
+    capState, rows, true, new Set(['term_Y']));
+  check('a running row on a terminal-only group vetoes absent-row settlement',
+    holderChanged === false && capChanged === false &&
+      holderState.workers.term_Y.status === 'live' && capState.workers.term_Y.status === 'live');
+}
+{
   check('rowReportsReleased: released/closed only',
     GATES.rowReportsReleased({ terminalState: 'released' }) === true &&
     GATES.rowReportsReleased({ terminalState: 'closed' }) === true &&
