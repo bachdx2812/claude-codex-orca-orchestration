@@ -1690,6 +1690,46 @@ rmState(`${SID}-hard-off`);
     }
     rmState(sid);
   }
+
+  // Bash can exit zero while Orca returns a structured failure. That reply is not an
+  // authoritative release and must leave the tracked group live.
+  {
+    const sid = `${SID}-release-ok-false`;
+    rmState(sid);
+    seed(sid, {
+      ctx_resource_old: workerEntry('ctx_resource_old'),
+      task_resource_old: workerEntry('ctx_resource_old'),
+    });
+    invoke(postBash('orca orchestration worker-release --dispatch ctx_resource_old --json',
+      '{"ok":false,"error":{"message":"release failed"}}', { sid }), env);
+    const state = readState(sid);
+    checkBool('terminal reconcile: ok:false release reply leaves the matching group live',
+      state.workers.ctx_resource_old.status === 'live' &&
+        state.workers.task_resource_old.status === 'live', true);
+    rmState(sid);
+  }
+
+  // Several release calls can share one Bash event. If any structured reply fails, the
+  // combined output cannot be attributed safely enough to settle either group.
+  {
+    const sid = `${SID}-release-mixed-chain`;
+    rmState(sid);
+    seed(sid, {
+      ctx_release_a: workerEntry('ctx_release_a'),
+      ctx_release_b: workerEntry('ctx_release_b'),
+    });
+    const command = 'orca orchestration worker-release --dispatch ctx_release_a --json && ' +
+      'orca orchestration worker-release --dispatch ctx_release_b --json';
+    const output = [
+      '{"ok":true,"result":{"mutation":{"dispatchId":"ctx_release_a"}}}',
+      '{"ok":false,"error":{"message":"release failed"}}',
+    ].join('\n');
+    invoke(postBash(command, output, { sid }), env);
+    const state = readState(sid);
+    checkBool('terminal reconcile: mixed chained release replies settle neither group',
+      state.workers.ctx_release_a.status === 'live' && state.workers.ctx_release_b.status === 'live', true);
+    rmState(sid);
+  }
 }
 
 // A failed readiness probe can still leave a usable terminal behind. The PostToolUse hook

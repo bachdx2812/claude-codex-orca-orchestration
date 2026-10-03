@@ -2126,6 +2126,14 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     dispatchIds(`${r1}[unterminated\n${r2}`), ['ctx_1', 'ctx_2']);
   check('splitJsonReplies: a well-formed `[1,2,3]` right after a closing `}` on the same line is still not reopened',
     dispatchIds(`${r1}[1,2,3]`), ['ctx_1']);
+
+  check('releaseReplyOutcome: an explicit ok:false reply is a failed release',
+    WG.releaseReplyOutcome(JSON.stringify({ ok: false, error: { message: 'release failed' } })), false);
+  check('releaseReplyOutcome: mixed chained release replies fail closed as one command',
+    WG.releaseReplyOutcome([
+      JSON.stringify({ ok: true, result: { mutation: { dispatchId: 'ctx_release_a' } } }),
+      JSON.stringify({ ok: false, error: { message: 'release failed' } }),
+    ].join('\n')), false);
 }
 
 // --- ownership.cjs: ownsOverlap regression cases for the fix-round-1 false negatives (item 3) --
