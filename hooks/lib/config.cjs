@@ -93,6 +93,10 @@ const DEFAULT_CONFIG = {
   janitor: {
     enabled: true,
     intervalMinutes: 10,
+    rebuildableIgnored: [
+      'node_modules/', 'dist/', 'build/', '.venv/', 'venv/', '__pycache__/',
+      '.pytest_cache/', '.next/', '.turbo/', 'coverage/', '*.pyc',
+    ],
   },
   maxParallelCodexWorkers: 3, // 0 = unlimited
   maxParallelKimiWorkers: 3, // 0 = unlimited
@@ -392,6 +396,13 @@ function loadConfig() {
   if (typeof merged.janitor.enabled !== 'boolean') {
     warnings.push(`janitor.enabled must be a boolean; using ${DEFAULT_CONFIG.janitor.enabled}.`);
     merged.janitor.enabled = DEFAULT_CONFIG.janitor.enabled;
+  }
+  if (!Array.isArray(merged.janitor.rebuildableIgnored) ||
+      merged.janitor.rebuildableIgnored.some((value) => typeof value !== 'string' || !value.trim())) {
+    warnings.push('janitor.rebuildableIgnored must be an array of non-empty strings; using the default.');
+    merged.janitor.rebuildableIgnored = [...DEFAULT_CONFIG.janitor.rebuildableIgnored];
+  } else {
+    merged.janitor.rebuildableIgnored = merged.janitor.rebuildableIgnored.map((value) => value.trim());
   }
   const janitorInterval = configuredNumber(merged.janitor.intervalMinutes);
   if (!Number.isInteger(janitorInterval) || janitorInterval < 1 || janitorInterval > 1440) {

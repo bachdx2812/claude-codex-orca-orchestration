@@ -41,7 +41,11 @@
   },
   "janitor": {
     "enabled": true,
-    "intervalMinutes": 10
+    "intervalMinutes": 10,
+    "rebuildableIgnored": [
+      "node_modules/", "dist/", "build/", ".venv/", "venv/", "__pycache__/",
+      ".pytest_cache/", ".next/", ".turbo/", "coverage/", "*.pyc"
+    ]
   },
   "maxParallelCodexWorkers": 3,
   "maxParallelKimiWorkers": 3,

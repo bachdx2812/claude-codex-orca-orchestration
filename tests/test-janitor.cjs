@@ -30,8 +30,12 @@ function runCase(name, row, extraEnv = {}, workers = []) {
   const actualRow = { ...row, path: worktreePath, worktreeId: `repo-1::${worktreePath}` };
   const actualWorkers = JSON.parse(JSON.stringify(workers)
     .replaceAll('/work/feature', worktreePath).replaceAll('/work/foreign', worktreePath));
+  const actualExtraEnv = Object.fromEntries(Object.entries(extraEnv).map(([key, value]) => [
+    key, typeof value === 'string' ? value.replaceAll('__WORKTREE__', worktreePath) : value,
+  ]));
   const calls = path.join(dir, 'orca-calls.log');
   const ghCalls = path.join(dir, 'gh-calls.log');
+  const psCalls = path.join(dir, 'ps-calls.log');
   const result = spawnSync(process.execPath, [JANITOR], {
     encoding: 'utf8',
     env: {
@@ -44,13 +48,16 @@ function runCase(name, row, extraEnv = {}, workers = []) {
       STUB_WORKTREES_JSON: JSON.stringify([actualRow]),
       STUB_WORKERS_JSON: JSON.stringify(actualWorkers),
       STUB_ORCA_CALLS_LOG: calls,
+      STUB_WORKTREE_PS_CALLS_LOG: psCalls,
       STUB_GH_CALLS_LOG: ghCalls,
       STUB_GIT_ORIGIN: 'git@github.com:acme/widgets.git',
       STUB_GIT_BRANCH: 'feature/work',
       STUB_GIT_CLEAN: '1',
       STUB_GIT_HAS_UPSTREAM: '1',
+      STUB_GIT_HEAD_OID: 'head123',
+      STUB_GH_HEAD_OID: 'head123',
       STUB_GH_STATE: 'MERGED',
-      ...extraEnv,
+      ...actualExtraEnv,
     },
   });
   return {
@@ -73,7 +80,10 @@ function worktree(overrides = {}) {
 
 const squash = runCase('squash-merged', worktree());
 check('squash-merged branch without an Orca PR is removed', squash.calls.includes(`worktree rm --worktree path:${squash.worktreePath} --json`), true);
-check('GitHub lookup targets the origin repository and branch', squash.ghCalls.includes('pr list --repo acme/widgets --head feature/work --state all --json state'), true);
+check('GitHub lookup targets the origin repository and branch',
+  squash.ghCalls.includes('pr list --repo acme/widgets --head feature/work --state all'), true);
+check('GitHub lookup checks up to 100 PRs and requests pushed head OIDs',
+  squash.ghCalls.includes('--limit 100 --json state,headRefOid'), true);
 check('successful janitor removal is logged', squash.log.includes(`removed ${JSON.stringify(squash.worktreePath)} (GitHub PR MERGED)`), true);
 
 const open = runCase('open-pr', worktree(), { STUB_GH_STATE: 'OPEN', STUB_GIT_ANCESTOR: '1' });
@@ -83,13 +93,54 @@ const dirty = runCase('dirty', worktree(), { STUB_GIT_CLEAN: '0' });
 check('a dirty worktree is kept', dirty.calls.includes('worktree rm'), false);
 
 const deletedUpstream = runCase('deleted-upstream', worktree(), {
-  STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_CONFIGURED_UPSTREAM: '1',
+  STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_UPSTREAM_GONE: '1',
 });
 check('an accepted clean branch is removable after its remote upstream is deleted',
   deletedUpstream.calls.includes(`worktree rm --worktree path:${deletedUpstream.worktreePath} --json`), true);
 
+const upstreamTimeout = runCase('upstream-timeout', worktree(), {
+  STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_UPSTREAM_SIGNAL: '1', STUB_GIT_UPSTREAM_GONE: '1',
+});
+check('a signalled or timed-out upstream probe fails closed', upstreamTimeout.calls.includes('worktree rm'), false);
+
+const extraLocalCommit = runCase('deleted-upstream-extra-local', worktree(), {
+  STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_UPSTREAM_GONE: '1',
+  STUB_GIT_HEAD_OID: 'local-after-push', STUB_GH_HEAD_OID: 'pushed-and-merged',
+});
+check('a deleted upstream with a local commit after the pushed PR head is kept',
+  extraLocalCommit.calls.includes('worktree rm'), false);
+
+const closedUnmerged = runCase('deleted-upstream-closed-unmerged', worktree(), {
+  STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_UPSTREAM_GONE: '1', STUB_GH_STATE: 'CLOSED',
+});
+check('a closed-unmerged PR never proves a deleted-upstream branch was pushed',
+  closedUnmerged.calls.includes('worktree rm'), false);
+
+const ignoredOutput = runCase('ignored-output', worktree(), { STUB_GIT_IGNORED: 'agent/output/result.zip' });
+check('a non-rebuildable ignored file keeps the worktree', ignoredOutput.calls.includes('worktree rm'), false);
+check('the blocking ignored path is logged', ignoredOutput.log.includes('agent/output/result.zip'), true);
+
+const ignoredBuild = runCase('ignored-build', worktree(), {
+  STUB_GIT_IGNORED: 'node_modules/,nested/__pycache__/cache.pyc,dist/',
+});
+check('a worktree containing only allowlisted rebuildable ignored files is removable',
+  ignoredBuild.calls.includes(`worktree rm --worktree path:${ignoredBuild.worktreePath} --json`), true);
+
+const linkedClosedOpen = runCase('linked-closed-new-open-real-shape', {
+  ...worktree(), linkedPR: { state: 'closed', number: 44 },
+}, { STUB_GH_STATE: 'OPEN', STUB_GIT_ANCESTOR: '1' });
+check('an OPEN GitHub PR vetoes a stale linked CLOSED PR', linkedClosedOpen.calls.includes('worktree rm'), false);
+
 const live = runCase('live-terminal', worktree({ liveTerminalCount: 1 }));
 check('a worktree with a live terminal is kept', live.calls.includes('worktree rm'), false);
+
+const liveOnRecheck = runCase('live-on-recheck', worktree(), {
+  STUB_WORKTREES_AFTER_FIRST_JSON: JSON.stringify([{
+    ...worktree({ liveTerminalCount: 1 }), path: '__WORKTREE__', worktreeId: 'repo-1::__WORKTREE__',
+  }]),
+});
+check('a terminal appearing after the initial snapshot prevents removal',
+  liveOnRecheck.calls.includes('worktree rm'), false);
 
 const foreign = runCase('foreign-session', worktree(),
   { STUB_GH_STATE: 'CLOSED' }, [{

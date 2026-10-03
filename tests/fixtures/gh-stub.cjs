@@ -6,4 +6,5 @@ if (process.env.STUB_GH_CALLS_LOG) {
 }
 if (process.env.STUB_GH_FAIL === '1') process.exit(1);
 const state = String(process.env.STUB_GH_STATE || 'NONE').toUpperCase();
-process.stdout.write(JSON.stringify(state === 'NONE' ? [] : [{ state }]));
+const headRefOid = process.env.STUB_GH_HEAD_OID || 'head123';
+process.stdout.write(JSON.stringify(state === 'NONE' ? [] : [{ state, headRefOid }]));

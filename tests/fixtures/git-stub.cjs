@@ -63,6 +63,10 @@ if (sub === 'branch') {
   done(branch ? `${branch}\n` : '', branch ? 0 : 0);
 }
 
+if (sub === 'for-each-ref') {
+  done(process.env.STUB_GIT_UPSTREAM_GONE === '1' ? '[gone]\n' : '\n', 0);
+}
+
 if (sub === 'config') {
   const configured = process.env.STUB_GIT_CONFIGURED_UPSTREAM === '1';
   if (!configured) done('', 1);
@@ -71,8 +75,10 @@ if (sub === 'config') {
 
 if (sub === 'rev-parse') {
   if (args.includes('@{u}')) {
+    if (process.env.STUB_GIT_UPSTREAM_SIGNAL === '1') process.kill(process.pid, 'SIGTERM');
     done(process.env.STUB_GIT_HAS_UPSTREAM === '1' ? 'origin/feature\n' : '', process.env.STUB_GIT_HAS_UPSTREAM === '1' ? 0 : 128);
   }
+  if (args[args.length - 1] === 'HEAD') done(`${process.env.STUB_GIT_HEAD_OID || 'head123'}\n`, 0);
   const ref = args[args.length - 1];
   if (ref === 'origin/main') done('deadbeef\n', process.env.STUB_GIT_NO_ORIGIN === '1' ? 1 : 0);
   if (ref === 'main') done('deadbeef\n', process.env.STUB_GIT_HAS_MAIN === '1' ? 0 : 1);
@@ -84,7 +90,9 @@ if (sub === 'merge-base') {
 }
 
 if (sub === 'status') {
-  done(process.env.STUB_GIT_CLEAN === '1' ? '' : ' M some/file.txt\n', 0);
+  if (process.env.STUB_GIT_CLEAN !== '1') done(' M some/file.txt\0', 0);
+  const ignored = process.env.STUB_GIT_IGNORED;
+  done(ignored ? ignored.split(',').map((file) => `!! ${file}\0`).join('') : '', 0);
 }
 
 if (sub === 'rev-list') {

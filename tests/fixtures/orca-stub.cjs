@@ -138,8 +138,14 @@ if (args[0] === 'terminal' && args[1] === 'list') {
   process.exit(0);
 }
 if (args[0] === 'worktree' && args[1] === 'ps') {
+  let psCall = 1;
   if (process.env.STUB_WORKTREE_PS_CALLS_LOG) {
-    try { fs.appendFileSync(process.env.STUB_WORKTREE_PS_CALLS_LOG, `${Date.now()}\n`); } catch {}
+    try {
+      if (fs.existsSync(process.env.STUB_WORKTREE_PS_CALLS_LOG)) {
+        psCall = fs.readFileSync(process.env.STUB_WORKTREE_PS_CALLS_LOG, 'utf8').split('\n').filter(Boolean).length + 1;
+      }
+      fs.appendFileSync(process.env.STUB_WORKTREE_PS_CALLS_LOG, `${Date.now()}\n`);
+    } catch {}
   }
   const failUntil = Number(process.env.STUB_WORKTREE_PS_FAIL_UNTIL || 0);
   if (failUntil && Date.now() < failUntil) {
@@ -160,7 +166,8 @@ if (args[0] === 'worktree' && args[1] === 'ps') {
     process.exit(0);
   }
   let worktrees = [];
-  const raw = process.env.STUB_WORKTREES_JSON;
+  const raw = psCall > 1 && process.env.STUB_WORKTREES_AFTER_FIRST_JSON
+    ? process.env.STUB_WORKTREES_AFTER_FIRST_JSON : process.env.STUB_WORKTREES_JSON;
   if (raw) {
     try {
       const source = raw.startsWith('@') ? fs.readFileSync(raw.slice(1), 'utf8') : raw;

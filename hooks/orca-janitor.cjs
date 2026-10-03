@@ -97,6 +97,7 @@ function isBlocked(worktree, blocked) {
 function runJanitor(ctx = {}) {
   const run = ctx.runOrca || runOrca;
   const git = ctx.git || runGit;
+  const cfg = ctx.cfg || loadConfig();
   const list = worktrees(run);
   const workers = workerRows(run);
   if (!list || !workers) return { ok: false, removed: [], reason: 'inventory unavailable or incomplete' };
@@ -104,8 +105,18 @@ function runJanitor(ctx = {}) {
   const removed = [];
   for (const worktree of list) {
     if (worktree.isMainWorktree || worktree.isArchived || worktree.liveTerminalCount !== 0 || isBlocked(worktree, blocked)) continue;
-    const verdict = evaluateDoneButOpen(worktree, { now: Date.now(), idleSeconds: 0, git, stat: ctx.stat });
+    const verdict = evaluateDoneButOpen(worktree, {
+      now: Date.now(), idleSeconds: 0, git, stat: ctx.stat,
+      rebuildableIgnored: cfg.janitor.rebuildableIgnored,
+      onBlockedIgnored: (filePath) => appendLog(`kept ${JSON.stringify(worktree.path)}: ignored path ${JSON.stringify(filePath)}`),
+    });
     if (!verdict.done) continue;
+    const freshList = worktrees(run);
+    const fresh = freshList && freshList.find((row) => row.path === worktree.path);
+    if (!fresh || fresh.isMainWorktree || fresh.isArchived || fresh.liveTerminalCount !== 0) {
+      appendLog(`kept ${JSON.stringify(worktree.path)}: live-terminal state changed before removal`);
+      continue;
+    }
     const reply = run(['worktree', 'rm', '--worktree', `path:${worktree.path}`, '--json'], 60000);
     if (reply && reply.ok !== false) {
       removed.push(worktree.path);
@@ -120,7 +131,7 @@ function runJanitor(ctx = {}) {
 function main() {
   const cfg = loadConfig();
   if (!janitorEnabled(cfg)) return;
-  const result = runJanitor();
+  const result = runJanitor({ cfg });
   if (!result.ok) {
     appendLog(`skipped: ${result.reason}`);
     process.exitCode = 1;

@@ -82,6 +82,7 @@ const GH_BIN = process.env.ORCH_GH_BIN || 'gh';
 const GIT_BIN = process.env.ORCH_GIT_BIN || 'git';
 const GH_PR_CACHE_FILE = path.join(DIR, 'github-pr-cache.json');
 const GH_PR_CACHE_MS = 10 * 60 * 1000;
+const GH_ACCEPTED_CACHE_MS = 2 * 60 * 1000;
 const RESUME_SCHEDULER = path.join(__dirname, 'orca-resume-scheduler.cjs');
 const DONE_PR_STATES = new Set(['merged', 'closed']);
 // GitLab's MR state vocabulary uses "opened"/"merged"/"closed"/"locked" where GitHub's PR
@@ -1050,24 +1051,22 @@ function runGh(args, cwd) {
   }
 }
 
-let githubPrCache = null;
-
 function loadGithubPrCache() {
-  if (githubPrCache) return githubPrCache;
   try {
     const value = JSON.parse(fs.readFileSync(GH_PR_CACHE_FILE, 'utf8'));
-    githubPrCache = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
   } catch {
-    githubPrCache = {};
+    return {};
   }
-  return githubPrCache;
 }
 
 function saveGithubPrCache(cache) {
   try {
     fs.mkdirSync(path.dirname(GH_PR_CACHE_FILE), { recursive: true });
+    const fresh = loadGithubPrCache();
+    const merged = { ...fresh, ...cache };
     const tmp = `${GH_PR_CACHE_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(cache));
+    fs.writeFileSync(tmp, JSON.stringify(merged));
     fs.renameSync(tmp, GH_PR_CACHE_FILE);
   } catch {}
 }
@@ -1080,8 +1079,9 @@ function githubRepoSlug(origin) {
   return match ? match[1] : null;
 }
 
-/** GitHub PR acceptance for a branch that Orca did not link to a PR. A successful query is
- * cached across daemon/janitor processes for ten minutes. Missing/unauthenticated gh, a
+/** GitHub PR state for a branch, including branches that Orca linked to a PR. An accepted
+ * verdict is cached across daemon/janitor processes for at most two minutes; open/none
+ * verdicts use the longer ten-minute cache. Missing/unauthenticated gh, a
  * non-GitHub origin, detached HEAD, malformed output, and timeouts all return null so the
  * caller retains the pre-existing Git-only acceptance rules. */
 function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
@@ -1094,17 +1094,21 @@ function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const now = ctx.now != null ? ctx.now : Date.now();
   const cache = ctx.cache || loadGithubPrCache();
   const cached = cache[key];
-  if (cached && Number.isFinite(cached.at) && now - cached.at < GH_PR_CACHE_MS) return cached.verdict;
-  const reply = gh(['pr', 'list', '--repo', repo, '--head', branch.stdout, '--state', 'all', '--json', 'state'], w.path);
+  const cacheMs = cached?.verdict?.accepted ? GH_ACCEPTED_CACHE_MS : GH_PR_CACHE_MS;
+  if (cached && Number.isFinite(cached.at) && now - cached.at < cacheMs) return cached.verdict;
+  const reply = gh(['pr', 'list', '--repo', repo, '--head', branch.stdout, '--state', 'all',
+    '--limit', '100', '--json', 'state,headRefOid'], w.path);
   if (!reply) return null;
   let rows;
   try { rows = JSON.parse(reply.stdout || '[]'); } catch { return null; }
   if (!Array.isArray(rows)) return null;
   const states = rows.map((row) => String(row && row.state || '').toUpperCase());
-  const verdict = states.includes('OPEN') ? { accepted: false, open: true, reason: null }
+  const mergedHeadOids = rows.filter((row) => String(row?.state || '').toUpperCase() === 'MERGED' &&
+    typeof row?.headRefOid === 'string' && row.headRefOid).map((row) => row.headRefOid);
+  const verdict = states.includes('OPEN') ? { accepted: false, open: true, reason: null, mergedHeadOids }
     : states.some((state) => state === 'MERGED' || state === 'CLOSED')
-      ? { accepted: true, open: false, reason: `GitHub PR ${states.includes('MERGED') ? 'MERGED' : 'CLOSED'}` }
-      : { accepted: false, open: false, reason: null };
+      ? { accepted: true, open: false, reason: `GitHub PR ${states.includes('MERGED') ? 'MERGED' : 'CLOSED'}`, mergedHeadOids }
+      : { accepted: false, open: false, reason: null, mergedHeadOids };
   cache[key] = { at: now, verdict };
   if (!ctx.cache) saveGithubPrCache(cache);
   return verdict;
@@ -1118,10 +1122,13 @@ function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
  */
 function resolveBaseRef(cwd, git) {
   const sym = git(['symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD'], cwd);
+  if (sym === null) return null;
   if (sym && sym.status === 0 && sym.stdout) return sym.stdout;
   const originMain = git(['rev-parse', '--verify', '-q', 'origin/main'], cwd);
+  if (originMain === null) return null;
   if (originMain && originMain.status === 0) return 'origin/main';
   const main = git(['rev-parse', '--verify', '-q', 'main'], cwd);
+  if (main === null) return null;
   if (main && main.status === 0) return 'main';
   return null;
 }
@@ -1214,17 +1221,21 @@ function hasOwnCommit(w, git) {
  * never-touched worktree, or one merely rebased/fast-forwarded onto a moved base without ever
  * gaining a commit of its own, would both qualify too). A still-open PR/MR is never accepted,
  * whatever git alone might say about the branch. Git is consulted ONLY in the no-linked-PR/MR
- * case: the cheap, Orca-reported PR/MR state always decides first when one exists, so a real
- * git call never runs for the (common) linked-PR case's acceptance leg — a PR/MR's own
- * merged/closed state is already external evidence real work happened, so H1's extra checks do
- * not apply there. Returns `{ accepted, reason }` so a caller can name which path fired.
+ * case. A GitHub lookup always gets the chance to veto a stale linked PR state when it finds
+ * any open PR for the head. A linked PR/MR's own merged/closed state remains external evidence
+ * real work happened, so the no-linked-PR commit-history checks do not apply there. Returns
+ * `{ accepted, reason, github }` so the clean check can also prove a deleted upstream's exact
+ * pushed head SHA.
  */
 function resolveAcceptance(w, git, stat, ctx = {}) {
+  const github = w.mrState == null && !ctx.skipGithub
+    ? resolveGithubAcceptance(w, git, ctx.gh || runGh, ctx) : null;
+  if (github?.open) return { accepted: false, reason: null, github };
   if (w.prState != null) {
     const state = String(w.prState).toLowerCase();
     return DONE_PR_STATES.has(state)
-      ? { accepted: true, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}` }
-      : { accepted: false, reason: null };
+      ? { accepted: true, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}`, github }
+      : { accepted: false, reason: null, github };
   }
   if (w.mrState != null) {
     const state = String(w.mrState).toLowerCase();
@@ -1233,14 +1244,12 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
       ? { accepted: true, reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}` }
       : { accepted: false, reason: null };
   }
-  const github = resolveGithubAcceptance(w, git, ctx.gh || runGh, ctx);
-  if (github?.open) return { accepted: false, reason: null };
-  if (github?.accepted) return { accepted: true, reason: github.reason };
+  if (github?.accepted) return { accepted: true, reason: github.reason, github };
   const base = resolveBaseRef(w.path, git);
   if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: null };
   if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: null };
   if (!hasOwnCommit(w, git)) return { accepted: false, reason: null };
-  return { accepted: true, reason: `no linked PR, HEAD already merged into ${base}` };
+  return { accepted: true, reason: `no linked PR, HEAD already merged into ${base}`, github };
 }
 
 /**
@@ -1258,35 +1267,59 @@ function isWorktreeIdle(w, now, idleSeconds) {
 }
 
 /**
- * The "clean" leg: no uncommitted changes, and no commits this worktree's branch holds
+ * The "clean" leg: no tracked/untracked changes or non-rebuildable ignored files, and no
+ * commits this worktree's branch holds
  * that its upstream does not (or, lacking an upstream entirely, that the resolved base
  * branch does not). Any git failure along the way (unreadable repo, a timeout) means "not
  * confirmed clean", never "clean" — same uncertainty rule as everywhere else here.
  */
-function hasConfiguredUpstream(cwd, git) {
-  const branch = git(['branch', '--show-current'], cwd);
-  if (!branch || branch.status !== 0 || !branch.stdout) return false;
-  const remote = git(['config', '--get', `branch.${branch.stdout}.remote`], cwd);
-  const merge = git(['config', '--get', `branch.${branch.stdout}.merge`], cwd);
-  return !!remote && remote.status === 0 && !!remote.stdout && !!merge && merge.status === 0 && !!merge.stdout;
+function ignoredPathAllowed(filePath, allowlist) {
+  const normalized = String(filePath || '').replace(/^\.\//, '').replaceAll('\\', '/');
+  return (allowlist || []).some((pattern) => {
+    if (pattern.startsWith('*.')) return normalized.endsWith(pattern.slice(1));
+    if (pattern.endsWith('/')) {
+      const dir = pattern.slice(0, -1);
+      return normalized === dir || normalized.startsWith(`${dir}/`) || normalized.includes(`/${dir}/`);
+    }
+    return normalized === pattern;
+  });
+}
+
+function cleanStatus(stdout, allowlist, onBlockedIgnored) {
+  const entries = String(stdout || '').split('\0').filter(Boolean);
+  for (const entry of entries) {
+    if (!entry.startsWith('!! ')) return false;
+    const filePath = entry.slice(3);
+    if (!ignoredPathAllowed(filePath, allowlist)) {
+      if (onBlockedIgnored) onBlockedIgnored(filePath);
+      return false;
+    }
+  }
+  return true;
 }
 
 function isWorktreeClean(w, git, ctx = {}) {
   // `--no-optional-locks`: a plain status read must never contend with, or be blocked by,
   // another concurrent git process's lock on this worktree's index — this daemon polls
   // repeatedly and runs alongside the user's own git/IDE activity.
-  const status = git(['--no-optional-locks', 'status', '--porcelain'], w.path);
-  if (!status || status.status !== 0 || status.stdout !== '') return false;
+  const status = git(['--no-optional-locks', 'status', '--porcelain', '--ignored', '-z'], w.path);
+  if (!status || status.status !== 0 || !cleanStatus(status.stdout,
+    ctx.rebuildableIgnored || cfg.janitor.rebuildableIgnored, ctx.onBlockedIgnored)) return false;
   const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], w.path);
+  if (upstream === null) return false;
   if (upstream && upstream.status === 0 && upstream.stdout) {
     const unpushed = git(['rev-list', '@{u}..HEAD'], w.path);
     return !!unpushed && unpushed.status === 0 && unpushed.stdout === '';
   }
-  // A pushed branch can lose its remote-tracking ref after its PR is accepted and the
-  // server deletes the branch. In that specific, externally-accepted case, the configured
-  // branch.<name>.remote/merge pair proves an upstream existed; its now-unresolvable @{u}
-  // is not evidence of unpushed work. The clean status above remains mandatory.
-  if (ctx.accepted && hasConfiguredUpstream(w.path, git)) return true;
+  const branch = git(['branch', '--show-current'], w.path);
+  if (!branch || branch.status !== 0 || !branch.stdout) return false;
+  const track = git(['for-each-ref', '--format=%(upstream:track)', `refs/heads/${branch.stdout}`], w.path);
+  if (!track || track.status !== 0) return false;
+  if (track.stdout === '[gone]') {
+    const head = git(['rev-parse', 'HEAD'], w.path);
+    return !!head && head.status === 0 && !!head.stdout &&
+      (ctx.github?.mergedHeadOids || []).includes(head.stdout);
+  }
   const base = resolveBaseRef(w.path, git);
   return !!base && isAncestorOf(w.path, git, base);
 }
@@ -1506,9 +1539,10 @@ function evaluateDoneButOpen(w, ctx = {}) {
   const git = ctx.git || runGit;
   const stat = ctx.stat || statMtimeMs;
   if (!isWorktreeIdle(w, now, idleSeconds)) return { done: false, reason: null };
-  const { accepted, reason } = resolveAcceptance(w, git, stat, ctx);
+  const acceptance = resolveAcceptance(w, git, stat, ctx);
+  const { accepted, reason } = acceptance;
   if (!accepted) return { done: false, reason: null };
-  if (!isWorktreeClean(w, git, { accepted: true })) return { done: false, reason: null };
+  if (!isWorktreeClean(w, git, { ...ctx, github: acceptance.github })) return { done: false, reason: null };
   return { done: true, reason };
 }
 
@@ -1629,7 +1663,10 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths, rmFaile
     const budgetDeadline = Date.now() + GIT_BUDGET_MS;
     const allEvaluated = [];
     for (const w of candidates) {
-      allEvaluated.push({ w, verdict: evaluateDoneButOpen(w, { now, idleSeconds: IDLE_SECONDS, git: runGit }) });
+      allEvaluated.push({ w, verdict: evaluateDoneButOpen(w, {
+        now, idleSeconds: IDLE_SECONDS, git: runGit, skipGithub: true,
+        rebuildableIgnored: cfg.janitor.rebuildableIgnored,
+      }) });
       beat(started);
       if (!isSeedingPass && Date.now() >= budgetDeadline) break;
     }
@@ -2330,7 +2367,7 @@ module.exports = {
   workerWorktreePaths, worktreeKeys, sessionWorktreeKeys, retainedTerminalHandles,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, resolveGithubAcceptance, githubRepoSlug, runGh,
-  isWorktreeIdle, isWorktreeClean, hasConfiguredUpstream, resolveBaseRef, isAncestorOf, runGit,
+  isWorktreeIdle, isWorktreeClean, ignoredPathAllowed, cleanStatus, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
   machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,

@@ -369,9 +369,13 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       // call) must not be mistaken for the subcommand itself.
       const sub = args.find((a) => !a.startsWith('--'));
       if (sub === 'symbolic-ref') return pick(overrides, 'symbolicRef', { status: 0, stdout: 'origin/main' });
+      if (sub === 'remote') return pick(overrides, 'remote', { status: 1, stdout: '' });
+      if (sub === 'branch') return pick(overrides, 'branch', { status: 0, stdout: 'feature' });
+      if (sub === 'for-each-ref') return pick(overrides, 'track', { status: 0, stdout: '' });
       if (sub === 'merge-base') return pick(overrides, 'mergeBase', { status: 0, stdout: '' });
       if (sub === 'status') return pick(overrides, 'status', { status: 0, stdout: '' });
       if (sub === 'rev-parse' && args.includes('@{u}')) return pick(overrides, 'upstream', { status: 0, stdout: 'origin/feature' });
+      if (sub === 'rev-parse' && args[args.length - 1] === 'HEAD') return pick(overrides, 'head', { status: 0, stdout: 'head123' });
       if (sub === 'rev-list') return pick(overrides, 'revList', { status: 0, stdout: '' });
       // H1: HEAD's own commit time (seconds), consulted only on the no-linked-PR/MR
       // acceptance path. Default (700s -> 700_000ms) sits after the default `stat` fixture
@@ -409,8 +413,27 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   const closedIdle = { ...mergedIdle, prState: 'closed', prNumber: 13 };
   check('closed PR + no live terminal + clean is done-but-open', heartbeat.isDoneButOpen(closedIdle, ctx()), true);
 
-  check('an open PR is never done-but-open (git is never consulted)',
-    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open' }, { ...ctx(), git: throwingGit }), false);
+  check('an open linked PR is never done-but-open',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open' }, ctx()), false);
+  check('an OPEN GitHub lookup vetoes a stale linked CLOSED PR',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'closed' }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[{"state":"OPEN","headRefOid":"head123"}]' }),
+      cache: {},
+    })), false);
+  {
+    let ghCalls = 0;
+    const git = fakeGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } });
+    const cache = { 'acme/widgets#feature': {
+      at: 1_000_000 - 120_000,
+      verdict: { accepted: true, open: false, reason: 'GitHub PR MERGED', mergedHeadOids: ['head123'] },
+    } };
+    heartbeat.resolveGithubAcceptance(mergedIdle, git, () => {
+      ghCalls += 1;
+      return { status: 0, stdout: '[]' };
+    }, { now: 1_000_000, cache });
+    check('an accepted GitHub cache entry is refreshed after two minutes', ghCalls, 1);
+  }
   check('a merged PR with a live terminal and no lastOutputAt is never done-but-open (uncertain idle)',
     heartbeat.isDoneButOpen({ ...mergedIdle, liveTerminalCount: 1 }, { ...ctx(), git: throwingGit }), false);
   check('the main worktree is never done-but-open even when merged and idle',
@@ -485,6 +508,17 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { upstream: { status: 128, stdout: '' }, mergeBase: { status: 1, stdout: '' } } })), false);
   check('an upstream with unpushed commits is never clean',
     heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { revList: { status: 0, stdout: 'deadbeef\n' } } })), false);
+  check('a null upstream probe fails closed instead of using deleted-upstream handling',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { upstream: null } })), false);
+  check('a gone upstream is clean only when a merged PR head exactly matches HEAD',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({
+      git: {
+        remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' },
+        upstream: { status: 128, stdout: '' }, track: { status: 0, stdout: '[gone]' },
+      },
+      gh: () => ({ status: 0, stdout: '[{"state":"MERGED","headRefOid":"head123"}]' }),
+      cache: {},
+    })), true);
 
   // Idle via the worktree-level lastOutputAt aggregate (no per-terminal data is exposed).
   const liveButQuiet = { ...mergedIdle, liveTerminalCount: 1, lastOutputAt: 1_000_000 - 120_000 };
