@@ -89,6 +89,10 @@ check('successful janitor removal is logged', squash.log.includes(`removed ${JSO
 const open = runCase('open-pr', worktree(), { STUB_GH_STATE: 'OPEN', STUB_GIT_ANCESTOR: '1' });
 check('an open PR is kept even when Git says the branch is merged', open.calls.includes('worktree rm'), false);
 
+const newlyOpen = runCase('newly-open-pr', worktree(), { STUB_GH_STATE_AFTER_FIRST: 'OPEN' });
+check('an uncached pre-removal check catches a PR opened after the initial verdict',
+  newlyOpen.calls.includes('worktree rm'), false);
+
 const dirty = runCase('dirty', worktree(), { STUB_GIT_CLEAN: '0' });
 check('a dirty worktree is kept', dirty.calls.includes('worktree rm'), false);
 

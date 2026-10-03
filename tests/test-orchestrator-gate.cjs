@@ -421,6 +421,8 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       gh: () => ({ status: 0, stdout: '[{"state":"OPEN","headRefOid":"head123"}]' }),
       cache: {},
     })), false);
+  check('a Git subprocess failure during GitHub lookup fails closed even for a linked merged PR',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { remote: null } })), false);
   {
     let ghCalls = 0;
     const git = fakeGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } });

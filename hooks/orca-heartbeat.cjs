@@ -1087,6 +1087,9 @@ function githubRepoSlug(origin) {
 function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const origin = git(['remote', 'get-url', 'origin'], w.path);
   const branch = git(['branch', '--show-current'], w.path);
+  if (origin === null || branch === null) {
+    return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
+  }
   if (!origin || origin.status !== 0 || !branch || branch.status !== 0 || !branch.stdout) return null;
   const repo = githubRepoSlug(origin.stdout);
   if (!repo) return null;
@@ -1230,6 +1233,7 @@ function hasOwnCommit(w, git) {
 function resolveAcceptance(w, git, stat, ctx = {}) {
   const github = w.mrState == null && !ctx.skipGithub
     ? resolveGithubAcceptance(w, git, ctx.gh || runGh, ctx) : null;
+  if (github?.uncertain) return { accepted: false, reason: null, github };
   if (github?.open) return { accepted: false, reason: null, github };
   if (w.prState != null) {
     const state = String(w.prState).toLowerCase();

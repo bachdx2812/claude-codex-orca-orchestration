@@ -114,14 +114,20 @@ function runJanitor(ctx = {}) {
   if (!list || !workers) return { ok: false, removed: [], reason: 'inventory unavailable or incomplete' };
   const blocked = blockedWorktreeKeys(workers);
   const removed = [];
+  const verdictFor = (worktree, extra = {}) => evaluateDoneButOpen(worktree, {
+    now: Date.now(), idleSeconds: 0, git, stat: ctx.stat,
+    rebuildableIgnored: cfg.janitor.rebuildableIgnored,
+    onBlockedIgnored: (filePath) => appendLog(`kept ${JSON.stringify(worktree.path)}: ignored path ${JSON.stringify(filePath)}`),
+    ...extra,
+  });
   for (const worktree of list) {
     if (worktree.isMainWorktree || worktree.isArchived || worktree.liveTerminalCount !== 0 || isBlocked(worktree, blocked)) continue;
-    const verdict = evaluateDoneButOpen(worktree, {
-      now: Date.now(), idleSeconds: 0, git, stat: ctx.stat,
-      rebuildableIgnored: cfg.janitor.rebuildableIgnored,
-      onBlockedIgnored: (filePath) => appendLog(`kept ${JSON.stringify(worktree.path)}: ignored path ${JSON.stringify(filePath)}`),
-    });
+    const verdict = verdictFor(worktree);
     if (!verdict.done) continue;
+    // Accepted cache entries may be up to two minutes old. Re-check without the shared
+    // cache immediately before the final terminal snapshot so a newly opened PR vetoes
+    // this run rather than waiting for a later janitor tick.
+    if (!verdictFor(worktree, { cache: {} }).done) continue;
     const freshList = worktrees(run);
     const fresh = freshList && freshList.find((row) => row.path === worktree.path);
     if (!fresh || fresh.isMainWorktree || fresh.isArchived || fresh.liveTerminalCount !== 0) {
