@@ -37,6 +37,8 @@ const SETTINGS_FILE = path.join(CLAUDE_DIR, 'settings.json');
 const CLAUDE_MD_FILE = path.join(CLAUDE_DIR, 'CLAUDE.md');
 const AGENTS_DIR = path.join(CLAUDE_DIR, 'agents');
 const MANIFEST_FILE = path.join(HOOKS_DIR, 'install-manifest.json');
+const JANITOR_LABEL = 'com.orca.claude-codex-orchestration.janitor';
+const JANITOR_PLIST = path.join(HOME, 'Library', 'LaunchAgents', `${JANITOR_LABEL}.plist`);
 
 // Agent definitions the installer ships. They are ONLY ever created, never overwritten:
 // an existing file may be user-edited, and uninstall removes only a file this installer
@@ -45,7 +47,7 @@ const AGENT_FILES = ['sonnet-coder.md'];
 
 const GATE_SCRIPT = 'orchestrator-gate.cjs';
 const HOOK_FILES = [
-  'orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'orca-resume-scheduler.cjs',
+  'orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'orca-janitor.cjs', 'orca-resume-scheduler.cjs',
   'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/codex-quota-probe.cjs', 'lib/shell-orca-invocations.cjs',
   'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
@@ -192,6 +194,53 @@ function checkPlatform() {
     console.error('This installer supports macOS and Linux only. Windows is not supported.');
     process.exit(1);
   }
+}
+
+function xmlEscape(value) {
+  return String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+function launchctl(args) {
+  const bin = process.env.ORCH_LAUNCHCTL_BIN || 'launchctl';
+  try {
+    execFileSync(bin, args, { stdio: 'ignore', timeout: 10000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function installJanitor(prevManifest) {
+  if (process.platform !== 'darwin') return { supported: false, installed: false };
+  const existed = fs.existsSync(JANITOR_PLIST);
+  const cfg = readJSONSafe(CONFIG_FILE, null) || readJSONSafe(path.join(REPO_ROOT, 'config', 'orchestration.config.example.json'), {});
+  const interval = Number.isInteger(cfg?.janitor?.intervalMinutes) && cfg.janitor.intervalMinutes > 0
+    ? cfg.janitor.intervalMinutes : 10;
+  const text = `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n` +
+    `<plist version="1.0"><dict>\n` +
+    `  <key>Label</key><string>${JANITOR_LABEL}</string>\n` +
+    `  <key>ProgramArguments</key><array><string>${xmlEscape(NODE_PATH)}</string><string>${xmlEscape(path.join(HOOKS_DIR, 'orca-janitor.cjs'))}</string></array>\n` +
+    `  <key>StartInterval</key><integer>${interval * 60}</integer>\n` +
+    `  <key>RunAtLoad</key><true/>\n` +
+    `</dict></plist>\n`;
+  writeText(JANITOR_PLIST, text);
+  if (!DRY_RUN) {
+    const domain = `gui/${process.getuid()}`;
+    launchctl(['bootout', domain, JANITOR_PLIST]);
+    if (!launchctl(['bootstrap', domain, JANITOR_PLIST])) {
+      warn(`could not register ${JANITOR_PLIST} with launchctl; the janitor can still be run manually.`);
+    }
+  }
+  return { supported: true, installed: true, path: JANITOR_PLIST, label: JANITOR_LABEL,
+    intervalMinutes: interval, createdNew: prevManifest?.janitor?.createdNew ?? !existed };
+}
+
+function uninstallJanitor(manifest) {
+  const record = manifest.janitor;
+  if (!record || !record.installed || process.platform !== 'darwin') return;
+  if (!DRY_RUN) launchctl(['bootout', `gui/${process.getuid()}`, record.path || JANITOR_PLIST]);
+  removeFile(record.path || JANITOR_PLIST);
 }
 
 // --- install: hook files -----------------------------------------------------
@@ -678,6 +727,7 @@ function install() {
   installHookFiles();
   const rulesFile = installRulesFile(prevManifest);
   const configFile = installConfig(prevManifest);
+  const janitor = installJanitor(prevManifest);
   const settings = installSettings({ pinModels: !NO_PIN }, prevManifest);
   const claudeMd = installClaudeMd(prevManifest);
   const agents = installAgents(prevManifest);
@@ -690,6 +740,7 @@ function install() {
     files: HOOK_FILES,
     rulesFile,
     configFile,
+    janitor,
     settings,
     claudeMd,
     agents,
@@ -710,6 +761,7 @@ function uninstall(purge) {
     return;
   }
   uninstallSettings(manifest);
+  uninstallJanitor(manifest);
   uninstallClaudeMd(manifest);
   uninstallAgents(manifest);
   uninstallRulesFile(manifest);

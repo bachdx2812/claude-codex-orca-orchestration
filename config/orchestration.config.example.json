@@ -39,6 +39,10 @@
     "stallSeconds": 900,
     "stallSecondsByAgent": { "kimi": 600 }
   },
+  "janitor": {
+    "enabled": true,
+    "intervalMinutes": 10
+  },
   "maxParallelCodexWorkers": 3,
   "maxParallelKimiWorkers": 3,
   "maxParallelDeepseekWorkers": 3,

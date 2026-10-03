@@ -90,6 +90,10 @@ const DEFAULT_CONFIG = {
     stallSeconds: 900,
     stallSecondsByAgent: { kimi: 600 },
   },
+  janitor: {
+    enabled: true,
+    intervalMinutes: 10,
+  },
   maxParallelCodexWorkers: 3, // 0 = unlimited
   maxParallelKimiWorkers: 3, // 0 = unlimited
   maxParallelDeepseekWorkers: 3, // 0 = unlimited
@@ -379,6 +383,22 @@ function loadConfig() {
   if (!isPlainObject(merged.heartbeat)) {
     warnings.push('heartbeat must be an object; using the default.');
     merged.heartbeat = deepMerge({}, DEFAULT_CONFIG.heartbeat);
+  }
+
+  if (!isPlainObject(merged.janitor)) {
+    warnings.push('janitor must be an object; using the default.');
+    merged.janitor = { ...DEFAULT_CONFIG.janitor };
+  }
+  if (typeof merged.janitor.enabled !== 'boolean') {
+    warnings.push(`janitor.enabled must be a boolean; using ${DEFAULT_CONFIG.janitor.enabled}.`);
+    merged.janitor.enabled = DEFAULT_CONFIG.janitor.enabled;
+  }
+  const janitorInterval = configuredNumber(merged.janitor.intervalMinutes);
+  if (!Number.isInteger(janitorInterval) || janitorInterval < 1 || janitorInterval > 1440) {
+    warnings.push(`janitor.intervalMinutes "${merged.janitor.intervalMinutes}" is not an integer 1-1440; using ${DEFAULT_CONFIG.janitor.intervalMinutes}.`);
+    merged.janitor.intervalMinutes = DEFAULT_CONFIG.janitor.intervalMinutes;
+  } else {
+    merged.janitor.intervalMinutes = janitorInterval;
   }
   const stallSeconds = configuredNumber(merged.heartbeat.stallSeconds);
   if (!Number.isInteger(stallSeconds) || stallSeconds < 1 || stallSeconds > 86400) {
@@ -758,6 +778,16 @@ function closeDoneWorktreesEnabled(cfg) {
   return closeDoneWorktreesMode(cfg) !== 'off';
 }
 
+function janitorEnabled(cfg) {
+  const override = process.env.ORCH_JANITOR;
+  if (override !== undefined) {
+    const value = override.trim().toLowerCase();
+    if (['0', 'false', 'off'].includes(value)) return false;
+    if (['1', 'true', 'on'].includes(value)) return true;
+  }
+  return cfg.janitor.enabled;
+}
+
 /**
  * The fraction of this machine's cores the parallel-agents budget derives its limit from
  * (0.1-1). `ORCH_PARALLEL_CORE_FRACTION` overrides the config value for one process; an
@@ -796,6 +826,7 @@ module.exports = {
   GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   closeDoneWorktreesMode,
+  janitorEnabled,
   parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
   deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
