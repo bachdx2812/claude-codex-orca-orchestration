@@ -205,11 +205,21 @@ function rowReportsReleased(row) {
   return terminalState === 'released' || terminalState === 'closed';
 }
 
+function rowCreatedAt(row) {
+  const value = row && row.createdAt;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || !value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 /**
  * True when a terminal worker row is conclusively detached from its tracked resource.
- * `rows` are newest-first (Orca's worker-list contract), so an earlier row with the same
- * handle and a different dispatch proves the terminal was re-dispatched. `terminalHandles`
- * is null when terminal-list was unavailable; only an authoritative Set may prove absence.
+ * When both rows provide `createdAt`, the later timestamp proves which dispatch is newer;
+ * otherwise `rows` are newest-first (Orca's worker-list contract), so an earlier row with
+ * the same handle and a different dispatch proves the terminal was re-dispatched.
+ * `terminalHandles` is null when terminal-list was unavailable; only an authoritative Set
+ * may prove absence.
  * A non-terminal worker never reconciles through these resource signals, including a
  * malformed/racing row that says `no_owned_resource` while still running.
  */
@@ -223,10 +233,15 @@ function rowReportsReconciled(row, rows = [], terminalHandles = null) {
   if (terminalHandles instanceof Set && !terminalHandles.has(handle)) return true;
 
   const index = rows.indexOf(row);
-  if (index <= 0) return false;
-  return rows.slice(0, index).some((newer) =>
-    newer && newer.agentTerminalHandle === handle && newer.dispatchId && row.dispatchId &&
-    newer.dispatchId !== row.dispatchId);
+  if (index < 0) return false;
+  const createdAt = rowCreatedAt(row);
+  return rows.some((newer, newerIndex) => {
+    if (!newer || newer === row || newer.agentTerminalHandle !== handle ||
+        !newer.dispatchId || !row.dispatchId || newer.dispatchId === row.dispatchId) return false;
+    const newerCreatedAt = rowCreatedAt(newer);
+    if (createdAt !== null && newerCreatedAt !== null) return newerCreatedAt > createdAt;
+    return newerIndex < index;
+  });
 }
 
 /**

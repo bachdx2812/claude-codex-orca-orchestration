@@ -1414,13 +1414,22 @@ rmState(`${SID}-hard-off`);
   const stateF = path.join(STATE_DIR, `${HSID}.json`);
   const beatF = path.join(STATE_DIR, `heartbeat-${HSID}.json`);
   fs.writeFileSync(stateF, JSON.stringify({ session_id: HSID, bypass: false, execAgent: null, last_heartbeat: 0, rate_limit_hits: 0,
-    workers: { ctx_e2e_fake: { role: 'codex-exec', started: Date.now(), status: 'live', last_seen: Date.now(), rate_limited_until: 0 } } }));
+    workers: { ctx_e2e_fake: { role: 'codex-exec', started: Date.now() - 11 * 60 * 1000,
+      status: 'live', last_seen: Date.now(), rate_limited_until: 0 } } }));
   const stop = { session_id: HSID, hook_event_name: 'Stop' };
-  // The stub has never heard of ctx_e2e_fake, so it reports nothing unsettled -> the record is settled.
+  // The stub has never heard of this old local record. An exhaustive list plus its age makes
+  // the absent-row reconciliation authoritative at Stop.
   const r = invoke(stop);
-  if (r.code === 0) pass += 1; else failures.push(`Stop with a worker Orca does not know should settle it, got ${r.code}`);
+  if (r.code === 0) pass += 1; else failures.push(`Stop with an old worker Orca does not know should settle it, got ${r.code}`);
   const st = JSON.parse(fs.readFileSync(stateF, 'utf8'));
-  if (st.workers.ctx_e2e_fake.status === 'settled') pass += 1; else failures.push('unknown worker was not settled');
+  if (st.workers.ctx_e2e_fake.status === 'settled') pass += 1; else failures.push('old unknown worker was not settled');
+  st.workers.ctx_e2e_fake.status = 'live';
+  st.workers.ctx_e2e_fake.started = Date.now();
+  fs.writeFileSync(stateF, JSON.stringify(st));
+  const fresh = invoke(stop);
+  if (fresh.code === DENY && /workers-unwatched/.test(fresh.err) &&
+      readState(HSID).workers.ctx_e2e_fake.status === 'live') pass += 1;
+  else failures.push(`Stop must keep a fresh worker absent from Orca live (exit ${fresh.code})`);
   // Liveness file: alive pid + fresh tick is recognised; a dead pid is not.
   fs.writeFileSync(beatF, JSON.stringify({ pid: process.pid, last_tick: Date.now(), interval: 20 }));
   const p1 = promptSubmit(HSID, 'status?');

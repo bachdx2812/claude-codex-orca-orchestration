@@ -223,6 +223,16 @@ const terminalRow = (overrides = {}) => ({
     GATES.rowReportsReconciled(newer, [newer, old], new Set(['term_terminal'])) === false);
 }
 {
+  const old = terminalRow({ createdAt: '2026-10-04T00:00:00.000Z',
+    resource: { id: 'resource_old', retainedReason: 'user_requested' } });
+  const newer = terminalRow({ dispatchId: 'ctx_newer', taskId: 'task_newer',
+    createdAt: '2026-10-04T00:01:00.000Z', workerState: 'running', dispatchStatus: 'running',
+    terminalState: 'active', resource: { id: 'resource_newer' } });
+  check('createdAt identifies a newer reused-terminal dispatch independent of row order',
+    GATES.rowReportsReconciled(old, [old, newer], new Set(['term_terminal'])) === true &&
+    GATES.rowReportsReconciled(newer, [old, newer], new Set(['term_terminal'])) === false);
+}
+{
   const closed = terminalRow({ resource: { id: 'resource_closed', retainedReason: 'user_requested' } });
   check('terminal row reconciles when terminal-list confirms its handle closed',
     GATES.rowReportsReconciled(closed, [closed], new Set()) === true);
