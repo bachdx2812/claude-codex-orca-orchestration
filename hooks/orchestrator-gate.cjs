@@ -72,6 +72,21 @@ const ORCA_DOWN_TTL_SECONDS = 900;      // how long an "Orca is down" declaratio
 // the default staleMs, so the worst case (a caller starting at the same instant the lock was
 // created) still lives long enough to observe and clear a truly abandoned lock itself.
 const CAP_LOCK_OPTS = { timeoutMs: 10500 };
+const BACKGROUND_SHELL_TTL_MS = 6 * 60 * 60 * 1000;
+const hookAdditionalContext = [];
+
+function addHookContext(text) {
+  if (text) hookAdditionalContext.push(text);
+}
+
+function flushHookContext(eventName) {
+  if (!hookAdditionalContext.length) return;
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: {
+    hookEventName: eventName,
+    additionalContext: hookAdditionalContext.join('\n'),
+  } }));
+  hookAdditionalContext.length = 0;
+}
 
 function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -517,6 +532,7 @@ function blank(sid) {
                              // max-parallel-agents budget; see lib/parallel-agent-cap.cjs
     backgroundShells: {},   // toolUseId -> { command, started, heartbeat } for Bash
                             // run_in_background launches still awaiting completion notice
+    sessionStartedAt: Date.now(),
     tasks: {},              // taskId -> { owns, ws } — recorded when `task-create` resolves its id
     last_heartbeat: 0,      // epoch ms of the last worker-status poll
     lastCodeAuthor: null,   // author of this session's pending code: 'codex' | 'kimi' |
@@ -552,6 +568,7 @@ function load(sid) {
     if (!s.agentClaims) s.agentClaims = {};
     if (!s.agents) s.agents = {};
     if (!s.backgroundShells) s.backgroundShells = {};
+    if (!Number.isFinite(s.sessionStartedAt)) s.sessionStartedAt = Date.now();
     if (!s.tasks) s.tasks = {};
     if (!Object.prototype.hasOwnProperty.call(s, 'lastCodeAuthor')) s.lastCodeAuthor = null;
     if (!Object.prototype.hasOwnProperty.call(s, 'lastCodeAuthorAt')) s.lastCodeAuthorAt = 0;
@@ -1217,7 +1234,18 @@ function activeOverrideLines(cfg, s) {
 }
 
 function onSessionStart(p, s, cfg) {
-  if (!fs.existsSync(stateFile(s.session_id))) save(s);
+  const lockDir = path.join(DIR, '.lock');
+  const locked = acquireLock(lockDir, {});
+  if (locked) {
+    try {
+      s = load(p.session_id);
+      s.backgroundShells = {};
+      s.sessionStartedAt = Date.now();
+      save(s);
+    } finally {
+      releaseLock(lockDir);
+    }
+  }
   const review = cfg.models.review.alias;
   const escalation = cfg.models.escalation.alias;
   const lookup = cfg.models.lookup.alias;
@@ -1303,6 +1331,19 @@ function formatBackgroundShellReminder(shells, now = Date.now()) {
     'stop finished/idle ones (TaskStop)';
 }
 
+function pruneBackgroundShells(s, now = Date.now()) {
+  const cutoff = Math.max(now - BACKGROUND_SHELL_TTL_MS,
+    Number.isFinite(s.sessionStartedAt) ? s.sessionStartedAt : 0);
+  let changed = false;
+  for (const [id, shell] of Object.entries(s.backgroundShells || {})) {
+    if (!shell || !Number.isFinite(shell.started) || shell.started < cutoff) {
+      delete s.backgroundShells[id];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function remindBackgroundShells(s) {
   const line = formatBackgroundShellReminder(s.backgroundShells);
   if (line) process.stdout.write(`${line}\n`);
@@ -1317,6 +1358,7 @@ function onUserPromptSubmit(p, s, cfg) {
   const locked = acquireLock(lockDir, {});
   try {
     s = load(p.session_id);
+    if (pruneBackgroundShells(s)) save(s);
     return onUserPromptSubmitLocked(p, s, cfg);
   } finally {
     if (locked) releaseLock(lockDir);
@@ -1662,48 +1704,26 @@ function onPreToolUse(p, s, cfg) {
     const codexInv = orcaInvocations(cmd).find((inv) =>
       inv.sub === 'orchestration worker-start' && flagValue(inv.args, '--agent') === 'codex');
     if (codexInv && !hasFlag(codexInv.args, '--terminal') && !hasFlag(codexInv.args, '--model') && cfg.models.codex.id) {
-      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
-        additionalContext: `orchestrator-gate advice: pin the Codex model explicitly - add --model ${cfg.models.codex.id} ` +
-          'to this worker-start so the fleet cannot silently drift onto a different default.' } }));
+      addHookContext(`orchestrator-gate advice: pin the Codex model explicitly - add --model ${cfg.models.codex.id} ` +
+        'to this worker-start so the fleet cannot silently drift onto a different default.');
     }
     const kimiInv = orcaInvocations(cmd).find((inv) =>
       inv.sub === 'orchestration worker-start' && flagValue(inv.args, '--agent') === 'kimi');
     if (kimiInv && hasFlag(kimiInv.args, '--model')) {
-      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
-        additionalContext: 'orchestrator-gate advice: drop --model for --agent kimi; Kimi uses default_model from ~/.kimi-code/config.toml and Orca cannot pin it.' } }));
+      addHookContext('orchestrator-gate advice: drop --model for --agent kimi; Kimi uses default_model from ~/.kimi-code/config.toml and Orca cannot pin it.');
     }
     const opencodeInv = orcaInvocations(cmd).find((inv) =>
       inv.sub === 'orchestration worker-start' && flagValue(inv.args, '--agent') === 'opencode');
     if (opencodeInv && hasFlag(opencodeInv.args, '--model')) {
-      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
-        additionalContext: 'orchestrator-gate advice: drop --model for --agent opencode; opencode uses the model from ~/.config/opencode/opencode.jsonc and Orca cannot pin it.' } }));
+      addHookContext('orchestrator-gate advice: drop --model for --agent opencode; opencode uses the model from ~/.config/opencode/opencode.jsonc and Orca cannot pin it.');
     }
 
-    if (input.run_in_background) {
-      const toolUseId = p.tool_use_id || p.toolUseId;
-      if (toolUseId) {
-        const lockDir = path.join(DIR, '.lock');
-        try { fs.mkdirSync(DIR, { recursive: true }); } catch {}
-        const locked = acquireLock(lockDir, {});
-        try {
-          if (locked) {
-            const fresh = load(p.session_id);
-            const heartbeat = /(?:^|[\s/])orca-heartbeat\.cjs(?:[\s"']|$)/.test(cmd);
-            if (heartbeat) {
-              const previous = Object.entries(fresh.backgroundShells || {})
-                .filter(([id, shell]) => id !== toolUseId && shell?.heartbeat);
-              if (previous.length) {
-                process.stdout.write(`orchestrator-gate: stop previous heartbeat shell ${previous[0][0]} with TaskStop before starting another; only one heartbeat may run per session.\n`);
-              }
-            }
-            fresh.backgroundShells[toolUseId] = {
-              command: commandHead(cmd), started: Date.now(), heartbeat,
-            };
-            save(fresh);
-          }
-        } finally {
-          if (locked) releaseLock(lockDir);
-        }
+    if (input.run_in_background && /(?:^|[\s/])orca-heartbeat\.cjs(?:[\s"']|$)/.test(cmd)) {
+      const fresh = load(p.session_id);
+      pruneBackgroundShells(fresh);
+      const previous = Object.entries(fresh.backgroundShells || {}).find(([, shell]) => shell?.heartbeat);
+      if (previous) {
+        addHookContext(`orchestrator-gate: stop previous heartbeat shell ${previous[0]} with TaskStop before starting another; only one heartbeat may run per session.`);
       }
     }
   }
@@ -1942,9 +1962,8 @@ function onPreToolUse(p, s, cfg) {
 
     // Light lookups: advise the lookup model (never blocks).
     if (wantsLookup && !new RegExp(escapeRegex(cfg.models.lookup.alias), 'i').test(model) && !isEscalation) {
-      process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
-        additionalContext: `orchestrator-gate advice: this looks like a light lookup (find/locate/read logs/explore). ` +
-          `Prefer model "${cfg.models.lookup.alias}" for such dispatches - cheaper and faster; keep the code model for heavier reading.` } }));
+      addHookContext(`orchestrator-gate advice: this looks like a light lookup (find/locate/read logs/explore). ` +
+        `Prefer model "${cfg.models.lookup.alias}" for such dispatches - cheaper and faster; keep the code model for heavier reading.`);
     }
 
     // max-parallel-agents: re-check + register the slot now, ONLY after every routing/
@@ -2435,6 +2454,16 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
     const out = `${resp.stdout || ''}\n${resp.stderr || ''}`;
     const toolUseId = p.tool_use_id || p.toolUseId || null;
 
+    if (input.run_in_background && toolUseId) {
+      pruneBackgroundShells(s);
+      s.backgroundShells[toolUseId] = {
+        command: commandHead(cmd),
+        started: Date.now(),
+        heartbeat: /(?:^|[\s/])orca-heartbeat\.cjs(?:[\s"']|$)/.test(cmd),
+      };
+      dirty = true;
+    }
+
     // Any orca worker/terminal inspection counts as a heartbeat poll.
     if (/\borca\b/.test(cmd) && /(worker-list|worker-read|worker-show|terminal (list|read|show)|worktree ps|task-list|inbox|check)\b/.test(cmd)) {
       s.last_heartbeat = Date.now();
@@ -2715,8 +2744,6 @@ function unsettledPerOrca(ids) {
 function onStop(p, s, cfg) {
   if (s.bypass || p.stop_hook_active) return;
 
-  remindBackgroundShells(s);
-
   // Backstop: sweep every unresolved Bash reservation and FOREGROUND (`background: false`)
   // `s.agents` registration at every Stop, regardless of whether any Orca worker is live.
   // A later hook may have denied an admitted tool call before it ran, so no PostToolUse
@@ -2852,7 +2879,10 @@ process.stdin.on('end', () => {
   if (process.env.ORCHESTRATOR_GATE === 'off') process.exit(0);
   let p;
   try { p = JSON.parse(raw || '{}'); } catch { process.exit(0); }
-  try { main(p); } catch (err) {
+  try {
+    main(p);
+    flushHookContext(p.hook_event_name);
+  } catch (err) {
     process.stderr.write(`[orchestrator-gate] internal error, allowing: ${err.message}\n`);
     process.exit(0);
   }
@@ -2864,5 +2894,5 @@ module.exports = {
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
   hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds,
   isPlanningReview, hasReviewEscalationReason, hasVerifyEscalationReason, classifyDispatch,
-  commandHead, formatAge, formatBackgroundShellReminder,
+  commandHead, formatAge, formatBackgroundShellReminder, pruneBackgroundShells,
 };

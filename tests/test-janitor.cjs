@@ -187,32 +187,62 @@ const gateEnv = {
 function invokeGate(payload) {
   return spawnSync(process.execPath, [GATE], { input: JSON.stringify(payload), encoding: 'utf8', env: gateEnv });
 }
+function hookContext(result) {
+  try { return JSON.parse(result.stdout).hookSpecificOutput?.additionalContext || ''; } catch { return ''; }
+}
 const shellSession = 'janitor-shell-e2e';
 for (let n = 1; n <= 4; n += 1) {
-  const result = invokeGate({
+  const payload = {
     hook_event_name: 'PreToolUse', session_id: shellSession, tool_name: 'Bash',
     tool_use_id: `toolu_shell_${n}`, cwd: gateDir,
     tool_input: { command: `sleep ${n}`, run_in_background: true },
-  });
+  };
+  const result = invokeGate(payload);
   check(`background shell ${n} is admitted`, result.status, 0);
+  if (n === 1) {
+    const preStatePath = path.join(gateEnv.ORCH_STATE_DIR, `${shellSession}.json`);
+    const preState = fs.existsSync(preStatePath) ? JSON.parse(fs.readFileSync(preStatePath, 'utf8')) : {};
+    check('PreToolUse does not record an unconfirmed background launch',
+      !!preState.backgroundShells?.toolu_shell_1, false);
+  }
+  invokeGate({ ...payload, hook_event_name: 'PostToolUse', tool_response: { status: 'async_launched' } });
 }
 const reminder = invokeGate({ hook_event_name: 'UserPromptSubmit', session_id: shellSession, prompt: 'continue' });
 check('the fourth tracked background shell triggers the live gate reminder',
   /4 background shells running .*TaskStop/.test(reminder.stdout), true);
+const stopReminder = invokeGate({ hook_event_name: 'Stop', session_id: shellSession, stop_hook_active: false });
+check('Stop does not emit an invisible background-shell reminder',
+  /background shells running/.test(stopReminder.stdout), false);
 const completion = invokeGate({ hook_event_name: 'UserPromptSubmit', session_id: shellSession,
   prompt: '<task-notification><tool-use-id>toolu_shell_1</tool-use-id><status>completed</status></task-notification>' });
 check('a matching completion notice drops the count back below the reminder threshold',
   /background shells running/.test(completion.stdout), false);
 
+const staleStatePath = path.join(gateEnv.ORCH_STATE_DIR, `${shellSession}.json`);
+const staleState = JSON.parse(fs.readFileSync(staleStatePath, 'utf8'));
+staleState.backgroundShells.toolu_stale = {
+  command: 'sleep forever', started: Date.now() - 7 * 60 * 60 * 1000, heartbeat: false,
+};
+fs.writeFileSync(staleStatePath, JSON.stringify(staleState));
+const staleReminder = invokeGate({ hook_event_name: 'UserPromptSubmit', session_id: shellSession, prompt: 'continue' });
+check('background shell entries expire after six hours', /sleep forever/.test(staleReminder.stdout), false);
+
 const heartbeatCommand = `${process.execPath} ${path.join(__dirname, '..', 'hooks', 'orca-heartbeat.cjs')}`;
-invokeGate({ hook_event_name: 'PreToolUse', session_id: shellSession, tool_name: 'Bash',
+const firstHeartbeatPayload = { hook_event_name: 'PreToolUse', session_id: shellSession, tool_name: 'Bash',
   tool_use_id: 'toolu_heartbeat_1', cwd: gateDir,
-  tool_input: { command: heartbeatCommand, run_in_background: true } });
+  tool_input: { command: heartbeatCommand, run_in_background: true } };
+invokeGate(firstHeartbeatPayload);
+invokeGate({ ...firstHeartbeatPayload, hook_event_name: 'PostToolUse', tool_response: { status: 'async_launched' } });
 const secondHeartbeat = invokeGate({ hook_event_name: 'PreToolUse', session_id: shellSession, tool_name: 'Bash',
   tool_use_id: 'toolu_heartbeat_2', cwd: gateDir,
   tool_input: { command: heartbeatCommand, run_in_background: true } });
-check('starting a second heartbeat identifies the previous shell for TaskStop',
-  /stop previous heartbeat shell toolu_heartbeat_1 with TaskStop/.test(secondHeartbeat.stdout), true);
+check('starting a second heartbeat identifies the previous shell in parsed hook context',
+  /stop previous heartbeat shell toolu_heartbeat_1 with TaskStop/.test(hookContext(secondHeartbeat)), true);
+
+invokeGate({ hook_event_name: 'SessionStart', session_id: shellSession, source: 'resume' });
+const afterSessionStart = invokeGate({ hook_event_name: 'UserPromptSubmit', session_id: shellSession, prompt: 'continue' });
+check('SessionStart clears background shell tracking from the previous process',
+  /background shells running/.test(afterSessionStart.stdout), false);
 
 fs.rmSync(ROOT, { recursive: true, force: true });
 console.log(`${passed} passed, ${failures.length} failed`);
