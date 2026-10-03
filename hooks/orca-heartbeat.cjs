@@ -76,9 +76,12 @@ const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
+const GH_BIN = process.env.ORCH_GH_BIN || 'gh';
 // Overridable the same way ORCA_BIN is (tests point this at a deterministic stub); a bare
 // "git" resolves against PATH exactly like the bare "orca" default does.
 const GIT_BIN = process.env.ORCH_GIT_BIN || 'git';
+const GH_PR_CACHE_FILE = path.join(DIR, 'github-pr-cache.json');
+const GH_PR_CACHE_MS = 10 * 60 * 1000;
 const RESUME_SCHEDULER = path.join(__dirname, 'orca-resume-scheduler.cjs');
 const DONE_PR_STATES = new Set(['merged', 'closed']);
 // GitLab's MR state vocabulary uses "opened"/"merged"/"closed"/"locked" where GitHub's PR
@@ -1037,6 +1040,76 @@ function runGit(args, cwd) {
   }
 }
 
+function runGh(args, cwd) {
+  try {
+    const r = spawnSync(GH_BIN, args, { cwd, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 });
+    if (r.error || r.status !== 0) return null;
+    return { status: r.status, stdout: (r.stdout || '').trim() };
+  } catch {
+    return null;
+  }
+}
+
+let githubPrCache = null;
+
+function loadGithubPrCache() {
+  if (githubPrCache) return githubPrCache;
+  try {
+    const value = JSON.parse(fs.readFileSync(GH_PR_CACHE_FILE, 'utf8'));
+    githubPrCache = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    githubPrCache = {};
+  }
+  return githubPrCache;
+}
+
+function saveGithubPrCache(cache) {
+  try {
+    fs.mkdirSync(path.dirname(GH_PR_CACHE_FILE), { recursive: true });
+    const tmp = `${GH_PR_CACHE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cache));
+    fs.renameSync(tmp, GH_PR_CACHE_FILE);
+  } catch {}
+}
+
+function githubRepoSlug(origin) {
+  const value = String(origin || '').trim().replace(/\.git$/, '');
+  let match = value.match(/^git@github\.com:([^/]+\/[^/]+)$/i);
+  if (match) return match[1];
+  match = value.match(/^(?:https?|ssh):\/\/(?:git@)?github\.com\/([^/]+\/[^/]+)$/i);
+  return match ? match[1] : null;
+}
+
+/** GitHub PR acceptance for a branch that Orca did not link to a PR. A successful query is
+ * cached across daemon/janitor processes for ten minutes. Missing/unauthenticated gh, a
+ * non-GitHub origin, detached HEAD, malformed output, and timeouts all return null so the
+ * caller retains the pre-existing Git-only acceptance rules. */
+function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
+  const origin = git(['remote', 'get-url', 'origin'], w.path);
+  const branch = git(['branch', '--show-current'], w.path);
+  if (!origin || origin.status !== 0 || !branch || branch.status !== 0 || !branch.stdout) return null;
+  const repo = githubRepoSlug(origin.stdout);
+  if (!repo) return null;
+  const key = `${repo}#${branch.stdout}`;
+  const now = ctx.now != null ? ctx.now : Date.now();
+  const cache = ctx.cache || loadGithubPrCache();
+  const cached = cache[key];
+  if (cached && Number.isFinite(cached.at) && now - cached.at < GH_PR_CACHE_MS) return cached.verdict;
+  const reply = gh(['pr', 'list', '--repo', repo, '--head', branch.stdout, '--state', 'all', '--json', 'state'], w.path);
+  if (!reply) return null;
+  let rows;
+  try { rows = JSON.parse(reply.stdout || '[]'); } catch { return null; }
+  if (!Array.isArray(rows)) return null;
+  const states = rows.map((row) => String(row && row.state || '').toUpperCase());
+  const verdict = states.includes('OPEN') ? { accepted: false, open: true, reason: null }
+    : states.some((state) => state === 'MERGED' || state === 'CLOSED')
+      ? { accepted: true, open: false, reason: `GitHub PR ${states.includes('MERGED') ? 'MERGED' : 'CLOSED'}` }
+      : { accepted: false, open: false, reason: null };
+  cache[key] = { at: now, verdict };
+  if (!ctx.cache) saveGithubPrCache(cache);
+  return verdict;
+}
+
 /**
  * The worktree's upstream default branch (e.g. "origin/main"), resolved from
  * `refs/remotes/origin/HEAD`, falling back to `origin/main` then `main`. Never runs
@@ -1146,7 +1219,7 @@ function hasOwnCommit(w, git) {
  * merged/closed state is already external evidence real work happened, so H1's extra checks do
  * not apply there. Returns `{ accepted, reason }` so a caller can name which path fired.
  */
-function resolveAcceptance(w, git, stat) {
+function resolveAcceptance(w, git, stat, ctx = {}) {
   if (w.prState != null) {
     return DONE_PR_STATES.has(w.prState)
       ? { accepted: true, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}` }
@@ -1158,6 +1231,9 @@ function resolveAcceptance(w, git, stat) {
       ? { accepted: true, reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}` }
       : { accepted: false, reason: null };
   }
+  const github = resolveGithubAcceptance(w, git, ctx.gh || runGh, ctx);
+  if (github?.open) return { accepted: false, reason: null };
+  if (github?.accepted) return { accepted: true, reason: github.reason };
   const base = resolveBaseRef(w.path, git);
   if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: null };
   if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: null };
@@ -1415,7 +1491,7 @@ function evaluateDoneButOpen(w, ctx = {}) {
   const git = ctx.git || runGit;
   const stat = ctx.stat || statMtimeMs;
   if (!isWorktreeIdle(w, now, idleSeconds)) return { done: false, reason: null };
-  const { accepted, reason } = resolveAcceptance(w, git, stat);
+  const { accepted, reason } = resolveAcceptance(w, git, stat, ctx);
   if (!accepted) return { done: false, reason: null };
   if (!isWorktreeClean(w, git)) return { done: false, reason: null };
   return { done: true, reason };
@@ -2238,7 +2314,8 @@ module.exports = {
   classifyTerminal, isHoldingResources, snapshotWorkers, sessionTerminalHandles,
   workerWorktreePaths, worktreeKeys, sessionWorktreeKeys, retainedTerminalHandles,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
-  resolveAcceptance, isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
+  resolveAcceptance, resolveGithubAcceptance, githubRepoSlug, runGh,
+  isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
   machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
