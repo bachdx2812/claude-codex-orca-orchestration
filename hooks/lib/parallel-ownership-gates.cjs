@@ -172,8 +172,18 @@ function fetchOrcaWorkerRows(orcaBin) {
 }
 
 const DONE = /^(succeeded|failed|stopped|cancelled|canceled|completed)$/i;
+const UNSUPERVISED = /^unsupervised$/i;
 
 function rowIsTerminal(row) {
+  const workerState = String(row && row.workerState || '');
+  const dispatchStatus = String(row && row.dispatchStatus || '');
+  const hasTerminalStatus = DONE.test(workerState) || DONE.test(dispatchStatus);
+  const hasNonTerminalStatus = [workerState, dispatchStatus]
+    .some((value) => value && !DONE.test(value) && !UNSUPERVISED.test(value));
+  return hasTerminalStatus && !hasNonTerminalStatus;
+}
+
+function rowHasTerminalStatus(row) {
   return DONE.test(String(row && row.workerState || '')) ||
     DONE.test(String(row && row.dispatchStatus || ''));
 }
@@ -288,7 +298,7 @@ function applyOrcaReconciliation(s, rows, exhaustive = true, terminalHandles = n
     if (groupRows.length) {
       if (groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles))) {
         if (WG.settleGroup(s.workers, group)) changed = true;
-      } else if (groupRows.every(rowIsTerminal)) {
+      } else if (groupRows.every(rowHasTerminalStatus)) {
         for (const [key, w] of Object.entries(s.workers || {})) {
           if (w.status === 'live' && WG.groupOf(w, key) === group && !w.capExempt) {
             w.capExempt = true;

@@ -184,6 +184,18 @@ const terminalRow = (overrides = {}) => ({
     GATES.rowReportsReconciled(row, [row], new Set()) === false);
 }
 {
+  const row = terminalRow({ workerState: 'running', dispatchStatus: 'failed' });
+  const s = { workers: {
+    ctx_terminal: { status: 'live', group: 'ctx_terminal', started: Date.now() },
+    task_terminal: { status: 'live', group: 'ctx_terminal', started: Date.now() },
+  } };
+  const changed = GATES.applyOrcaReconciliation(s, [row], true, new Set());
+  check('disagreeing running/failed statuses never settle the group',
+    GATES.rowReportsReconciled(row, [row], new Set()) === false && changed === true &&
+      s.workers.ctx_terminal.status === 'live' && s.workers.task_terminal.status === 'live' &&
+      s.workers.ctx_terminal.capExempt === true && s.workers.task_terminal.capExempt === true);
+}
+{
   const row = terminalRow({ workerState: 'succeeded', dispatchStatus: 'completed',
     resource: { id: 'resource_live', retainedReason: 'user_requested' } });
   check('user-requested retained row with a live terminal remains unreconciled',

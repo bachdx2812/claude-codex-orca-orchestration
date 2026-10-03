@@ -1628,6 +1628,28 @@ rmState(`${SID}-hard-off`);
     rmState(sid);
   }
 
+  // Status fields can race during transitions. A terminal dispatch status never overrides
+  // an explicitly running worker state for settlement.
+  {
+    const sid = `${SID}-disagreeing-statuses`;
+    rmState(sid);
+    seed(sid, {
+      ctx_resource_old: workerEntry('ctx_resource_old'),
+      task_resource_old: workerEntry('ctx_resource_old'),
+      term_resource: workerEntry('ctx_resource_old', Date.now(), { kind: 'terminal' }),
+    });
+    const running = row({ workerState: 'running', dispatchStatus: 'failed' });
+    const result = invoke(stop(sid), { ...env, STUB_WORKERS_JSON: JSON.stringify([running]),
+      STUB_TERMINALS_JSON: '[]' });
+    const state = readState(sid);
+    checkBool('terminal reconcile: running worker with failed dispatch status remains live',
+      result.code === DENY && /workers-unwatched/.test(result.err) &&
+        state.workers.ctx_resource_old.status === 'live' &&
+        state.workers.task_resource_old.status === 'live' &&
+        state.workers.term_resource.status === 'live', true);
+    rmState(sid);
+  }
+
   // A user-requested retained terminal remains available for reuse after successful work.
   {
     const sid = `${SID}-user-retained-live`;
