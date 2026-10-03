@@ -515,6 +515,8 @@ function blank(sid) {
     agents: {},             // toolUseId -> { ts, background, type, model } — EVERY main-panel
                              // Agent/Task dispatch (not only code briefs), for the machine-wide
                              // max-parallel-agents budget; see lib/parallel-agent-cap.cjs
+    backgroundShells: {},   // toolUseId -> { command, started, heartbeat } for Bash
+                            // run_in_background launches still awaiting completion notice
     tasks: {},              // taskId -> { owns, ws } — recorded when `task-create` resolves its id
     last_heartbeat: 0,      // epoch ms of the last worker-status poll
     lastCodeAuthor: null,   // author of this session's pending code: 'codex' | 'kimi' |
@@ -549,6 +551,7 @@ function load(sid) {
     if (!s.reservations) s.reservations = {};
     if (!s.agentClaims) s.agentClaims = {};
     if (!s.agents) s.agents = {};
+    if (!s.backgroundShells) s.backgroundShells = {};
     if (!s.tasks) s.tasks = {};
     if (!Object.prototype.hasOwnProperty.call(s, 'lastCodeAuthor')) s.lastCodeAuthor = null;
     if (!Object.prototype.hasOwnProperty.call(s, 'lastCodeAuthorAt')) s.lastCodeAuthorAt = 0;
@@ -1280,6 +1283,31 @@ function isNonOperatorTurn(prompt) {
 // A flag counts only as a standalone token, not inside backticks or a longer word.
 const operatorFlag = (prompt, flag) => new RegExp(`(^|\\s)${flag}(?=\\s|$)`, 'i').test(prompt);
 
+function commandHead(command) {
+  return String(command || '').trim().split(/\r?\n/, 1)[0].replace(/\s+/g, ' ').slice(0, 100) || '(empty command)';
+}
+
+function formatAge(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.round(minutes / 60)}h`;
+}
+
+function formatBackgroundShellReminder(shells, now = Date.now()) {
+  const running = Object.values(shells || {}).filter((shell) => shell && Number.isFinite(shell.started));
+  if (running.length <= 3) return null;
+  const oldest = running.reduce((a, b) => a.started <= b.started ? a : b);
+  return `${running.length} background shells running (oldest: ${oldest.command}, ${formatAge(now - oldest.started)}) - ` +
+    'stop finished/idle ones (TaskStop)';
+}
+
+function remindBackgroundShells(s) {
+  const line = formatBackgroundShellReminder(s.backgroundShells);
+  if (line) process.stdout.write(`${line}\n`);
+}
+
 function onUserPromptSubmit(p, s, cfg) {
   maybeReconcilePendingPlaceholders(p.session_id);
   // CRITICAL: reload fresh under the lock, same reasoning as onPostToolUse — this handler
@@ -1313,9 +1341,11 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     for (const m of raw.matchAll(/<tool-use-id>\s*(toolu_[A-Za-z0-9_-]+|agent_[A-Za-z0-9_-]+)\s*<\/tool-use-id>/gi)) {
       if (s.agentClaims[m[1]]) { delete s.agentClaims[m[1]]; releasedAny = true; }
       if (s.agents && s.agents[m[1]]) { delete s.agents[m[1]]; releasedAny = true; }
+      if (s.backgroundShells && s.backgroundShells[m[1]]) { delete s.backgroundShells[m[1]]; releasedAny = true; }
     }
     if (releasedAny) save(s);
   }
+  remindBackgroundShells(s);
 
   // Backstop: sweep leaked FOREGROUND (`background: false`) `s.agents` registrations on
   // every genuine operator turn. Bash reservations are deliberately NOT swept here: a Bash
@@ -1648,6 +1678,33 @@ function onPreToolUse(p, s, cfg) {
       process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse',
         additionalContext: 'orchestrator-gate advice: drop --model for --agent opencode; opencode uses the model from ~/.config/opencode/opencode.jsonc and Orca cannot pin it.' } }));
     }
+
+    if (input.run_in_background) {
+      const toolUseId = p.tool_use_id || p.toolUseId;
+      if (toolUseId) {
+        const lockDir = path.join(DIR, '.lock');
+        const locked = acquireLock(lockDir, {});
+        try {
+          if (locked) {
+            const fresh = load(p.session_id);
+            const heartbeat = /(?:^|[\s/])orca-heartbeat\.cjs(?:[\s"']|$)/.test(cmd);
+            if (heartbeat) {
+              const previous = Object.entries(fresh.backgroundShells || {})
+                .filter(([id, shell]) => id !== toolUseId && shell?.heartbeat);
+              if (previous.length) {
+                process.stdout.write(`orchestrator-gate: stop previous heartbeat shell ${previous[0][0]} with TaskStop before starting another; only one heartbeat may run per session.\n`);
+              }
+            }
+            fresh.backgroundShells[toolUseId] = {
+              command: commandHead(cmd), started: Date.now(), heartbeat,
+            };
+            save(fresh);
+          }
+        } finally {
+          if (locked) releaseLock(lockDir);
+        }
+      }
+    }
   }
 
   // Gate: max-parallel-agents — EARLY, READ-ONLY fast-fail. A MACHINE-wide budget (this
@@ -1965,6 +2022,7 @@ function dropFailedToolState(s, toolUseId) {
   }
   if (s.agentClaims[toolUseId]) { delete s.agentClaims[toolUseId]; dirty = true; }
   if (s.agents && s.agents[toolUseId]) { delete s.agents[toolUseId]; dirty = true; }
+  if (s.backgroundShells && s.backgroundShells[toolUseId]) { delete s.backgroundShells[toolUseId]; dirty = true; }
   return dirty;
 }
 
@@ -2230,6 +2288,10 @@ function onPostToolUseFailure(p, s, cfg) {
     s = load(p.session_id);
     const toolUseId = p.tool_use_id || p.toolUseId;
     let dirty = false;
+    if (toolUseId && s.backgroundShells && s.backgroundShells[toolUseId]) {
+      delete s.backgroundShells[toolUseId];
+      dirty = true;
+    }
     if (p.tool_name === 'Bash') {
       const cmd = String((p.tool_input && p.tool_input.command) || '');
       // A worker-stop/-release/-abandon whose command exited non-zero can still carry a
@@ -2652,6 +2714,8 @@ function unsettledPerOrca(ids) {
 function onStop(p, s, cfg) {
   if (s.bypass || p.stop_hook_active) return;
 
+  remindBackgroundShells(s);
+
   // Backstop: sweep every unresolved Bash reservation and FOREGROUND (`background: false`)
   // `s.agents` registration at every Stop, regardless of whether any Orca worker is live.
   // A later hook may have denied an admitted tool call before it ran, so no PostToolUse
@@ -2799,4 +2863,5 @@ module.exports = {
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
   hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds,
   isPlanningReview, hasReviewEscalationReason, hasVerifyEscalationReason, classifyDispatch,
+  commandHead, formatAge, formatBackgroundShellReminder,
 };
