@@ -382,6 +382,16 @@ brief in a shared workspace declares the files it will touch**
 on its own line) **and a claim that overlaps another live one is refused**
 (`ownership-overlap`, naming the holder and its age).
 
+A terminal worker is already reconciled when it is in a terminal worker/dispatch state and
+Orca reports any conclusive resource-detachment signal: `terminalState` is `released` or
+`closed`, top-level or `resource.retainedReason` is `no_owned_resource`, its `agentTerminalHandle` is
+absent from a successful `orca terminal list`, or that handle now belongs to a different,
+newer dispatch. Stop, heartbeat ownership cleanup, and at-cap reconciliation use this same
+rule. A running row never settles from one of these signals. A completed
+`user_requested` retain whose terminal is still live remains available for reuse, while a
+successful `worker-release` or `worker-abandon` reply settles its tracked group immediately
+without waiting for worker-list to change.
+
 Prefer `--worktree new-child` (Orca) or Agent `isolation:"worktree"` for genuinely
 parallel workers: isolated work needs no `Owns:` at all and can never conflict with
 anything, since each isolated dispatch gets a unique workspace key — narrowing an `Owns:`

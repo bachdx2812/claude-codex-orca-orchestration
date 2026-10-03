@@ -2850,13 +2850,13 @@ function onStop(p, s, cfg) {
   const ids = trackable.map(([k]) => k);
   const confirmed = trackable.length ? unsettledPerOrca(ids, fetched) : [];
 
-  // Orca is the authority for trackable ids. If it says every one of ours is released,
+  // Orca is the authority for trackable ids. If it says every one of ours is reconciled,
   // the session's own bookkeeping was simply stale - settle those (never the pending
   // ones) and, if nothing pending remains either, let the panel go. The `unsettledPerOrca`
-  // network round trip above deliberately runs OUTSIDE any lock (it can take up to 15s, and
+  // network round trip above deliberately runs OUTSIDE any lock (it can take up to 5s, and
   // holding the lock that long would stall every other concurrent hook process); this
   // mutation is the only state write onStop performs, so it alone is what needs the
-  // acquire-lock -> reload-fresh -> mutate -> save discipline (item 1).
+  // acquire-lock -> reload-fresh -> mutate -> save discipline.
   if (confirmed && confirmed.length === 0) {
     const lockDir = path.join(DIR, '.lock');
     const locked = acquireLock(lockDir, {});

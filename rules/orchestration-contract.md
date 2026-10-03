@@ -604,6 +604,24 @@ and needs no heartbeat at `Stop`. Orca's automatic
 `terminalState: retained` on a readiness failure does not get this exemption unless this
 session recorded an explicit `worker-retain`. Release the worker when it is no longer needed.
 
+The retain-or-release gate tracks owned resources, not stale historical rows. Stop, the
+heartbeat's group cleanup, ownership-overlap reconciliation, and every at-cap reconcile
+settle a tracked worker group when every matching Orca row is terminal
+(`workerState` or `dispatchStatus` is succeeded, failed, stopped, cancelled, or completed)
+and any of these is true:
+
+- `terminalState` is `released` or `closed`;
+- top-level or `resource.retainedReason` is `no_owned_resource`;
+- a successful `orca terminal list --json` does not contain its `agentTerminalHandle`; or
+- the newest-first worker list contains a different, newer dispatch with that same handle.
+
+The last rule settles the old dispatch group while leaving the newer dispatch live and
+subject to normal heartbeat/Stop enforcement. A non-terminal row never settles through
+these resource signals, even if it temporarily reports `no_owned_resource`. A succeeded or
+completed `user_requested` retain with a still-live terminal keeps the existing reuse
+behavior. An `ok: true` reply from `worker-release` or `worker-abandon` settles the matching
+tracked group immediately; a structured `ok: false` reply does not.
+
 Codex connection-lost/reconnect-failed messages are terminal even when the TUI keeps
 repainting. The heartbeat reports that terminal as `WORKER STUCK` once per session,
 persisted across daemon restarts; release and re-dispatch it because uncommitted work may
@@ -881,9 +899,10 @@ under the cap never pays that round trip, and that round trip itself runs OUTSID
 lock (acquired again only to recheck and reserve afterward), so an at-cap session never
 blocks every other concurrent hook process for its full duration. A worker Orca reports
 done (`workerState`/`dispatchStatus` succeeded/failed/stopped/cancelled/completed) but
-still holding its terminal (`terminalState` not `released`) is cap-exempt — it frees capacity
-without being settled, since settling it here would make the still-unreleased terminal
-invisible to the `workers-unreconciled` Stop gate. A race between two parallel `Bash` calls
+still holding a live, owned terminal is cap-exempt — it frees capacity without being
+settled, since settling it here would make the still-owned terminal invisible to the
+`workers-unreconciled` Stop gate. Terminal rows already detached by the shared reconciliation
+rule above are settled instead. A race between two parallel `Bash` calls
 is closed by a file lock around "reload the state fresh from disk under the lock, then
 count, then reserve, then save" — every process that races this section reads the
 PREVIOUS winner's just-saved reservation, not a stale pre-lock snapshot, so the losing
@@ -932,10 +951,11 @@ somehow survives: every genuine operator `UserPromptSubmit` (never an injected
 notification/reminder), and every `Stop`.
 
 At capacity, before refusing, the gate reconciles the CALLER's OWN session's Orca-tracked
-workers against a fresh `orca orchestration worker-list --json` (the same out-of-lock-fetch
-+ locked-reapply pattern the Codex-only cap's own at-cap reconcile uses) and re-counts — a
-worker this session's bookkeeping still shows live, but that Orca has already confirmed
-released or done, would otherwise refuse a dispatch that could actually proceed right now.
+workers against fresh `orca orchestration worker-list --json` and `orca terminal list
+--json` results (the same out-of-lock-fetch + locked-reapply pattern the Codex-only cap's own
+at-cap reconcile uses) and re-counts — a worker this session's bookkeeping still shows live,
+but that Orca has confirmed released, resource-less, closed, or superseded by a newer
+dispatch on the same terminal, would otherwise refuse a dispatch that could proceed now.
 This runs for the `Agent`/`Task`, `worker-start`, and `terminal create` paths alike. If the
 state-file lock itself cannot be acquired at all (contended by many concurrent dispatches —
 exactly the condition this cap exists to catch), the check refuses with a distinct,

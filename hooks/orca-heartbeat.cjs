@@ -834,7 +834,7 @@ function loadSessionState() {
 }
 
 /**
- * Settle this session's gate-state groups that Orca's worker-list reports released. A
+ * Settle this session's gate-state groups that Orca reports detached from their resources. A
  * worker stopped/released whose release reply was non-ok never settles in the gate's own
  * PostToolUse bookkeeping, so its group stays `live` and keeps holding its Owns: claim
  * forever — the heartbeat already polls the list, so it reconciles what it sees. Runs under
@@ -848,11 +848,11 @@ function settleOrcaReleasedSessionGroups(workerRows, terminalRows = null) {
   try {
     const state = loadSessionState();
     // Same rule the gate's ownership-overlap path uses: a group settles only when EVERY
-    // worker-list row matching one of its live keys reports released — never on a single
-    // released row (a --retry-of / re-dispatched group can carry an old released row while
+    // worker-list row matching one of its live keys reports reconciled — never on a single
+    // detached row (a --retry-of / re-dispatched group can carry an old terminal row while
     // its newer dispatch, sharing the task id, is still live; the list is newest-first and
-    // `every()` keeps the live row decisive). No absent leg here: the heartbeat only
-    // settles on positive released evidence, never on a row being missing.
+    // `every()` keeps the live row decisive). No absent worker-row leg here: the heartbeat
+    // only settles on positive detachment evidence, never merely because a row is missing.
     const groups = new Set();
     for (const [key, w] of Object.entries(state.workers || {})) {
       if (w && w.status === 'live') groups.add(WG.groupOf(w, key));

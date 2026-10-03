@@ -257,8 +257,9 @@ function applyOwnershipHolderReconciliation(
 }
 
 /**
- * Pure apply: mutates `s.workers` in place against already-fetched Orca rows — dropping rows
- * Orca reports released, marking a done-but-still-terminal-held row cap-exempt (see below),
+ * Pure apply: mutates `s.workers` in place against already-fetched Orca rows — settling
+ * terminal groups conclusively detached from their resources, marking a done-but-still-
+ * terminal-held row cap-exempt (see below),
  * and — only when `exhaustive` is not false (the fetched list was the whole list, all pages
  * followed) — dropping an id Orca never mentions at all once it is older than 10 minutes (a
  * very recent dispatch Orca simply hasn't listed yet is kept). Must only be called while the
