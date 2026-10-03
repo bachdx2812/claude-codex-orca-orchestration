@@ -1044,10 +1044,16 @@ function runGit(args, cwd) {
 function runGh(args, cwd) {
   try {
     const r = spawnSync(GH_BIN, args, { cwd, encoding: 'utf8', timeout: 5000, maxBuffer: 1024 * 1024 });
-    if (r.error || r.status !== 0) return null;
+    // A machine without gh keeps the historical Git-only fallback. Once gh exists, however,
+    // a timeout, signal, auth error, or other non-zero result is uncertainty and must keep a
+    // GitHub worktree rather than silently dropping the open-PR veto.
+    if (r.error?.code === 'ENOENT') return null;
+    if (r.error || r.status === null || r.status === undefined || r.status !== 0) {
+      return { uncertain: true };
+    }
     return { status: r.status, stdout: (r.stdout || '').trim() };
   } catch {
-    return null;
+    return { uncertain: true };
   }
 }
 
@@ -1081,9 +1087,9 @@ function githubRepoSlug(origin) {
 
 /** GitHub PR state for a branch, including branches that Orca linked to a PR. An accepted
  * verdict is cached across daemon/janitor processes for at most two minutes; open/none
- * verdicts use the longer ten-minute cache. Missing/unauthenticated gh, a
- * non-GitHub origin, detached HEAD, malformed output, and timeouts all return null so the
- * caller retains the pre-existing Git-only acceptance rules. */
+ * verdicts use the longer ten-minute cache. A missing gh binary returns null so the caller
+ * retains the pre-existing Git-only acceptance rules. For a GitHub origin, every other gh
+ * failure or malformed answer is uncertain and keeps the worktree. */
 function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const origin = git(['remote', 'get-url', 'origin'], w.path);
   const branch = git(['branch', '--show-current'], w.path);
@@ -1102,9 +1108,16 @@ function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const reply = gh(['pr', 'list', '--repo', repo, '--head', branch.stdout, '--state', 'all',
     '--limit', '100', '--json', 'state,headRefOid'], w.path);
   if (!reply) return null;
+  if (reply.uncertain || reply.status !== 0) {
+    return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
+  }
   let rows;
-  try { rows = JSON.parse(reply.stdout || '[]'); } catch { return null; }
-  if (!Array.isArray(rows)) return null;
+  try { rows = JSON.parse(reply.stdout || '[]'); } catch {
+    return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
+  }
+  if (!Array.isArray(rows)) {
+    return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
+  }
   const states = rows.map((row) => String(row && row.state || '').toUpperCase());
   const mergedHeadOids = rows.filter((row) => String(row?.state || '').toUpperCase() === 'MERGED' &&
     typeof row?.headRefOid === 'string' && row.headRefOid).map((row) => row.headRefOid);

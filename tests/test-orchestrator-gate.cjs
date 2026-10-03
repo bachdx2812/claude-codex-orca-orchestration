@@ -421,6 +421,21 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       gh: () => ({ status: 0, stdout: '[{"state":"OPEN","headRefOid":"head123"}]' }),
       cache: {},
     })), false);
+  check('a gh command error on a GitHub origin keeps a linked CLOSED worktree',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'closed' }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ uncertain: true }), cache: {},
+    })), false);
+  check('a gh timeout on a GitHub origin keeps a linked MERGED worktree',
+    heartbeat.isDoneButOpen(mergedIdle, ctx({
+      git: { remote: { status: 0, stdout: 'https://github.com/acme/widgets.git' } },
+      gh: () => ({ uncertain: true }), cache: {},
+    })), false);
+  check('a missing gh binary preserves Git-only acceptance for a linked CLOSED worktree',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'closed' }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => null, cache: {},
+    })), true);
   check('a Git subprocess failure during GitHub lookup fails closed even for a linked merged PR',
     heartbeat.isDoneButOpen(mergedIdle, ctx({ git: { remote: null } })), false);
   {
