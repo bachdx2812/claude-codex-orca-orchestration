@@ -1109,7 +1109,8 @@ function handleTerminalCreateAgentCap(p, s, cfg, cmd, d) {
           if (locked === false) { violation = PAC.LOCK_CONTENTION_MESSAGE; break; }
           fresh = load(s.session_id);
           Object.assign(fresh.reservations, localReservations);
-          if (fetched !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, fetched.rows, fetched.exhaustive);
+          if (fetched !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(
+            fresh, fetched.rows, fetched.exhaustive, fetched.terminalHandles);
           usage = PAC.machineWideLiveUnits(DIR, Date.now(), { currentState: fresh, currentSessionId: fresh.session_id });
         }
         if (usage.total >= limit) {
@@ -1655,7 +1656,8 @@ function reconcileParallelAgentsAtCap(state, sessionId, cfg, lockDir, locked) {
   if (reacquired === null) return { state, violation: null, locked: null };
   if (reacquired === false) return { state, violation: PAC.LOCK_CONTENTION_MESSAGE, locked: false };
   const fresh = load(sessionId);
-  if (fetched !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(fresh, fetched.rows, fetched.exhaustive);
+  if (fetched !== null) PARALLEL_OWNERSHIP.applyOrcaReconciliation(
+    fresh, fetched.rows, fetched.exhaustive, fetched.terminalHandles);
   return { state: fresh, violation: checkParallelAgentCapacity(fresh, cfg), locked: true };
 }
 
@@ -2755,27 +2757,18 @@ function onPostToolUseLocked(p, s, cfg, releaseRows) {
  * Returns null when Orca cannot answer, so the caller can fall back to the
  * session's own record rather than either blocking blindly or waving it through.
  */
-function unsettledPerOrca(ids) {
+function unsettledPerOrca(ids, fetched = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN)) {
   if (!ids.length) return [];
-  try {
-    const out = require('child_process').execFileSync(
-      ORCA_BIN, ['orchestration', 'worker-list', '--json'],
-      { encoding: 'utf8', timeout: 15000, maxBuffer: 32 * 1024 * 1024 }
-    );
-    const parsed = JSON.parse(out);
-    const r = parsed.result ?? parsed;
-    const workers = Array.isArray(r) ? r : r.workers || [];
-    const wanted = new Set(ids);
-    // Only this session's dispatches matter. The machine carries a long backlog
-    // of retained terminals from earlier sessions; blocking on those would make
-    // every future session unstoppable.
-    return workers
-      .filter((w) => wanted.has(w.dispatchId) || wanted.has(w.taskId) || wanted.has(w.agentTerminalHandle))
-      .filter((w) => w.terminalState && w.terminalState !== 'released')
-      .map((w) => `${w.dispatchId} [${w.workerState}/${w.terminalState}]`);
-  } catch {
-    return null;
-  }
+  if (fetched === null) return null;
+  const wanted = new Set(ids);
+  // Only this session's dispatches matter. The machine carries a long backlog
+  // of retained terminals from earlier sessions; blocking on those would make
+  // every future session unstoppable.
+  return fetched.rows
+    .filter((w) => wanted.has(w.dispatchId) || wanted.has(w.taskId) || wanted.has(w.agentTerminalHandle))
+    .filter((w) => !PARALLEL_OWNERSHIP.rowReportsReconciled(
+      w, fetched.rows, fetched.terminalHandles))
+    .map((w) => `${w.dispatchId} [${w.workerState}/${w.terminalState}]`);
 }
 
 function onStop(p, s, cfg) {
@@ -2814,9 +2807,29 @@ function onStop(p, s, cfg) {
     }
   }
 
-  const live = liveWorkers(s);
+  let live = liveWorkers(s);
   if (!live.length) return;
   const d = (gate, reason) => { if (!gateDisabled(cfg, gate)) { logViolation(s, gate, reason); process.stderr.write(reason); process.exit(2); } };
+
+  // Fetch outside the state lock, then reconcile against a freshly reloaded snapshot.
+  // Besides released terminals, this settles terminal rows that explicitly own no
+  // resource, whose terminal has closed, or whose handle belongs to a newer dispatch.
+  // Running rows never satisfy the shared predicate and remain supervised below.
+  const fetched = PARALLEL_OWNERSHIP.fetchOrcaWorkerRows(ORCA_BIN);
+  if (fetched !== null) {
+    const lockDir = path.join(DIR, '.lock');
+    const locked = acquireLock(lockDir, {});
+    try {
+      s = load(p.session_id);
+      const changed = PARALLEL_OWNERSHIP.applyOrcaReconciliation(
+        s, fetched.rows, fetched.exhaustive, fetched.terminalHandles);
+      if (changed) save(s);
+    } finally {
+      if (locked) releaseLock(lockDir);
+    }
+    live = liveWorkers(s);
+    if (!live.length) return;
+  }
 
   // "pending-<ts>" placeholders (a worker-start whose reply carried no dispatch id, see
   // onPostToolUse) are never in Orca's own worker-list by construction - Orca was never
@@ -2828,7 +2841,7 @@ function onStop(p, s, cfg) {
   const trackable = live.filter(([k]) => !k.startsWith('pending-'));
 
   const ids = trackable.map(([k]) => k);
-  const confirmed = trackable.length ? unsettledPerOrca(ids) : [];
+  const confirmed = trackable.length ? unsettledPerOrca(ids, fetched) : [];
 
   // Orca is the authority for trackable ids. If it says every one of ours is released,
   // the session's own bookkeeping was simply stale - settle those (never the pending

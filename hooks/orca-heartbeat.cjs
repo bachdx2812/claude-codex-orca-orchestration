@@ -840,7 +840,7 @@ function loadSessionState() {
  * forever — the heartbeat already polls the list, so it reconciles what it sees. Runs under
  * the same state-file lock the gate uses, and persists only when something changed.
  */
-function settleOrcaReleasedSessionGroups(workerRows) {
+function settleOrcaReleasedSessionGroups(workerRows, terminalRows = null) {
   if (!workerRows || !workerRows.length) return;
   const lockDir = path.join(DIR, '.lock');
   const locked = acquireLock(lockDir, {});
@@ -858,7 +858,8 @@ function settleOrcaReleasedSessionGroups(workerRows) {
       if (w && w.status === 'live') groups.add(WG.groupOf(w, key));
     }
     const changed = GATES.applyOwnershipHolderReconciliation(
-      state, workerRows, [...groups], Date.now(), false);
+      state, workerRows, [...groups], Date.now(), false,
+      terminalRows ? new Set(terminalRows.map((t) => t && t.handle).filter(Boolean)) : null);
     if (changed) {
       try {
         const file = path.join(DIR, `${SESSION}.json`);
@@ -1915,7 +1916,6 @@ function main() {
     const ws = workers();
     beat(started); // item L1: refresh liveness between round trips at a short --interval
     if (ws) {
-      settleOrcaReleasedSessionGroups(ws);
       for (const w of ws) if (w && w.dispatchId && !isDoneRow(w)) everSeenRunningIds.add(w.dispatchId);
       for (const worktreePath of workerWorktreePaths(ws)) ownedWorktreePaths.add(worktreePath);
       for (const handle of sessionTerminalHandles(ws)) ownTerminalHandles.add(handle);
@@ -1943,6 +1943,7 @@ function main() {
     }
 
     const ts = terminals();
+    if (ws) settleOrcaReleasedSessionGroups(ws, ts);
     if (ts) {
       // Re-read gate state each tick so a bare terminal created after daemon startup joins
       // this session's set even though it has no worker-list row.

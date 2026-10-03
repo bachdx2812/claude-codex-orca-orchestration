@@ -141,15 +141,47 @@ function fetchOrcaWorkerRows(orcaBin) {
     rows.push(...(Array.isArray(r) ? r : (r && r.workers) || []));
     const page = (!Array.isArray(r) && r && r.page) || {};
     const hasMore = page.hasMore === true || page.nextCursor != null;
-    if (!hasMore) return { rows, exhaustive: true };
+    if (!hasMore) break;
     if (typeof page.nextCursor !== 'string' || !page.nextCursor || Date.now() >= deadline) {
-      return { rows, exhaustive: false };
+      return { rows, exhaustive: false, terminalHandles: null };
     }
     cursor = page.nextCursor;
   }
+
+  // A terminal worker can outlive its Dispatch row, and a retained row can describe a
+  // handle that has already closed. Fetch the current terminal inventory while the same
+  // bounded reconciliation budget is still active. A failed/malformed terminal-list is
+  // represented as null (unknown), never an empty set: absence may prove a handle closed
+  // only when Orca returned an authoritative terminal array.
+  let terminalHandles = null;
+  if (Date.now() < deadline) {
+    try {
+      const out = require('child_process').execFileSync(
+        orcaBin, ['terminal', 'list', '--json'],
+        { encoding: 'utf8', timeout: Math.max(1, deadline - Date.now()), maxBuffer: 32 * 1024 * 1024 }
+      );
+      const parsed = JSON.parse(out);
+      if (parsed.ok !== false) {
+        const r = parsed.result ?? parsed;
+        const terminals = Array.isArray(r) ? r : (r && Array.isArray(r.terminals) ? r.terminals : null);
+        if (terminals) terminalHandles = new Set(terminals.map((t) => t && t.handle).filter(Boolean));
+      }
+    } catch { /* terminal liveness stays unknown */ }
+  }
+  return { rows, exhaustive: true, terminalHandles };
 }
 
 const DONE = /^(succeeded|failed|stopped|cancelled|canceled|completed)$/i;
+
+function rowIsTerminal(row) {
+  return DONE.test(String(row && row.workerState || '')) ||
+    DONE.test(String(row && row.dispatchStatus || ''));
+}
+
+function rowRetainedReason(row) {
+  if (!row || typeof row !== 'object') return '';
+  return String(row.retainedReason || (row.resource && row.resource.retainedReason) || '').toLowerCase();
+}
 
 // A worker-list row Orca reports as fully released: its terminal is released/closed — either
 // directly, or with the worker itself done (stopped/failed/...) and the terminal released,
@@ -159,6 +191,30 @@ const DONE = /^(succeeded|failed|stopped|cancelled|canceled|completed)$/i;
 function rowReportsReleased(row) {
   const terminalState = String(row.terminalState || '').toLowerCase();
   return terminalState === 'released' || terminalState === 'closed';
+}
+
+/**
+ * True when a terminal worker row is conclusively detached from its tracked resource.
+ * `rows` are newest-first (Orca's worker-list contract), so an earlier row with the same
+ * handle and a different dispatch proves the terminal was re-dispatched. `terminalHandles`
+ * is null when terminal-list was unavailable; only an authoritative Set may prove absence.
+ * A non-terminal worker never reconciles through these resource signals, including a
+ * malformed/racing row that says `no_owned_resource` while still running.
+ */
+function rowReportsReconciled(row, rows = [], terminalHandles = null) {
+  if (!rowIsTerminal(row)) return false;
+  if (rowReportsReleased(row)) return true;
+  if (rowRetainedReason(row) === 'no_owned_resource') return true;
+
+  const handle = row && row.agentTerminalHandle;
+  if (!handle) return false;
+  if (terminalHandles instanceof Set && !terminalHandles.has(handle)) return true;
+
+  const index = rows.indexOf(row);
+  if (index <= 0) return false;
+  return rows.slice(0, index).some((newer) =>
+    newer && newer.agentTerminalHandle === handle && newer.dispatchId && row.dispatchId &&
+    newer.dispatchId !== row.dispatchId);
 }
 
 /**
@@ -175,7 +231,9 @@ function rowReportsReleased(row) {
  * `applyOrcaReconciliation`: only against a freshly reloaded state under the held lock.
  * Returns true when anything changed.
  */
-function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now(), exhaustive = true) {
+function applyOwnershipHolderReconciliation(
+  s, rows, groupIds, now = Date.now(), exhaustive = true, terminalHandles = null
+) {
   let changed = false;
   const tenMinAgo = now - 10 * 60 * 1000;
   for (const group of groupIds || []) {
@@ -185,7 +243,8 @@ function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now(),
     const groupRows = (rows || []).filter((row) =>
       keys.includes(row.dispatchId) || keys.includes(row.taskId) || keys.includes(row.agentTerminalHandle));
     if (groupRows.length > 0) {
-      if (groupRows.every(rowReportsReleased) && WG.settleGroup(s.workers, group)) changed = true;
+      if (groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles)) &&
+          WG.settleGroup(s.workers, group)) changed = true;
       continue;
     }
     const oldest = Math.min(...keys.map((k) => {
@@ -208,33 +267,42 @@ function applyOwnershipHolderReconciliation(s, rows, groupIds, now = Date.now(),
  * a concurrent process's write made during the fetch's own round trip. Returns true when
  * anything changed.
  */
-function applyOrcaReconciliation(s, rows, exhaustive = true) {
-  const liveIds = new Set();
-  const releasedIds = new Set();
-  const doneButHeldIds = new Set();
-  for (const w of rows || []) {
-    const ids = [w.dispatchId, w.taskId, w.agentTerminalHandle].filter(Boolean);
-    // Independent field checks (item 8): `workerState` being present but non-matching (e.g.
-    // "running") must never short-circuit away from also checking `dispatchStatus` — a
-    // worker can be reported done through either field alone.
-    const isDone = DONE.test(String(w.workerState || '')) || DONE.test(String(w.dispatchStatus || ''));
-    if (w.terminalState === 'released') {
-      // Fully released: free its capacity AND drop it from tracking (below).
-      for (const id of ids) releasedIds.add(id);
-    } else if (isDone) {
-      // Done, but still holding its terminal: a resource leak the Stop gate
-      // (workers-unreconciled) must still catch. Cap-exempt (it is not doing work
-      // anymore, so it must not block a new dispatch) but NOT settled/untracked — settling
-      // it here would make it invisible to that later check and it would never get
-      // released.
-      for (const id of ids) doneButHeldIds.add(id);
-    } else {
-      for (const id of ids) liveIds.add(id);
-    }
-  }
+function applyOrcaReconciliation(s, rows, exhaustive = true, terminalHandles = null) {
   const tenMinAgo = Date.now() - 10 * 60 * 1000;
   let changed = false;
-  for (const [key, w] of Object.entries(s.workers)) {
+  const groups = new Map();
+  for (const [key, w] of Object.entries(s.workers || {})) {
+    if (w.status !== 'live' || key.startsWith('pending-')) continue;
+    const group = WG.groupOf(w, key);
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(key);
+  }
+
+  // Reconcile by group, not by individual id. This matters when a terminal handle is reused:
+  // the old terminal row must settle its old dispatch/task group without settling the newer
+  // live group that now owns the same `term_*` key.
+  for (const [group, keys] of groups) {
+    const groupRows = (rows || []).filter((row) =>
+      keys.includes(row.dispatchId) || keys.includes(row.taskId) || keys.includes(row.agentTerminalHandle));
+    if (groupRows.length) {
+      if (groupRows.every((row) => rowReportsReconciled(row, rows, terminalHandles))) {
+        if (WG.settleGroup(s.workers, group)) changed = true;
+      } else if (groupRows.every(rowIsTerminal)) {
+        for (const [key, w] of Object.entries(s.workers || {})) {
+          if (w.status === 'live' && WG.groupOf(w, key) === group && !w.capExempt) {
+            w.capExempt = true;
+            changed = true;
+          }
+        }
+      }
+      continue;
+    }
+    const oldest = Math.min(...keys.map((key) => Number.isFinite(s.workers[key].started)
+      ? s.workers[key].started : Date.now()));
+    if (exhaustive && oldest < tenMinAgo && WG.settleGroup(s.workers, group)) changed = true;
+  }
+
+  for (const [key, w] of Object.entries(s.workers || {})) {
     if (w.status !== 'live') continue;
     // A "pending-<ts>" key is a placeholder registered when a worker-start's own reply
     // carried no id at all (see orchestrator-gate.cjs) — Orca was NEVER given this key as an
@@ -247,9 +315,6 @@ function applyOrcaReconciliation(s, rows, exhaustive = true) {
       if (WG.pendingPlaceholderExpired(key, w)) { w.status = 'settled'; changed = true; }
       continue;
     }
-    if (releasedIds.has(key)) { w.status = 'settled'; changed = true; continue; }
-    if (doneButHeldIds.has(key)) { if (!w.capExempt) { w.capExempt = true; changed = true; } continue; }
-    if (exhaustive && !liveIds.has(key) && (w.started || 0) < tenMinAgo) { w.status = 'settled'; changed = true; }
   }
   return changed;
 }
@@ -346,7 +411,7 @@ function reconcilePendingPlaceholders(s, rows, now = Date.now()) {
 function reconcileCodexGroupsWithOrca(s, orcaBin) {
   const fetched = fetchOrcaWorkerRows(orcaBin);
   if (fetched === null) return false;
-  applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive);
+  applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive, fetched.terminalHandles);
   return true;
 }
 
@@ -629,7 +694,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
             if (fetched !== null &&
-                applyOwnershipHolderReconciliation(s, fetched.rows, holderGroups, Date.now(), fetched.exhaustive)) {
+                applyOwnershipHolderReconciliation(s, fetched.rows, holderGroups, Date.now(),
+                  fetched.exhaustive, fetched.terminalHandles)) {
               reconcileChanged = true;
             }
             claims = OC.liveClaims(s, ttl, replacesGroup).filter((c) => c.id !== sourceTaskResKey);
@@ -699,7 +765,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
               }
               s = load(sessionId);
               Object.assign(s.reservations, localReservations);
-              if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive)) reconcileChanged = true;
+              if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive,
+                fetched.terminalHandles)) reconcileChanged = true;
               usage = deps.machineWideLiveUnits(DIR, Date.now(), { currentState: s, currentSessionId: sessionId });
             }
             if (usage.total >= limit) {
@@ -730,7 +797,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
-            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive)) reconcileChanged = true;
+            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive,
+              fetched.terminalHandles)) reconcileChanged = true;
             live = WG.countLiveGroups(s.workers, 'codex') + OC.countPendingCodexReservations(s);
           }
           if (live >= cap) {
@@ -755,7 +823,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
-            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive)) reconcileChanged = true;
+            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive,
+              fetched.terminalHandles)) reconcileChanged = true;
             live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
           }
           if (live >= kimiCap) {
@@ -778,7 +847,8 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
             if (locked === null) return;
             s = load(sessionId);
             Object.assign(s.reservations, localReservations);
-            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive)) reconcileChanged = true;
+            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive,
+              fetched.terminalHandles)) reconcileChanged = true;
             live = WG.countLiveGroups(s.workers, 'opencode') + OC.countPendingReservations(s, 'opencode');
           }
           if (live >= deepseekCap) {
@@ -823,6 +893,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
 module.exports = {
   OWNS_BRIEF_HELP, resolveWorkerStartAgent, liveGroupIds, liveCodexGroupIds, reconcileCodexGroupsWithOrca,
-  fetchOrcaWorkerRows, applyOrcaReconciliation, applyOwnershipHolderReconciliation, rowReportsReleased,
+  fetchOrcaWorkerRows, applyOrcaReconciliation, applyOwnershipHolderReconciliation,
+  rowReportsReleased, rowReportsReconciled, rowIsTerminal,
   reconcilePendingPlaceholders, handleOrcaDispatchGates, resolveSpecText,
 };
