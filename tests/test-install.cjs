@@ -10,12 +10,15 @@ const INSTALLER = path.join(__dirname, '..', 'install.mjs');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-install-test-'));
 const binDir = path.join(root, 'bin');
 fs.mkdirSync(binDir);
+const launchctlLog = path.join(root, 'launchctl.log');
 try { fs.symlinkSync(process.execPath, path.join(binDir, 'node')); } catch {}
 for (const bin of ['claude', 'orca', 'codex', 'kimi']) {
   const file = path.join(binDir, bin);
   fs.writeFileSync(file, '#!/bin/sh\necho "stub 1.0"\n');
   fs.chmodSync(file, 0o755);
 }
+fs.copyFileSync(path.join(__dirname, 'fixtures', 'launchctl-stub.cjs'), path.join(binDir, 'launchctl'));
+fs.chmodSync(path.join(binDir, 'launchctl'), 0o755);
 let passed = 0;
 const failures = [];
 
@@ -24,7 +27,8 @@ function run(args, homeName, extraEnv = {}) {
   fs.mkdirSync(home, { recursive: true });
   const result = spawnSync(process.execPath, [INSTALLER, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`, ...extraEnv },
+    env: { ...process.env, HOME: home, USERPROFILE: home, PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`,
+      STUB_LAUNCHCTL_LOG: launchctlLog, ...extraEnv },
   });
   return { ...result, home };
 }
@@ -124,12 +128,37 @@ check('--replace-foreign-gate preserves test-orchestrator-gate.cjs',
 const missingHome = 'check-missing-artifact';
 const installedForMissing = run([], missingHome);
 check('fixture install for missing-artifact check succeeds', installedForMissing.status, 0);
+const janitorPlist = path.join(installedForMissing.home, 'Library', 'LaunchAgents',
+  'com.orca.claude-codex-orchestration.janitor.plist');
+check('install writes the janitor LaunchAgent on macOS', process.platform !== 'darwin' || fs.existsSync(janitorPlist), true);
+check('the janitor LaunchAgent uses the default ten-minute interval', process.platform !== 'darwin' ||
+  fs.readFileSync(janitorPlist, 'utf8').includes('<integer>600</integer>'), true);
+check('the janitor LaunchAgent preserves an executable search path for orca and gh', process.platform !== 'darwin' ||
+  fs.readFileSync(janitorPlist, 'utf8').includes('<key>PATH</key>'), true);
+check('install registers the janitor with launchctl', process.platform !== 'darwin' ||
+  fs.readFileSync(launchctlLog, 'utf8').includes(`bootstrap gui/${process.getuid()} ${janitorPlist}`), true);
 const missingManifest = JSON.parse(fs.readFileSync(
   path.join(installedForMissing.home, '.claude', 'hooks', 'orchestration', 'install-manifest.json'), 'utf8'));
 fs.unlinkSync(path.join(installedForMissing.home, '.claude', 'hooks', 'orchestration', missingManifest.files[0]));
 const missingCheck = run(['--check'], missingHome);
 check('--check prints MISS for a missing installed artifact', /\bMISS\b/.test(missingCheck.stdout), true);
 check('--check exits 1 whenever it prints MISS', missingCheck.status, 1);
+
+if (process.platform === 'darwin') {
+  const preexistingHome = path.join(root, 'janitor-preexisting');
+  const preexistingPlist = path.join(preexistingHome, 'Library', 'LaunchAgents',
+    'com.orca.claude-codex-orchestration.janitor.plist');
+  fs.mkdirSync(path.dirname(preexistingPlist), { recursive: true });
+  fs.writeFileSync(preexistingPlist, 'pre-existing launch agent\n');
+  const installed = run([], 'janitor-preexisting');
+  check('install with a pre-existing janitor plist succeeds', installed.status, 0);
+  check('install activates this package janitor over the backed-up plist',
+    fs.readFileSync(preexistingPlist, 'utf8').includes('orca-janitor.cjs'), true);
+  const uninstalled = run(['--uninstall'], 'janitor-preexisting');
+  check('uninstall with a pre-existing janitor plist succeeds', uninstalled.status, 0);
+  check('uninstall restores the pre-existing janitor plist',
+    fs.readFileSync(preexistingPlist, 'utf8'), 'pre-existing launch agent\n');
+}
 
 // --- coder availability section (stubs only: fake codex/kimi binaries, tmp Kimi homes,
 // an unreachable usage URL; nothing touches real ~/.kimi-code, real codex, or the network)
@@ -194,10 +223,15 @@ const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonn
   // An untouched, installer-created agent definition IS removed on uninstall.
   const clean = run([], 'agents-clean');
   const cleanDest = path.join(clean.home, '.claude', 'agents', 'sonnet-coder.md');
+  const cleanPlist = path.join(clean.home, 'Library', 'LaunchAgents',
+    'com.orca.claude-codex-orchestration.janitor.plist');
   check('clean install ships the agent definition', fs.existsSync(cleanDest), true);
   const uninstClean = run(['--uninstall'], 'agents-clean');
   check('clean uninstall exits successfully', uninstClean.status, 0);
   check('uninstall removes an unmodified installer-created agent definition', fs.existsSync(cleanDest), false);
+  check('uninstall removes the janitor LaunchAgent', process.platform === 'darwin' ? fs.existsSync(cleanPlist) : false, false);
+  check('uninstall unregisters the janitor from launchctl', process.platform !== 'darwin' ||
+    fs.readFileSync(launchctlLog, 'utf8').includes(`bootout gui/${process.getuid()} ${cleanPlist}`), true);
 
   // A pre-existing (not installer-created) agent definition is left alone by both.
   const pre = run([], 'agents-preexisting');

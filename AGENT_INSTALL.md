@@ -71,6 +71,15 @@ the same session reports a worktree that became done-but-open while it was not r
 a real reminder rather than silently folding it into pre-existing backlog. See
 `README.md#subagents-and-parallel-work` for the full acceptance/idle/clean breakdown.
 
+The installer also registers a machine-wide macOS LaunchAgent for
+`hooks/orca-janitor.cjs`. It runs every `janitor.intervalMinutes` (default 10) and safely
+removes accepted, clean, fully pushed non-main worktrees with a known zero live-terminal
+count and no unreleased or retained worker row, even after the owning panel exits. For
+GitHub branches without an Orca-linked PR, it uses a 5-second `gh pr list` lookup cached
+for 10 minutes so squash-merged or closed PRs count while open PRs remain protected.
+Disable it with `janitor.enabled: false` or `ORCH_JANITOR=0`; activity is logged to
+`<stateDir>/janitor.log`.
+
 ## 1. Prerequisite checks
 
 ```bash
@@ -233,7 +242,11 @@ commits, or one merely rebased/fast-forwarded onto a base that itself advanced a
 worktree was created, is never mistaken for done-but-open work) and clean, with no live
 terminal on it; disable with `false` or `ORCH_CLOSE_DONE_WORKTREES`
 set to `0`/`false` (`1`/`true` forces it on; anything else, including empty, defers to the
-config). `parallelCoreFraction`/`maxParallelAgents`'s env overrides treat an empty or
+config). `janitor.enabled` (default `true`) and `janitor.intervalMinutes` (default `10`)
+control the machine-wide cleanup schedule; `ORCH_JANITOR=0` disables janitor runs. The
+gate also reminds the panel when more than three `run_in_background` Bash shells remain,
+and requires one heartbeat per session: stop finished or idle tasks with `TaskStop` and
+never leave `sleep`/`until` wait loops behind. `parallelCoreFraction`/`maxParallelAgents`'s env overrides treat an empty or
 whitespace-only value as unset (never coerced to `0`), and their config-file values accept
 only an actual JSON number (or `null` for `maxParallelAgents`) — never a numeric string.
 The same empty/whitespace-is-unset rule applies to `ORCH_CODEX_HANDOFF_USED` /

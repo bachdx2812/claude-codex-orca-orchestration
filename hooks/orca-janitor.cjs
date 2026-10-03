@@ -34,7 +34,8 @@ function worktrees(run = runOrca) {
   if (!reply || reply.ok === false) return null;
   const result = reply.result ?? reply;
   if (!Array.isArray(result.worktrees) || result.truncated) return null;
-  return result.worktrees.filter((row) => row && typeof row.path === 'string').map((row) => ({
+  return result.worktrees.filter((row) => row && typeof row.path === 'string' &&
+    (row.hostId === undefined || row.hostId === 'local')).map((row) => ({
     path: row.path,
     worktreeId: typeof row.worktreeId === 'string' ? row.worktreeId : '',
     displayName: row.displayName || row.path,

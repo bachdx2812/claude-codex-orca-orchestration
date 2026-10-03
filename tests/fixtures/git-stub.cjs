@@ -53,6 +53,22 @@ if (sub === 'symbolic-ref') {
   done('origin/main\n', 0);
 }
 
+if (sub === 'remote') {
+  const origin = process.env.STUB_GIT_ORIGIN;
+  done(origin ? `${origin}\n` : '', origin ? 0 : 2);
+}
+
+if (sub === 'branch') {
+  const branch = process.env.STUB_GIT_BRANCH;
+  done(branch ? `${branch}\n` : '', branch ? 0 : 0);
+}
+
+if (sub === 'config') {
+  const configured = process.env.STUB_GIT_CONFIGURED_UPSTREAM === '1';
+  if (!configured) done('', 1);
+  done(args[args.length - 1].endsWith('.remote') ? 'origin\n' : 'refs/heads/feature/work\n', 0);
+}
+
 if (sub === 'rev-parse') {
   if (args.includes('@{u}')) {
     done(process.env.STUB_GIT_HAS_UPSTREAM === '1' ? 'origin/feature\n' : '', process.env.STUB_GIT_HAS_UPSTREAM === '1' ? 0 : 128);

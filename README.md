@@ -335,6 +335,28 @@ watching) reports it as a real wake event, not silently-reabsorbed backlog. Disa
 (or the legacy `1`/`true` = remind, `0`/`false` = off) — any other value, including empty,
 defers to the config.
 
+**Machine-wide worktree janitor.** The installer registers `hooks/orca-janitor.cjs` as a
+macOS LaunchAgent that runs every `janitor.intervalMinutes` (default 10). Unlike the
+session-owned heartbeat, it evaluates every local Orca worktree, so cleanup continues after
+the panel that created a worktree exits. It removes only a non-main, non-archived worktree
+whose `liveTerminalCount` is the known number `0`, which has no unreleased or retained Orca
+worker row, is clean with nothing unpushed (or a configured upstream deleted after the work
+was accepted), and is accepted. Acceptance includes Orca's
+linked PR/MR state, a bounded `gh pr list` lookup by origin repository and branch for
+squash-merged or closed GitHub PRs that Orca did not link (5-second timeout, 10-minute
+cache), or the existing ancestor plus reflog proof. An open GitHub PR vetoes removal even
+if Git alone looks merged. Missing or unauthenticated `gh` falls back to the Git-only rules.
+Results are appended to `<stateDir>/janitor.log`; set `janitor.enabled` to `false` or
+`ORCH_JANITOR=0` to disable it.
+
+**Background shell hygiene.** The gate records this session's `Bash` launches with
+`run_in_background: true` until their completion notification arrives. At
+`UserPromptSubmit` and `Stop`, more than three still-running shells produces one reminder
+naming the oldest command and age and asking for `TaskStop`. Starting a second heartbeat
+also identifies the previous heartbeat shell to stop: keep only one heartbeat per session.
+Never leave `sleep`/`until` polling loops running; use the heartbeat instead of ad-hoc wait
+loops.
+
 **Enforced vs advisory.** Enforced: gates apply to the main panel only (subagents and
 Orca-worker sessions are never gated); `Stop` refuses to end the session while a worker is
 running and unwatched (`workers-unwatched` — no live heartbeat) or finished but still

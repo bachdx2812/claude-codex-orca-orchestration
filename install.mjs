@@ -213,6 +213,7 @@ function launchctl(args) {
 function installJanitor(prevManifest) {
   if (process.platform !== 'darwin') return { supported: false, installed: false };
   const existed = fs.existsSync(JANITOR_PLIST);
+  let backedUpAt = prevManifest?.janitor?.backedUpAt || null;
   const cfg = readJSONSafe(CONFIG_FILE, null) || readJSONSafe(path.join(REPO_ROOT, 'config', 'orchestration.config.example.json'), {});
   const interval = Number.isInteger(cfg?.janitor?.intervalMinutes) && cfg.janitor.intervalMinutes > 0
     ? cfg.janitor.intervalMinutes : 10;
@@ -221,9 +222,14 @@ function installJanitor(prevManifest) {
     `<plist version="1.0"><dict>\n` +
     `  <key>Label</key><string>${JANITOR_LABEL}</string>\n` +
     `  <key>ProgramArguments</key><array><string>${xmlEscape(NODE_PATH)}</string><string>${xmlEscape(path.join(HOOKS_DIR, 'orca-janitor.cjs'))}</string></array>\n` +
+    `  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xmlEscape(process.env.PATH || '/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin')}</string></dict>\n` +
     `  <key>StartInterval</key><integer>${interval * 60}</integer>\n` +
     `  <key>RunAtLoad</key><true/>\n` +
     `</dict></plist>\n`;
+  if (existed && !prevManifest?.janitor?.installed && !backedUpAt) {
+    backedUpAt = backupPath(JANITOR_PLIST);
+    if (!DRY_RUN) fs.copyFileSync(JANITOR_PLIST, backedUpAt);
+  }
   writeText(JANITOR_PLIST, text);
   if (!DRY_RUN) {
     const domain = `gui/${process.getuid()}`;
@@ -233,14 +239,23 @@ function installJanitor(prevManifest) {
     }
   }
   return { supported: true, installed: true, path: JANITOR_PLIST, label: JANITOR_LABEL,
-    intervalMinutes: interval, createdNew: prevManifest?.janitor?.createdNew ?? !existed };
+    intervalMinutes: interval, createdNew: prevManifest?.janitor?.createdNew ?? !existed, backedUpAt };
 }
 
 function uninstallJanitor(manifest) {
   const record = manifest.janitor;
   if (!record || !record.installed || process.platform !== 'darwin') return;
   if (!DRY_RUN) launchctl(['bootout', `gui/${process.getuid()}`, record.path || JANITOR_PLIST]);
-  removeFile(record.path || JANITOR_PLIST);
+  if (record.backedUpAt && fs.existsSync(record.backedUpAt)) {
+    if (DRY_RUN) log(`  [dry-run] would restore ${record.backedUpAt} -> ${record.path || JANITOR_PLIST}`);
+    else {
+      fs.copyFileSync(record.backedUpAt, record.path || JANITOR_PLIST);
+      fs.unlinkSync(record.backedUpAt);
+      launchctl(['bootstrap', `gui/${process.getuid()}`, record.path || JANITOR_PLIST]);
+    }
+  } else {
+    removeFile(record.path || JANITOR_PLIST);
+  }
 }
 
 // --- install: hook files -----------------------------------------------------

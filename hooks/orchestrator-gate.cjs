@@ -1683,6 +1683,7 @@ function onPreToolUse(p, s, cfg) {
       const toolUseId = p.tool_use_id || p.toolUseId;
       if (toolUseId) {
         const lockDir = path.join(DIR, '.lock');
+        try { fs.mkdirSync(DIR, { recursive: true }); } catch {}
         const locked = acquireLock(lockDir, {});
         try {
           if (locked) {

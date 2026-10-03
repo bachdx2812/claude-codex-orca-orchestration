@@ -1221,13 +1221,15 @@ function hasOwnCommit(w, git) {
  */
 function resolveAcceptance(w, git, stat, ctx = {}) {
   if (w.prState != null) {
-    return DONE_PR_STATES.has(w.prState)
+    const state = String(w.prState).toLowerCase();
+    return DONE_PR_STATES.has(state)
       ? { accepted: true, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}` }
       : { accepted: false, reason: null };
   }
   if (w.mrState != null) {
-    if (OPEN_MR_STATES.has(w.mrState)) return { accepted: false, reason: null };
-    return DONE_PR_STATES.has(w.mrState)
+    const state = String(w.mrState).toLowerCase();
+    if (OPEN_MR_STATES.has(state)) return { accepted: false, reason: null };
+    return DONE_PR_STATES.has(state)
       ? { accepted: true, reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}` }
       : { accepted: false, reason: null };
   }
@@ -1261,7 +1263,15 @@ function isWorktreeIdle(w, now, idleSeconds) {
  * branch does not). Any git failure along the way (unreadable repo, a timeout) means "not
  * confirmed clean", never "clean" — same uncertainty rule as everywhere else here.
  */
-function isWorktreeClean(w, git) {
+function hasConfiguredUpstream(cwd, git) {
+  const branch = git(['branch', '--show-current'], cwd);
+  if (!branch || branch.status !== 0 || !branch.stdout) return false;
+  const remote = git(['config', '--get', `branch.${branch.stdout}.remote`], cwd);
+  const merge = git(['config', '--get', `branch.${branch.stdout}.merge`], cwd);
+  return !!remote && remote.status === 0 && !!remote.stdout && !!merge && merge.status === 0 && !!merge.stdout;
+}
+
+function isWorktreeClean(w, git, ctx = {}) {
   // `--no-optional-locks`: a plain status read must never contend with, or be blocked by,
   // another concurrent git process's lock on this worktree's index — this daemon polls
   // repeatedly and runs alongside the user's own git/IDE activity.
@@ -1272,6 +1282,11 @@ function isWorktreeClean(w, git) {
     const unpushed = git(['rev-list', '@{u}..HEAD'], w.path);
     return !!unpushed && unpushed.status === 0 && unpushed.stdout === '';
   }
+  // A pushed branch can lose its remote-tracking ref after its PR is accepted and the
+  // server deletes the branch. In that specific, externally-accepted case, the configured
+  // branch.<name>.remote/merge pair proves an upstream existed; its now-unresolvable @{u}
+  // is not evidence of unpushed work. The clean status above remains mandatory.
+  if (ctx.accepted && hasConfiguredUpstream(w.path, git)) return true;
   const base = resolveBaseRef(w.path, git);
   return !!base && isAncestorOf(w.path, git, base);
 }
@@ -1493,7 +1508,7 @@ function evaluateDoneButOpen(w, ctx = {}) {
   if (!isWorktreeIdle(w, now, idleSeconds)) return { done: false, reason: null };
   const { accepted, reason } = resolveAcceptance(w, git, stat, ctx);
   if (!accepted) return { done: false, reason: null };
-  if (!isWorktreeClean(w, git)) return { done: false, reason: null };
+  if (!isWorktreeClean(w, git, { accepted: true })) return { done: false, reason: null };
   return { done: true, reason };
 }
 
@@ -2315,7 +2330,7 @@ module.exports = {
   workerWorktreePaths, worktreeKeys, sessionWorktreeKeys, retainedTerminalHandles,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, resolveGithubAcceptance, githubRepoSlug, runGh,
-  isWorktreeIdle, isWorktreeClean, resolveBaseRef, isAncestorOf, runGit,
+  isWorktreeIdle, isWorktreeClean, hasConfiguredUpstream, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
   machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,

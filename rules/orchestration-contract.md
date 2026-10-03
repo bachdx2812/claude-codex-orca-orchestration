@@ -815,6 +815,36 @@ been backlog. Disable it with `closeDoneWorktrees: "off"` in the config, or
 `ORCH_CLOSE_DONE_WORKTREES` set to `0`/`false`/`off` for one process (`1`/`true` forces
 remind mode; `remove` forces remove mode; any other value defers to the config).
 
+### Machine-wide janitor
+
+`orca-janitor.cjs` is independent of the session heartbeat and is installed as a macOS
+LaunchAgent. Every `janitor.intervalMinutes` (default 10), it inspects the complete local
+worktree and worker inventories. It removes a worktree only when all of these facts are
+positive: it is neither main nor archived; `liveTerminalCount` is the numeric value `0`;
+no worker row for the worktree remains unreleased or retained; the worktree is clean and
+has nothing unpushed (or its configured upstream was deleted after acceptance); and its
+work was accepted. Ownership by the currently running panel
+is not required.
+
+For a GitHub branch with no Orca-linked PR, acceptance additionally runs `gh pr list
+--repo <origin-repo> --head <branch> --state all --json state`, bounded to five seconds and
+cached for ten minutes per repository/branch. `MERGED` or `CLOSED` accepts a squash-merged
+branch; `OPEN` explicitly keeps it. Missing `gh`, missing authentication, non-GitHub
+origins, and query failures fall back to the existing ancestor plus reflog rule. Every
+successful or failed removal is appended to `<stateDir>/janitor.log`. Configure with
+`janitor.enabled` and `janitor.intervalMinutes`; `ORCH_JANITOR=0` disables a run.
+
+### Background shell hygiene
+
+The gate tracks every main-panel `Bash` launch with `run_in_background: true` by tool-use
+id, command head, and start time until a matching completion notification arrives. On
+`UserPromptSubmit` and `Stop`, more than three outstanding shells emits one line naming the
+oldest command and age and asks the panel to stop finished or idle ones with `TaskStop`.
+Before a new `orca-heartbeat.cjs` background launch, the gate names any previous heartbeat
+shell that is still tracked and tells the panel to stop it; one session needs only one
+heartbeat. Never leave `sleep`/`until` wait loops running. Prefer the heartbeat over ad-hoc
+polling loops.
+
 ## Parallel Codex workers and file ownership
 
 **Section 0 fixes (pre-existing bugs).** Two bugs in the worker-tracking state predate
