@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { loadConfig, stateDir, janitorEnabled } = require('./lib/config.cjs');
+const { fetchWorkerListPages } = require('./lib/orca-worker-list-pages.cjs');
 const {
   evaluateDoneButOpen, runGit, worktreeKeys, TERMINAL_WORKER_STATES,
 } = require('./orca-heartbeat.cjs');
@@ -172,26 +173,24 @@ function worktrees(run = runOrca) {
  * against removing a worktree some other Run still owns.
  */
 function workerRows(run = runOrca) {
-  const rows = [];
-  let cursor = null;
-  let scope;
-  for (let page = 0; page < WORKER_LIST_MAX_PAGES; page += 1) {
-    const args = ['orchestration', 'worker-list', '--include-remote', '--limit', String(WORKER_LIST_PAGE_LIMIT), '--json'];
-    if (cursor) args.push('--cursor', cursor);
+  let lastReply = null;
+  const paged = fetchWorkerListPages((args) => {
     const reply = run(args);
-    if (!reply) return { ok: false, reason: 'worker-list: no reply' };
-    if (reply.ok === false) return { ok: false, reason: `worker-list: ${failureReason(reply)}` };
-    const result = reply.result ?? reply;
-    if (!Array.isArray(result.workers)) return { ok: false, reason: 'worker-list: missing workers array' };
-    if (page === 0) scope = result.scope;
-    rows.push(...result.workers);
-    if (!result.page?.hasMore) return { ok: true, workers: rows, scope };
-    if (!result.page.nextCursor || result.page.nextCursor === cursor) {
-      return { ok: false, reason: 'worker-list: hasMore with no usable cursor' };
-    }
-    cursor = result.page.nextCursor;
-  }
-  return { ok: false, reason: `worker-list: exceeded page cap (${WORKER_LIST_MAX_PAGES})` };
+    lastReply = reply;
+    return reply;
+  }, {
+    baseArgs: ['orchestration', 'worker-list', '--include-remote', '--json'],
+    pageLimit: WORKER_LIST_PAGE_LIMIT,
+    maxPages: WORKER_LIST_MAX_PAGES,
+  });
+  if (paged.ok) return { ok: true, workers: paged.rows, scope: paged.scope };
+  // A real Orca `ok: false` error (the actual reason) takes priority over the shared
+  // helper's own generic stop label, whichever page it happened on.
+  if (lastReply && lastReply.ok === false) return { ok: false, reason: `worker-list: ${failureReason(lastReply)}` };
+  if (paged.stoppedBy === 'rows') return { ok: false, reason: 'worker-list: missing workers array' };
+  if (paged.stoppedBy === 'cursor') return { ok: false, reason: 'worker-list: hasMore with no usable cursor' };
+  if (paged.stoppedBy === 'page-cap') return { ok: false, reason: `worker-list: exceeded page cap (${WORKER_LIST_MAX_PAGES})` };
+  return { ok: false, reason: 'worker-list: no reply' };
 }
 
 function workerWorktreeKeys(row) {

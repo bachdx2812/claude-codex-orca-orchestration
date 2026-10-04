@@ -72,6 +72,7 @@ const HANDOVER = require('./lib/worker-quota-handover.cjs');
 const RESUME = require('./lib/quota-reset-resume.cjs');
 const WG = require('./lib/worker-groups.cjs');
 const GATES = require('./lib/parallel-ownership-gates.cjs');
+const WORKER_LIST_PAGES = require('./lib/orca-worker-list-pages.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 
 const DIR = stateDir();
@@ -713,8 +714,20 @@ function resolveTerminalScreen(readText, previousText, listPreview) {
   return listPreview || '';
 }
 
+/**
+ * All supervised-worker rows, paging past Orca's 100-row-per-call limit via the shared
+ * `orca-worker-list-pages.cjs` helper. Preserves the pre-paging contract exactly: null on
+ * any failure (unreachable Orca, `ok: false`, a reply with no rows array, a cursor chain
+ * that cannot be followed, or the page cap) rather than a partial list — every caller of
+ * `workers()` already treats null as "worker-list is unavailable right now."
+ */
 function workers() {
-  return parseWorkerRows(orca(['orchestration', 'worker-list', '--json']));
+  const paged = WORKER_LIST_PAGES.fetchWorkerListPages((args) => {
+    const reply = orca(args);
+    return reply && reply.ok !== false ? reply : null;
+  }, { baseArgs: ['orchestration', 'worker-list', '--json'] });
+  if (!paged.ok) return null;
+  return parseWorkerRows({ result: { workers: paged.rows } });
 }
 
 /**

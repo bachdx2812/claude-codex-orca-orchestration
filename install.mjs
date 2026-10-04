@@ -54,6 +54,7 @@ const HOOK_FILES = [
   'lib/terminal-signals.cjs', 'lib/worker-progress-fingerprint.cjs', 'lib/worker-quota-handover.cjs', 'lib/quota-reset-resume.cjs', 'lib/live-probe-cache.cjs', 'lib/kimi-quota-probe.cjs',
   'lib/deepseek-quota-probe.cjs',
   'lib/coder-availability.cjs', 'lib/coder-pool-route.cjs', 'lib/codex-priority-tier.cjs',
+  'lib/orca-worker-list-pages.cjs',
 ];
 const EVENTS = {
   SessionStart: '*',
