@@ -493,11 +493,10 @@ function runCaseDryRun(name, row, extraEnv = {}, workers = []) {
 
 const dryRun = runCaseDryRun('dry-run-removable', worktree());
 check('--dry-run never calls worktree rm', dryRun.calls.includes('worktree rm'), false);
-check('--dry-run logs a "would remove" line with the verdict reason',
-  dryRun.log.includes(`would remove ${JSON.stringify(dryRun.worktreePath)} (GitHub PR MERGED)`), true);
-check('--dry-run prints the same "would remove" line to stdout',
+check('--dry-run prints the "would remove" line to stdout instead of the log file',
   dryRun.stdout.includes(`would remove ${JSON.stringify(dryRun.worktreePath)} (GitHub PR MERGED)`), true);
 check('--dry-run prints a one-line summary count', /would be removed/.test(dryRun.stdout), true);
+check('--dry-run never writes janitor.log at all', dryRun.log, '');
 
 const dryRunKept = runCaseDryRun('dry-run-kept', worktree(), { STUB_GIT_CLEAN: '0' });
 check('--dry-run also prints "kept" lines for non-removable worktrees',

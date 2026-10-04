@@ -26,9 +26,11 @@ const WORKER_LIST_MAX_PAGES = 50;
 // Per-worktree "kept" reasons, persisted so a run only re-logs a line when the reason for
 // that path actually changed (item 1) instead of repeating the same line every tick.
 const KEPT_STATE_FILE = path.join(stateDir(), 'janitor-kept.json');
-// Set from main() when invoked with --dry-run: every appendLog call also echoes to the
-// console so a live diagnostic run shows its evaluation without digging into the log file.
-let ECHO_TO_CONSOLE = false;
+// Set from main() when invoked with --dry-run: every appendLog call echoes to the console
+// instead of writing janitor.log, so a live diagnostic run is fully non-mutating (same
+// guarantee already given for github-pr-cache.json and janitor-kept.json) and still shows
+// its evaluation without digging into the log file.
+let DRY_RUN = false;
 
 function rotateLog() {
   try {
@@ -40,7 +42,7 @@ function rotateLog() {
 }
 
 function appendLog(message) {
-  if (ECHO_TO_CONSOLE) console.log(message);
+  if (DRY_RUN) { console.log(message); return; }
   try {
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
     rotateLog();
@@ -343,7 +345,7 @@ function runJanitor(ctx = {}) {
 
 function main() {
   const dryRun = process.argv.includes('--dry-run');
-  ECHO_TO_CONSOLE = dryRun;
+  DRY_RUN = dryRun;
   const cfg = loadConfig();
   if (!janitorEnabled(cfg)) {
     if (dryRun) console.log('orca-janitor --dry-run: janitor.enabled is false; nothing evaluated');
