@@ -1116,30 +1116,44 @@ function githubRepoSlug(origin) {
  * verdict is cached across daemon/janitor processes for at most two minutes; open/none
  * verdicts use the longer ten-minute cache. A missing gh binary returns null so the caller
  * retains the pre-existing Git-only acceptance rules. For a GitHub origin, every other gh
- * failure or malformed answer is uncertain and keeps the worktree. */
+ * failure or malformed answer is uncertain and keeps the worktree.
+ *
+ * A detached HEAD (no branch at all — Orca's `*-fix` worktrees) falls back to a direct
+ * `gh pr view <number>` lookup by Orca's own linked `w.prNumber`, instead of giving up with
+ * `null`, whenever one is known: `gh pr list --head <branch>` has nothing to search by with
+ * no branch name, which previously left `w.prState` (including an Orca-side placeholder like
+ * `unknown`) as the only signal forever, even once the PR was actually merged on GitHub.
+ */
 function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const origin = git(['remote', 'get-url', 'origin'], w.path);
   const branch = git(['branch', '--show-current'], w.path);
   if (origin === null || branch === null) {
     return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
   }
-  if (!origin || origin.status !== 0 || !branch || branch.status !== 0 || !branch.stdout) return null;
+  if (!origin || origin.status !== 0) return null;
   const repo = githubRepoSlug(origin.stdout);
   if (!repo) return null;
-  const key = `${repo}#${branch.stdout}`;
+  const hasBranch = !!branch && branch.status === 0 && !!branch.stdout;
+  if (!hasBranch && (branch.status !== 0 || w.prNumber == null)) return null;
+  const key = hasBranch ? `${repo}#${branch.stdout}` : `${repo}##${w.prNumber}`;
   const now = ctx.now != null ? ctx.now : Date.now();
   const cache = ctx.cache || loadGithubPrCache();
   const cached = cache[key];
   const cacheMs = cached?.verdict?.accepted ? GH_ACCEPTED_CACHE_MS : GH_PR_CACHE_MS;
   if (cached && Number.isFinite(cached.at) && now - cached.at < cacheMs) return cached.verdict;
-  const reply = gh(['pr', 'list', '--repo', repo, '--head', branch.stdout, '--state', 'all',
-    '--limit', '100', '--json', 'state,headRefOid'], w.path);
+  const reply = hasBranch
+    ? gh(['pr', 'list', '--repo', repo, '--head', branch.stdout, '--state', 'all',
+      '--limit', '100', '--json', 'state,headRefOid'], w.path)
+    : gh(['pr', 'view', String(w.prNumber), '--repo', repo, '--json', 'state,headRefOid'], w.path);
   if (!reply) return null;
   if (reply.uncertain || reply.status !== 0) {
     return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
   }
   let rows;
-  try { rows = JSON.parse(reply.stdout || '[]'); } catch {
+  try {
+    const parsed = JSON.parse(reply.stdout || (hasBranch ? '[]' : '{}'));
+    rows = hasBranch ? parsed : [parsed];
+  } catch {
     return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
   }
   if (!Array.isArray(rows)) {
@@ -1155,6 +1169,38 @@ function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   cache[key] = { at: now, verdict };
   if (!ctx.cache) saveGithubPrCache(cache);
   return verdict;
+}
+
+/**
+ * The detached-HEAD counterpart to `resolveGithubAcceptance`: a detached worktree has no
+ * branch name, so a `gh pr list --head <branch>` lookup never finds it even when HEAD happens
+ * to be exactly the head commit of some OPEN PR (opened from a different local branch, a
+ * fork, or another worktree entirely). This instead lists every currently OPEN PR for the
+ * repo and matches by commit SHA (`headRefOid`). Returns `{ blocked: true }` when a match is
+ * found (never remove — the commit is still live work somewhere), `{ blocked: false }` when
+ * gh succeeded and found no match, or `{ blocked: true, uncertain: true }` on any git/gh
+ * failure (same fail-closed rule as every other github-backed check here). A missing `gh`
+ * binary (`reply === null`) is not uncertainty — it is the pre-existing "no gh available"
+ * case, so this is never blocking without `gh` just as `resolveGithubAcceptance` never is.
+ */
+function resolveGithubOpenPrForHeadSha(w, git, gh = runGh, ctx = {}) {
+  const origin = git(['remote', 'get-url', 'origin'], w.path);
+  if (origin === null) return { blocked: true, uncertain: true };
+  if (!origin || origin.status !== 0) return { blocked: false };
+  const repo = githubRepoSlug(origin.stdout);
+  if (!repo) return { blocked: false };
+  const head = git(['rev-parse', 'HEAD'], w.path);
+  if (!head || head.status !== 0 || !head.stdout) return { blocked: true, uncertain: true };
+  const reply = gh(['pr', 'list', '--repo', repo, '--state', 'open', '--json', 'headRefOid', '--limit', '100'], w.path);
+  if (!reply) return { blocked: false };
+  if (reply.uncertain || reply.status !== 0) return { blocked: true, uncertain: true };
+  let rows;
+  try { rows = JSON.parse(reply.stdout || '[]'); } catch { return { blocked: true, uncertain: true }; }
+  if (!Array.isArray(rows)) return { blocked: true, uncertain: true };
+  const matched = rows.some((row) => row && row.headRefOid === head.stdout);
+  return matched
+    ? { blocked: true, reason: `open PR at HEAD ${String(head.stdout).slice(0, 8)}` }
+    : { blocked: false };
 }
 
 /**
@@ -1269,6 +1315,18 @@ function hasOwnCommit(w, git) {
  * real work happened, so the no-linked-PR commit-history checks do not apply there. Returns
  * `{ accepted, reason, github }` so the clean check can also prove a deleted upstream's exact
  * pushed head SHA.
+ *
+ * A fresh, successful `gh` lookup for this exact head wins over Orca's own linked-PR state
+ * (`w.prState`) whenever it reaches a verdict (MERGED/CLOSED/OPEN): `w.prState` is a cached
+ * snapshot from whenever Orca last synced the link and can go stale — a PR merged (or
+ * closed) after Orca linked it would otherwise keep reporting `w.prState` as the old `open`
+ * (or an Orca-side placeholder like `unknown`) forever, keeping a genuinely done worktree
+ * "kept" indefinitely. The `github?.open` check above already rules out any OPEN PR for this
+ * head before this is reached, so `github?.accepted` here is never reached while GitHub still
+ * shows an open PR. `gh` uncertainty, a missing binary, or a lookup that found nothing for
+ * this head (no PR matched by branch name at all) all fall through to `w.prState` unchanged —
+ * this only overrides a *resolved, non-open* `w.prState` value such as a stale `open` or an
+ * unrecognized placeholder string.
  */
 function resolveAcceptance(w, git, stat, ctx = {}) {
   const github = w.mrState == null && !ctx.skipGithub
@@ -1278,6 +1336,13 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
   // not have to reimplement this leg's own logic just to describe it.
   if (github?.uncertain) return { accepted: false, reason: 'gh uncertain', github };
   if (github?.open) return { accepted: false, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} OPEN`, github };
+  if (github?.accepted) {
+    return {
+      accepted: true,
+      reason: w.prState != null ? `PR #${w.prNumber != null ? w.prNumber : '?'} ${github.reason}` : github.reason,
+      github,
+    };
+  }
   if (w.prState != null) {
     const state = String(w.prState).toLowerCase();
     return {
@@ -1294,11 +1359,19 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
       reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}`,
     };
   }
-  if (github?.accepted) return { accepted: true, reason: github.reason, github };
   const base = resolveBaseRef(w.path, git);
   if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: 'no upstream + not in base', github };
   if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: 'not accepted', github };
   if (!hasOwnCommit(w, git)) return { accepted: false, reason: 'not accepted', github };
+  // A detached HEAD (Orca's `*-fix` worktrees) has no branch name, so `resolveGithubAcceptance`
+  // above never finds a PR by head branch and returns null — yet HEAD may still be exactly
+  // the head commit of an open PR opened from some other branch/fork. Check by commit SHA
+  // instead before accepting; any gh/git failure here fails closed (kept), same rule as
+  // everywhere else in this file.
+  const openAtHead = resolveGithubOpenPrForHeadSha(w, git, ctx.gh || runGh, ctx);
+  if (openAtHead.blocked) {
+    return { accepted: false, reason: openAtHead.uncertain ? 'gh uncertain' : (openAtHead.reason || 'open PR at HEAD'), github };
+  }
   return { accepted: true, reason: `no linked PR, HEAD already merged into ${base}`, github };
 }
 
@@ -1383,15 +1456,23 @@ function isWorktreeClean(w, git, ctx = {}) {
     return clean;
   }
   const branch = git(['branch', '--show-current'], w.path);
-  if (!branch || branch.status !== 0 || !branch.stdout) { ctx.onNotClean?.('git probe failed'); return false; }
-  const track = git(['for-each-ref', '--format=%(upstream:track)', `refs/heads/${branch.stdout}`], w.path);
-  if (!track || track.status !== 0) { ctx.onNotClean?.('git probe failed'); return false; }
-  if (track.stdout === '[gone]') {
-    const head = git(['rev-parse', 'HEAD'], w.path);
-    const clean = !!head && head.status === 0 && !!head.stdout &&
-      (ctx.github?.mergedHeadOids || []).includes(head.stdout);
-    if (!clean) ctx.onNotClean?.('unpushed');
-    return clean;
+  if (!branch || branch.status !== 0) { ctx.onNotClean?.('git probe failed'); return false; }
+  // `git branch --show-current` succeeds with empty stdout on a DETACHED HEAD (e.g. Orca's
+  // `*-fix` worktrees) — that is not a probe failure, it is "no branch, no upstream, no
+  // tracking info exists at all", so there is nothing for `for-each-ref`'s `[gone]` check to
+  // read and this falls straight through to the same base-ancestor fallback used below for a
+  // named branch with no tracking ref: HEAD already being an ancestor of the resolved base is
+  // the only pushed/merged signal left either way.
+  if (branch.stdout) {
+    const track = git(['for-each-ref', '--format=%(upstream:track)', `refs/heads/${branch.stdout}`], w.path);
+    if (!track || track.status !== 0) { ctx.onNotClean?.('git probe failed'); return false; }
+    if (track.stdout === '[gone]') {
+      const head = git(['rev-parse', 'HEAD'], w.path);
+      const clean = !!head && head.status === 0 && !!head.stdout &&
+        (ctx.github?.mergedHeadOids || []).includes(head.stdout);
+      if (!clean) ctx.onNotClean?.('unpushed');
+      return clean;
+    }
   }
   const base = resolveBaseRef(w.path, git);
   const clean = !!base && isAncestorOf(w.path, git, base);
@@ -2450,7 +2531,7 @@ module.exports = {
   classifyTerminal, isHoldingResources, snapshotWorkers, sessionTerminalHandles,
   workerWorktreePaths, worktreeKeys, sessionWorktreeKeys, retainedTerminalHandles,
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
-  resolveAcceptance, resolveGithubAcceptance, githubRepoSlug, runGh,
+  resolveAcceptance, resolveGithubAcceptance, resolveGithubOpenPrForHeadSha, githubRepoSlug, runGh,
   isWorktreeIdle, isWorktreeClean, ignoredPathAllowed, cleanStatus, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,

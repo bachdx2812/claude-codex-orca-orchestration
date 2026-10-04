@@ -415,6 +415,33 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
 
   check('an open linked PR is never done-but-open',
     heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open' }, ctx()), false);
+  // Item A/C: Orca's own linked-PR state is a cached snapshot and can go stale — a fresh gh
+  // query that confirms MERGED (and reports no OPEN PR for the head) must win over a stale
+  // `prState: 'open'`, and likewise over an Orca-side placeholder like `prState: 'unknown'`.
+  check('Orca-linked "open" is stale: a fresh gh MERGED verdict (no OPEN PR for the head) wins',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open', prNumber: 55 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[{"state":"MERGED","headRefOid":"head123"}]' }),
+      cache: {},
+    })), true);
+  check('a real OPEN PR for the head still vetoes acceptance even though Orca cached "open" too',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open', prNumber: 57 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[{"state":"OPEN","headRefOid":"head123"}]' }),
+      cache: {},
+    })), false);
+  check('an Orca placeholder prState ("unknown") is overridden by a fresh gh MERGED verdict',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'unknown', prNumber: 54 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[{"state":"MERGED","headRefOid":"head123"}]' }),
+      cache: {},
+    })), true);
+  check('an unrecognized prState with no gh verdict at all (no PR found by branch) stays kept',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'unknown', prNumber: 54 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[]' }),
+      cache: {},
+    })), false);
   check('an OPEN GitHub lookup vetoes a stale linked CLOSED PR',
     heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'closed' }, ctx({
       git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
@@ -536,6 +563,68 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       gh: () => ({ status: 0, stdout: '[{"state":"MERGED","headRefOid":"head123"}]' }),
       cache: {},
     })), true);
+
+  // Item B: a detached HEAD (Orca's `*-fix` worktrees) has no branch name at all — `git
+  // branch --show-current` succeeds with empty stdout, which is not a probe failure. The
+  // clean check must fall back to the same base-ancestor signal used for a named branch with
+  // no tracking info at all, not report "git probe failed" merely because there is no branch
+  // name to look up tracking for.
+  const detachedGit = (overrides = {}) => ({
+    branch: { status: 0, stdout: '' }, upstream: { status: 128, stdout: '' }, ...overrides,
+  });
+  check('a detached HEAD that is an ancestor of base and clean is done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ git: detachedGit() })), true);
+  check('a detached HEAD with uncommitted changes is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({
+      git: detachedGit({ status: { status: 0, stdout: ' M x\n' } }),
+    })), false);
+  check('a detached HEAD not an ancestor of base is never done-but-open',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({
+      git: detachedGit({ mergeBase: { status: 1, stdout: '' } }),
+    })), false);
+  check('a detached HEAD git status probe failure keeps the worktree (never a pass on uncertainty)',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ git: detachedGit({ status: null }) })), false);
+
+  // Item 2 (detached HEAD acceptance): even once HEAD is an ancestor of base with its own
+  // merged commit, a detached worktree must still be vetoed when its exact commit SHA is the
+  // head of some OPEN PR elsewhere (opened from a different branch/fork) — there is no branch
+  // name to find that PR by, so this is checked by commit SHA against every open PR in the repo.
+  check('a detached HEAD whose commit matches an OPEN PR head SHA is never accepted',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: () => ({ status: 0, stdout: '[{"headRefOid":"head123"}]' }),
+      cache: {},
+    })), false);
+  check('a detached HEAD whose commit matches no OPEN PR head SHA is accepted',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: () => ({ status: 0, stdout: '[{"headRefOid":"someoneElseHead"}]' }),
+      cache: {},
+    })), true);
+  check('a gh failure on the detached-HEAD open-PR-by-SHA check fails closed',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: () => ({ uncertain: true }),
+      cache: {},
+    })), false);
+
+  // Item 3 (PR #54 "unknown"): a detached HEAD with an Orca-linked PR NUMBER (no branch to
+  // search gh by) resolves via a direct `gh pr view <number>` lookup instead of giving up and
+  // falling back to Orca's own (possibly stale/placeholder) `prState`.
+  check('a detached HEAD with a linked PR number resolves via "gh pr view", not branch lookup',
+    heartbeat.isDoneButOpen({ ...noPrIdle, prState: 'unknown', prNumber: 54 }, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: (args) => (args[1] === 'view'
+        ? { status: 0, stdout: '{"state":"MERGED","headRefOid":"head123"}' }
+        : { status: 0, stdout: '[]' }),
+      cache: {},
+    })), true);
+  check('a detached HEAD with a linked PR number still open via "gh pr view" is kept',
+    heartbeat.isDoneButOpen({ ...noPrIdle, prState: 'unknown', prNumber: 54 }, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: () => ({ status: 0, stdout: '{"state":"OPEN","headRefOid":"head123"}' }),
+      cache: {},
+    })), false);
 
   // Idle via the worktree-level lastOutputAt aggregate (no per-terminal data is exposed).
   const liveButQuiet = { ...mergedIdle, liveTerminalCount: 1, lastOutputAt: 1_000_000 - 120_000 };
