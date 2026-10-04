@@ -853,10 +853,10 @@ unpushed (a deleted upstream additionally requires Git's exact `[gone]` marker a
 GitHub PR `headRefOid` equal to `HEAD`); and its work was accepted. Ownership by the
 currently running panel is not required.
 
-A worker row blocks removal unless its terminal was released AND every state field it
+A worker row blocks removal unless its terminal was released, or every state field it
 actually carries (`workerState`, `dispatchStatus`) is terminal
 (`succeeded`/`failed`/`stopped`/`cancelled`/`completed`) — a row with no state fields at all
-is never treated as finished. Unlike the OR-based done checks the heartbeat uses for
+still blocks. Unlike the OR-based done checks the heartbeat uses for
 non-destructive auto-close, this `worktree rm` guard fails closed on disagreement: a row
 whose fields disagree (e.g. `workerState: "running"` with `dispatchStatus: "failed"`, or the
 reverse) still blocks, and so does `workerState: "unsupervised"` — unknown liveness is not

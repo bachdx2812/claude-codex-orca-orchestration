@@ -151,6 +151,18 @@ const liveOnRecheck = runCase('live-on-recheck', worktree(), {
 });
 check('a terminal appearing after the initial snapshot prevents removal',
   liveOnRecheck.calls.includes('worktree rm'), false);
+check('the recheck-liveness-changed reason is logged distinctly',
+  liveOnRecheck.log.includes('live-terminal state changed before removal'), true);
+
+const missingOnRecheck = runCase('missing-on-recheck', worktree(), {
+  STUB_WORKTREES_AFTER_FIRST_JSON: '[]',
+});
+check('a worktree absent from the fresh re-read is kept',
+  missingOnRecheck.calls.includes('worktree rm'), false);
+check('a failed/missing fresh re-read logs a distinct reason, not the liveness-changed one',
+  missingOnRecheck.log.includes('re-read before removal failed'), true);
+check('a failed/missing fresh re-read does not reuse the liveness-changed reason',
+  missingOnRecheck.log.includes('live-terminal state changed before removal'), false);
 
 const foreign = runCase('foreign-session', worktree(),
   { STUB_GH_STATE: 'CLOSED' }, [{

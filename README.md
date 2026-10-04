@@ -341,11 +341,10 @@ session-owned heartbeat, it evaluates every local Orca worktree, so cleanup cont
 the panel that created a worktree exits. It removes only a non-main, non-archived worktree
 whose `liveTerminalCount` is the known number `0`, which has no still-live Orca worker row,
 has no tracked/untracked changes or non-rebuildable ignored files, and has nothing
-unpushed. A worker row blocks removal unless its terminal was released AND every state
+unpushed. A worker row blocks removal unless its terminal was released, or every state
 field it carries (`workerState`, `dispatchStatus`) is terminal — a row whose fields
 disagree (e.g. `running` + `failed`, or the reverse) still blocks, fail-closed, and so does
-`workerState: "unsupervised"`; only a row terminal on every present field, with its terminal
-released, is finished. A deleted upstream is safe only when Git reports exactly `[gone]` and a
+`workerState: "unsupervised"`; a row with no state fields at all also still blocks. A deleted upstream is safe only when Git reports exactly `[gone]` and a
 merged GitHub PR's `headRefOid` exactly equals local `HEAD`. `janitor.rebuildableIgnored`
 configures the ignored-path allowlist (defaults cover dependency, build, cache, and coverage
 outputs only). Acceptance includes Orca's linked PR/MR state, a bounded `gh pr list` lookup

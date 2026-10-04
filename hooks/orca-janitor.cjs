@@ -151,10 +151,11 @@ function workerWorktreeKeys(row) {
 }
 
 /**
- * A worker row only STOPS blocking removal once every present state field has reached a
- * terminal state (succeeded/completed/failed/stopped/cancelled) AND its terminal has been
- * released. Unlike the OR-based done checks used for non-destructive heartbeat auto-close
- * elsewhere in this codebase, a `worktree rm` guard must fail closed on disagreement: a row
+ * A worker row blocks removal unless its terminal has been released, or every present
+ * state field has reached a terminal state (succeeded/completed/failed/stopped/cancelled)
+ * — a row with no state fields at all still blocks. Unlike the OR-based done checks used
+ * for non-destructive heartbeat auto-close elsewhere in this codebase, a `worktree rm`
+ * guard must fail closed on disagreement: a row
  * whose fields disagree (e.g. `workerState: "running"` with `dispatchStatus: "failed"`, or
  * the reverse) is NOT finished and keeps blocking, same as an `unsupervised` row — this
  * guard, unlike heartbeat supervision, treats `unsupervised` as "unknown liveness", not
@@ -239,7 +240,11 @@ function runJanitor(ctx = {}) {
     if (!verdictFor(worktree, { cache: {} }).done) continue;
     const freshResult = worktrees(run);
     const fresh = freshResult.ok && freshResult.worktrees.find((row) => row.path === worktree.path);
-    if (!fresh || fresh.isMainWorktree || fresh.isArchived || fresh.liveTerminalCount !== 0) {
+    if (!fresh) {
+      logKept(keptState, worktree.path, 're-read before removal failed');
+      continue;
+    }
+    if (fresh.isMainWorktree || fresh.isArchived || fresh.liveTerminalCount !== 0) {
       logKept(keptState, worktree.path, 'live-terminal state changed before removal');
       continue;
     }
