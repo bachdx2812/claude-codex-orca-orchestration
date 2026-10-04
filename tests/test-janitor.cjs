@@ -303,6 +303,46 @@ check('a kept-state entry for a worktree no longer in the inventory is pruned on
 check('the kept-state entry for the still-inventoried worktree survives the prune',
   Object.prototype.hasOwnProperty.call(keptStateAfterPrune, dedupWorktreePath), true);
 
+// A `worktree rm` that fails at the process level (non-zero exit, empty stdout) must never
+// be mistaken for success — runOrca must return null, not `{}`, so the janitor logs the
+// failure and keeps the worktree's prior kept-state entry intact (item 1).
+const rmFailDir = path.join(ROOT, 'rm-fails');
+fs.mkdirSync(rmFailDir, { recursive: true });
+const rmFailWorktreePath = path.join(rmFailDir, 'worktree');
+fs.mkdirSync(rmFailWorktreePath, { recursive: true });
+fs.writeFileSync(path.join(rmFailWorktreePath, '.git'), 'gitdir: synthetic\n');
+const rmFailBaseEnv = {
+  STUB_WORKTREES_JSON: JSON.stringify([{
+    ...worktree(), path: rmFailWorktreePath, worktreeId: `repo-1::${rmFailWorktreePath}`,
+  }]),
+  STUB_WORKERS_JSON: '[]',
+  STUB_GIT_ORIGIN: 'git@github.com:acme/widgets.git', STUB_GIT_BRANCH: 'feature/work',
+  STUB_GIT_HAS_UPSTREAM: '1', STUB_GIT_HEAD_OID: 'head123', STUB_GH_HEAD_OID: 'head123',
+  STUB_GH_STATE: 'MERGED',
+};
+// Run 1: dirty, establishes a persisted kept-state entry to prove it survives.
+runJanitorRaw(rmFailDir, { ...rmFailBaseEnv, STUB_GIT_CLEAN: '0' });
+const rmFailKeptPath = path.join(rmFailDir, 'state', 'janitor-kept.json');
+const keptBeforeRmFail = JSON.parse(fs.readFileSync(rmFailKeptPath, 'utf8'));
+check('rm-fail case starts with a persisted kept entry', keptBeforeRmFail[rmFailWorktreePath], 'dirty');
+
+// Run 2: clean (removable) + a forced worktree-rm process failure.
+const rmFailCalls = path.join(rmFailDir, 'orca-calls.log');
+runJanitorRaw(rmFailDir, {
+  ...rmFailBaseEnv, STUB_GIT_CLEAN: '1', STUB_WORKTREE_RM_FAIL: '1', STUB_ORCA_CALLS_LOG: rmFailCalls,
+});
+const rmFailCallsOut = fs.existsSync(rmFailCalls) ? fs.readFileSync(rmFailCalls, 'utf8') : '';
+check('a forced worktree-rm process failure is attempted',
+  rmFailCallsOut.includes(`worktree rm --worktree path:${rmFailWorktreePath} --json`), true);
+const rmFailLog = fs.readFileSync(path.join(rmFailDir, 'state', 'janitor.log'), 'utf8');
+check('a forced worktree-rm process failure is never logged as removed',
+  rmFailLog.includes(`removed ${JSON.stringify(rmFailWorktreePath)}`), false);
+check('a forced worktree-rm process failure logs "remove failed"',
+  rmFailLog.includes(`remove failed ${JSON.stringify(rmFailWorktreePath)}`), true);
+const keptAfterRmFail = JSON.parse(fs.readFileSync(rmFailKeptPath, 'utf8'));
+check('the kept-state entry survives a failed removal rather than being cleared',
+  keptAfterRmFail[rmFailWorktreePath], 'dirty');
+
 // Incomplete inventory names the failing source (item 3).
 const incompleteDir = path.join(ROOT, 'incomplete-inventory');
 fs.mkdirSync(incompleteDir, { recursive: true });

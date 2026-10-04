@@ -83,19 +83,29 @@ function logKept(state, worktreePath, reason) {
 /**
  * A real Orca CLI error (e.g. the `--limit` over 100 rejection this module exists to avoid)
  * answers `{ ok: false, error: { code, message } }` on stdout with a non-zero exit code, not
- * silence — so this parses stdout as JSON regardless of exit status, and only falls back to
- * null (genuinely "no reply") when the process itself errored or stdout was not JSON at all.
- * That lets every caller read `reply.error.message` instead of losing it behind "no reply".
+ * silence — so this parses stdout as JSON on a non-zero exit too, instead of losing it
+ * behind "no reply". But a non-zero exit (or a signal) with no parseable `ok: false` body is
+ * a genuine failure, not a reply this module can trust: an empty stdout, a crash, or JSON
+ * with no `ok: false` on a failing exit all return null, never `{}` — a bare `{}` used to
+ * pass a mutating caller's `reply.ok !== false` check and get logged as a successful
+ * `worktree rm` even though the process actually failed.
  */
 function runOrca(args, timeout = 10000) {
   try {
     const result = spawnSync(ORCA_BIN, args, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024 });
     if (result.error) return null;
+    const stdout = result.stdout || '';
+    if (!stdout.trim()) return null;
+    let parsed;
     try {
-      return JSON.parse(result.stdout || '{}');
+      parsed = JSON.parse(stdout);
     } catch {
       return null;
     }
+    if (result.status !== 0 || result.signal) {
+      return parsed && parsed.ok === false ? parsed : null;
+    }
+    return parsed;
   } catch {
     return null;
   }

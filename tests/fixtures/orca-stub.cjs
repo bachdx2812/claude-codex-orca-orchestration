@@ -77,6 +77,9 @@ if (args[0] === 'terminal' && args[1] === 'close') {
 }
 if (args[0] === 'worktree' && args[1] === 'rm') {
   recordCall();
+  // STUB_WORKTREE_RM_FAIL=1 reproduces a real process-level failure: non-zero exit, empty
+  // stdout — distinct from STUB_WORKTREE_RM_OK_FALSE, which is a reply Orca itself answers.
+  if (process.env.STUB_WORKTREE_RM_FAIL === '1') process.exit(1);
   const ok = process.env.STUB_WORKTREE_RM_OK_FALSE === '1' ? false : true;
   process.stdout.write(JSON.stringify({ ok, result: {} }));
   process.exit(0);
