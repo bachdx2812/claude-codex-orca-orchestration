@@ -1376,6 +1376,62 @@ expect('a neutral scouting dispatch is allowed',
   rmState(RSID);
 }
 
+// Codex service_tier = "priority"/"fast" warning (item 5): the SessionStart banner surfaces
+// it exactly like install.mjs --check, without ever editing the operator's real Codex
+// config — CODEX_HOME points at a synthetic, per-test config.toml the whole way through.
+function codexHomeWithTier(name, tomlText) {
+  const dir = path.join(RUN_DIR, name);
+  fs.mkdirSync(dir, { recursive: true });
+  if (tomlText !== null) fs.writeFileSync(path.join(dir, 'config.toml'), tomlText);
+  return dir;
+}
+{
+  const priorityEnv = { ...quotaEnv('priority-tier', 10, 30),
+    CODEX_HOME: codexHomeWithTier('codex-home-priority', 'service_tier = "priority"\n') };
+  const RSID = `${SID}-priority-tier`;
+  const out = spawnGate({ session_id: RSID, hook_event_name: 'SessionStart' }, priorityEnv).stdout;
+  if (/CODEX WARNING:.*service_tier = "priority"/.test(out)) pass += 1;
+  else failures.push(`SessionStart banner must warn about service_tier = "priority": ${out.slice(0, 400)}`);
+  rmState(RSID);
+}
+{
+  const flexEnv = { ...quotaEnv('flex-tier', 10, 30),
+    CODEX_HOME: codexHomeWithTier('codex-home-flex', 'service_tier = "flex"\n') };
+  const RSID = `${SID}-flex-tier`;
+  const out = spawnGate({ session_id: RSID, hook_event_name: 'SessionStart' }, flexEnv).stdout;
+  if (!/CODEX WARNING/.test(out)) pass += 1;
+  else failures.push(`SessionStart banner must not warn about a non-priority tier: ${out.slice(0, 400)}`);
+  rmState(RSID);
+}
+{
+  const absentEnv = { ...quotaEnv('absent-tier', 10, 30),
+    CODEX_HOME: codexHomeWithTier('codex-home-absent', null) };
+  const RSID = `${SID}-absent-tier`;
+  const out = spawnGate({ session_id: RSID, hook_event_name: 'SessionStart' }, absentEnv).stdout;
+  if (!/CODEX WARNING/.test(out)) pass += 1;
+  else failures.push(`SessionStart banner must not warn when no Codex config exists: ${out.slice(0, 400)}`);
+  rmState(RSID);
+}
+{
+  const allowedEnv = { ...quotaEnv('allowed-priority-tier', 10, 30, { codexAllowPriorityTier: true }),
+    CODEX_HOME: codexHomeWithTier('codex-home-allowed', 'service_tier = "priority"\n') };
+  const RSID = `${SID}-allowed-priority-tier`;
+  const out = spawnGate({ session_id: RSID, hook_event_name: 'SessionStart' }, allowedEnv).stdout;
+  if (!/CODEX WARNING/.test(out)) pass += 1;
+  else failures.push(`codexAllowPriorityTier: true must silence the SessionStart warning: ${out.slice(0, 400)}`);
+  rmState(RSID);
+}
+{
+  const envOverrideEnv = { ...quotaEnv('env-allowed-priority-tier', 10, 30),
+    CODEX_HOME: codexHomeWithTier('codex-home-env-allowed', 'service_tier = "priority"\n'),
+    ORCH_CODEX_ALLOW_PRIORITY_TIER: '1' };
+  const RSID = `${SID}-env-allowed-priority-tier`;
+  const out = spawnGate({ session_id: RSID, hook_event_name: 'SessionStart' }, envOverrideEnv).stdout;
+  if (!/CODEX WARNING/.test(out)) pass += 1;
+  else failures.push(`ORCH_CODEX_ALLOW_PRIORITY_TIER=1 must silence the SessionStart warning: ${out.slice(0, 400)}`);
+  rmState(RSID);
+}
+
 // Activation modes (amendment 1): "orca-only" (the real default, not the "always" this
 // suite otherwise forces) gates only a session that carries ORCA_TERMINAL_HANDLE; "off"
 // never gates; "always" gates unconditionally regardless of the environment.

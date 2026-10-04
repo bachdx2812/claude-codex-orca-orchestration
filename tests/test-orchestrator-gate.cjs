@@ -2610,6 +2610,62 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   fs.rmSync(root, { recursive: true, force: true });
 }
 
+// --- codex-priority-tier.cjs: detectCodexPriorityTier (pure, never touches a real home) --
+{
+  const PRIORITY_TIER = require('../hooks/lib/codex-priority-tier.cjs');
+  const tierRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-priority-tier-'));
+  function tierEnv(name, text) {
+    const home = path.join(tierRoot, name);
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    if (text !== null) fs.writeFileSync(path.join(home, '.codex', 'config.toml'), text);
+    return { HOME: home };
+  }
+  check('a bare top-level service_tier = "priority" is detected',
+    !!PRIORITY_TIER.detectCodexPriorityTier(tierEnv('top-priority', 'service_tier = "priority"\n')), true);
+  check('a bare top-level service_tier = "fast" is detected',
+    !!PRIORITY_TIER.detectCodexPriorityTier(tierEnv('top-fast', 'service_tier = "fast"\n')), true);
+  check('service_tier = "flex" is not flagged',
+    PRIORITY_TIER.detectCodexPriorityTier(tierEnv('top-flex', 'service_tier = "flex"\n')), null);
+  check('service_tier = "default" is not flagged',
+    PRIORITY_TIER.detectCodexPriorityTier(tierEnv('top-default', 'service_tier = "default"\n')), null);
+  check('no config file at all is not flagged',
+    PRIORITY_TIER.detectCodexPriorityTier(tierEnv('no-config', null)), null);
+  check('a commented-out service_tier line is not flagged',
+    PRIORITY_TIER.detectCodexPriorityTier(tierEnv('commented', '# service_tier = "priority"\n')), null);
+  {
+    const found = PRIORITY_TIER.detectCodexPriorityTier(tierEnv('with-line-number',
+      'model = "gpt-5"\nservice_tier = "priority"\n'));
+    check('the detected entry names the 1-based line number', found && found.lineNumber, 2);
+    check('the detected entry names the exact line text', found && found.line, 'service_tier = "priority"');
+  }
+  check('a priority tier on a non-default profile does not apply',
+    PRIORITY_TIER.detectCodexPriorityTier(tierEnv('non-default-profile',
+      'profile = "work"\n\n[profiles.work]\nmodel = "gpt-5"\n\n[profiles.other]\nservice_tier = "priority"\n')),
+    null);
+  check('a priority tier on the default profile applies',
+    !!PRIORITY_TIER.detectCodexPriorityTier(tierEnv('default-profile',
+      'profile = "work"\n\n[profiles.work]\nservice_tier = "priority"\n')), true);
+  check('CODEX_HOME overrides the default ~/.codex location', (() => {
+    const customDir = path.join(tierRoot, 'custom-codex-home');
+    fs.mkdirSync(customDir, { recursive: true });
+    fs.writeFileSync(path.join(customDir, 'config.toml'), 'service_tier = "priority"\n');
+    return !!PRIORITY_TIER.detectCodexPriorityTier({ HOME: path.join(tierRoot, 'unused'), CODEX_HOME: customDir });
+  })(), true);
+  check('config.codexAllowPriorityTier defaults to false', config.loadConfig().codexAllowPriorityTier, false);
+  check('config.codexAllowPriorityTier(cfg) reads the configured value',
+    config.codexAllowPriorityTier({ codexAllowPriorityTier: true }), true);
+  const prevEnvAllow = process.env.ORCH_CODEX_ALLOW_PRIORITY_TIER;
+  process.env.ORCH_CODEX_ALLOW_PRIORITY_TIER = '1';
+  check('ORCH_CODEX_ALLOW_PRIORITY_TIER=1 overrides a false config value to true',
+    config.codexAllowPriorityTier({ codexAllowPriorityTier: false }), true);
+  process.env.ORCH_CODEX_ALLOW_PRIORITY_TIER = '0';
+  check('ORCH_CODEX_ALLOW_PRIORITY_TIER=0 overrides a true config value to false',
+    config.codexAllowPriorityTier({ codexAllowPriorityTier: true }), false);
+  if (prevEnvAllow === undefined) delete process.env.ORCH_CODEX_ALLOW_PRIORITY_TIER;
+  else process.env.ORCH_CODEX_ALLOW_PRIORITY_TIER = prevEnvAllow;
+  fs.rmSync(tierRoot, { recursive: true, force: true });
+}
+
 fs.rmSync(STATE_DIR, { recursive: true, force: true });
 
 console.log(`${pass} passed, ${failures.length} failed`);

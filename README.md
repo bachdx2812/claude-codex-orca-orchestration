@@ -488,6 +488,15 @@ default; rerun with `--replace-foreign-gate` to remove those registrations under
 normal `settings.json` backup. `--help`/`-h` only prints usage, and an unknown option exits
 2 without installing. Check mode exits 1 whenever it reports a `MISS`, `FAIL`, or `PROBLEM`.
 
+Both `--check` and the `SessionStart` banner also warn (never edit) when the operator's own
+`~/.codex/config.toml` (or `$CODEX_HOME/config.toml`) sets `service_tier = "priority"` —
+shown as "fast" in the Codex footer — either as a bare top-level key or inside the
+`[profiles.<name>]` section for the profile a top-level `profile = "<name>"` key names as
+the default. Operator finding (2026-10-04): that tier burns Codex quota much faster than
+the default; removing the line cut burn visibly. Silence the warning once it is a
+deliberate choice with `codexAllowPriorityTier: true` in the config, or
+`ORCH_CODEX_ALLOW_PRIORITY_TIER=1` for one process.
+
 Full agent-facing install/verify/customise/rollback steps: `AGENT_INSTALL.md`.
 
 ## Workflow (text diagram)

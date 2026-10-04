@@ -53,7 +53,7 @@ const HOOK_FILES = [
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
   'lib/terminal-signals.cjs', 'lib/worker-progress-fingerprint.cjs', 'lib/worker-quota-handover.cjs', 'lib/quota-reset-resume.cjs', 'lib/live-probe-cache.cjs', 'lib/kimi-quota-probe.cjs',
   'lib/deepseek-quota-probe.cjs',
-  'lib/coder-availability.cjs', 'lib/coder-pool-route.cjs',
+  'lib/coder-availability.cjs', 'lib/coder-pool-route.cjs', 'lib/codex-priority-tier.cjs',
 ];
 const EVENTS = {
   SessionStart: '*',
@@ -900,6 +900,22 @@ function check() {
     const codexHome = process.env.CODEX_HOME || path.join(HOME, '.codex');
     const authFile = path.join(codexHome, 'auth.json');
     log(`codex login: ${fs.existsSync(authFile) ? `auth file present at ${authFile} (not a guarantee it is valid)` : `no auth file found at ${authFile} - run \`codex login\``}`);
+    try {
+      const base = hookLibBase();
+      if (base) {
+        const priorityTierLib = require(path.join(base, 'lib/codex-priority-tier.cjs'));
+        const cfgLib = require(path.join(base, 'lib/config.cjs'));
+        const allowed = cfgLib.codexAllowPriorityTier(cfgLib.loadConfig());
+        const found = allowed ? null : priorityTierLib.detectCodexPriorityTier(process.env);
+        if (found) {
+          warn(`Codex config ${found.file}:${found.lineNumber} sets service_tier = "${found.tier}" ` +
+            `(shows as "fast" in the Codex footer) - this burns Codex quota faster; remove the line ` +
+            `\`${found.line}\`, or set codexAllowPriorityTier: true to accept it.`);
+        }
+      }
+    } catch (err) {
+      warn(`could not check the Codex config for service_tier: ${err.message}`);
+    }
   }
   log(`opencode: ${which('opencode') ? (versionOf('opencode') || 'present') : 'NOT FOUND on PATH (DeepSeek coder unavailable)'}`);
   if (!hasOrca || !hasCodex) {

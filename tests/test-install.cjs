@@ -213,6 +213,78 @@ check('--check reports kimi usable once credentials exist (quota unknown on an u
   /coder kimi: usable \[binary [^\]]*stub 1\.0, auth ok, quota unknown\]/.test(credsOut), true);
 check('--check never prints the Kimi access token', credsOut.includes(FIXTURE_TOKEN), false);
 
+// --- Codex service_tier = "priority"/"fast" surfacing (never edits the operator's config) --
+function writeCodexConfig(home, text) {
+  const codexHome = path.join(home, '.codex');
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, 'config.toml'), text);
+}
+
+const priorityHome = path.join(root, 'codex-priority-tier');
+fs.mkdirSync(priorityHome, { recursive: true });
+writeCodexConfig(priorityHome, 'service_tier = "priority"\n');
+const priorityCheck = run(['--check'], 'codex-priority-tier');
+check('--check warns about a top-level service_tier = "priority"',
+  /WARNING:.*config\.toml.*service_tier = "priority"/i.test(`${priorityCheck.stdout}${priorityCheck.stderr}`), true);
+
+const fastHome = path.join(root, 'codex-fast-tier');
+fs.mkdirSync(fastHome, { recursive: true });
+writeCodexConfig(fastHome, 'service_tier = "fast"\n');
+const fastCheck = run(['--check'], 'codex-fast-tier');
+check('--check warns about a top-level service_tier = "fast" too',
+  /WARNING:.*service_tier = "fast"/i.test(`${fastCheck.stdout}${fastCheck.stderr}`), true);
+
+const absentHome = path.join(root, 'codex-tier-absent');
+fs.mkdirSync(absentHome, { recursive: true });
+writeCodexConfig(absentHome, 'model = "gpt-5"\n');
+const absentCheck = run(['--check'], 'codex-tier-absent');
+check('--check does not warn when no service_tier is set',
+  /service_tier/i.test(`${absentCheck.stdout}${absentCheck.stderr}`), false);
+
+const flexHome = path.join(root, 'codex-tier-flex');
+fs.mkdirSync(flexHome, { recursive: true });
+writeCodexConfig(flexHome, 'service_tier = "flex"\n');
+const flexCheck = run(['--check'], 'codex-tier-flex');
+check('--check does not warn for a non-priority tier such as "flex"',
+  /service_tier/i.test(`${flexCheck.stdout}${flexCheck.stderr}`), false);
+
+const defaultHome = path.join(root, 'codex-tier-default');
+fs.mkdirSync(defaultHome, { recursive: true });
+writeCodexConfig(defaultHome, 'service_tier = "default"\n');
+const defaultTierCheck = run(['--check'], 'codex-tier-default');
+check('--check does not warn for the "default" tier',
+  /service_tier/i.test(`${defaultTierCheck.stdout}${defaultTierCheck.stderr}`), false);
+
+const nonDefaultProfileHome = path.join(root, 'codex-tier-non-default-profile');
+fs.mkdirSync(nonDefaultProfileHome, { recursive: true });
+writeCodexConfig(nonDefaultProfileHome,
+  'profile = "work"\n\n[profiles.work]\nmodel = "gpt-5"\n\n[profiles.other]\nservice_tier = "priority"\n');
+const nonDefaultProfileCheck = run(['--check'], 'codex-tier-non-default-profile');
+check('--check does not warn about a priority tier set on a non-default profile',
+  /service_tier/i.test(`${nonDefaultProfileCheck.stdout}${nonDefaultProfileCheck.stderr}`), false);
+
+const defaultProfileHome = path.join(root, 'codex-tier-default-profile');
+fs.mkdirSync(defaultProfileHome, { recursive: true });
+writeCodexConfig(defaultProfileHome, 'profile = "work"\n\n[profiles.work]\nservice_tier = "priority"\n');
+const defaultProfileCheck = run(['--check'], 'codex-tier-default-profile');
+check('--check warns about a priority tier set on the default profile',
+  /WARNING:.*service_tier = "priority"/i.test(`${defaultProfileCheck.stdout}${defaultProfileCheck.stderr}`), true);
+
+const allowHome = path.join(root, 'codex-tier-allowed');
+fs.mkdirSync(path.join(allowHome, '.claude'), { recursive: true });
+fs.writeFileSync(path.join(allowHome, '.claude', 'orchestration.config.json'),
+  JSON.stringify({ codexAllowPriorityTier: true }));
+writeCodexConfig(allowHome, 'service_tier = "priority"\n');
+const allowCheck = run(['--check'], 'codex-tier-allowed');
+check('codexAllowPriorityTier: true silences the warning',
+  /service_tier/i.test(`${allowCheck.stdout}${allowCheck.stderr}`), false);
+
+const unreadableHome = path.join(root, 'codex-tier-unreadable');
+fs.mkdirSync(unreadableHome, { recursive: true });
+const unreadableCheck = run(['--check'], 'codex-tier-unreadable');
+check('a missing Codex config file never warns and never crashes --check',
+  unreadableCheck.status === 0 && !/service_tier/i.test(`${unreadableCheck.stdout}${unreadableCheck.stderr}`), true);
+
 // --- shipped agent definitions (agents/sonnet-coder.md): created only when absent, ------
 // --- never overwritten, removed on uninstall only when still the shipped original -------
 const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonnet-coder.md'), 'utf8');

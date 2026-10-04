@@ -66,6 +66,9 @@ const DEFAULT_CONFIG = {
     lookup: ['Explore'],
   },
   codexHandoffUsedPercent: 95,
+  // Silences the `service_tier = "priority"`/`"fast"` warning (install --check + SessionStart
+  // banner) for an operator who has deliberately chosen that Codex config.toml tier.
+  codexAllowPriorityTier: false,
   handoverWarnMarginPercent: 5,
   autoResumeAfterReset: true,
   autoResumePanel: true,
@@ -290,7 +293,7 @@ function loadConfig() {
     merged.handoverWarnMarginPercent = handoverWarnMargin;
   }
 
-  for (const key of ['autoResumeAfterReset', 'autoResumePanel']) {
+  for (const key of ['autoResumeAfterReset', 'autoResumePanel', 'codexAllowPriorityTier']) {
     if (typeof merged[key] !== 'boolean') {
       warnings.push(`${key} must be a boolean; using ${DEFAULT_CONFIG[key]}.`);
       merged[key] = DEFAULT_CONFIG[key];
@@ -610,6 +613,20 @@ function stallSeconds(cfg) {
   return cfg.heartbeat.stallSeconds;
 }
 
+/**
+ * Whether the Codex `service_tier = "priority"`/`"fast"` warning is silenced.
+ * `ORCH_CODEX_ALLOW_PRIORITY_TIER` overrides the config value for one process; accepts
+ * 1/true/yes/on and 0/false/no/off (case-insensitive), same as `autoResumeAfterReset`.
+ */
+function codexAllowPriorityTier(cfg) {
+  const envOverride = process.env.ORCH_CODEX_ALLOW_PRIORITY_TIER;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    if (/^(?:1|true|yes|on)$/i.test(envOverride)) return true;
+    if (/^(?:0|false|no|off)$/i.test(envOverride)) return false;
+  }
+  return cfg.codexAllowPriorityTier;
+}
+
 /** Whether exhausted work is parked for a detached reset scheduler. */
 function autoResumeAfterReset(cfg) {
   const envOverride = process.env.ORCH_AUTO_RESUME;
@@ -842,5 +859,5 @@ module.exports = {
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
   deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
   maxParallelDeepseekWorkers, reviewModelForCoder, verifyModelAlias,
-  stallSeconds, autoResumeAfterReset,
+  stallSeconds, autoResumeAfterReset, codexAllowPriorityTier,
 };

@@ -34,7 +34,7 @@ const {
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
   deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
-  maxParallelDeepseekWorkers, reviewModelForCoder, verifyModelAlias,
+  maxParallelDeepseekWorkers, reviewModelForCoder, verifyModelAlias, codexAllowPriorityTier,
 } = require('./lib/config.cjs');
 const WG = require('./lib/worker-groups.cjs');
 const PAC = require('./lib/parallel-agent-cap.cjs');
@@ -47,6 +47,7 @@ const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
 const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const EXEC_QUOTA = require('./lib/exec-route-by-quota.cjs');
 const HANDOVER = require('./lib/worker-quota-handover.cjs');
+const CODEX_PRIORITY_TIER = require('./lib/codex-priority-tier.cjs');
 
 const DIR = stateDir();
 const LOG = path.join(DIR, 'violations.log');
@@ -1268,6 +1269,9 @@ function onSessionStart(p, s, cfg) {
   const kimiThreshold = kimiHandoffUsed(cfg);
   const deepseekThreshold = deepseekHandoffUsed(cfg);
   const route = currentExecRoute(cfg, s);
+  const priorityTierWarningText = codexAllowPriorityTier(cfg) ? null
+    : CODEX_PRIORITY_TIER.formatCodexPriorityTierWarning();
+  const priorityTierWarning = priorityTierWarningText ? `- CODEX WARNING: ${priorityTierWarningText}\n` : '';
   const warnings = (cfg.warnings || []).map((w) => `- CONFIG WARNING: ${w}\n`).join('');
   const overrideWarnings = activeOverrideLines(cfg, s).map((line) => `- ACTIVE OVERRIDE: ${line}\n`).join('');
   // Every coder is optional: the banner names only the coders usable on THIS machine
@@ -1287,6 +1291,7 @@ function onSessionStart(p, s, cfg) {
   process.stdout.write(
     'ORCHESTRATION CONTRACT (enforced by orchestrator-gate.cjs):\n' +
     warnings +
+    priorityTierWarning +
     overrideWarnings +
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +

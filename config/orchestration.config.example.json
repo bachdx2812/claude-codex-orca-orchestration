@@ -18,6 +18,7 @@
     "lookup": ["Explore"]
   },
   "codexHandoffUsedPercent": 95,
+  "codexAllowPriorityTier": false,
   "kimiHandoffUsedPercent": 95,
   "deepseekHandoffUsedPercent": 95,
   "handoverWarnMarginPercent": 5,

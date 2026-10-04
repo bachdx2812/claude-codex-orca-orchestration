@@ -333,6 +333,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   },
   "agents": { "escalation": [], "lookup": ["Explore"] },
   "codexHandoffUsedPercent": 95,
+  "codexAllowPriorityTier": false,
   "kimiHandoffUsedPercent": 95,
   "deepseekHandoffUsedPercent": 95,
   "handoverWarnMarginPercent": 5,
@@ -385,6 +386,13 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `codexHandoffUsedPercent`: integer 0-100, default 95. Codex leaves the eligible peer
   pool once it has used this much of its tightest quota window. Overridable for one
   process with `ORCH_CODEX_HANDOFF_USED`.
+- `codexAllowPriorityTier`: boolean, default `false`. Silences the warning (`install.mjs
+  --check` and the `SessionStart` banner) when the operator's own `~/.codex/config.toml`
+  (or `$CODEX_HOME/config.toml`) sets `service_tier = "priority"` or `"fast"` — operator
+  finding, 2026-10-04: that setting shows as "fast" in the Codex footer and burned Codex
+  quota much faster; removing it cut burn visibly. The gate only ever reports where to
+  look (file + line) — it never edits the operator's Codex config. Overridable for one
+  process with `ORCH_CODEX_ALLOW_PRIORITY_TIER` (1/true/yes/on, 0/false/no/off).
 - `kimiHandoffUsedPercent`: integer 0-100, default 95. Kimi's own, independent threshold:
   Kimi leaves the eligible peer pool once it has used this much of its
   tightest quota window. Overridable for one process with `ORCH_KIMI_HANDOFF_USED`.
