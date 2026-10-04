@@ -90,6 +90,17 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
     process.stdout.write(JSON.stringify({ ok: false }));
     process.exit(0);
   }
+  // Mirrors the real Orca CLI: any --limit over 100 is rejected outright, exit 1, with a
+  // JSON error body on stdout (not silence) — callers must parse stdout regardless of exit
+  // status to see `error.message` instead of treating this as "no reply".
+  const limitIdx = args.indexOf('--limit');
+  const limitValue = limitIdx >= 0 ? Number(args[limitIdx + 1]) : NaN;
+  if (Number.isFinite(limitValue) && limitValue > 100) {
+    process.stdout.write(JSON.stringify({
+      ok: false, error: { code: 'invalid_argument', message: 'Too big: expected number to be <=100' },
+    }));
+    process.exit(1);
+  }
   let workers;
   if (process.env.STUB_WORKERS_JSON) {
     try { workers = JSON.parse(process.env.STUB_WORKERS_JSON); } catch { workers = []; }

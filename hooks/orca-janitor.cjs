@@ -12,12 +12,22 @@ const {
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
 const LOG_FILE = path.join(stateDir(), 'janitor.log');
 const MAX_LOG_BYTES = 1024 * 1024;
-// A busy machine's `worktree ps` / `worker-list` pages must not be truncated by a small
-// default page size — pass an explicitly large limit to both inventory calls.
+// A busy machine's `worktree ps` page must not be truncated by a small default page size —
+// `worktree ps` genuinely accepts a large explicit limit (verified against a live Orca).
+// `worker-list` does NOT: Orca rejects any `--limit` above 100 with `invalid_argument`
+// ("Too big: expected number to be <=100"), so worker-list paging follows `page.nextCursor`
+// at this bounded per-page size instead (see `workerRows` below).
 const INVENTORY_LIMIT = 10000;
+const WORKER_LIST_PAGE_LIMIT = 100;
+// Fails closed rather than looping forever if Orca ever hands back a `nextCursor` chain
+// that never terminates.
+const WORKER_LIST_MAX_PAGES = 50;
 // Per-worktree "kept" reasons, persisted so a run only re-logs a line when the reason for
 // that path actually changed (item 1) instead of repeating the same line every tick.
 const KEPT_STATE_FILE = path.join(stateDir(), 'janitor-kept.json');
+// Set from main() when invoked with --dry-run: every appendLog call also echoes to the
+// console so a live diagnostic run shows its evaluation without digging into the log file.
+let ECHO_TO_CONSOLE = false;
 
 function rotateLog() {
   try {
@@ -29,6 +39,7 @@ function rotateLog() {
 }
 
 function appendLog(message) {
+  if (ECHO_TO_CONSOLE) console.log(message);
   try {
     fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
     rotateLog();
@@ -69,14 +80,31 @@ function logKept(state, worktreePath, reason) {
   appendLog(`kept ${JSON.stringify(worktreePath)}: ${reason}`);
 }
 
+/**
+ * A real Orca CLI error (e.g. the `--limit` over 100 rejection this module exists to avoid)
+ * answers `{ ok: false, error: { code, message } }` on stdout with a non-zero exit code, not
+ * silence — so this parses stdout as JSON regardless of exit status, and only falls back to
+ * null (genuinely "no reply") when the process itself errored or stdout was not JSON at all.
+ * That lets every caller read `reply.error.message` instead of losing it behind "no reply".
+ */
 function runOrca(args, timeout = 10000) {
   try {
     const result = spawnSync(ORCA_BIN, args, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024 });
-    if (result.error || result.status !== 0) return null;
-    return JSON.parse(result.stdout || '{}');
+    if (result.error) return null;
+    try {
+      return JSON.parse(result.stdout || '{}');
+    } catch {
+      return null;
+    }
   } catch {
     return null;
   }
+}
+
+/** `{ ok: false }` or `{ ok: false, error: { message } }` -> a human-readable reason suffix. */
+function failureReason(reply) {
+  const message = reply && reply.error && typeof reply.error.message === 'string' ? reply.error.message : null;
+  return message || 'ok:false';
 }
 
 /**
@@ -89,7 +117,7 @@ function runOrca(args, timeout = 10000) {
 function worktrees(run = runOrca) {
   const reply = run(['worktree', 'ps', '--json', '--limit', String(INVENTORY_LIMIT)]);
   if (!reply) return { ok: false, reason: 'worktree ps: no reply' };
-  if (reply.ok === false) return { ok: false, reason: 'worktree ps: ok:false' };
+  if (reply.ok === false) return { ok: false, reason: `worktree ps: ${failureReason(reply)}` };
   const result = reply.result ?? reply;
   if (!Array.isArray(result.worktrees)) return { ok: false, reason: 'worktree ps: missing worktrees array' };
   if (result.truncated) return { ok: false, reason: 'worktree ps: truncated' };
@@ -112,20 +140,24 @@ function worktrees(run = runOrca) {
 }
 
 /**
- * `orca orchestration worker-list`, paginated with an explicitly large per-page limit
- * (item 3). Returns `{ ok: true, workers }` or `{ ok: false, reason }` naming the failure:
- * no reply, `ok: false`, a missing `workers` array, or a page that claims more rows exist
- * but hands out no usable cursor to follow.
+ * `orca orchestration worker-list`, paginated by following `page.nextCursor` at a bounded
+ * per-page `--limit` (Orca rejects any `--limit` over 100 outright with `invalid_argument`,
+ * verified live — unlike `worktree ps`, which does accept a large explicit limit). Returns
+ * `{ ok: true, workers }` or `{ ok: false, reason }` naming the failure: no reply, `ok: false`
+ * (with Orca's own error message when it supplied one), a missing `workers` array, a page
+ * that claims more rows exist but hands out no usable cursor to follow, or the page cap
+ * below being hit — fails closed rather than looping forever on a cursor chain that never
+ * terminates.
  */
 function workerRows(run = runOrca) {
   const rows = [];
   let cursor = null;
-  do {
-    const args = ['orchestration', 'worker-list', '--include-remote', '--limit', String(INVENTORY_LIMIT), '--json'];
+  for (let page = 0; page < WORKER_LIST_MAX_PAGES; page += 1) {
+    const args = ['orchestration', 'worker-list', '--include-remote', '--limit', String(WORKER_LIST_PAGE_LIMIT), '--json'];
     if (cursor) args.push('--cursor', cursor);
     const reply = run(args);
     if (!reply) return { ok: false, reason: 'worker-list: no reply' };
-    if (reply.ok === false) return { ok: false, reason: 'worker-list: ok:false' };
+    if (reply.ok === false) return { ok: false, reason: `worker-list: ${failureReason(reply)}` };
     const result = reply.result ?? reply;
     if (!Array.isArray(result.workers)) return { ok: false, reason: 'worker-list: missing workers array' };
     rows.push(...result.workers);
@@ -134,7 +166,8 @@ function workerRows(run = runOrca) {
       return { ok: false, reason: 'worker-list: hasMore with no usable cursor' };
     }
     cursor = result.page.nextCursor;
-  } while (true);
+  }
+  return { ok: false, reason: `worker-list: exceeded page cap (${WORKER_LIST_MAX_PAGES})` };
 }
 
 function workerWorktreeKeys(row) {
@@ -248,6 +281,11 @@ function runJanitor(ctx = {}) {
       logKept(keptState, worktree.path, 'live-terminal state changed before removal');
       continue;
     }
+    if (ctx.dryRun) {
+      removed.push(worktree.path);
+      appendLog(`would remove ${JSON.stringify(worktree.path)} (${verdict.reason})`);
+      continue;
+    }
     const reply = run(['worktree', 'rm', '--worktree', `path:${worktree.path}`, '--json'], 60000);
     if (reply && reply.ok !== false) {
       removed.push(worktree.path);
@@ -257,7 +295,7 @@ function runJanitor(ctx = {}) {
       appendLog(`remove failed ${JSON.stringify(worktree.path)}`);
     }
   }
-  if (!ctx.keptState) {
+  if (!ctx.keptState && !ctx.dryRun) {
     // Bound the persisted kept-state file to this run's own inventory: a worktree removed
     // manually, by heartbeat `remove` mode, or via a direct `orca worktree rm` never clears
     // its own entry here, so without this prune the file would grow by one stale key per
@@ -272,12 +310,21 @@ function runJanitor(ctx = {}) {
 }
 
 function main() {
+  const dryRun = process.argv.includes('--dry-run');
+  ECHO_TO_CONSOLE = dryRun;
   const cfg = loadConfig();
-  if (!janitorEnabled(cfg)) return;
-  const result = runJanitor({ cfg });
+  if (!janitorEnabled(cfg)) {
+    if (dryRun) console.log('orca-janitor --dry-run: janitor.enabled is false; nothing evaluated');
+    return;
+  }
+  const result = runJanitor({ cfg, dryRun });
   if (!result.ok) {
     appendLog(`skipped: ${result.reason}`);
     process.exitCode = 1;
+    return;
+  }
+  if (dryRun) {
+    console.log(`orca-janitor --dry-run: ${result.removed.length} worktree(s) would be removed`);
   }
 }
 
