@@ -1251,26 +1251,32 @@ function hasOwnCommit(w, git) {
 function resolveAcceptance(w, git, stat, ctx = {}) {
   const github = w.mrState == null && !ctx.skipGithub
     ? resolveGithubAcceptance(w, git, ctx.gh || runGh, ctx) : null;
-  if (github?.uncertain) return { accepted: false, reason: null, github };
-  if (github?.open) return { accepted: false, reason: null, github };
+  // `reason` always carries a diagnostic string, whether or not `accepted` is true, so a
+  // caller that only needs "why wasn't this removed" (orca-janitor's kept-reason log) does
+  // not have to reimplement this leg's own logic just to describe it.
+  if (github?.uncertain) return { accepted: false, reason: 'gh uncertain', github };
+  if (github?.open) return { accepted: false, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} OPEN`, github };
   if (w.prState != null) {
     const state = String(w.prState).toLowerCase();
-    return DONE_PR_STATES.has(state)
-      ? { accepted: true, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}`, github }
-      : { accepted: false, reason: null, github };
+    return {
+      accepted: DONE_PR_STATES.has(state),
+      reason: `PR #${w.prNumber != null ? w.prNumber : '?'} ${w.prState}`,
+      github,
+    };
   }
   if (w.mrState != null) {
     const state = String(w.mrState).toLowerCase();
-    if (OPEN_MR_STATES.has(state)) return { accepted: false, reason: null };
-    return DONE_PR_STATES.has(state)
-      ? { accepted: true, reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}` }
-      : { accepted: false, reason: null };
+    if (OPEN_MR_STATES.has(state)) return { accepted: false, reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}` };
+    return {
+      accepted: DONE_PR_STATES.has(state),
+      reason: `MR #${w.mrNumber != null ? w.mrNumber : '?'} ${w.mrState}`,
+    };
   }
   if (github?.accepted) return { accepted: true, reason: github.reason, github };
   const base = resolveBaseRef(w.path, git);
-  if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: null };
-  if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: null };
-  if (!hasOwnCommit(w, git)) return { accepted: false, reason: null };
+  if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: 'no upstream + not in base', github };
+  if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: 'not accepted', github };
+  if (!hasOwnCommit(w, git)) return { accepted: false, reason: 'not accepted', github };
   return { accepted: true, reason: `no linked PR, HEAD already merged into ${base}`, github };
 }
 
@@ -1307,10 +1313,13 @@ function ignoredPathAllowed(filePath, allowlist) {
   });
 }
 
-function cleanStatus(stdout, allowlist, onBlockedIgnored) {
+function cleanStatus(stdout, allowlist, onBlockedIgnored, onDirty) {
   const entries = String(stdout || '').split('\0').filter(Boolean);
   for (const entry of entries) {
-    if (!entry.startsWith('!! ')) return false;
+    if (!entry.startsWith('!! ')) {
+      onDirty?.();
+      return false;
+    }
     const filePath = entry.slice(3);
     if (!ignoredPathAllowed(filePath, allowlist)) {
       if (onBlockedIgnored) onBlockedIgnored(filePath);
@@ -1320,6 +1329,15 @@ function cleanStatus(stdout, allowlist, onBlockedIgnored) {
   return true;
 }
 
+/**
+ * `ctx.onNotClean(reason)` is an optional diagnostic callback (orca-janitor's kept-reason
+ * log) fired exactly once, right before a `false` return, naming which leg failed —
+ * 'dirty' (tracked/untracked changes; the more specific 'ignored <path>' case already
+ * reports itself via `ctx.onBlockedIgnored` inside `cleanStatus`, so it is not duplicated
+ * here), 'unpushed' (commits ahead of upstream, or a deleted-upstream head that was never
+ * the pushed/merged one) or 'no upstream + not in base' (no upstream at all and HEAD isn't
+ * contained in the resolved base). It never changes the boolean return — purely additive.
+ */
 function isWorktreeClean(w, git, ctx = {}) {
   // `--no-optional-locks`: a plain status read must never contend with, or be blocked by,
   // another concurrent git process's lock on this worktree's index — this daemon polls
@@ -1327,25 +1345,34 @@ function isWorktreeClean(w, git, ctx = {}) {
   const status = git([
     '--no-optional-locks', 'status', '--porcelain', '--ignored', '--untracked-files=normal', '-z',
   ], w.path);
-  if (!status || status.status !== 0 || !cleanStatus(status.stdout,
-    ctx.rebuildableIgnored || cfg.janitor.rebuildableIgnored, ctx.onBlockedIgnored)) return false;
+  if (!status || status.status !== 0) { ctx.onNotClean?.('dirty'); return false; }
+  if (!cleanStatus(status.stdout, ctx.rebuildableIgnored || cfg.janitor.rebuildableIgnored,
+    ctx.onBlockedIgnored, () => ctx.onNotClean?.('dirty'))) {
+    return false;
+  }
   const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], w.path);
-  if (upstream === null) return false;
+  if (upstream === null) { ctx.onNotClean?.('dirty'); return false; }
   if (upstream && upstream.status === 0 && upstream.stdout) {
     const unpushed = git(['rev-list', '@{u}..HEAD'], w.path);
-    return !!unpushed && unpushed.status === 0 && unpushed.stdout === '';
+    const clean = !!unpushed && unpushed.status === 0 && unpushed.stdout === '';
+    if (!clean) ctx.onNotClean?.('unpushed');
+    return clean;
   }
   const branch = git(['branch', '--show-current'], w.path);
-  if (!branch || branch.status !== 0 || !branch.stdout) return false;
+  if (!branch || branch.status !== 0 || !branch.stdout) { ctx.onNotClean?.('dirty'); return false; }
   const track = git(['for-each-ref', '--format=%(upstream:track)', `refs/heads/${branch.stdout}`], w.path);
-  if (!track || track.status !== 0) return false;
+  if (!track || track.status !== 0) { ctx.onNotClean?.('dirty'); return false; }
   if (track.stdout === '[gone]') {
     const head = git(['rev-parse', 'HEAD'], w.path);
-    return !!head && head.status === 0 && !!head.stdout &&
+    const clean = !!head && head.status === 0 && !!head.stdout &&
       (ctx.github?.mergedHeadOids || []).includes(head.stdout);
+    if (!clean) ctx.onNotClean?.('unpushed');
+    return clean;
   }
   const base = resolveBaseRef(w.path, git);
-  return !!base && isAncestorOf(w.path, git, base);
+  const clean = !!base && isAncestorOf(w.path, git, base);
+  if (!clean) ctx.onNotClean?.('no upstream + not in base');
+  return clean;
 }
 
 /**
@@ -1562,10 +1589,16 @@ function evaluateDoneButOpen(w, ctx = {}) {
   const idleSeconds = ctx.idleSeconds != null ? ctx.idleSeconds : IDLE_SECONDS;
   const git = ctx.git || runGit;
   const stat = ctx.stat || statMtimeMs;
-  if (!isWorktreeIdle(w, now, idleSeconds)) return { done: false, reason: null };
+  if (!isWorktreeIdle(w, now, idleSeconds)) {
+    ctx.onNotDone?.('live terminal');
+    return { done: false, reason: null };
+  }
   const acceptance = resolveAcceptance(w, git, stat, ctx);
   const { accepted, reason } = acceptance;
-  if (!accepted) return { done: false, reason: null };
+  if (!accepted) {
+    ctx.onNotDone?.(acceptance.reason || 'not accepted');
+    return { done: false, reason: null };
+  }
   if (!isWorktreeClean(w, git, { ...ctx, github: acceptance.github })) return { done: false, reason: null };
   return { done: true, reason };
 }

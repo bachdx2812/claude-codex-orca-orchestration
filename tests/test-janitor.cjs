@@ -158,7 +158,23 @@ const retained = runCase('retained-worker', worktree(), {}, [{
   dispatchId: 'ctx_retained', terminalState: 'retained', workerState: 'succeeded',
   projection: { workspace: { id: 'repo-1::/work/feature' } },
 }]);
-check('a retained worker row prevents removal', retained.calls.includes('worktree rm'), false);
+check('a retained-but-terminal (succeeded) worker row no longer blocks removal',
+  retained.calls.includes(`worktree rm --worktree path:${retained.worktreePath} --json`), true);
+
+const runningWorker = runCase('running-worker', worktree(), {}, [{
+  dispatchId: 'ctx_running', terminalState: 'active', workerState: 'running',
+  projection: { workspace: { id: 'repo-1::/work/feature' } },
+}]);
+check('a still-running worker row keeps blocking removal', runningWorker.calls.includes('worktree rm'), false);
+check('the worker-row kept reason names the dispatch id and states',
+  runningWorker.log.includes(`kept ${JSON.stringify(runningWorker.worktreePath)}: worker row ctx_running running/active`), true);
+
+const contradictoryRow = runCase('contradictory-worker-row', worktree(), {}, [{
+  dispatchId: 'ctx_contradictory', terminalState: 'retained', workerState: 'failed', dispatchStatus: 'completed',
+  projection: { workspace: { id: 'repo-1::/work/feature' } },
+}]);
+check('a row terminal via either workerState or dispatchStatus no longer blocks removal',
+  contradictoryRow.calls.includes(`worktree rm --worktree path:${contradictoryRow.worktreePath} --json`), true);
 
 const ghUnavailable = runCase('gh-unavailable', worktree(), {
   STUB_GH_FAIL: '1', STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_ANCESTOR: '1',
@@ -176,6 +192,77 @@ const ghMissing = runCase('gh-missing', worktree(), {
 });
 check('a missing gh binary keeps the Git-only ancestor and reflog fallback',
   ghMissing.calls.includes(`worktree rm --worktree path:${ghMissing.worktreePath} --json`), true);
+
+// The kept-reason log dedups by reason-per-path (item 1): two consecutive runs that keep
+// the same worktree for the same reason must log the line only once.
+function runJanitorRaw(dir, extraEnv) {
+  return spawnSync(process.execPath, [JANITOR], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ORCH_STATE_DIR: path.join(dir, 'state'),
+      ORCH_CONFIG_PATH: path.join(dir, 'missing-config.json'),
+      ORCA_BIN: ORCA,
+      ORCH_GIT_BIN: GIT,
+      ORCH_GH_BIN: GH,
+      ...extraEnv,
+    },
+  });
+}
+
+const dedupDir = path.join(ROOT, 'kept-reason-dedup');
+fs.mkdirSync(dedupDir, { recursive: true });
+const dedupWorktreePath = path.join(dedupDir, 'worktree');
+fs.mkdirSync(dedupWorktreePath, { recursive: true });
+fs.writeFileSync(path.join(dedupWorktreePath, '.git'), 'gitdir: synthetic\n');
+const dedupEnv = {
+  STUB_WORKTREES_JSON: JSON.stringify([{
+    ...worktree(), path: dedupWorktreePath, worktreeId: `repo-1::${dedupWorktreePath}`,
+  }]),
+  STUB_WORKERS_JSON: '[]',
+  STUB_GIT_ORIGIN: 'git@github.com:acme/widgets.git', STUB_GIT_BRANCH: 'feature/work',
+  STUB_GIT_HAS_UPSTREAM: '1', STUB_GIT_HEAD_OID: 'head123', STUB_GH_HEAD_OID: 'head123',
+  STUB_GH_STATE: 'MERGED', STUB_GIT_CLEAN: '0',
+};
+runJanitorRaw(dedupDir, dedupEnv);
+runJanitorRaw(dedupDir, dedupEnv);
+const dedupLogPath = path.join(dedupDir, 'state', 'janitor.log');
+const dedupLog = fs.existsSync(dedupLogPath) ? fs.readFileSync(dedupLogPath, 'utf8') : '';
+const dedupLines = dedupLog.split('\n').filter((line) => line.includes(`kept ${JSON.stringify(dedupWorktreePath)}: dirty`));
+check('a kept reason unchanged across two runs is logged exactly once', dedupLines.length, 1);
+
+// A reason change (dirty -> a live terminal appearing) must log again rather than staying
+// silent because some earlier reason for this path was already recorded.
+const dedupEnvChanged = { ...dedupEnv, STUB_GIT_CLEAN: '0',
+  STUB_WORKTREES_JSON: JSON.stringify([{
+    ...worktree({ liveTerminalCount: 1 }), path: dedupWorktreePath, worktreeId: `repo-1::${dedupWorktreePath}`,
+  }]) };
+runJanitorRaw(dedupDir, dedupEnvChanged);
+const dedupLogAfterChange = fs.readFileSync(dedupLogPath, 'utf8');
+check('a changed kept reason for the same path is logged again',
+  dedupLogAfterChange.includes(`kept ${JSON.stringify(dedupWorktreePath)}: live terminal`), true);
+
+// Incomplete inventory names the failing source (item 3).
+const incompleteDir = path.join(ROOT, 'incomplete-inventory');
+fs.mkdirSync(incompleteDir, { recursive: true });
+runJanitorRaw(incompleteDir, { STUB_WORKTREES_JSON: '[]', STUB_WORKERS_OK_FALSE: '1' });
+const incompleteLog = fs.readFileSync(path.join(incompleteDir, 'state', 'janitor.log'), 'utf8');
+check('an unreadable worker-list names itself in the skip reason',
+  incompleteLog.includes('skipped: inventory unavailable or incomplete (worker-list: ok:false)'), true);
+
+const incompleteWorktreesDir = path.join(ROOT, 'incomplete-worktrees');
+fs.mkdirSync(incompleteWorktreesDir, { recursive: true });
+runJanitorRaw(incompleteWorktreesDir, { STUB_WORKERS_JSON: '[]', STUB_WORKTREES_NO_ARRAY: '1' });
+const incompleteWorktreesLog = fs.readFileSync(path.join(incompleteWorktreesDir, 'state', 'janitor.log'), 'utf8');
+check('a worktree-ps reply with no worktrees array names itself in the skip reason',
+  incompleteWorktreesLog.includes('skipped: inventory unavailable or incomplete (worktree ps: missing worktrees array)'), true);
+
+const truncatedDir = path.join(ROOT, 'truncated-worktrees');
+fs.mkdirSync(truncatedDir, { recursive: true });
+runJanitorRaw(truncatedDir, { STUB_WORKERS_JSON: '[]', STUB_WORKTREES_JSON: '[]', STUB_WORKTREES_TRUNCATED: '1' });
+const truncatedLog = fs.readFileSync(path.join(truncatedDir, 'state', 'janitor.log'), 'utf8');
+check('a truncated worktree-ps page names itself in the skip reason',
+  truncatedLog.includes('skipped: inventory unavailable or incomplete (worktree ps: truncated)'), true);
 
 const disabledDir = path.join(ROOT, 'disabled');
 fs.mkdirSync(disabledDir, { recursive: true });
