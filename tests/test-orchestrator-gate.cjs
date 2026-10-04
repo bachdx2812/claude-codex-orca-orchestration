@@ -421,7 +421,40 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('Orca-linked "open" is stale: a fresh gh MERGED verdict (no OPEN PR for the head) wins',
     heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open', prNumber: 55 }, ctx({
       git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
-      gh: () => ({ status: 0, stdout: '[{"state":"MERGED","headRefOid":"head123"}]' }),
+      gh: () => ({ status: 0, stdout: '[{"state":"MERGED","headRefOid":"head123","number":55}]' }),
+      cache: {},
+    })), true);
+  // H1: a verdict served from the cross-process cache must never override a `prState` of
+  // `open` — the real PR could have been reopened inside that cache window, and only a live
+  // query made on this call can rule that out.
+  check('H1: a cached MERGED verdict does not override a fresher Orca "open" prState',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open', prNumber: 55 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[]' }),
+      cache: { 'acme/widgets#feature': {
+        at: 1_000_000 - 60_000,
+        verdict: { accepted: true, open: false, reason: 'GitHub PR MERGED', mergedHeadOids: ['head123'], mergedPrNumbers: [55] },
+      } },
+    })), false);
+  // M2: a historical CLOSED PR on a reused branch name (a different, older number) must not
+  // override Orca's fresher linked "open" state.
+  check('M2: a CLOSED PR under a different number does not override a linked "open" prState',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open', prNumber: 80 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[{"state":"CLOSED","headRefOid":"head123","number":50}]' }),
+      cache: {},
+    })), false);
+  // M2: even the SAME numbered PR must be MERGED, not merely CLOSED, to override "open".
+  check('M2: the same numbered PR found only CLOSED (not merged) does not override "open"',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open', prNumber: 80 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[{"state":"CLOSED","headRefOid":"head123","number":80}]' }),
+      cache: {},
+    })), false);
+  check('M2: the same numbered PR found MERGED does override a linked "open" prState',
+    heartbeat.isDoneButOpen({ ...mergedIdle, prState: 'open', prNumber: 80 }, ctx({
+      git: { remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } },
+      gh: () => ({ status: 0, stdout: '[{"state":"MERGED","headRefOid":"head123","number":80}]' }),
       cache: {},
     })), true);
   check('a real OPEN PR for the head still vetoes acceptance even though Orca cached "open" too',
@@ -533,6 +566,30 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('hasOwnCommit is false on a git failure (never a pass on uncertainty)',
     heartbeat.hasOwnCommit(noPrIdle, fakeGit({ reflog: null })), false);
 
+  // C1: detachedCommitsReachableFromRemotes walks the SHA+subject reflog and requires every
+  // commit-prefixed entry to be reachable from a remote-tracking ref (`--not --remotes`
+  // printing nothing). `fakeGit`'s 'log' key stands in here for `git log -g` (same
+  // subcommand name, regardless of the `-g` flag), tab-separated `<sha>\t<subject>` per line.
+  check('C1: detachedCommitsReachableFromRemotes is true when the reflog has no commit action at all (nothing to lose)',
+    heartbeat.detachedCommitsReachableFromRemotes(noPrIdle, fakeGit({ log: { status: 0, stdout: 'deadbeef\tcheckout: moving' } })), true);
+  check('C1: detachedCommitsReachableFromRemotes is true when every recorded commit is reachable from a remote',
+    heartbeat.detachedCommitsReachableFromRemotes(noPrIdle, fakeGit({
+      log: { status: 0, stdout: 'abc123\tcommit: work' },
+      revList: { status: 0, stdout: '' },
+    })), true);
+  check('C1: detachedCommitsReachableFromRemotes is false when a recorded commit is NOT reachable from any remote',
+    heartbeat.detachedCommitsReachableFromRemotes(noPrIdle, fakeGit({
+      log: { status: 0, stdout: 'abc123\tcommit: work' },
+      revList: { status: 0, stdout: 'abc123\n' },
+    })), false);
+  check('C1: detachedCommitsReachableFromRemotes fails closed on a reflog read failure',
+    heartbeat.detachedCommitsReachableFromRemotes(noPrIdle, fakeGit({ log: null })), false);
+  check('C1: detachedCommitsReachableFromRemotes fails closed on a rev-list failure',
+    heartbeat.detachedCommitsReachableFromRemotes(noPrIdle, fakeGit({
+      log: { status: 0, stdout: 'abc123\tcommit: work' },
+      revList: null,
+    })), false);
+
   // Review round 3, item 3 (H1 leftover false positive): the OLD mtime/commit-time signal
   // alone (`hasProducedMergedWork`) is satisfied by a worktree that was merely rebased/
   // fast-forwarded onto a base that itself advanced after the worktree's creation — HEAD's
@@ -589,16 +646,19 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   // merged commit, a detached worktree must still be vetoed when its exact commit SHA is the
   // head of some OPEN PR elsewhere (opened from a different branch/fork) — there is no branch
   // name to find that PR by, so this is checked by commit SHA against every open PR in the repo.
+  // H3: resolveGithubOpenPrForHeadSha now queries the commit's own associated-PRs endpoint
+  // (`gh api repos/{repo}/commits/{sha}/pulls`), which returns PR rows scoped to that exact
+  // commit already — matched by `state`, not by re-checking `headRefOid`.
   check('a detached HEAD whose commit matches an OPEN PR head SHA is never accepted',
     heartbeat.isDoneButOpen(noPrIdle, ctx({
       git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
-      gh: () => ({ status: 0, stdout: '[{"headRefOid":"head123"}]' }),
+      gh: () => ({ status: 0, stdout: '[{"state":"open"}]' }),
       cache: {},
     })), false);
   check('a detached HEAD whose commit matches no OPEN PR head SHA is accepted',
     heartbeat.isDoneButOpen(noPrIdle, ctx({
       git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
-      gh: () => ({ status: 0, stdout: '[{"headRefOid":"someoneElseHead"}]' }),
+      gh: () => ({ status: 0, stdout: '[]' }),
       cache: {},
     })), true);
   check('a gh failure on the detached-HEAD open-PR-by-SHA check fails closed',
@@ -607,6 +667,24 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       gh: () => ({ uncertain: true }),
       cache: {},
     })), false);
+  // H3: a full page (or any error) from the commits/pulls lookup must be treated as
+  // uncertain and kept, never a silent "no match found".
+  check('H3: a malformed (non-array) response from the by-SHA lookup fails closed',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: () => ({ status: 0, stdout: '{"not":"an array"}' }),
+      cache: {},
+    })), false);
+  {
+    let capturedArgs = null;
+    heartbeat.resolveGithubOpenPrForHeadSha(
+      { path: '/wt/a' },
+      fakeGit(detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } })),
+      (args) => { capturedArgs = args; return { status: 0, stdout: '[]' }; },
+    );
+    check('H3: resolveGithubOpenPrForHeadSha queries the commit-scoped pulls endpoint with --paginate',
+      capturedArgs, ['api', 'repos/acme/widgets/commits/head123/pulls', '--paginate']);
+  }
 
   // Item 3 (PR #54 "unknown"): a detached HEAD with an Orca-linked PR NUMBER (no branch to
   // search gh by) resolves via a direct `gh pr view <number>` lookup instead of giving up and
@@ -625,6 +703,42 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       gh: () => ({ status: 0, stdout: '{"state":"OPEN","headRefOid":"head123"}' }),
       cache: {},
     })), false);
+  // M1: `gh pr view <n>` checked only PR #54 — a merged PR #54 whose own head differs from
+  // this worktree's actual current HEAD is weak evidence and must not be accepted.
+  check('M1: a detached HEAD with a linked PR number MERGED at a DIFFERENT head SHA is kept',
+    heartbeat.isDoneButOpen({ ...noPrIdle, prState: 'unknown', prNumber: 54 }, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: (args) => (args[1] === 'view'
+        ? { status: 0, stdout: '{"state":"MERGED","headRefOid":"someoneElseHead"}' }
+        : { status: 0, stdout: '[]' }),
+      cache: {},
+    })), false);
+  // M1: PR #54 is MERGED at this exact HEAD, but a second, different OPEN PR is also at this
+  // exact HEAD (opened from a fork/other branch) — the by-SHA veto must still run and keep it.
+  check('M1: a detached HEAD with a linked PR number MERGED at HEAD, but a second OPEN PR at the same HEAD, is kept',
+    heartbeat.isDoneButOpen({ ...noPrIdle, prState: 'unknown', prNumber: 54 }, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: (args) => (args[1] === 'view'
+        ? { status: 0, stdout: '{"state":"MERGED","headRefOid":"head123"}' }
+        : { status: 0, stdout: '[{"state":"open"}]' }),
+      cache: {},
+    })), false);
+
+  // H2: the heartbeat (`skipGithub: true`) never makes a gh call for the by-SHA veto, and
+  // for a detached HEAD specifically that means there is no way left to safely verify
+  // acceptance through the no-linked-PR path — it is always kept there, janitor-only.
+  check('H2: skipGithub keeps a detached HEAD that would otherwise be accepted (heartbeat never removes it)',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ git: detachedGit(), skipGithub: true })), false);
+  {
+    let ghCalls = 0;
+    const named = { path: '/wt/a' };
+    heartbeat.resolveAcceptance(named, fakeGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      () => 500_000, { now: 1_000_000, skipGithub: true, gh: () => { ghCalls += 1; return { status: 0, stdout: '[]' }; } });
+    check('H2: skipGithub makes no gh call at all for a named branch either (heartbeat stays git-only)',
+      ghCalls, 0);
+  }
+  check('H2: a named branch (not detached) is still accepted git-only under skipGithub, same as before',
+    heartbeat.isDoneButOpen(noPrIdle, ctx({ skipGithub: true })), true);
 
   // Idle via the worktree-level lastOutputAt aggregate (no per-terminal data is exposed).
   const liveButQuiet = { ...mergedIdle, liveTerminalCount: 1, lastOutputAt: 1_000_000 - 120_000 };
@@ -2405,6 +2519,107 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
     sh(['merge', '-q', '--ff-only', 'feature-own'], base);
     check('H1 real-git: a worktree whose own commit is merged into base is done-but-open',
       heartbeat.isDoneButOpen(rowFor(ownPath), realCtx()), true);
+
+    fs.rmSync(ROOT, { recursive: true, force: true });
+  }
+}
+
+// C1 real-git: a detached worktree's own commit can exist ONLY in that worktree's per-
+// worktree HEAD reflog once the worktree later checks out away from it (e.g. onto a moved
+// origin/main). `git worktree rm` deletes that reflog, so removing the worktree at that
+// point would permanently lose a commit that is otherwise unreferenced anywhere. This can
+// only be reproduced against a real remote (a bare repo), since "reachable from a remote"
+// is exactly the signal `--not --remotes` reads.
+{
+  const gitAvailable = (() => {
+    try { return spawnSync('git', ['--version']).status === 0; } catch { return false; }
+  })();
+  if (!gitAvailable) {
+    console.log('C1 real-git tests skipped: no git binary on PATH');
+  } else {
+    function sh(args, cwd) {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      if (r.status !== 0) throw new Error(`git ${args.join(' ')} in ${cwd} failed: ${r.stderr || r.stdout}`);
+      return (r.stdout || '').trim();
+    }
+    const realGit = (args, cwd) => {
+      const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      if (r.error || r.status === null || r.status === undefined) return null;
+      return { status: r.status, stdout: (r.stdout || '').trim() };
+    };
+    const rowFor = (wtPath) => ({
+      path: wtPath, displayName: path.basename(wtPath), isMainWorktree: false, isArchived: false, liveTerminalCount: 0,
+    });
+    const realCtx = () => ({ now: Date.now(), idleSeconds: 60, git: realGit, stat: heartbeat.statMtimeMs });
+    const sleepPastSecondBoundary = () => { spawnSync('sleep', ['1.2']); };
+
+    const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-c1-realgit-'));
+    const remote = path.join(ROOT, 'remote.git');
+    fs.mkdirSync(remote);
+    sh(['init', '-q', '--bare', '-b', 'main'], remote);
+
+    const base = path.join(ROOT, 'base');
+    fs.mkdirSync(base);
+    sh(['init', '-q', '-b', 'main'], base);
+    sh(['config', 'user.email', 'orch-test@example.invalid'], base);
+    sh(['config', 'user.name', 'Orch Test'], base);
+    sh(['remote', 'add', 'origin', remote], base);
+    fs.writeFileSync(path.join(base, 'f.txt'), 'a\n');
+    sh(['add', '.'], base);
+    sh(['commit', '-q', '-m', 'initial'], base);
+    sh(['push', '-q', 'origin', 'main'], base);
+    const commitA = sh(['rev-parse', 'HEAD'], base);
+
+    // Case 1 (the regression): worktree detaches at A, commits X on top of it (recorded only
+    // in this worktree's own HEAD reflog — no branch ever names it), base then advances to B
+    // and is pushed, and the worktree checks out origin/main (B), walking away from X. X is
+    // now reachable from no branch or remote; only this worktree's reflog still knows it
+    // existed. Removing the worktree at this point would lose it permanently.
+    const orphanPath = path.join(ROOT, 'wt-orphan');
+    sh(['worktree', 'add', '-q', '--detach', orphanPath, commitA], base);
+    sleepPastSecondBoundary();
+    fs.writeFileSync(path.join(orphanPath, 'x.txt'), 'orphan work\n');
+    sh(['add', '.'], orphanPath);
+    sh(['commit', '-q', '-m', 'orphan commit'], orphanPath);
+    fs.writeFileSync(path.join(base, 'f.txt'), 'b\n');
+    sh(['commit', '-q', '-am', 'advance base'], base);
+    sh(['push', '-q', 'origin', 'main'], base);
+    sh(['fetch', '-q', 'origin'], orphanPath);
+    sh(['checkout', '-q', 'origin/main'], orphanPath);
+    check('C1 real-git: a detached worktree with a commit unreachable from any remote (reflog-only) is kept, never removed',
+      heartbeat.isDoneButOpen(rowFor(orphanPath), realCtx()), false);
+
+    // Case 2 (no false positive): a detached worktree whose own commit was ALSO pushed to the
+    // remote before it checked away — that commit is reachable from `refs/remotes/origin/main`
+    // itself, so there is nothing left to lose and the worktree is still accepted/clean. Uses
+    // its own independent base+remote (Case 1 already advanced the shared `remote`/`base`
+    // past commitA, which would make a push of a second commitA-child non-fast-forward).
+    const remote2 = path.join(ROOT, 'remote2.git');
+    fs.mkdirSync(remote2);
+    sh(['init', '-q', '--bare', '-b', 'main'], remote2);
+    const base2 = path.join(ROOT, 'base2');
+    fs.mkdirSync(base2);
+    sh(['init', '-q', '-b', 'main'], base2);
+    sh(['config', 'user.email', 'orch-test@example.invalid'], base2);
+    sh(['config', 'user.name', 'Orch Test'], base2);
+    sh(['remote', 'add', 'origin', remote2], base2);
+    fs.writeFileSync(path.join(base2, 'f.txt'), 'a\n');
+    sh(['add', '.'], base2);
+    sh(['commit', '-q', '-m', 'initial'], base2);
+    sh(['push', '-q', 'origin', 'main'], base2);
+    const commitA2 = sh(['rev-parse', 'HEAD'], base2);
+
+    const safePath = path.join(ROOT, 'wt-safe');
+    sh(['worktree', 'add', '-q', '--detach', safePath, commitA2], base2);
+    sleepPastSecondBoundary();
+    fs.writeFileSync(path.join(safePath, 'y.txt'), 'safe work\n');
+    sh(['add', '.'], safePath);
+    sh(['commit', '-q', '-m', 'safe commit'], safePath);
+    sh(['push', '-q', 'origin', 'HEAD:main'], safePath);
+    sh(['fetch', '-q', 'origin'], safePath);
+    sh(['checkout', '-q', 'origin/main'], safePath);
+    check('C1 real-git: a clean detached worktree on base with no orphan commits (its own commit was pushed) is accepted and removed',
+      heartbeat.isDoneButOpen(rowFor(safePath), realCtx()), true);
 
     fs.rmSync(ROOT, { recursive: true, force: true });
   }

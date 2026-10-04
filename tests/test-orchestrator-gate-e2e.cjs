@@ -4338,12 +4338,31 @@ async function heartbeatWorktreeTests() {
       name: 'no-pr-ancestor',
       worktrees: [{ path: pMerged, displayName: 'np', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 0 }],
-      gitEnv: { STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)),
+      // H2/decision: the heartbeat never accepts a detached HEAD through this no-linked-PR
+      // path (only the janitor, which actually runs gh, can) — a named branch is required
+      // here to exercise the general "no PR, ancestor, clean" acceptance this test is about.
+      gitEnv: { STUB_GIT_BRANCH: 'feature/work', STUB_GIT_ANCESTOR: '1',
+        STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)),
         STUB_GIT_REFLOG_HAS_COMMIT: '1' },
       args: ['--interval', '1', '--idle', '60', '--max', '1'],
     });
     checkBool('no linked PR/MR + git confirms HEAD is an ancestor of base + clean is done-but-open',
       outMerged.includes(`pre-existing done-but-open worktree(s) at startup: np (${pMerged})`), true);
+
+    // H2/decision: the exact same scenario, but genuinely detached (no branch name at all)
+    // — the heartbeat must keep it, never accept/remove it, since it makes no gh call to
+    // verify a stray OPEN PR isn't sitting at this exact commit from some other branch/fork.
+    const pDetached = realWtDirWithGitMarker('np-detached', Date.now() - 3_600_000);
+    const outDetached = await runHeartbeat({
+      name: 'no-pr-ancestor-detached',
+      worktrees: [{ path: pDetached, displayName: 'np-detached', isMainWorktree: false, isArchived: false,
+        liveTerminalCount: 0 }],
+      gitEnv: { STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)),
+        STUB_GIT_REFLOG_HAS_COMMIT: '1' },
+      args: ['--interval', '1', '--idle', '60', '--max', '1'],
+    });
+    checkBool('H2: the heartbeat never accepts a detached HEAD through the no-linked-PR path, even once otherwise-accepted',
+      outDetached.includes('pre-existing'), false);
 
     const outNotMerged = await runHeartbeat({
       name: 'no-pr-not-ancestor',
