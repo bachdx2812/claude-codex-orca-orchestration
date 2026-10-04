@@ -1123,6 +1123,12 @@ function githubRepoSlug(origin) {
  * `null`, whenever one is known: `gh pr list --head <branch>` has nothing to search by with
  * no branch name, which previously left `w.prState` (including an Orca-side placeholder like
  * `unknown`) as the only signal forever, even once the PR was actually merged on GitHub.
+ *
+ * The returned verdict carries `fresh: true` only when it came from a live gh call made on
+ * THIS invocation; a verdict served from the cross-process cache carries `fresh: false`. The
+ * caller (`resolveAcceptance`) uses this to decide whether the verdict may override Orca's
+ * own, possibly fresher, linked `w.prState` — a cached verdict up to two minutes old must not
+ * override a fresh `open` (e.g. a PR reopened inside that window).
  */
 function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const origin = git(['remote', 'get-url', 'origin'], w.path);
@@ -1140,11 +1146,13 @@ function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const cache = ctx.cache || loadGithubPrCache();
   const cached = cache[key];
   const cacheMs = cached?.verdict?.accepted ? GH_ACCEPTED_CACHE_MS : GH_PR_CACHE_MS;
-  if (cached && Number.isFinite(cached.at) && now - cached.at < cacheMs) return cached.verdict;
+  if (cached && Number.isFinite(cached.at) && now - cached.at < cacheMs) {
+    return { ...cached.verdict, fresh: false };
+  }
   const reply = hasBranch
     ? gh(['pr', 'list', '--repo', repo, '--head', branch.stdout, '--state', 'all',
-      '--limit', '100', '--json', 'state,headRefOid'], w.path)
-    : gh(['pr', 'view', String(w.prNumber), '--repo', repo, '--json', 'state,headRefOid'], w.path);
+      '--limit', '100', '--json', 'state,headRefOid,number'], w.path)
+    : gh(['pr', 'view', String(w.prNumber), '--repo', repo, '--json', 'state,headRefOid,number'], w.path);
   if (!reply) return null;
   if (reply.uncertain || reply.status !== 0) {
     return { accepted: false, open: false, reason: null, mergedHeadOids: [], uncertain: true };
@@ -1162,26 +1170,34 @@ function resolveGithubAcceptance(w, git, gh = runGh, ctx = {}) {
   const states = rows.map((row) => String(row && row.state || '').toUpperCase());
   const mergedHeadOids = rows.filter((row) => String(row?.state || '').toUpperCase() === 'MERGED' &&
     typeof row?.headRefOid === 'string' && row.headRefOid).map((row) => row.headRefOid);
-  const verdict = states.includes('OPEN') ? { accepted: false, open: true, reason: null, mergedHeadOids }
+  // M2: which PR numbers this lookup actually found MERGED — a historical CLOSED PR on a
+  // reused branch name, or a MERGED PR with a different number than the one Orca linked,
+  // must not silently count as "the linked PR merged" to the caller.
+  const mergedPrNumbers = rows.filter((row) => String(row?.state || '').toUpperCase() === 'MERGED' &&
+    typeof row?.number === 'number').map((row) => row.number);
+  const verdict = states.includes('OPEN') ? { accepted: false, open: true, reason: null, mergedHeadOids, mergedPrNumbers }
     : states.some((state) => state === 'MERGED' || state === 'CLOSED')
-      ? { accepted: true, open: false, reason: `GitHub PR ${states.includes('MERGED') ? 'MERGED' : 'CLOSED'}`, mergedHeadOids }
-      : { accepted: false, open: false, reason: null, mergedHeadOids };
+      ? { accepted: true, open: false, reason: `GitHub PR ${states.includes('MERGED') ? 'MERGED' : 'CLOSED'}`, mergedHeadOids, mergedPrNumbers }
+      : { accepted: false, open: false, reason: null, mergedHeadOids, mergedPrNumbers };
   cache[key] = { at: now, verdict };
   if (!ctx.cache) saveGithubPrCache(cache);
-  return verdict;
+  return { ...verdict, fresh: true };
 }
 
 /**
- * The detached-HEAD counterpart to `resolveGithubAcceptance`: a detached worktree has no
- * branch name, so a `gh pr list --head <branch>` lookup never finds it even when HEAD happens
- * to be exactly the head commit of some OPEN PR (opened from a different local branch, a
- * fork, or another worktree entirely). This instead lists every currently OPEN PR for the
- * repo and matches by commit SHA (`headRefOid`). Returns `{ blocked: true }` when a match is
- * found (never remove — the commit is still live work somewhere), `{ blocked: false }` when
- * gh succeeded and found no match, or `{ blocked: true, uncertain: true }` on any git/gh
- * failure (same fail-closed rule as every other github-backed check here). A missing `gh`
- * binary (`reply === null`) is not uncertainty — it is the pre-existing "no gh available"
- * case, so this is never blocking without `gh` just as `resolveGithubAcceptance` never is.
+ * A commit-SHA-scoped open-PR veto: HEAD may be exactly the head commit of some OPEN PR
+ * opened from a different branch, a fork, or another worktree entirely, which a lookup by
+ * branch name or by one specific PR number would never find. Runs for every head this
+ * reaches — a detached HEAD (no branch name to look up at all) and a named branch alike, as
+ * one extra safety net on top of `resolveGithubAcceptance`'s own branch/number-scoped
+ * lookup. Queries `gh api repos/{repo}/commits/{sha}/pulls`, the commit's own associated-PRs
+ * endpoint, with `--paginate` so no PR count can be silently missed off a later page.
+ * Returns `{ blocked: true }` when an OPEN PR is found (never remove — the commit is still
+ * live work somewhere), `{ blocked: false }` when gh succeeded and found no open match, or
+ * `{ blocked: true, uncertain: true }` on any git/gh failure (same fail-closed rule as every
+ * other github-backed check here). A missing `gh` binary (`reply === null`) is not
+ * uncertainty — it is the pre-existing "no gh available" case, so this is never blocking
+ * without `gh` just as `resolveGithubAcceptance` never is.
  */
 function resolveGithubOpenPrForHeadSha(w, git, gh = runGh, ctx = {}) {
   const origin = git(['remote', 'get-url', 'origin'], w.path);
@@ -1191,13 +1207,13 @@ function resolveGithubOpenPrForHeadSha(w, git, gh = runGh, ctx = {}) {
   if (!repo) return { blocked: false };
   const head = git(['rev-parse', 'HEAD'], w.path);
   if (!head || head.status !== 0 || !head.stdout) return { blocked: true, uncertain: true };
-  const reply = gh(['pr', 'list', '--repo', repo, '--state', 'open', '--json', 'headRefOid', '--limit', '100'], w.path);
+  const reply = gh(['api', `repos/${repo}/commits/${head.stdout}/pulls`, '--paginate'], w.path);
   if (!reply) return { blocked: false };
   if (reply.uncertain || reply.status !== 0) return { blocked: true, uncertain: true };
   let rows;
   try { rows = JSON.parse(reply.stdout || '[]'); } catch { return { blocked: true, uncertain: true }; }
   if (!Array.isArray(rows)) return { blocked: true, uncertain: true };
-  const matched = rows.some((row) => row && row.headRefOid === head.stdout);
+  const matched = rows.some((row) => row && String(row.state || '').toLowerCase() === 'open');
   return matched
     ? { blocked: true, reason: `open PR at HEAD ${String(head.stdout).slice(0, 8)}` }
     : { blocked: false };
@@ -1327,16 +1343,54 @@ function hasOwnCommit(w, git) {
  * this head (no PR matched by branch name at all) all fall through to `w.prState` unchanged —
  * this only overrides a *resolved, non-open* `w.prState` value such as a stale `open` or an
  * unrecognized placeholder string.
+ *
+ * Two narrower rules specifically guard an override of a `w.prState` of exactly `open`
+ * (item H1/M2 — a PR Orca currently believes is still open): a verdict served from the
+ * cross-process cache (`github.fresh === false`) may never override it, since the real PR
+ * could have been reopened inside that up-to-two-minute cache window and only a live query
+ * made on this call can rule that out; and when `w.prNumber` is set, the override additionally
+ * requires that PR number to be the one `gh` actually found MERGED (`github.mergedPrNumbers`)
+ * — a different, older CLOSED PR on a reused branch name, or a CLOSED (not merged) verdict
+ * for the SAME number, must never count as "the linked PR is done" on their own. Neither rule
+ * applies to any other `w.prState` value (an Orca placeholder like `unknown` keeps today's
+ * looser behavior: any MERGED/CLOSED verdict for the branch overrides it).
+ *
+ * For a detached HEAD (no branch name) accepted through a linked PR number
+ * (`gh pr view <number>`), that lookup checks only the one numbered PR — a second, different
+ * OPEN PR whose head happens to be this exact commit (opened from another branch/fork) would
+ * go unchecked. Accepting there additionally requires the verdict's `mergedHeadOids` to
+ * contain the worktree's actual current HEAD, and a passing commit-SHA open-PR veto
+ * (`resolveGithubOpenPrForHeadSha`) — the same veto the no-linked-PR path below always runs.
  */
 function resolveAcceptance(w, git, stat, ctx = {}) {
   const github = w.mrState == null && !ctx.skipGithub
     ? resolveGithubAcceptance(w, git, ctx.gh || runGh, ctx) : null;
+  // Only ever needed below the GitHub/no-linked-MR legs (an MR worktree short-circuits
+  // before either uses it), so this is never probed for the MR case — same "git is
+  // consulted only when needed" rule the rest of this function already follows.
+  const branch = w.mrState == null ? git(['branch', '--show-current'], w.path) : null;
+  const branchUncertain = w.mrState == null && (!branch || branch.status !== 0);
+  const isDetached = w.mrState == null && !branchUncertain && !branch.stdout;
   // `reason` always carries a diagnostic string, whether or not `accepted` is true, so a
   // caller that only needs "why wasn't this removed" (orca-janitor's kept-reason log) does
   // not have to reimplement this leg's own logic just to describe it.
   if (github?.uncertain) return { accepted: false, reason: 'gh uncertain', github };
   if (github?.open) return { accepted: false, reason: `PR #${w.prNumber != null ? w.prNumber : '?'} OPEN`, github };
-  if (github?.accepted) {
+  const prStateOpen = w.prState != null && String(w.prState).toLowerCase() === 'open';
+  const overridesOpen = !prStateOpen ||
+    (github?.fresh !== false && w.prNumber != null && (github?.mergedPrNumbers || []).includes(w.prNumber));
+  if (github?.accepted && overridesOpen) {
+    if (branchUncertain) return { accepted: false, reason: 'gh uncertain', github };
+    if (isDetached) {
+      const head = git(['rev-parse', 'HEAD'], w.path);
+      const headMatches = !!head && head.status === 0 && !!head.stdout &&
+        (github.mergedHeadOids || []).includes(head.stdout);
+      if (!headMatches) return { accepted: false, reason: 'gh uncertain', github };
+      const openAtHead = resolveGithubOpenPrForHeadSha(w, git, ctx.gh || runGh, ctx);
+      if (openAtHead.blocked) {
+        return { accepted: false, reason: openAtHead.uncertain ? 'gh uncertain' : (openAtHead.reason || 'open PR at HEAD'), github };
+      }
+    }
     return {
       accepted: true,
       reason: w.prState != null ? `PR #${w.prNumber != null ? w.prNumber : '?'} ${github.reason}` : github.reason,
@@ -1363,12 +1417,21 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
   if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: 'no upstream + not in base', github };
   if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: 'not accepted', github };
   if (!hasOwnCommit(w, git)) return { accepted: false, reason: 'not accepted', github };
+  if (branchUncertain) return { accepted: false, reason: 'gh uncertain', github };
   // A detached HEAD (Orca's `*-fix` worktrees) has no branch name, so `resolveGithubAcceptance`
   // above never finds a PR by head branch and returns null — yet HEAD may still be exactly
   // the head commit of an open PR opened from some other branch/fork. Check by commit SHA
   // instead before accepting; any gh/git failure here fails closed (kept), same rule as
-  // everywhere else in this file.
-  const openAtHead = resolveGithubOpenPrForHeadSha(w, git, ctx.gh || runGh, ctx);
+  // everywhere else in this file. `ctx.skipGithub` (the heartbeat, which makes no gh calls at
+  // all) skips this veto entirely — and, for a detached HEAD specifically, that means there is
+  // no way left to safely verify acceptance at all, so the heartbeat never accepts a detached
+  // HEAD through this path; only the janitor (which does run gh) can.
+  if (isDetached && ctx.skipGithub) {
+    return { accepted: false, reason: 'detached HEAD, github check skipped', github };
+  }
+  const openAtHead = ctx.skipGithub
+    ? { blocked: false }
+    : resolveGithubOpenPrForHeadSha(w, git, ctx.gh || runGh, ctx);
   if (openAtHead.blocked) {
     return { accepted: false, reason: openAtHead.uncertain ? 'gh uncertain' : (openAtHead.reason || 'open PR at HEAD'), github };
   }
@@ -1435,6 +1498,41 @@ function cleanStatus(stdout, allowlist, onBlockedIgnored, onDirty) {
  * a distinct diagnosis from an actual dirty/unpushed verdict, since the next troubleshooting
  * step differs). It never changes the boolean return — purely additive.
  */
+/**
+ * A detached worktree's own commits (Orca's `*-fix` worktrees) can exist ONLY in its
+ * per-worktree HEAD reflog (`.git/worktrees/<name>/logs/HEAD`) — nothing else names them,
+ * since there is no branch ref holding them. HEAD being an ancestor of the resolved base
+ * only proves HEAD's own commit is already upstream somewhere; it says nothing about an
+ * earlier commit this worktree made and then moved away from (e.g. `git checkout
+ * origin/main` after committing). `git worktree rm` deletes that reflog, and gc then drops
+ * any commit it alone referenced, permanently losing it.
+ *
+ * Walks this worktree's own HEAD reflog (`git log -g --format=%H%x09%gs HEAD`), collects
+ * every SHA whose subject starts with `commit` (the same real-commit-action predicate as
+ * `hasOwnCommit`), and requires `git rev-list <shas> --not --remotes` to print nothing —
+ * i.e. every one of those commits is already reachable from some ref this worktree's
+ * remote(s) have. No commit action recorded at all is trivially reachable (there is
+ * nothing to lose). Any git failure along the way returns `false` (not reachable) — never
+ * a pass, same fail-closed rule as everywhere else in this file. Pure local git: `--remotes`
+ * reads already-fetched remote-tracking refs, no network call.
+ */
+function detachedCommitsReachableFromRemotes(w, git) {
+  const r = git(['log', '-g', '--format=%H%x09%gs', 'HEAD'], w.path);
+  if (!r || r.status !== 0) return false;
+  const shas = [];
+  for (const line of String(r.stdout || '').split('\n')) {
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const sha = line.slice(0, tab).trim();
+    const subject = line.slice(tab + 1).trim();
+    if (sha && /^commit\b/.test(subject)) shas.push(sha);
+  }
+  if (shas.length === 0) return true;
+  const rev = git(['rev-list', ...shas, '--not', '--remotes'], w.path);
+  if (!rev || rev.status !== 0) return false;
+  return rev.stdout === '';
+}
+
 function isWorktreeClean(w, git, ctx = {}) {
   // `--no-optional-locks`: a plain status read must never contend with, or be blocked by,
   // another concurrent git process's lock on this worktree's index — this daemon polls
@@ -1476,8 +1574,16 @@ function isWorktreeClean(w, git, ctx = {}) {
   }
   const base = resolveBaseRef(w.path, git);
   const clean = !!base && isAncestorOf(w.path, git, base);
-  if (!clean) ctx.onNotClean?.('no upstream + not in base');
-  return clean;
+  if (!clean) { ctx.onNotClean?.('no upstream + not in base'); return false; }
+  // Detached HEAD only: a named branch's own ref survives `git worktree rm` (branches are
+  // not worktree-scoped), so any commit on it stays reachable regardless of this worktree's
+  // reflog. A detached HEAD has no such ref, so its own commit history must additionally be
+  // proven reachable from a remote before the worktree can be called clean.
+  if (!branch.stdout && !detachedCommitsReachableFromRemotes(w, git)) {
+    ctx.onNotClean?.('unpushed');
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -2533,7 +2639,7 @@ module.exports = {
   isDoneButOpen, evaluateDoneButOpen, formatDoneWorktreeEvent, formatDoneWorktreeStartupSummary,
   resolveAcceptance, resolveGithubAcceptance, resolveGithubOpenPrForHeadSha, githubRepoSlug, runGh,
   isWorktreeIdle, isWorktreeClean, ignoredPathAllowed, cleanStatus, resolveBaseRef, isAncestorOf, runGit,
-  statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit,
+  statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit, detachedCommitsReachableFromRemotes,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
   machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
   loadPersistedExitedReports, savePersistedExitedReports, reportWorkerExited,
