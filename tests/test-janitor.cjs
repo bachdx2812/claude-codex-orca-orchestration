@@ -169,12 +169,39 @@ check('a still-running worker row keeps blocking removal', runningWorker.calls.i
 check('the worker-row kept reason names the dispatch id and states',
   runningWorker.log.includes(`kept ${JSON.stringify(runningWorker.worktreePath)}: worker row ctx_running running/active`), true);
 
-const contradictoryRow = runCase('contradictory-worker-row', worktree(), {}, [{
-  dispatchId: 'ctx_contradictory', terminalState: 'retained', workerState: 'failed', dispatchStatus: 'completed',
+const bothTerminalRow = runCase('both-fields-terminal-worker-row', worktree(), {}, [{
+  dispatchId: 'ctx_both_terminal', terminalState: 'retained', workerState: 'failed', dispatchStatus: 'completed',
   projection: { workspace: { id: 'repo-1::/work/feature' } },
 }]);
-check('a row terminal via either workerState or dispatchStatus no longer blocks removal',
-  contradictoryRow.calls.includes(`worktree rm --worktree path:${contradictoryRow.worktreePath} --json`), true);
+check('a row terminal on both workerState and dispatchStatus no longer blocks removal',
+  bothTerminalRow.calls.includes(`worktree rm --worktree path:${bothTerminalRow.worktreePath} --json`), true);
+
+const disagreeingRunningFailed = runCase('disagreeing-running-failed', worktree(), {}, [{
+  dispatchId: 'ctx_disagree_1', terminalState: 'retained', workerState: 'running', dispatchStatus: 'failed',
+  projection: { workspace: { id: 'repo-1::/work/feature' } },
+}]);
+check('a row with workerState running and dispatchStatus failed keeps blocking removal',
+  disagreeingRunningFailed.calls.includes('worktree rm'), false);
+
+const disagreeingFailedRunning = runCase('disagreeing-failed-running', worktree(), {}, [{
+  dispatchId: 'ctx_disagree_2', terminalState: 'active', workerState: 'failed', dispatchStatus: 'running',
+  projection: { workspace: { id: 'repo-1::/work/feature' } },
+}]);
+check('a row with workerState failed and dispatchStatus running keeps blocking removal',
+  disagreeingFailedRunning.calls.includes('worktree rm'), false);
+
+const succeededNoDispatchStatus = runCase('succeeded-no-dispatch-status', worktree(), {}, [{
+  dispatchId: 'ctx_succeeded_only', terminalState: 'retained', workerState: 'succeeded',
+  projection: { workspace: { id: 'repo-1::/work/feature' } },
+}]);
+check('a succeeded row with no dispatchStatus field no longer blocks removal',
+  succeededNoDispatchStatus.calls.includes(`worktree rm --worktree path:${succeededNoDispatchStatus.worktreePath} --json`), true);
+
+const unsupervisedRow = runCase('unsupervised-worker-row', worktree(), {}, [{
+  dispatchId: 'ctx_unsupervised', terminalState: 'active', workerState: 'unsupervised',
+  projection: { workspace: { id: 'repo-1::/work/feature' } },
+}]);
+check('an unsupervised worker row still blocks removal', unsupervisedRow.calls.includes('worktree rm'), false);
 
 const ghUnavailable = runCase('gh-unavailable', worktree(), {
   STUB_GH_FAIL: '1', STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_ANCESTOR: '1',
@@ -241,6 +268,22 @@ runJanitorRaw(dedupDir, dedupEnvChanged);
 const dedupLogAfterChange = fs.readFileSync(dedupLogPath, 'utf8');
 check('a changed kept reason for the same path is logged again',
   dedupLogAfterChange.includes(`kept ${JSON.stringify(dedupWorktreePath)}: live terminal`), true);
+
+// The kept-state file is bounded to the current run's own inventory (MED-2): a path that
+// left the inventory (removed manually, by heartbeat `remove` mode, or via a direct
+// `orca worktree rm`) must not linger in `janitor-kept.json` forever.
+const dedupKeptStatePath = path.join(dedupDir, 'state', 'janitor-kept.json');
+const keptStateBeforePrune = JSON.parse(fs.readFileSync(dedupKeptStatePath, 'utf8'));
+check('the kept-state file holds an entry for the still-inventoried worktree',
+  Object.prototype.hasOwnProperty.call(keptStateBeforePrune, dedupWorktreePath), true);
+keptStateBeforePrune['/no/longer/in/inventory'] = 'dirty';
+fs.writeFileSync(dedupKeptStatePath, JSON.stringify(keptStateBeforePrune));
+runJanitorRaw(dedupDir, dedupEnvChanged);
+const keptStateAfterPrune = JSON.parse(fs.readFileSync(dedupKeptStatePath, 'utf8'));
+check('a kept-state entry for a worktree no longer in the inventory is pruned on save',
+  Object.prototype.hasOwnProperty.call(keptStateAfterPrune, '/no/longer/in/inventory'), false);
+check('the kept-state entry for the still-inventoried worktree survives the prune',
+  Object.prototype.hasOwnProperty.call(keptStateAfterPrune, dedupWorktreePath), true);
 
 // Incomplete inventory names the failing source (item 3).
 const incompleteDir = path.join(ROOT, 'incomplete-inventory');

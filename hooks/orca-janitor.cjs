@@ -151,20 +151,24 @@ function workerWorktreeKeys(row) {
 }
 
 /**
- * A worker row only blocks removal while it is actually live: its `workerState` is not
- * 'unsupervised', NEITHER `workerState` NOR `dispatchStatus` has reached a terminal state
- * (succeeded/completed/failed/stopped/cancelled — either field alone reaching one is
- * enough to call the row finished, matching the OR-based `isFailedWorker`/done checks used
- * for auto-close elsewhere in this codebase), and its terminal has not been released. A row
- * Orca reports done but still shows `terminalState: "retained"` therefore no longer blocks
- * removal (item 2) — the worktree-level `liveTerminalCount === 0` guard in `runJanitor`
- * still independently vetoes any worktree that actually has a live terminal.
+ * A worker row only STOPS blocking removal once every present state field has reached a
+ * terminal state (succeeded/completed/failed/stopped/cancelled) AND its terminal has been
+ * released. Unlike the OR-based done checks used for non-destructive heartbeat auto-close
+ * elsewhere in this codebase, a `worktree rm` guard must fail closed on disagreement: a row
+ * whose fields disagree (e.g. `workerState: "running"` with `dispatchStatus: "failed"`, or
+ * the reverse) is NOT finished and keeps blocking, same as an `unsupervised` row — this
+ * guard, unlike heartbeat supervision, treats `unsupervised` as "unknown liveness", not
+ * "safe to ignore". A row Orca reports done on every present field and whose terminal shows
+ * `terminalState: "retained"` therefore no longer blocks removal (item 2) — the
+ * worktree-level `liveTerminalCount === 0` guard in `runJanitor` still independently vetoes
+ * any worktree that actually has a live terminal.
  */
 function isLiveWorkerRow(row) {
-  return !!row && row.workerState !== 'unsupervised' &&
-    !TERMINAL_WORKER_STATES.has(row.workerState) &&
-    !TERMINAL_WORKER_STATES.has(row.dispatchStatus) &&
-    row.terminalState !== 'released';
+  if (!row) return false;
+  if (row.terminalState === 'released') return false;
+  const fields = [row.workerState, row.dispatchStatus].filter((v) => v != null && v !== '');
+  const finished = fields.length > 0 && fields.every((v) => TERMINAL_WORKER_STATES.has(v));
+  return !finished;
 }
 
 function blockedWorktreeKeys(rows) {
@@ -248,7 +252,17 @@ function runJanitor(ctx = {}) {
       appendLog(`remove failed ${JSON.stringify(worktree.path)}`);
     }
   }
-  if (!ctx.keptState) saveKeptState(keptState);
+  if (!ctx.keptState) {
+    // Bound the persisted kept-state file to this run's own inventory: a worktree removed
+    // manually, by heartbeat `remove` mode, or via a direct `orca worktree rm` never clears
+    // its own entry here, so without this prune the file would grow by one stale key per
+    // such removal forever.
+    const livePaths = new Set(list.map((worktree) => worktree.path));
+    for (const key of Object.keys(keptState)) {
+      if (!livePaths.has(key)) delete keptState[key];
+    }
+    saveKeptState(keptState);
+  }
   return { ok: true, removed };
 }
 
