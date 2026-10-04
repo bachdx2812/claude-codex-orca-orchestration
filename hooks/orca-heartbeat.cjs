@@ -720,12 +720,21 @@ function resolveTerminalScreen(readText, previousText, listPreview) {
  * any failure (unreachable Orca, `ok: false`, a reply with no rows array, a cursor chain
  * that cannot be followed, or the page cap) rather than a partial list — every caller of
  * `workers()` already treats null as "worker-list is unavailable right now."
+ *
+ * Bounded to one heartbeat interval (capped at 20s) via `deadlineAt` — a degraded Orca
+ * answering each page slowly but just under its own per-page timeout must not let this
+ * single call run long enough to starve the daemon's own `beat()` liveness write. A
+ * deadline stop is `ok: false` like any other incomplete page, so it still returns null
+ * here, unchanged from before.
  */
 function workers() {
   const paged = WORKER_LIST_PAGES.fetchWorkerListPages((args) => {
     const reply = orca(args);
     return reply && reply.ok !== false ? reply : null;
-  }, { baseArgs: ['orchestration', 'worker-list', '--json'] });
+  }, {
+    baseArgs: ['orchestration', 'worker-list', '--json'],
+    deadlineAt: Date.now() + Math.min(INTERVAL_SECONDS * 1000, 20000),
+  });
   if (!paged.ok) return null;
   return parseWorkerRows({ result: { workers: paged.rows } });
 }
@@ -2454,7 +2463,7 @@ module.exports = {
   shouldTrackWorkerProgress,
   clearMissingPendingJobsForTick,
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
-  parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen,
+  parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen, workers,
   parseWorkerRows, workerRowCompletedAt, pruneBoundedMaps,
   probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
   pidAlive, spawnResumeScheduler,

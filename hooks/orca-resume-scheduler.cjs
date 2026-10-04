@@ -44,6 +44,11 @@ function authorizedWorkerHandles(workers, panelHandle = process.env.ORCA_TERMINA
  * helper. Preserves the pre-paging contract: null on no reply/`ok: false` on any page,
  * otherwise every row across every page (a page with no usable rows array still counts as
  * zero rows for that page, not a failure — same leniency the single-call version had).
+ *
+ * Bounded to ~15s total via `deadlineAt` — a degraded Orca answering each page slowly but
+ * just under its own per-page timeout must not block a scheduler tick indefinitely. A
+ * deadline stop keeps whatever rows were already collected, same as an existing
+ * cursor/page-cap stop: fewer authorized handles, which fails closed (no typing).
  */
 function workerHandles() {
   let failed = false;
@@ -56,6 +61,7 @@ function workerHandles() {
     return reply;
   }, {
     baseArgs: ['orchestration', 'worker-list', '--json'],
+    deadlineAt: Date.now() + 15000,
     getRows: (reply) => {
       const result = reply.result || reply;
       const list = Array.isArray(result) ? result : result?.workers;

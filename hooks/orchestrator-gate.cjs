@@ -936,6 +936,11 @@ function roleFile(sid) {
  * helper. `execFileSync` throwing (unreachable Orca, non-zero exit, timeout, bad JSON) on
  * ANY page still returns null for the whole call, matching the pre-paging behavior exactly
  * — this gate must never read "live, but only for the first 100 workers" as "nobody live".
+ *
+ * Bounded to ~5s total via `deadlineAt`, same as this call's own per-page `execFileSync`
+ * timeout — a degraded Orca answering each page slowly but just under its timeout must not
+ * turn this PreToolUse hook into an unbounded wait. A deadline stop keeps whatever rows
+ * were already collected, same as an existing cursor/page-cap stop (see below).
  */
 function orcaWorkerHandles() {
   let threw = false;
@@ -951,6 +956,7 @@ function orcaWorkerHandles() {
     }
   }, {
     baseArgs: ['orchestration', 'worker-list', '--json'],
+    deadlineAt: Date.now() + 5000,
     // Pre-paging code never checked `ok: false`; a reply with no usable rows array was
     // read as "no workers", not a failure. Preserved here on purpose.
     getRows: (reply) => {
@@ -2951,7 +2957,7 @@ process.stdin.on('end', () => {
 module.exports = {
   shellSyntaxOnly, redirectTargets, isExemptPath, movesOnlyExemptPaths, shellSegments,
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
-  hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds,
+  hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds, orcaWorkerHandles,
   isPlanningReview, hasReviewEscalationReason, hasVerifyEscalationReason, classifyDispatch,
   commandHead, formatAge, formatBackgroundShellReminder, pruneBackgroundShells,
 };
