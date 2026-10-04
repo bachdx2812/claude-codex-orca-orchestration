@@ -325,6 +325,101 @@ const truncatedLog = fs.readFileSync(path.join(truncatedDir, 'state', 'janitor.l
 check('a truncated worktree-ps page names itself in the skip reason',
   truncatedLog.includes('skipped: inventory unavailable or incomplete (worktree ps: truncated)'), true);
 
+// The real Orca CLI rejects any worker-list --limit over 100 outright (invalid_argument,
+// exit 1, JSON error body on stdout) — the stub reproduces that shape so a regression back
+// to a >100 limit is caught by the suite without needing a live Orca.
+const stubLimitResult = spawnSync(process.execPath, [ORCA, 'orchestration', 'worker-list', '--include-remote', '--limit', '10000', '--json'], { encoding: 'utf8' });
+check('the stub rejects a worker-list limit over 100 like a real Orca', stubLimitResult.status, 1);
+let stubLimitReply = {};
+try { stubLimitReply = JSON.parse(stubLimitResult.stdout); } catch {}
+check('the stub rejection carries the real invalid_argument shape',
+  stubLimitReply.ok === false && stubLimitReply.error?.code === 'invalid_argument' &&
+  stubLimitReply.error?.message === 'Too big: expected number to be <=100', true);
+
+const stubLimitOk = spawnSync(process.execPath, [ORCA, 'orchestration', 'worker-list', '--include-remote', '--limit', '100', '--json'], { encoding: 'utf8' });
+check('a worker-list limit at 100 is accepted', stubLimitOk.status, 0);
+
+// workerRows() itself must surface Orca's own error message rather than the opaque "ok:false"
+// / "no reply" labels this fix replaces.
+const { workerRows } = require('../hooks/orca-janitor.cjs');
+const overLimitReply = workerRows((args) => {
+  check('workerRows requests a page size of 100, never more', args.includes('--limit') && args[args.indexOf('--limit') + 1], '100');
+  return { ok: false, error: { code: 'invalid_argument', message: 'Too big: expected number to be <=100' } };
+});
+check('workerRows surfaces the real ok:false error message, not a generic label',
+  overLimitReply.ok === false && overLimitReply.reason === 'worker-list: Too big: expected number to be <=100', true);
+
+// Multi-page worker-list: the janitor must follow page.nextCursor and actually use page 2's
+// rows during evaluation (item 4) — a running worker row that only exists on page 2 still
+// blocks removal, proving the second page was fetched and consulted, not just discarded.
+const pagedBlocked = runCase('paged-worker-list-blocks', worktree(), {
+  STUB_WORKERS_PAGE_CURSOR: '1',
+  STUB_WORKERS_PAGE2_JSON: JSON.stringify([{
+    dispatchId: 'ctx_page2', terminalState: 'active', workerState: 'running',
+    projection: { workspace: { id: 'repo-1::__WORKTREE__' } },
+  }]),
+});
+check('a worker row that only exists on worker-list page 2 still blocks removal',
+  pagedBlocked.calls.includes('worktree rm'), false);
+check('the page-2 blocking worker is named in the kept reason',
+  pagedBlocked.log.includes('worker row ctx_page2 running/active'), true);
+
+// --dry-run performs the full evaluation but never mutates: no `worktree rm` call, logged
+// (and printed) as "would remove" instead of "removed".
+function runCaseDryRun(name, row, extraEnv = {}, workers = []) {
+  const dir = path.join(ROOT, name);
+  fs.mkdirSync(dir, { recursive: true });
+  const worktreePath = path.join(dir, 'worktree');
+  fs.mkdirSync(worktreePath, { recursive: true });
+  fs.writeFileSync(path.join(worktreePath, '.git'), 'gitdir: synthetic\n');
+  const actualRow = { ...row, path: worktreePath, worktreeId: `repo-1::${worktreePath}` };
+  const actualWorkers = JSON.parse(JSON.stringify(workers).replaceAll('/work/feature', worktreePath));
+  const calls = path.join(dir, 'orca-calls.log');
+  const result = spawnSync(process.execPath, [JANITOR, '--dry-run'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ORCH_STATE_DIR: path.join(dir, 'state'),
+      ORCH_CONFIG_PATH: path.join(dir, 'missing-config.json'),
+      ORCA_BIN: ORCA,
+      ORCH_GIT_BIN: GIT,
+      ORCH_GH_BIN: GH,
+      STUB_WORKTREES_JSON: JSON.stringify([actualRow]),
+      STUB_WORKERS_JSON: JSON.stringify(actualWorkers),
+      STUB_ORCA_CALLS_LOG: calls,
+      STUB_GIT_ORIGIN: 'git@github.com:acme/widgets.git',
+      STUB_GIT_BRANCH: 'feature/work',
+      STUB_GIT_CLEAN: '1',
+      STUB_GIT_HAS_UPSTREAM: '1',
+      STUB_GIT_HEAD_OID: 'head123',
+      STUB_GH_HEAD_OID: 'head123',
+      STUB_GH_STATE: 'MERGED',
+      ...extraEnv,
+    },
+  });
+  return {
+    result,
+    stdout: result.stdout,
+    calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '',
+    log: fs.existsSync(path.join(dir, 'state', 'janitor.log'))
+      ? fs.readFileSync(path.join(dir, 'state', 'janitor.log'), 'utf8') : '',
+    worktreePath,
+  };
+}
+
+const dryRun = runCaseDryRun('dry-run-removable', worktree());
+check('--dry-run never calls worktree rm', dryRun.calls.includes('worktree rm'), false);
+check('--dry-run logs a "would remove" line with the verdict reason',
+  dryRun.log.includes(`would remove ${JSON.stringify(dryRun.worktreePath)} (GitHub PR MERGED)`), true);
+check('--dry-run prints the same "would remove" line to stdout',
+  dryRun.stdout.includes(`would remove ${JSON.stringify(dryRun.worktreePath)} (GitHub PR MERGED)`), true);
+check('--dry-run prints a one-line summary count', /would be removed/.test(dryRun.stdout), true);
+
+const dryRunKept = runCaseDryRun('dry-run-kept', worktree(), { STUB_GIT_CLEAN: '0' });
+check('--dry-run also prints "kept" lines for non-removable worktrees',
+  dryRunKept.stdout.includes(`kept ${JSON.stringify(dryRunKept.worktreePath)}: dirty`), true);
+check('--dry-run never calls worktree rm for a kept worktree', dryRunKept.calls.includes('worktree rm'), false);
+
 const disabledDir = path.join(ROOT, 'disabled');
 fs.mkdirSync(disabledDir, { recursive: true });
 const disabledConfig = path.join(disabledDir, 'config.json');
