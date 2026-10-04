@@ -104,6 +104,36 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
     }));
     process.exit(1);
   }
+  const cursorIdxEarly = args.indexOf('--cursor');
+  const cursorEarly = cursorIdxEarly >= 0 ? args[cursorIdxEarly + 1] : null;
+  // STUB_WORKERS_PAGE_INFINITE=1 — every page hands out a fresh, never-repeating cursor
+  // and claims more rows exist, forever: exercises the page-cap fail-closed guard, which
+  // must stop a cursor chain that genuinely never terminates.
+  if (process.env.STUB_WORKERS_PAGE_INFINITE === '1') {
+    const n = cursorEarly ? Number(cursorEarly.replace('page-', '')) + 1 : 1;
+    process.stdout.write(JSON.stringify({
+      result: {
+        workers: [{ dispatchId: `inf-${n}` }],
+        page: { limit: 100, total: 999999, hasMore: true, nextCursor: `page-${n}` },
+      },
+    }));
+    process.exit(0);
+  }
+  // STUB_WORKERS_PAGE2_ERROR=1 (with STUB_WORKERS_PAGE_CURSOR=1) — page 1 succeeds, page 2
+  // answers `ok: false`: an error part-way through pagination, not on the very first call.
+  if (process.env.STUB_WORKERS_PAGE2_ERROR === '1' && cursorEarly === 'stub-page-2') {
+    process.stdout.write(JSON.stringify({ ok: false, error: { code: 'internal', message: 'page 2 exploded' } }));
+    process.exit(1);
+  }
+  // STUB_WORKERS_PAGE_REPEAT_CURSOR=1 — every page (including the first) hands back the
+  // exact same `nextCursor` it was given, with hasMore still true: the repeated-cursor
+  // guard must stop following it rather than loop forever re-fetching the same page.
+  if (process.env.STUB_WORKERS_PAGE_REPEAT_CURSOR === '1') {
+    process.stdout.write(JSON.stringify({
+      result: { workers: [], page: { limit: 100, total: 1, hasMore: true, nextCursor: 'stub-page-2' } },
+    }));
+    process.exit(0);
+  }
   let workers;
   if (process.env.STUB_WORKERS_JSON) {
     try { workers = JSON.parse(process.env.STUB_WORKERS_JSON); } catch { workers = []; }

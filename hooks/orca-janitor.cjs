@@ -270,13 +270,19 @@ function runJanitor(ctx = {}) {
   }
   const blocked = blockedWorktreeKeys(workers);
   const removed = [];
-  const keptState = ctx.keptState || loadKeptState();
+  // --dry-run must stay fully non-mutating (no `github-pr-cache.json` write — resolveGithub
+  // Acceptance only skips its own save when handed a `cache` object — see item 4) and must
+  // print every "kept" line rather than the cross-run dedup an operator diagnosing a stuck
+  // worktree would otherwise have to clear by hand: starting from an empty in-memory map
+  // (never the persisted file) makes `logKept` treat every reason as new this run.
+  const keptState = ctx.keptState || (ctx.dryRun ? {} : loadKeptState());
   const verdictFor = (worktree, extra = {}) => evaluateDoneButOpen(worktree, {
     now: Date.now(), idleSeconds: 0, git, stat: ctx.stat,
     rebuildableIgnored: cfg.janitor.rebuildableIgnored,
     onBlockedIgnored: (filePath) => logKept(keptState, worktree.path, `ignored ${filePath}`),
     onNotDone: (reason) => logKept(keptState, worktree.path, reason),
     onNotClean: (reason) => logKept(keptState, worktree.path, reason),
+    ...(ctx.dryRun ? { cache: {} } : {}),
     ...extra,
   });
   for (const worktree of list) {

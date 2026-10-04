@@ -404,6 +404,31 @@ check('a worker row that only exists on worker-list page 2 still blocks removal'
 check('the page-2 blocking worker is named in the kept reason',
   pagedBlocked.log.includes('worker row ctx_page2 running/active'), true);
 
+// A cursor chain that never terminates is capped rather than looping forever (item 4).
+const pageCap = runCase('page-cap-exceeded', worktree(), { STUB_WORKERS_PAGE_INFINITE: '1' });
+check('a worker-list cursor chain that never terminates is capped, not followed forever',
+  pageCap.calls.includes('worktree rm'), false);
+check('a page-cap skip names the page count in the skip reason',
+  pageCap.log.includes('skipped: inventory unavailable or incomplete (worker-list: exceeded page cap (50))'), true);
+
+// An ok:false error on page 2 (not page 1) still fails the whole worker-list fetch closed,
+// with the real error message, not a generic "missing workers array" label (item 4).
+const page2Error = runCase('page2-error', worktree(), {
+  STUB_WORKERS_PAGE_CURSOR: '1', STUB_WORKERS_PAGE2_ERROR: '1',
+});
+check('an ok:false error on worker-list page 2 fails the whole run closed',
+  page2Error.calls.includes('worktree rm'), false);
+check('a page-2 error surfaces the real Orca error message',
+  page2Error.log.includes('skipped: inventory unavailable or incomplete (worker-list: page 2 exploded)'), true);
+
+// A repeated cursor (hasMore true, but the same nextCursor as last time) must stop the
+// loop instead of re-fetching the same page forever (item 4).
+const repeatedCursor = runCase('repeated-cursor', worktree(), { STUB_WORKERS_PAGE_REPEAT_CURSOR: '1' });
+check('a worker-list page that repeats its own cursor stops instead of looping',
+  repeatedCursor.calls.includes('worktree rm'), false);
+check('a repeated-cursor skip names the reason',
+  repeatedCursor.log.includes('skipped: inventory unavailable or incomplete (worker-list: hasMore with no usable cursor)'), true);
+
 // worker-list's scope is surfaced in the log once per run (item 2) — there is no live Orca
 // flag to force a "list every Run" scope, so the janitor cannot fail closed on it; it only
 // records what scope actually applied, keeping liveTerminalCount===0 as the real guard.
@@ -478,6 +503,29 @@ const dryRunKept = runCaseDryRun('dry-run-kept', worktree(), { STUB_GIT_CLEAN: '
 check('--dry-run also prints "kept" lines for non-removable worktrees',
   dryRunKept.stdout.includes(`kept ${JSON.stringify(dryRunKept.worktreePath)}: dirty`), true);
 check('--dry-run never calls worktree rm for a kept worktree', dryRunKept.calls.includes('worktree rm'), false);
+
+// --dry-run is fully non-mutating (item 4): neither the GitHub PR lookup cache nor the
+// kept-state file is ever written, even though a normal run writes both.
+const dryRunNoCache = path.join(ROOT, 'dry-run-removable');
+check('--dry-run never writes github-pr-cache.json',
+  fs.existsSync(path.join(dryRunNoCache, 'state', 'github-pr-cache.json')), false);
+check('--dry-run never writes janitor-kept.json',
+  fs.existsSync(path.join(dryRunNoCache, 'state', 'janitor-kept.json')), false);
+
+// A real (non-dry-run) removal DOES write github-pr-cache.json — confirms the above is
+// dry-run-specific behavior, not a regression that disabled the cache entirely.
+check('a real run writes github-pr-cache.json',
+  fs.existsSync(path.join(ROOT, 'squash-merged', 'state', 'github-pr-cache.json')), true);
+
+// --dry-run ignores the persisted kept-reason dedup and prints every "kept" line on every
+// run, unlike a real run which only logs a reason once per path until it changes.
+const dryRunDedupEnv = { STUB_GIT_CLEAN: '0' };
+const dryRunDedup1 = runCaseDryRun('dry-run-dedup', worktree(), dryRunDedupEnv);
+const dryRunDedup2 = runCaseDryRun('dry-run-dedup', worktree(), dryRunDedupEnv);
+check('--dry-run prints the same kept reason on a first run',
+  dryRunDedup1.stdout.includes(`kept ${JSON.stringify(dryRunDedup1.worktreePath)}: dirty`), true);
+check('--dry-run prints the same kept reason again on a second run (no dedup)',
+  dryRunDedup2.stdout.includes(`kept ${JSON.stringify(dryRunDedup2.worktreePath)}: dirty`), true);
 
 const disabledDir = path.join(ROOT, 'disabled');
 fs.mkdirSync(disabledDir, { recursive: true });
