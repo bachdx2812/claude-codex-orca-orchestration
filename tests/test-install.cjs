@@ -279,6 +279,35 @@ const allowCheck = run(['--check'], 'codex-tier-allowed');
 check('codexAllowPriorityTier: true silences the warning',
   /service_tier/i.test(`${allowCheck.stdout}${allowCheck.stderr}`), false);
 
+const singleQuotedHome = path.join(root, 'codex-tier-single-quoted');
+fs.mkdirSync(singleQuotedHome, { recursive: true });
+writeCodexConfig(singleQuotedHome, "service_tier = 'priority'\n");
+const singleQuotedCheck = run(['--check'], 'codex-tier-single-quoted');
+check('--check warns about a single-quoted top-level service_tier',
+  /WARNING:.*service_tier = 'priority'/i.test(`${singleQuotedCheck.stdout}${singleQuotedCheck.stderr}`), true);
+
+const dottedKeyHome = path.join(root, 'codex-tier-dotted-key');
+fs.mkdirSync(dottedKeyHome, { recursive: true });
+writeCodexConfig(dottedKeyHome, 'profile = "work"\nprofiles.work.service_tier = "fast"\n');
+const dottedKeyCheck = run(['--check'], 'codex-tier-dotted-key');
+check('--check warns about a dotted-key profile service_tier on the default profile',
+  /WARNING:.*service_tier = "fast"/i.test(`${dottedKeyCheck.stdout}${dottedKeyCheck.stderr}`), true);
+
+const quotedSectionHome = path.join(root, 'codex-tier-quoted-section');
+fs.mkdirSync(quotedSectionHome, { recursive: true });
+writeCodexConfig(quotedSectionHome, 'profile = "work"\n\n[profiles."work"]\nservice_tier = "priority"\n');
+const quotedSectionCheck = run(['--check'], 'codex-tier-quoted-section');
+check('--check warns about a priority tier under a quoted default-profile section name',
+  /WARNING:.*service_tier = "priority"/i.test(`${quotedSectionCheck.stdout}${quotedSectionCheck.stderr}`), true);
+
+const overriddenByFlexHome = path.join(root, 'codex-tier-overridden-by-flex');
+fs.mkdirSync(overriddenByFlexHome, { recursive: true });
+writeCodexConfig(overriddenByFlexHome,
+  'profile = "work"\nservice_tier = "priority"\n\n[profiles.work]\nservice_tier = "flex"\n');
+const overriddenByFlexCheck = run(['--check'], 'codex-tier-overridden-by-flex');
+check('--check does not warn about a top-level priority tier the default profile overrides with flex',
+  /service_tier/i.test(`${overriddenByFlexCheck.stdout}${overriddenByFlexCheck.stderr}`), false);
+
 const unreadableHome = path.join(root, 'codex-tier-unreadable');
 fs.mkdirSync(unreadableHome, { recursive: true });
 const unreadableCheck = run(['--check'], 'codex-tier-unreadable');

@@ -801,7 +801,7 @@ function versionOf(bin, args = ['--version']) {
 
 function hookLibBase() {
   const needed = ['lib/coder-availability.cjs', 'lib/coder-pool-route.cjs',
-    'lib/exec-route-by-quota.cjs', 'lib/config.cjs'];
+    'lib/exec-route-by-quota.cjs', 'lib/config.cjs', 'lib/codex-priority-tier.cjs'];
   for (const base of [HOOKS_DIR, path.join(REPO_ROOT, 'hooks')]) {
     if (needed.every((rel) => fs.existsSync(path.join(base, rel)))) return base;
   }
