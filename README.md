@@ -339,9 +339,13 @@ defers to the config.
 macOS LaunchAgent that runs every `janitor.intervalMinutes` (default 10). Unlike the
 session-owned heartbeat, it evaluates every local Orca worktree, so cleanup continues after
 the panel that created a worktree exits. It removes only a non-main, non-archived worktree
-whose `liveTerminalCount` is the known number `0`, which has no unreleased or retained Orca
-worker row, has no tracked/untracked changes or non-rebuildable ignored files, and has
-nothing unpushed. A deleted upstream is safe only when Git reports exactly `[gone]` and a
+whose `liveTerminalCount` is the known number `0`, which has no still-live Orca worker row,
+has no tracked/untracked changes or non-rebuildable ignored files, and has nothing
+unpushed. A worker row blocks removal unless its terminal was released AND every state
+field it carries (`workerState`, `dispatchStatus`) is terminal — a row whose fields
+disagree (e.g. `running` + `failed`, or the reverse) still blocks, fail-closed, and so does
+`workerState: "unsupervised"`; only a row terminal on every present field, with its terminal
+released, is finished. A deleted upstream is safe only when Git reports exactly `[gone]` and a
 merged GitHub PR's `headRefOid` exactly equals local `HEAD`. `janitor.rebuildableIgnored`
 configures the ignored-path allowlist (defaults cover dependency, build, cache, and coverage
 outputs only). Acceptance includes Orca's linked PR/MR state, a bounded `gh pr list` lookup
@@ -349,11 +353,16 @@ by origin repository and branch (5-second timeout, 100-row limit; accepted resul
 for at most two minutes), or the existing ancestor plus reflog proof. Any open GitHub PR
 for the head vetoes removal, including when Orca links an older closed PR. Missing or
 unauthenticated `gh` falls back to the Git-only rules, but can never prove a deleted upstream
-safe. Terminal state is checked again immediately before removal. Results are appended to
-`<stateDir>/janitor.log` and rotate near 1 MB. Set `janitor.enabled` to `false` to disable
-scheduled runs at execution time; `ORCH_JANITOR=0` affects manual runs (or use
-`launchctl setenv ORCH_JANITOR 0`). Changing `janitor.intervalMinutes` requires reinstalling
-so the LaunchAgent plist is regenerated; run `node install.mjs --check` after reinstalling.
+safe. Terminal state is checked again immediately before removal. Every kept worktree logs
+`kept <path>: <reason>` to `<stateDir>/janitor.log` once per distinct reason per path (an
+unchanged reason across runs stays silent; a changed reason logs again); the per-path
+last-logged reason persists in `<stateDir>/janitor-kept.json`, pruned each run to the paths
+the current inventory actually contains so a worktree removed outside the janitor does not
+leave a stale entry behind forever. The log rotates near 1 MB. Set `janitor.enabled` to
+`false` to disable scheduled runs at execution time; `ORCH_JANITOR=0` affects manual runs
+(or use `launchctl setenv ORCH_JANITOR 0`). Changing `janitor.intervalMinutes` requires
+reinstalling so the LaunchAgent plist is regenerated; run `node install.mjs --check` after
+reinstalling.
 
 **Background shell hygiene.** After a successful `PostToolUse`, the gate records this
 session's `Bash` launches with `run_in_background: true` until their completion notification

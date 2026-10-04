@@ -846,20 +846,37 @@ remind mode; `remove` forces remove mode; any other value defers to the config).
 `orca-janitor.cjs` is independent of the session heartbeat and is installed as a macOS
 LaunchAgent. Every `janitor.intervalMinutes` (default 10), it inspects the complete local
 worktree and worker inventories. It removes a worktree only when all of these facts are
-positive: it is neither main nor archived; `liveTerminalCount` is the numeric value `0`;
-no worker row for the worktree remains unreleased or retained; the worktree is clean and
-has no tracked/untracked changes or ignored files outside `janitor.rebuildableIgnored`; has
-nothing unpushed (a deleted upstream additionally requires Git's exact `[gone]` marker and a
-merged GitHub PR `headRefOid` equal to `HEAD`); and its work was accepted. Ownership by the currently running panel
-is not required.
+positive: it is neither main nor archived; `liveTerminalCount` is the numeric value `0`; no
+worker row for the worktree is still live (see below); the worktree is clean and has no
+tracked/untracked changes or ignored files outside `janitor.rebuildableIgnored`; has nothing
+unpushed (a deleted upstream additionally requires Git's exact `[gone]` marker and a merged
+GitHub PR `headRefOid` equal to `HEAD`); and its work was accepted. Ownership by the
+currently running panel is not required.
+
+A worker row blocks removal unless its terminal was released AND every state field it
+actually carries (`workerState`, `dispatchStatus`) is terminal
+(`succeeded`/`failed`/`stopped`/`cancelled`/`completed`) — a row with no state fields at all
+is never treated as finished. Unlike the OR-based done checks the heartbeat uses for
+non-destructive auto-close, this `worktree rm` guard fails closed on disagreement: a row
+whose fields disagree (e.g. `workerState: "running"` with `dispatchStatus: "failed"`, or the
+reverse) still blocks, and so does `workerState: "unsupervised"` — unknown liveness is not
+treated as safe to remove. A row Orca reports done on every present field, with
+`terminalState: "retained"`, no longer blocks by itself; `liveTerminalCount === 0` is
+re-checked independently and still vetoes a worktree with an actual live terminal.
 
 For a GitHub branch, acceptance also runs `gh pr list --repo <origin-repo> --head <branch>
 --state all --limit 100 --json state,headRefOid`, bounded to five seconds. Any `OPEN` result
 keeps the worktree even when Orca links an older closed PR. Accepted results cache for no
 more than two minutes. Missing `gh`, missing authentication, non-GitHub origins, and query
 failures fall back to the existing ancestor plus reflog rule, but never prove a deleted
-upstream safe. Orca's live-terminal count is re-read immediately before removal. Logs rotate
-near 1 MB. `janitor.enabled: false` disables LaunchAgent runs at execution time;
+upstream safe. Orca's live-terminal count is re-read immediately before removal. Every time
+the janitor keeps a worktree, it logs `kept <path>: <reason>` to its log file — once per
+distinct reason per path, so an unchanged kept reason across runs stays silent and only a
+changed reason logs again. The per-path last-logged reason persists in
+`janitor-kept.json` (in the gate state dir), pruned on every run to the paths the current
+worktree inventory actually contains, so a path removed outside the janitor (manually, by
+heartbeat `remove` mode, or by a direct `orca worktree rm`) does not linger in it forever.
+Logs rotate near 1 MB. `janitor.enabled: false` disables LaunchAgent runs at execution time;
 `ORCH_JANITOR=0` is process-local unless set through launchd. Interval changes require an
 installer rerun so the plist is regenerated.
 
