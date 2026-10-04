@@ -404,6 +404,25 @@ check('a worker row that only exists on worker-list page 2 still blocks removal'
 check('the page-2 blocking worker is named in the kept reason',
   pagedBlocked.log.includes('worker row ctx_page2 running/active'), true);
 
+// worker-list's scope is surfaced in the log once per run (item 2) — there is no live Orca
+// flag to force a "list every Run" scope, so the janitor cannot fail closed on it; it only
+// records what scope actually applied, keeping liveTerminalCount===0 as the real guard.
+const boundScope = runCase('worker-list-scope-bound', worktree(), {
+  STUB_WORKERS_SCOPE_SOURCE: 'bound', STUB_WORKERS_SCOPE_RUN: 'run_other',
+});
+check('a bound worker-list scope is logged once per run',
+  boundScope.log.includes('worker-list scope: bound'), true);
+check('a bound scope does not by itself block an otherwise-removable worktree',
+  boundScope.calls.includes(`worktree rm --worktree path:${boundScope.worktreePath} --json`), true);
+
+const allScope = runCase('worker-list-scope-all', worktree(), { STUB_WORKERS_SCOPE_SOURCE: 'all' });
+check('an all-runs worker-list scope is logged once per run',
+  allScope.log.includes('worker-list scope: all'), true);
+
+const noScope = runCase('worker-list-no-scope', worktree());
+check('no scope field (older Orca) logs nothing scope-related',
+  noScope.log.includes('worker-list scope:'), false);
+
 // --dry-run performs the full evaluation but never mutates: no `worktree rm` call, logged
 // (and printed) as "would remove" instead of "removed".
 function runCaseDryRun(name, row, extraEnv = {}, workers = []) {

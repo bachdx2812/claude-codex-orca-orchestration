@@ -153,15 +153,28 @@ function worktrees(run = runOrca) {
  * `orca orchestration worker-list`, paginated by following `page.nextCursor` at a bounded
  * per-page `--limit` (Orca rejects any `--limit` over 100 outright with `invalid_argument`,
  * verified live — unlike `worktree ps`, which does accept a large explicit limit). Returns
- * `{ ok: true, workers }` or `{ ok: false, reason }` naming the failure: no reply, `ok: false`
- * (with Orca's own error message when it supplied one), a missing `workers` array, a page
- * that claims more rows exist but hands out no usable cursor to follow, or the page cap
- * below being hit — fails closed rather than looping forever on a cursor chain that never
- * terminates.
+ * `{ ok: true, workers, scope }` or `{ ok: false, reason }` naming the failure: no reply,
+ * `ok: false` (with Orca's own error message when it supplied one), a missing `workers`
+ * array, a page that claims more rows exist but hands out no usable cursor to follow, or the
+ * page cap below being hit — fails closed rather than looping forever on a cursor chain that
+ * never terminates.
+ *
+ * Scope (live-verified against a real Orca, no fail-closed gate): `worker-list --help`
+ * documents no "list every Run" flag — `--run <id>` takes a real Run id only, and a
+ * nonexistent one (tried live with "all") answers `ok: true` with zero rows, not a broader
+ * scope. The help text says scoping already widens to every Run on its own "when there is no
+ * [terminal] binding", so under launchd (no Orca ancestry) this may already be `scope.source
+ * === 'all'`; there is no flag this module can pass to force it, and failing closed on a
+ * `'bound'` scope would just disable the janitor again (the exact regression this fix
+ * exists to avoid). `result.scope` is instead surfaced to the caller once per run so an
+ * operator can see which case actually applies in `janitor.log` — the `liveTerminalCount
+ * === 0` guard in `runJanitor`, which is scope-independent, stays the primary protection
+ * against removing a worktree some other Run still owns.
  */
 function workerRows(run = runOrca) {
   const rows = [];
   let cursor = null;
+  let scope;
   for (let page = 0; page < WORKER_LIST_MAX_PAGES; page += 1) {
     const args = ['orchestration', 'worker-list', '--include-remote', '--limit', String(WORKER_LIST_PAGE_LIMIT), '--json'];
     if (cursor) args.push('--cursor', cursor);
@@ -170,8 +183,9 @@ function workerRows(run = runOrca) {
     if (reply.ok === false) return { ok: false, reason: `worker-list: ${failureReason(reply)}` };
     const result = reply.result ?? reply;
     if (!Array.isArray(result.workers)) return { ok: false, reason: 'worker-list: missing workers array' };
+    if (page === 0) scope = result.scope;
     rows.push(...result.workers);
-    if (!result.page?.hasMore) return { ok: true, workers: rows };
+    if (!result.page?.hasMore) return { ok: true, workers: rows, scope };
     if (!result.page.nextCursor || result.page.nextCursor === cursor) {
       return { ok: false, reason: 'worker-list: hasMore with no usable cursor' };
     }
@@ -252,6 +266,9 @@ function runJanitor(ctx = {}) {
   }
   const list = worktreeResult.worktrees;
   const workers = workerResult.workers;
+  if (workerResult.scope && typeof workerResult.scope.source === 'string') {
+    appendLog(`worker-list scope: ${workerResult.scope.source}`);
+  }
   const blocked = blockedWorktreeKeys(workers);
   const removed = [];
   const keptState = ctx.keptState || loadKeptState();

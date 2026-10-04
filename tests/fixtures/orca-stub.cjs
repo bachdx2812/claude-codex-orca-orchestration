@@ -144,7 +144,12 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
       page = { limit: 100, total: workers.length + 1, hasMore: true, nextCursor: 'stub-page-2' };
     }
   }
-  process.stdout.write(JSON.stringify({ result: { workers, page } }));
+  // STUB_WORKERS_SCOPE_SOURCE simulates the real `result.scope.source` field
+  // ("bound"/"all"/"flag"); unset answers no scope at all, matching an older Orca.
+  const scope = process.env.STUB_WORKERS_SCOPE_SOURCE
+    ? { run: process.env.STUB_WORKERS_SCOPE_RUN || 'run_stub', source: process.env.STUB_WORKERS_SCOPE_SOURCE }
+    : undefined;
+  process.stdout.write(JSON.stringify({ result: { workers, page, scope } }));
   process.exit(0);
 }
 if (args[0] === 'terminal' && args[1] === 'list') {
