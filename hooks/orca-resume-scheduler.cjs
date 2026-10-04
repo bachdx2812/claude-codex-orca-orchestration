@@ -6,6 +6,7 @@ const path = require('path');
 const RESUME = require('./lib/quota-reset-resume.cjs');
 const QUOTA = require('./lib/exec-route-by-quota.cjs');
 const { stateDir } = require('./lib/config.cjs');
+const { fetchWorkerListPages } = require('./lib/orca-worker-list-pages.cjs');
 
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
 const DIR = stateDir();
@@ -38,12 +39,31 @@ function authorizedWorkerHandles(workers, panelHandle = process.env.ORCA_TERMINA
     .map((worker) => worker.agentTerminalHandle).filter(Boolean));
 }
 
+/**
+ * Pages past Orca's 100-row-per-call limit via the shared `orca-worker-list-pages.cjs`
+ * helper. Preserves the pre-paging contract: null on no reply/`ok: false` on any page,
+ * otherwise every row across every page (a page with no usable rows array still counts as
+ * zero rows for that page, not a failure — same leniency the single-call version had).
+ */
 function workerHandles() {
-  const reply = orca(['orchestration', 'worker-list', '--json']);
-  if (!reply || reply.ok === false) return null;
-  const result = reply?.result || reply;
-  const workers = Array.isArray(result) ? result : result?.workers;
-  return authorizedWorkerHandles(workers);
+  let failed = false;
+  const paged = fetchWorkerListPages((args) => {
+    const reply = orca(args);
+    if (!reply || reply.ok === false) {
+      failed = true;
+      return null;
+    }
+    return reply;
+  }, {
+    baseArgs: ['orchestration', 'worker-list', '--json'],
+    getRows: (reply) => {
+      const result = reply.result || reply;
+      const list = Array.isArray(result) ? result : result?.workers;
+      return Array.isArray(list) ? list : [];
+    },
+  });
+  if (failed) return null;
+  return authorizedWorkerHandles(paged.rows);
 }
 
 function isAuthorized(job) {

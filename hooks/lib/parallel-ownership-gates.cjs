@@ -18,6 +18,7 @@
 const path = require('path');
 const { createHash } = require('crypto');
 const WG = require('./worker-groups.cjs');
+const { fetchWorkerListPages } = require('./orca-worker-list-pages.cjs');
 const OWN = require('./ownership.cjs');
 const OC = require('./ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./file-lock.cjs');
@@ -109,44 +110,56 @@ function fetchOrcaWorkerRows(orcaBin) {
   // The real reply pages at 100 rows, newest first: `result.page = {limit, total, hasMore,
   // nextCursor}` (there is no `truncated` field). A page that says it is not the whole list
   // must never drive an "absent from the list => settle" decision, so the caller gets an
-  // `exhaustive` flag alongside the rows: we follow `--cursor` while the overall 5s budget
-  // lasts, and mark the list non-exhaustive when the budget runs out mid-pagination (or
-  // the reply claims more pages without giving a cursor to follow).
+  // `exhaustive` flag alongside the rows: the shared `orca-worker-list-pages.cjs` helper
+  // follows `--cursor` while the overall 5s budget lasts (passed in as `deadlineAt`, with
+  // each page's own `execFileSync` timeout shrinking to match), and a `page-cap`/`cursor`/
+  // `deadline` stop (budget exhausted mid-pagination, or the reply claims more pages
+  // without giving a usable cursor to follow) marks the list non-exhaustive rather than
+  // failing it outright — same as before the shared helper existed.
   const deadline = Date.now() + 5000;
-  const rows = [];
-  let cursor = null;
-  for (;;) {
-    const args = ['orchestration', 'worker-list', '--json'];
-    if (cursor) args.push('--cursor', cursor);
+  let hardFailure = false;
+  const paged = fetchWorkerListPages((args, meta) => {
     let out;
     try {
       out = require('child_process').execFileSync(
         orcaBin, args,
-        { encoding: 'utf8', timeout: Math.max(1, deadline - Date.now()), maxBuffer: 32 * 1024 * 1024 }
+        { encoding: 'utf8', timeout: Math.max(1, meta.remainingMs ?? (deadline - Date.now())), maxBuffer: 32 * 1024 * 1024 }
       );
     } catch {
+      hardFailure = true;
       return null;
     }
-    let r;
+    let parsed;
     try {
-      const parsed = JSON.parse(out);
-      // A non-ok reply is not a real worker list: treating it as one (or worse, as an
-      // EMPTY list) would let "absent from the list" settle groups that are actually
-      // still live. Degrade to null — the caller then trusts local state instead.
-      if (parsed.ok === false) return null;
-      r = parsed.result ?? parsed;
+      parsed = JSON.parse(out);
     } catch {
+      hardFailure = true;
       return null;
     }
-    rows.push(...(Array.isArray(r) ? r : (r && r.workers) || []));
-    const page = (!Array.isArray(r) && r && r.page) || {};
-    const hasMore = page.hasMore === true || page.nextCursor != null;
-    if (!hasMore) break;
-    if (typeof page.nextCursor !== 'string' || !page.nextCursor || Date.now() >= deadline) {
-      return { rows, exhaustive: false, terminalHandles: null };
+    // A non-ok reply is not a real worker list: treating it as one (or worse, as an
+    // EMPTY list) would let "absent from the list" settle groups that are actually
+    // still live. Degrade to null — the caller then trusts local state instead.
+    if (parsed.ok === false) {
+      hardFailure = true;
+      return null;
     }
-    cursor = page.nextCursor;
-  }
+    return parsed;
+  }, {
+    baseArgs: ['orchestration', 'worker-list', '--json'],
+    deadlineAt: deadline,
+    getRows: (reply) => {
+      const r = reply.result ?? reply;
+      return Array.isArray(r) ? r : (Array.isArray(r?.workers) ? r.workers : []);
+    },
+    getPage: (reply) => {
+      const r = reply.result ?? reply;
+      const page = (!Array.isArray(r) && r && r.page) || {};
+      return { ...page, hasMore: page.hasMore === true || page.nextCursor != null };
+    },
+  });
+  if (hardFailure) return null;
+  if (!paged.ok) return { rows: paged.rows, exhaustive: false, terminalHandles: null };
+  const rows = paged.rows;
 
   // A terminal worker can outlive its Dispatch row, and a retained row can describe a
   // handle that has already closed. Fetch the current terminal inventory while the same

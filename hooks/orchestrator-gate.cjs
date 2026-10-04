@@ -48,6 +48,7 @@ const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const EXEC_QUOTA = require('./lib/exec-route-by-quota.cjs');
 const HANDOVER = require('./lib/worker-quota-handover.cjs');
 const CODEX_PRIORITY_TIER = require('./lib/codex-priority-tier.cjs');
+const { fetchWorkerListPages } = require('./lib/orca-worker-list-pages.cjs');
 
 const DIR = stateDir();
 const LOG = path.join(DIR, 'violations.log');
@@ -930,18 +931,37 @@ function roleFile(sid) {
  * Terminal handles of Orca workers still holding their terminal, or null when
  * Orca cannot answer. Released rows are excluded: an operator may keep typing in
  * a released worker's terminal, and that session must be gated like any other.
+ *
+ * Pages past Orca's 100-row-per-call limit via the shared `orca-worker-list-pages.cjs`
+ * helper. `execFileSync` throwing (unreachable Orca, non-zero exit, timeout, bad JSON) on
+ * ANY page still returns null for the whole call, matching the pre-paging behavior exactly
+ * — this gate must never read "live, but only for the first 100 workers" as "nobody live".
  */
 function orcaWorkerHandles() {
+  let threw = false;
+  const paged = fetchWorkerListPages((args) => {
+    try {
+      const out = require('child_process').execFileSync(
+        ORCA_BIN, args, { encoding: 'utf8', timeout: 5000, maxBuffer: 32 * 1024 * 1024 }
+      );
+      return JSON.parse(out);
+    } catch {
+      threw = true;
+      return null;
+    }
+  }, {
+    baseArgs: ['orchestration', 'worker-list', '--json'],
+    // Pre-paging code never checked `ok: false`; a reply with no usable rows array was
+    // read as "no workers", not a failure. Preserved here on purpose.
+    getRows: (reply) => {
+      const r = reply.result ?? reply;
+      return Array.isArray(r) ? r : (Array.isArray(r.workers) ? r.workers : []);
+    },
+  });
+  if (threw) return null;
   try {
-    const out = require('child_process').execFileSync(
-      ORCA_BIN, ['orchestration', 'worker-list', '--json'],
-      { encoding: 'utf8', timeout: 5000, maxBuffer: 32 * 1024 * 1024 }
-    );
-    const parsed = JSON.parse(out);
-    const r = parsed.result ?? parsed;
-    const workers = Array.isArray(r) ? r : r.workers || [];
     const handles = new Set();
-    for (const w of workers) {
+    for (const w of paged.rows) {
       if (w.terminalState === 'released') continue;
       if (w.projection && w.projection.role && w.projection.role !== 'worker') continue;
       // Only terminals Orca launched and owns for a worker (worker-start) carry a
