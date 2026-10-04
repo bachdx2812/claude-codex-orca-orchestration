@@ -96,6 +96,12 @@ check('an uncached pre-removal check catches a PR opened after the initial verdi
 const dirty = runCase('dirty', worktree(), { STUB_GIT_CLEAN: '0' });
 check('a dirty worktree is kept', dirty.calls.includes('worktree rm'), false);
 
+const statusProbeFailed = runCase('status-probe-failed', worktree(), { STUB_GIT_STATUS_FAIL: '1' });
+check('a worktree whose git status probe itself fails is kept',
+  statusProbeFailed.calls.includes('worktree rm'), false);
+check('a git probe failure is logged distinctly from a real dirty verdict',
+  statusProbeFailed.log.includes(`kept ${JSON.stringify(statusProbeFailed.worktreePath)}: git probe failed`), true);
+
 const deletedUpstream = runCase('deleted-upstream', worktree(), {
   STUB_GIT_HAS_UPSTREAM: '0', STUB_GIT_UPSTREAM_GONE: '1',
 });

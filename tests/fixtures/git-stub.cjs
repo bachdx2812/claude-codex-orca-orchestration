@@ -13,6 +13,8 @@
  *   STUB_GIT_HAS_MAIN=1         `rev-parse --verify main` succeeds (local-only fallback base)
  *   STUB_GIT_ANCESTOR=1         `merge-base --is-ancestor` exits 0 (HEAD is merged into base)
  *   STUB_GIT_CLEAN=1            `status --porcelain` prints nothing (a clean worktree)
+ *   STUB_GIT_STATUS_FAIL=1      `status --porcelain` itself exits non-zero (a probe
+ *                              failure distinct from a real dirty/clean verdict)
  *   STUB_GIT_HAS_UPSTREAM=1     `rev-parse @{u}` succeeds (a real upstream exists)
  *   STUB_GIT_UNPUSHED=1         `rev-list @{u}..HEAD` prints a commit (unpushed work)
  *   STUB_GIT_HEAD_COMMIT_TIME  `log -1 --format=%ct HEAD` prints this value (unix seconds);
@@ -90,6 +92,7 @@ if (sub === 'merge-base') {
 }
 
 if (sub === 'status') {
+  if (process.env.STUB_GIT_STATUS_FAIL === '1') done('', 128);
   if (process.env.STUB_GIT_CLEAN !== '1') done(' M some/file.txt\0', 0);
   const ignored = process.env.STUB_GIT_IGNORED;
   done(ignored ? ignored.split(',').map((file) => `!! ${file}\0`).join('') : '', 0);

@@ -1335,8 +1335,10 @@ function cleanStatus(stdout, allowlist, onBlockedIgnored, onDirty) {
  * 'dirty' (tracked/untracked changes; the more specific 'ignored <path>' case already
  * reports itself via `ctx.onBlockedIgnored` inside `cleanStatus`, so it is not duplicated
  * here), 'unpushed' (commits ahead of upstream, or a deleted-upstream head that was never
- * the pushed/merged one) or 'no upstream + not in base' (no upstream at all and HEAD isn't
- * contained in the resolved base). It never changes the boolean return — purely additive.
+ * the pushed/merged one), 'no upstream + not in base' (no upstream at all and HEAD isn't
+ * contained in the resolved base), or 'git probe failed' (the git spawn/exit itself failed —
+ * a distinct diagnosis from an actual dirty/unpushed verdict, since the next troubleshooting
+ * step differs). It never changes the boolean return — purely additive.
  */
 function isWorktreeClean(w, git, ctx = {}) {
   // `--no-optional-locks`: a plain status read must never contend with, or be blocked by,
@@ -1345,13 +1347,13 @@ function isWorktreeClean(w, git, ctx = {}) {
   const status = git([
     '--no-optional-locks', 'status', '--porcelain', '--ignored', '--untracked-files=normal', '-z',
   ], w.path);
-  if (!status || status.status !== 0) { ctx.onNotClean?.('dirty'); return false; }
+  if (!status || status.status !== 0) { ctx.onNotClean?.('git probe failed'); return false; }
   if (!cleanStatus(status.stdout, ctx.rebuildableIgnored || cfg.janitor.rebuildableIgnored,
     ctx.onBlockedIgnored, () => ctx.onNotClean?.('dirty'))) {
     return false;
   }
   const upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}'], w.path);
-  if (upstream === null) { ctx.onNotClean?.('dirty'); return false; }
+  if (upstream === null) { ctx.onNotClean?.('git probe failed'); return false; }
   if (upstream && upstream.status === 0 && upstream.stdout) {
     const unpushed = git(['rev-list', '@{u}..HEAD'], w.path);
     const clean = !!unpushed && unpushed.status === 0 && unpushed.stdout === '';
@@ -1359,9 +1361,9 @@ function isWorktreeClean(w, git, ctx = {}) {
     return clean;
   }
   const branch = git(['branch', '--show-current'], w.path);
-  if (!branch || branch.status !== 0 || !branch.stdout) { ctx.onNotClean?.('dirty'); return false; }
+  if (!branch || branch.status !== 0 || !branch.stdout) { ctx.onNotClean?.('git probe failed'); return false; }
   const track = git(['for-each-ref', '--format=%(upstream:track)', `refs/heads/${branch.stdout}`], w.path);
-  if (!track || track.status !== 0) { ctx.onNotClean?.('dirty'); return false; }
+  if (!track || track.status !== 0) { ctx.onNotClean?.('git probe failed'); return false; }
   if (track.stdout === '[gone]') {
     const head = git(['rev-parse', 'HEAD'], w.path);
     const clean = !!head && head.status === 0 && !!head.stdout &&
