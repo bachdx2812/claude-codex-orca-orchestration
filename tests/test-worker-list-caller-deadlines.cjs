@@ -148,6 +148,26 @@ function runInChild(expr, env) {
   check('resume-scheduler workerHandles(): a page-2 failure returns null', out, null);
 }
 
+// An incomplete-but-not-failed stop (hasMore: true with no nextCursor, the helper's
+// 'cursor' stop) must also return null, not treat the partial rows as exhaustive —
+// otherwise a handle missing only because its page was never fetched reads as
+// unauthorized, which `quota-reset-resume.cjs` turns into a permanent job cancellation
+// instead of a retry.
+{
+  const out = runInChild(`
+    const rs = require(${JSON.stringify(path.join(__dirname, '..', 'hooks', 'orca-resume-scheduler.cjs'))});
+    const handles = rs.workerHandles();
+    process.stdout.write(JSON.stringify(handles ? Array.from(handles) : null));
+  `, {
+    STUB_WORKERS_JSON: JSON.stringify([{
+      dispatchId: 'ctx_rs1', agentTerminalHandle: 'term_rs1', workerState: 'running', terminalState: 'active',
+    }]),
+    STUB_WORKERS_PAGE_HAS_MORE: '1',
+  });
+  check('resume-scheduler workerHandles(): an incomplete (cursor) stop returns null, not a partial list',
+    out, null);
+}
+
 console.log(`${passed} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  FAIL ${failure}`);
 process.exit(failures.length ? 1 : 0);

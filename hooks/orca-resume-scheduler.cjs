@@ -45,10 +45,13 @@ function authorizedWorkerHandles(workers, panelHandle = process.env.ORCA_TERMINA
  * otherwise every row across every page (a page with no usable rows array still counts as
  * zero rows for that page, not a failure — same leniency the single-call version had).
  *
- * Bounded to ~15s total via `deadlineAt` — a degraded Orca answering each page slowly but
- * just under its own per-page timeout must not block a scheduler tick indefinitely. A
- * deadline stop keeps whatever rows were already collected, same as an existing
- * cursor/page-cap stop: fewer authorized handles, which fails closed (no typing).
+ * Bounded to deadline (15s) + at most one page timeout total — the helper only checks the
+ * deadline between pages, so a degraded Orca answering slowly but just under its own
+ * per-page timeout can still run one more full page past it. A deadline/cursor/page-cap
+ * stop means the list is incomplete, not merely short: it returns null (authorization
+ * unknown) rather than treating the partial rows as exhaustive, so the caller retries
+ * instead of cancelling a parked job over a handle that may simply be on a page never
+ * fetched.
  */
 function workerHandles() {
   let failed = false;
@@ -68,7 +71,7 @@ function workerHandles() {
       return Array.isArray(list) ? list : [];
     },
   });
-  if (failed) return null;
+  if (failed || !paged.ok) return null;
   return authorizedWorkerHandles(paged.rows);
 }
 

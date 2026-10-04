@@ -937,10 +937,12 @@ function roleFile(sid) {
  * ANY page still returns null for the whole call, matching the pre-paging behavior exactly
  * — this gate must never read "live, but only for the first 100 workers" as "nobody live".
  *
- * Bounded to ~5s total via `deadlineAt`, same as this call's own per-page `execFileSync`
- * timeout — a degraded Orca answering each page slowly but just under its timeout must not
- * turn this PreToolUse hook into an unbounded wait. A deadline stop keeps whatever rows
- * were already collected, same as an existing cursor/page-cap stop (see below).
+ * Bounded to deadline (5s) + at most one page timeout total, same as this call's own
+ * per-page `execFileSync` timeout — the helper only checks the deadline between pages, so
+ * a degraded Orca answering each page slowly but just under its timeout can still run one
+ * more full page past it. That must not turn this PreToolUse hook into an unbounded wait. A
+ * deadline stop keeps whatever rows were already collected, same as an existing
+ * cursor/page-cap stop (see below).
  */
 function orcaWorkerHandles() {
   let threw = false;
