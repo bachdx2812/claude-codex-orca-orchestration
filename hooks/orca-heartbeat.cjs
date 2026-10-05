@@ -1371,6 +1371,19 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
   const branch = w.mrState == null ? git(['branch', '--show-current'], w.path) : null;
   const branchUncertain = w.mrState == null && (!branch || branch.status !== 0);
   const isDetached = w.mrState == null && !branchUncertain && !branch.stdout;
+  // Round 2, item H1: this guard used to sit only inside the no-linked-PR leg far below,
+  // which left a hole for a detached HEAD carrying an Orca-cached `prState` of `merged`/
+  // `closed` (an Orca-linked-PR row under `ctx.skipGithub`): with `github` forced to `null`
+  // by `skipGithub`, that case fell through every other leg to the plain `w.prState` branch
+  // below and got accepted on Orca's cached state alone — exactly the unverifiable detached
+  // HEAD the heartbeat must never accept on its own. Checked immediately once `isDetached`
+  // is known, before the Orca linked-PR early return or any other leg gets a chance to
+  // accept it. `ctx.skipGithub` (the heartbeat, which makes no gh calls at all) means there
+  // is no way left to safely verify a detached HEAD's acceptance; only the janitor (which
+  // does run gh) can.
+  if (isDetached && ctx.skipGithub) {
+    return { accepted: false, reason: 'detached HEAD, github check skipped', github };
+  }
   // `reason` always carries a diagnostic string, whether or not `accepted` is true, so a
   // caller that only needs "why wasn't this removed" (orca-janitor's kept-reason log) does
   // not have to reimplement this leg's own logic just to describe it.
@@ -1422,13 +1435,8 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
   // above never finds a PR by head branch and returns null — yet HEAD may still be exactly
   // the head commit of an open PR opened from some other branch/fork. Check by commit SHA
   // instead before accepting; any gh/git failure here fails closed (kept), same rule as
-  // everywhere else in this file. `ctx.skipGithub` (the heartbeat, which makes no gh calls at
-  // all) skips this veto entirely — and, for a detached HEAD specifically, that means there is
-  // no way left to safely verify acceptance at all, so the heartbeat never accepts a detached
-  // HEAD through this path; only the janitor (which does run gh) can.
-  if (isDetached && ctx.skipGithub) {
-    return { accepted: false, reason: 'detached HEAD, github check skipped', github };
-  }
+  // everywhere else in this file. The `isDetached && ctx.skipGithub` veto for this leg is
+  // already handled above, right after `isDetached` is computed.
   const openAtHead = ctx.skipGithub
     ? { blocked: false }
     : resolveGithubOpenPrForHeadSha(w, git, ctx.gh || runGh, ctx);

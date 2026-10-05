@@ -740,6 +740,29 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('H2: a named branch (not detached) is still accepted git-only under skipGithub, same as before',
     heartbeat.isDoneButOpen(noPrIdle, ctx({ skipGithub: true })), true);
 
+  // Round 2, item H1: before this fix, the `isDetached && ctx.skipGithub` veto lived only
+  // inside the no-linked-PR leg far below — a detached HEAD carrying an Orca-cached
+  // `prState` of `merged`/`closed` instead fell through to the plain `w.prState` branch
+  // (which never looks at `isDetached` at all) and got accepted on Orca's cached state
+  // alone, under `skipGithub`, with no gh call ever made to verify it. The veto now fires
+  // immediately once `isDetached` is known, before any leg gets a chance to accept it.
+  check('H1: a detached HEAD with Orca prState "merged" is never accepted under skipGithub',
+    heartbeat.isDoneButOpen({ ...noPrIdle, prState: 'merged', prNumber: 77 }, ctx({
+      git: detachedGit(), skipGithub: true,
+    })), false);
+  check('H1: a detached HEAD with Orca prState "closed" is never accepted under skipGithub',
+    heartbeat.isDoneButOpen({ ...noPrIdle, prState: 'closed', prNumber: 78 }, ctx({
+      git: detachedGit(), skipGithub: true,
+    })), false);
+  check('H1: the same Orca prState "merged" detached HEAD is still accepted by the janitor (which runs gh)',
+    heartbeat.isDoneButOpen({ ...noPrIdle, prState: 'merged', prNumber: 77 }, ctx({
+      git: detachedGit({ remote: { status: 0, stdout: 'git@github.com:acme/widgets.git' } }),
+      gh: (args) => (args[1] === 'view'
+        ? { status: 0, stdout: '{"state":"MERGED","headRefOid":"head123"}' }
+        : { status: 0, stdout: '[]' }),
+      cache: {},
+    })), true);
+
   // Idle via the worktree-level lastOutputAt aggregate (no per-terminal data is exposed).
   const liveButQuiet = { ...mergedIdle, liveTerminalCount: 1, lastOutputAt: 1_000_000 - 120_000 };
   check('a live terminal whose aggregate lastOutputAt is past the idle threshold is idle',

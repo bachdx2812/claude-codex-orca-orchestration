@@ -3408,7 +3408,15 @@ function runHeartbeat({
       CLAUDE_CODE_SESSION_ID: heartbeatSession, STUB_WORKTREES_JSON: `@${wtFile}`,
       STUB_WORKTREE_PS_CALLS_LOG: callsLogFile, STUB_WORKERS_JSON: JSON.stringify(scopedWorkerRows),
       STUB_TERMINALS_JSON: JSON.stringify(terminalRows || []),
-      STUB_GIT_CLEAN: '1', STUB_GIT_HAS_UPSTREAM: '1',
+      // Round 2, item H1: `resolveAcceptance` now vetoes a detached HEAD outright under
+      // `skipGithub` (the heartbeat never makes a gh call, so it has no way left to safely
+      // verify one) — before that fix, acceptance for the common PR-state legs below never
+      // even looked at the branch name, so leaving `git branch --show-current` at the
+      // stub's own empty-stdout default (which is what a REAL detached HEAD also reports)
+      // was harmless. Default every worktree here to a real, named branch so these generic
+      // PR/idle/clean fixtures keep exercising the "has a branch" acceptance legs they were
+      // written for; a test that genuinely wants a detached HEAD overrides this back to ''.
+      STUB_GIT_CLEAN: '1', STUB_GIT_HAS_UPSTREAM: '1', STUB_GIT_BRANCH: 'feature/work',
       ...(gitEnv || {}), ...(envOverrides || {}),
     };
     const child = spawn(process.execPath, [HEARTBEAT, ...(args || [])], { env });
@@ -4357,7 +4365,7 @@ async function heartbeatWorktreeTests() {
       name: 'no-pr-ancestor-detached',
       worktrees: [{ path: pDetached, displayName: 'np-detached', isMainWorktree: false, isArchived: false,
         liveTerminalCount: 0 }],
-      gitEnv: { STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)),
+      gitEnv: { STUB_GIT_BRANCH: '', STUB_GIT_ANCESTOR: '1', STUB_GIT_HEAD_COMMIT_TIME: String(Math.floor(Date.now() / 1000)),
         STUB_GIT_REFLOG_HAS_COMMIT: '1' },
       args: ['--interval', '1', '--idle', '60', '--max', '1'],
     });
