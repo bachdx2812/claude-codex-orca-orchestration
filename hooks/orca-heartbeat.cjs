@@ -1507,28 +1507,26 @@ function cleanStatus(stdout, allowlist, onBlockedIgnored, onDirty) {
  * origin/main` after committing). `git worktree rm` deletes that reflog, and gc then drops
  * any commit it alone referenced, permanently losing it.
  *
- * Walks this worktree's own HEAD reflog (`git log -g --format=%H%x09%gs HEAD`), collects
- * every SHA whose subject starts with `commit` (the same real-commit-action predicate as
- * `hasOwnCommit`), and requires `git rev-list <shas> --not --remotes` to print nothing —
- * i.e. every one of those commits is already reachable from some ref this worktree's
- * remote(s) have. No commit action recorded at all is trivially reachable (there is
- * nothing to lose). Any git failure along the way returns `false` (not reachable) — never
- * a pass, same fail-closed rule as everywhere else in this file. Pure local git: `--remotes`
- * reads already-fetched remote-tracking refs, no network call.
+ * Walks EVERY entry in this worktree's own HEAD reflog (`git log -g --format=%H HEAD`),
+ * not only entries whose action is a real commit (`commit`/`commit (amend)`/
+ * `commit (merge)`) — a `revert`, `cherry-pick`, or any other reflog action can also leave
+ * behind a commit that exists nowhere else, and filtering by action name alone let exactly
+ * that slip through (round 2, item C1: a revert or a cherry-pick of an already-deleted
+ * local commit, each followed by `git checkout` away, previously read as "nothing to
+ * lose"). Every distinct SHA named by the reflog (deduped) must be reachable from some ref
+ * this worktree's remote(s), local branches, or local tags already have — `git rev-list
+ * <shas> --not --remotes --branches --tags` printing nothing. No reflog entries at all is
+ * trivially reachable (there is nothing to lose). Any git failure along the way returns
+ * `false` (not reachable) — never a pass, same fail-closed rule as everywhere else in this
+ * file. Pure local git: `--remotes`/`--branches`/`--tags` read already-fetched refs, no
+ * network call.
  */
 function detachedCommitsReachableFromRemotes(w, git) {
-  const r = git(['log', '-g', '--format=%H%x09%gs', 'HEAD'], w.path);
+  const r = git(['log', '-g', '--format=%H', 'HEAD'], w.path);
   if (!r || r.status !== 0) return false;
-  const shas = [];
-  for (const line of String(r.stdout || '').split('\n')) {
-    const tab = line.indexOf('\t');
-    if (tab < 0) continue;
-    const sha = line.slice(0, tab).trim();
-    const subject = line.slice(tab + 1).trim();
-    if (sha && /^commit\b/.test(subject)) shas.push(sha);
-  }
+  const shas = [...new Set(String(r.stdout || '').split('\n').map((line) => line.trim()).filter(Boolean))];
   if (shas.length === 0) return true;
-  const rev = git(['rev-list', ...shas, '--not', '--remotes'], w.path);
+  const rev = git(['rev-list', ...shas, '--not', '--remotes', '--branches', '--tags'], w.path);
   if (!rev || rev.status !== 0) return false;
   return rev.stdout === '';
 }
