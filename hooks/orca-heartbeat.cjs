@@ -1371,6 +1371,12 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
   const branch = w.mrState == null ? git(['branch', '--show-current'], w.path) : null;
   const branchUncertain = w.mrState == null && (!branch || branch.status !== 0);
   const isDetached = w.mrState == null && !branchUncertain && !branch.stdout;
+  // Round 2, item L1: a single hoisted early return for an uncertain branch probe, instead
+  // of the same `if (branchUncertain) return ...` repeated in two legs below — `isDetached`
+  // is always `false` whenever `branchUncertain` is `true` (see its definition above), so
+  // moving this ahead of the H1 detached-HEAD veto changes nothing about which worktrees it
+  // can apply to.
+  if (branchUncertain) return { accepted: false, reason: 'gh uncertain', github };
   // Round 2, item H1: this guard used to sit only inside the no-linked-PR leg far below,
   // which left a hole for a detached HEAD carrying an Orca-cached `prState` of `merged`/
   // `closed` (an Orca-linked-PR row under `ctx.skipGithub`): with `github` forced to `null`
@@ -1393,7 +1399,6 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
   const overridesOpen = !prStateOpen ||
     (github?.fresh !== false && w.prNumber != null && (github?.mergedPrNumbers || []).includes(w.prNumber));
   if (github?.accepted && overridesOpen) {
-    if (branchUncertain) return { accepted: false, reason: 'gh uncertain', github };
     if (isDetached) {
       const head = git(['rev-parse', 'HEAD'], w.path);
       const headMatches = !!head && head.status === 0 && !!head.stdout &&
@@ -1430,13 +1435,12 @@ function resolveAcceptance(w, git, stat, ctx = {}) {
   if (!base || !isAncestorOf(w.path, git, base)) return { accepted: false, reason: 'no upstream + not in base', github };
   if (!hasProducedMergedWork(w, git, stat)) return { accepted: false, reason: 'not accepted', github };
   if (!hasOwnCommit(w, git)) return { accepted: false, reason: 'not accepted', github };
-  if (branchUncertain) return { accepted: false, reason: 'gh uncertain', github };
   // A detached HEAD (Orca's `*-fix` worktrees) has no branch name, so `resolveGithubAcceptance`
   // above never finds a PR by head branch and returns null — yet HEAD may still be exactly
   // the head commit of an open PR opened from some other branch/fork. Check by commit SHA
   // instead before accepting; any gh/git failure here fails closed (kept), same rule as
-  // everywhere else in this file. The `isDetached && ctx.skipGithub` veto for this leg is
-  // already handled above, right after `isDetached` is computed.
+  // everywhere else in this file. The `branchUncertain` and `isDetached && ctx.skipGithub`
+  // vetoes for this leg are already handled above, right after each is computed.
   const openAtHead = ctx.skipGithub
     ? { blocked: false }
     : resolveGithubOpenPrForHeadSha(w, git, ctx.gh || runGh, ctx);
