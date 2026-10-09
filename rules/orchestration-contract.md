@@ -220,7 +220,9 @@ either, regardless of what the operator's standing override says.
 
 Codex and Kimi are peers; DeepSeek (via `opencode`) is an `overflow` coder by default
 (picked only once no subscription coder is eligible, before Sonnet) and a full peer when
-`deepseekRole` is `peer`. Every coder is optional: any machine may have none of them.
+`deepseekRole` is `peer`. Every coder is optional: any machine may have none of them. A coder
+listed in `disabledCoders` is excluded like an unusable coder, never probed, and its override
+and matching `worker-start` are refused.
 Automatic routing first establishes which coders are usable,
 then applies the load-balancing order in rule 3; Codex is chosen first only at the final
 tie-break. A quota-unknown reading does not by itself make a usable coder ineligible.
@@ -360,6 +362,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   "maxParallelDeepseekWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
+  "disabledCoders": [],
   "closeDoneWorktrees": "remove",
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null
@@ -466,6 +469,10 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
   the SessionStart banner.
+- `disabledCoders`: normalized list of `codex`, `kimi`, and `deepseek` names to exclude
+  entirely from availability probes, quota routing, banners, overrides, dispatch, and
+  handover destinations. `ORCH_DISABLED_CODERS` is a comma-separated process override;
+  a blank value is unset. The `coder-disabled` gate controls worker-start refusal.
 - `maxParallelCodexWorkers`: integer 0-32, default 3. How many live Codex worker *groups*
   (see "Section 0 fixes" below — one worker-start reply's dispatch id, task id and
   terminal handle together are one group, never three) this session may hold at once; `0`

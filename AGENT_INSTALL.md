@@ -212,9 +212,13 @@ The file is plain JSON — no comments — parsed as-is:
   "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "replyLanguage": "Vietnamese",
-  "disabledGates": ["code-brief-needs-verify"]
+  "disabledGates": ["code-brief-needs-verify"],
+  "disabledCoders": []
 }
 ```
+
+`disabledCoders` removes named external coders from probing and routing; `ORCH_DISABLED_CODERS`
+is a comma-separated process override. Matching overrides are ignored and `worker-start` is refused.
 
 (`codexHandoffUsedPercent: 90` hands Codex off slightly earlier than the default 95;
 `kimiHandoffUsedPercent` is Kimi's own, separate threshold (default 95) — both tunable via

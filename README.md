@@ -18,7 +18,8 @@ Repo: <https://github.com/bachdx2812/claude-codex-orca-orchestration>
 Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kimi | DeepSeek writes code
 [Sonnet only once every coder is unusable or has used >= its handoff threshold of quota,
  read live; separate, configurable thresholds via codexHandoffUsedPercent /
- ORCH_CODEX_HANDOFF_USED, kimiHandoffUsedPercent / ORCH_KIMI_HANDOFF_USED and
+ ORCH_CODEX_HANDOFF_USED, kimiHandoffUsedPercent / ORCH_KIMI_HANDOFF_USED,
+ disabledCoders / ORCH_DISABLED_CODERS and
  deepseekHandoffUsedPercent / ORCH_DEEPSEEK_HANDOFF_USED]
 -> review reads code and judges the diff on Opus; verify runs existing checks on Sonnet
 -> main panel reports
@@ -30,7 +31,7 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kim
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Reviewer | Code review — reads code and judges the diff | Opus 5.5 (`claude-opus-5-5`), regardless of which coder wrote it | `Agent` with `model: "opus"` per `models.reviewByCoder` | `models.reviewByCoder`, `models.reviewEffort` |
 | Verifier | Verify-run — runs existing checks (CI gate, screenshots, play-test, post-deploy smoke), not reading/judging the diff | Sonnet 5.5 (`claude-sonnet-5-5`) | `Agent` with `model: "sonnet"` at `models.verify.effort` | `models.verify` |
-| Coder pool (peers) | Every task class previously handled by Codex: code, builds, refactors, tests, bulk conversions, and fix loops | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) + DeepSeek (`model` in `~/.config/opencode/opencode.jsonc`) | Spread across eligible Orca workers. Pick the coder with MORE QUOTA LEFT first: a free per-session slot, then more headroom below that coder's own threshold; within `coderHeadroomTieBand` (default 10 points), fewer live workers machine-wide; then the coder other than `lastCoder`; then Codex. A quota-unknown coder ranks as `unknownHeadroomAssumed` (default 30) headroom points; a reset-aware estimate of the last successful reading counts as known. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`; DeepSeek uses `worker-start --agent opencode` without `--model`. DeepSeek defaults to `deepseekRole: "overflow"` — picked only once no subscription coder is eligible, before Sonnet. | `models.codex`, `models.kimi`, `models.deepseek`, `deepseekRole`, per-coder caps and thresholds, `coderHeadroomTieBand`, `unknownHeadroomAssumed` |
+| Coder pool (peers) | Every task class previously handled by Codex: code, builds, refactors, tests, bulk conversions, and fix loops | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) + DeepSeek (`model` in `~/.config/opencode/opencode.jsonc`) | Spread across eligible Orca workers. Pick the coder with MORE QUOTA LEFT first: a free per-session slot, then more headroom below that coder's own threshold; within `coderHeadroomTieBand` (default 10 points), fewer live workers machine-wide; then the coder other than `lastCoder`; then Codex. A quota-unknown coder ranks as `unknownHeadroomAssumed` (default 30) headroom points; a reset-aware estimate of the last successful reading counts as known. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`; DeepSeek uses `worker-start --agent opencode` without `--model`. DeepSeek defaults to `deepseekRole: "overflow"` — picked only once no subscription coder is eligible, before Sonnet. | `models.codex`, `models.kimi`, `models.deepseek`, `deepseekRole`, `disabledCoders`, per-coder caps and thresholds, `coderHeadroomTieBand`, `unknownHeadroomAssumed` |
 | Coder (handoff) | Same work once every usable coder has used >= its handoff threshold of its live-read quota (Codex: `codexHandoffUsedPercent`, default 95, override `ORCH_CODEX_HANDOFF_USED`; Kimi: `kimiHandoffUsedPercent`, default 95, override `ORCH_KIMI_HANDOFF_USED`; DeepSeek: `deepseekHandoffUsedPercent`, default 95, override `ORCH_DEEPSEEK_HANDOFF_USED`) or is unusable on this machine | Sonnet | `Agent` with `subagent_type: "sonnet-coder"` + `model: "sonnet"` at `models.code.effort` (default medium; brief must name a verify command) | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `deepseekHandoffUsedPercent`, `models.code` (incl. `effort` / `agentType`), `execFallbackWhenCodexUnavailable` |
 | Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
 | Escalation | Only after Opus 5.5 failed even at higher effort; the dispatch must say both | Fable 5.1 (`claude-fable-5-1`) | `Agent` with `model: "fable"` + "escalation: opus failed ... at high effort ..." | `models.escalation` |
@@ -575,10 +576,16 @@ The file is plain JSON — no comments — parsed as-is:
   "maxParallelDeepseekWorkers": 3,
   "ownershipClaimTtlMinutes": 60,
   "disabledGates": ["code-brief-needs-verify"],
+  "disabledCoders": [],
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null
 }
 ```
+
+`disabledCoders` switches listed external coders (`codex`, `kimi`, or `deepseek`) off
+entirely: they are not probed, routed, or shown in routing output. Their operator override
+is ignored and the `coder-disabled` gate refuses a matching `worker-start`. The comma-separated
+`ORCH_DISABLED_CODERS` value replaces the config list for one process; blank means unset.
 
 (`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95;
 `kimiHandoffUsedPercent` and `deepseekHandoffUsedPercent` are each coder's own, separate

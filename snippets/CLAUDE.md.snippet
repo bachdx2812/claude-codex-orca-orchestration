@@ -21,6 +21,8 @@ the SessionStart banner printed each session as the exact current numbers, not t
   neither coder is eligible, use the configured in-session code model. The operator can
   override with `--code-model <alias|codex|codex:<model>|kimi|kimi:<model>|auto>` or the
   `--exec-*` shortcuts. A Kimi worker starts with `worker-start --agent kimi` (no `--model`).
+- A coder listed in `disabledCoders` (or `ORCH_DISABLED_CODERS`) is off: never routed, its
+  `--code-model`/`--exec-*` override is ignored, and its `worker-start` is refused.
 - Every code brief names a verify command.
 - A heartbeat daemon must supervise any live Orca worker; `Stop` refuses to end the
   session with one still live and unwatched.
