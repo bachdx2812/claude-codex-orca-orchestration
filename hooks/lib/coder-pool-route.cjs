@@ -28,6 +28,7 @@
  * via `coders[coder].estimated` / `quotaFetchedAt` for the reminder text.
  *
  * `options.live` is MACHINE-wide live counts (the load-balancing ordering key);
+ * `options.disabled` removes named coders from routing regardless of availability.
  * `options.sessionLive` is THIS session's live counts, the basis of the free-slot key:
  * the caps in `options.caps` are per-session (maxParallel*Workers), so a slot is free
  * when this session's own count is below its own cap, regardless of what other
@@ -56,6 +57,7 @@ function markerActive(marker, quota, threshold) {
 
 function formatCoderState(coderName, coder) {
   const name = label(String(coderName).toLowerCase());
+  if (coder.state === 'disabled') return `${name} (disabled by config)`;
   if (coder.state === 'unusable') return `${name} (unusable: ${coder.reason})`;
   if (coder.state === 'exhausted') return `${name} (exhausted${coder.reason ? `: ${coder.reason}` : ''})`;
   if (coder.leftPct === null) return `${name} (quota unknown, available)`;
@@ -74,6 +76,7 @@ function pickCoderPool(options = {}) {
   const live = options.live || {};
   const sessionLive = options.sessionLive || live;
   const caps = options.caps || {};
+  const disabled = new Set(Array.isArray(options.disabled) ? options.disabled : []);
   const lastCoder = CODERS.includes(options.lastCoder) ? options.lastCoder : null;
   // DeepSeek's routing role (binding operator decision, 2026-10-01): 'overflow' (default)
   // picks it only when NO subscription coder (Codex/Kimi) is eligible, but before the
@@ -102,7 +105,10 @@ function pickCoderPool(options = {}) {
     const leftPct = knownQuota(quota) ? Math.max(0, 100 - quota.usedPercent) : null;
     let state = 'eligible';
     let reason = null;
-    if (!usable) {
+    if (disabled.has(coder)) {
+      state = 'disabled';
+      reason = 'disabled by config';
+    } else if (!usable) {
       state = 'unusable';
       reason = available.reason || 'unavailable';
     } else if (knownQuota(quota) && quota.usedPercent >= threshold) {
@@ -112,9 +118,11 @@ function pickCoderPool(options = {}) {
       state = 'exhausted';
       reason = exhaustion[coder].reason || 'quota exhaustion marker active';
     }
-    coders[coder] = { state, leftPct, headroom: headroomFor(coder), live: liveCount, sessionLive: sessionLiveCount, cap, reason,
-      estimated: knownQuota(quota) && quota.estimated === true,
-      quotaFetchedAt: knownQuota(quota) && typeof quota.fetchedAt === 'number' ? quota.fetchedAt : null };
+    coders[coder] = { state, leftPct: state === 'disabled' ? null : leftPct,
+      headroom: state === 'disabled' ? null : headroomFor(coder), live: liveCount,
+      sessionLive: sessionLiveCount, cap, reason,
+      estimated: state !== 'disabled' && knownQuota(quota) && quota.estimated === true,
+      quotaFetchedAt: state !== 'disabled' && knownQuota(quota) && typeof quota.fetchedAt === 'number' ? quota.fetchedAt : null };
   }
 
   const order = CODERS.filter((coder) => coders[coder].state === 'eligible');
@@ -151,10 +159,18 @@ function pickCoderPool(options = {}) {
   });
 
   if (!order.length) {
-    const states = CODERS.map((coder) => `${label(coder)} ${coders[coder].reason || coders[coder].state}`);
+    const shown = CODERS.filter((coder) => coders[coder].state !== 'disabled');
+    if (!shown.length) {
+      return {
+        route: 'code', order, pick: null, coders,
+        summary: 'no external coder enabled',
+        why: 'auto: every coder disabled by config',
+      };
+    }
+    const states = shown.map((coder) => `${label(coder)} ${coders[coder].reason || coders[coder].state}`);
     return {
       route: 'code', order, pick: null, coders,
-      summary: CODERS.map((coder) => formatCoderState(coder, coders[coder])).join(' or '),
+      summary: shown.map((coder) => formatCoderState(coder, coders[coder])).join(' or '),
       why: `auto: ${states.join(', ')}`,
     };
   }
@@ -175,7 +191,8 @@ function pickCoderPool(options = {}) {
     else if (lastCoder === other) pickReason = 'alternation';
     else pickReason = `${label(pick).toLowerCase()} first`;
   }
-  const summary = `${CODERS.map((coder) => {
+  const shown = CODERS.filter((coder) => coders[coder].state !== 'disabled');
+  const summary = `${shown.map((coder) => {
     const state = coders[coder];
     if (state.state !== 'eligible') return formatCoderState(coder, state);
     if (state.standby) return `${label(coder)} (overflow standby)`;

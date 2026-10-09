@@ -12,6 +12,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { CODERS } = require('./coder-availability.cjs');
 
 // Every gate id `disabledGates` may name. Kept here (not scattered across the gate) so
 // validation and documentation stay in sync with what can actually be disabled.
@@ -35,6 +36,7 @@ const GATE_NAMES = [
   'code-brief-needs-owns',
   'ownership-overlap',
   'max-parallel-agents',
+  'coder-disabled',
 ];
 
 const DEFAULT_CONFIG = {
@@ -106,6 +108,7 @@ const DEFAULT_CONFIG = {
   maxParallelDeepseekWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
+  disabledCoders: [], // coders switched off entirely: 'codex' | 'kimi' | 'deepseek'
   // heartbeat done-worktree handling: 'remove' (run `orca worktree rm` itself), 'remind'
   // (wake the panel with the rm command, never run it) or 'off'. Legacy booleans still
   // load: true -> 'remind', false -> 'off'.
@@ -448,6 +451,22 @@ function loadConfig() {
     if (unknown.length) warnings.push(`disabledGates has unknown gate name(s): ${unknown.join(', ')}.`);
   }
 
+  if (!Array.isArray(merged.disabledCoders)) {
+    warnings.push('disabledCoders must be an array of coder names (codex|kimi|deepseek); ignoring.');
+    merged.disabledCoders = [];
+  } else {
+    const unknown = merged.disabledCoders.filter((coder) =>
+      typeof coder !== 'string' || !CODERS.includes(coder.trim().toLowerCase()));
+    if (unknown.length) {
+      warnings.push(`disabledCoders has unknown coder name(s): ${unknown.map((coder) =>
+        typeof coder === 'string' ? coder.trim().toLowerCase() : JSON.stringify(coder)).join(', ')} (known: ${CODERS.join(', ')}).`);
+    }
+    merged.disabledCoders = [...new Set(merged.disabledCoders
+      .filter((coder) => typeof coder === 'string')
+      .map((coder) => coder.trim().toLowerCase())
+      .filter((coder) => CODERS.includes(coder)))];
+  }
+
   if (merged.execFallbackWhenCodexUnavailable !== 'sonnet' && merged.execFallbackWhenCodexUnavailable !== null) {
     warnings.push(`execFallbackWhenCodexUnavailable "${merged.execFallbackWhenCodexUnavailable}" is not "sonnet" or null; using "sonnet".`);
     merged.execFallbackWhenCodexUnavailable = 'sonnet';
@@ -530,6 +549,17 @@ function loadConfig() {
 /** True when `gate` was named in `cfg.disabledGates`. */
 function gateDisabled(cfg, gate) {
   return Array.isArray(cfg.disabledGates) && cfg.disabledGates.includes(gate);
+}
+
+/** Coders switched off entirely. A non-blank env value replaces the config list. */
+function disabledCoders(cfg) {
+  const override = process.env.ORCH_DISABLED_CODERS;
+  if (override !== undefined && override.trim() !== '') {
+    return [...new Set(override.split(',')
+      .map((coder) => coder.trim().toLowerCase())
+      .filter((coder) => CODERS.includes(coder)))];
+  }
+  return [...(Array.isArray(cfg.disabledCoders) ? cfg.disabledCoders : [])];
 }
 
 /**
@@ -851,7 +881,7 @@ function maxParallelAgents(cfg) {
 }
 
 module.exports = {
-  GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, handoffUsed, configPath, stateDir,
+  GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, disabledCoders, handoffUsed, configPath, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   closeDoneWorktreesMode,
   janitorEnabled,

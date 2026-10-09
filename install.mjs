@@ -831,13 +831,15 @@ function checkCoders(hasOrca) {
     const stateDir = cfgLib.stateDir();
     const thresholds = { codex: cfgLib.handoffUsed(cfg), kimi: cfgLib.kimiHandoffUsed(cfg), deepseek: cfgLib.deepseekHandoffUsed(cfg) };
     const caps = { codex: cfgLib.maxParallelCodexWorkers(cfg), kimi: cfgLib.maxParallelKimiWorkers(cfg), deepseek: cfgLib.maxParallelDeepseekWorkers(cfg) };
+    const disabled = cfgLib.disabledCoders(cfg);
     log(`thresholds: codexHandoffUsedPercent=${thresholds.codex} kimiHandoffUsedPercent=${thresholds.kimi} ` +
       `maxParallelKimiWorkers=${caps.kimi} maxParallelCodexWorkers=${caps.codex} ` +
       `deepseekRole=${cfgLib.deepseekRole(cfg)} deepseekDailySpendCapUsd=${cfgLib.deepseekDailySpendCapUsd(cfg)} ` +
-      `deepseekHandoffUsedPercent=${thresholds.deepseek} maxParallelDeepseekWorkers=${caps.deepseek}`);
+      `deepseekHandoffUsedPercent=${thresholds.deepseek} maxParallelDeepseekWorkers=${caps.deepseek} ` +
+      `disabledCoders=${disabled.join(',') || 'none'}`);
     const authState = quotaLib.codexAuthState(stateDir, now, cfgLib.coderAvailabilityCacheSeconds(cfg) * 1000);
     const availability = availLib.coderAvailability({
-      fresh: true, env: process.env, orcaInstalled: !!hasOrca, codexAuthState: authState, now,
+      fresh: true, env: process.env, orcaInstalled: !!hasOrca, codexAuthState: authState, now, disabled,
     });
     probeStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-check-'));
     const quotas = { codex: null, kimi: null, deepseek: null };
@@ -857,6 +859,10 @@ function checkCoders(hasOrca) {
       quotas.deepseek = q && !q.failed ? q : null;
     }
     for (const coder of ['codex', 'kimi', 'deepseek']) {
+      if (disabled.includes(coder)) {
+        log(`coder ${coder}: disabled by config`);
+        continue;
+      }
       const a = availability[coder] || { usable: false, reason: 'unknown', auth: 'unknown', binPath: null };
       const q = quotas[coder];
       const quotaText = q && q.unlimited ? 'unlimited (spend cap 0)'
@@ -867,7 +873,7 @@ function checkCoders(hasOrca) {
         `[binary ${binText}, auth ${authText}, quota ${quotaText}]`);
     }
     const pool = poolLib.pickCoderPool({
-      availability, quotas, thresholds,
+      availability, quotas, thresholds, disabled,
       roles: { deepseek: cfgLib.deepseekRole(cfg) },
       exhaustion: availLib.readCoderExhaustion(stateDir, now),
       live: { codex: 0, kimi: 0, deepseek: 0 }, caps,

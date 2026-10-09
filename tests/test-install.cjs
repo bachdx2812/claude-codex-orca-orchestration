@@ -198,6 +198,20 @@ check('--check reports deepseek unusable when opencode is absent',
 check('--check prints the coder pool summary',
   /pool: Codex quota unknown, available \(0\/3 live\) or Kimi \(unusable: not signed in\) or DeepSeek \(unusable: not installed\); pick Codex/.test(emptyOut), true);
 
+const disabledConfig = path.join(root, 'disabled-coder-config.json');
+fs.writeFileSync(disabledConfig, JSON.stringify({ disabledCoders: ['kimi'] }));
+const disabledCheck = run(['--check'], 'check-kimi-disabled', {
+  ORCH_CONFIG_PATH: disabledConfig,
+  ORCH_KIMI_HOME: emptyKimiHome,
+  ORCH_KIMI_BIN: path.join(binDir, 'kimi'),
+  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
+  ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
+});
+const disabledOut = `${disabledCheck.stdout}${disabledCheck.stderr}`;
+check('--check prints the disabled coder list', /disabledCoders=kimi/.test(disabledOut), true);
+check('--check reports a disabled coder without availability details',
+  /coder kimi: disabled by config/.test(disabledOut) && !/coder kimi: .*binary/.test(disabledOut), true);
+
 const credsKimiHome = path.join(root, 'kimi-home-creds');
 fs.mkdirSync(path.join(credsKimiHome, 'credentials'), { recursive: true });
 const FIXTURE_TOKEN = 'fixture-token-9f8e7d6c5b4a-never-print';

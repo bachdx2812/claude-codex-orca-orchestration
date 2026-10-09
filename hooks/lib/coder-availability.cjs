@@ -149,13 +149,14 @@ function binFor(coder, env) {
   return coder === 'kimi' ? kimiBin(env) : coder === 'deepseek' ? opencodeBin(env) : codexBin(env);
 }
 
-function validateAvailability(entry, _now, expectedCodexAuth) {
+function validateAvailability(entry, _now, expectedCodexAuth, disabled = []) {
   if (!entry || typeof entry !== 'object' || typeof entry.fetchedAt !== 'number') return null;
   const result = {};
   for (const coder of CODERS) {
     const item = entry[coder];
     if (!item || item.coder !== coder || typeof item.usable !== 'boolean' ||
         typeof item.installed !== 'boolean' || typeof item.checkedAt !== 'number') return null;
+    if ((item.disabled === true) !== disabled.includes(coder)) return null;
     result[coder] = { ...item };
   }
   if (expectedCodexAuth === 'logged-out' && result.codex.auth !== 'logged-out') return null;
@@ -168,12 +169,16 @@ function coderAvailability(options = {}) {
   const cacheSeconds = options.cacheSeconds === undefined ? 600 : options.cacheSeconds;
   const now = options.now === undefined ? Date.now() : options.now;
   const codexAuth = options.codexAuthState || 'unknown';
+  const disabled = Array.isArray(options.disabled) ? options.disabled : [];
   const probe = () => Object.fromEntries(CODERS.map((coder) => [coder, {
-    ...probeCoderAvailability(coder, {
+    ...(disabled.includes(coder) ? {
+      coder, installed: false, binPath: null, auth: 'unknown', usable: false,
+      disabled: true, reason: 'disabled by config',
+    } : probeCoderAvailability(coder, {
       env: options.env || process.env,
       orcaInstalled: options.orcaInstalled,
       codexAuthState: codexAuth,
-    }),
+    })),
     checkedAt: now,
   }]));
   if (options.fresh === true) return probe();
@@ -184,7 +189,7 @@ function coderAvailability(options = {}) {
     cacheSeconds,
     now,
     probe,
-    validate: (entry, at) => validateAvailability(entry, at, codexAuth),
+    validate: (entry, at) => validateAvailability(entry, at, codexAuth, disabled),
     probeTimeoutMs: 500,
   });
 }

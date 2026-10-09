@@ -51,6 +51,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   loadConfig, stateDir, closeDoneWorktreesEnabled, closeDoneWorktreesMode, stallSeconds, handoffUsed, kimiHandoffUsed,
+  disabledCoders,
   codexQuotaCacheSeconds, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds,
   deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
   maxParallelDeepseekWorkers,
@@ -638,15 +639,16 @@ function cachedCoderQuotas(now = Date.now(), deps = {}) {
 }
 
 function buildHandoverPool(quotas, now = Date.now(), deps = {}) {
+  const disabled = disabledCoders(cfg);
   const authState = (deps.codexAuthState || QUOTA.codexAuthState)(
     DIR, now, coderAvailabilityCacheSeconds(cfg) * 1000
   );
   const availability = deps.availability || CODER_AVAILABILITY.coderAvailability({
     stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
-    orcaInstalled: true, env: process.env, codexAuthState: authState,
+    orcaInstalled: true, env: process.env, codexAuthState: authState, disabled,
   });
   return (deps.pickCoderPool || CODER_POOL.pickCoderPool)({
-    availability, quotas,
+    availability, quotas, disabled,
     thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg), deepseek: deepseekHandoffUsed(cfg) },
     roles: { deepseek: deepseekRole(cfg) },
     exhaustion: (deps.readCoderExhaustion || CODER_AVAILABILITY.readCoderExhaustion)(DIR, now),

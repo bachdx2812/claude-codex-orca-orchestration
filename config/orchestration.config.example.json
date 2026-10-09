@@ -53,6 +53,7 @@
   "maxParallelDeepseekWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
+  "disabledCoders": [],
   "closeDoneWorktrees": "remove",
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null
