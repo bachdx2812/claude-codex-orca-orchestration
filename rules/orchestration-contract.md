@@ -36,6 +36,10 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
    / `escalation: sonnet verify could not decide ...`). The
    configured escalation model (`models.escalation.alias`, default `fable`) is reserved for
    work the review model could not do, even at higher effort — a dispatch to it must say so.
+   Unblock/advice work may also use the review model. A description beginning with
+   `advise`, `advice`, `unblock`, or `consult`, or an `advisor`/`kongming` subagent type,
+   is exempt from `review-model-scope`. Explicit code intent still wins, so `Unblock and
+   fix the parser` follows the execution route.
 3. **Code goes to the configured in-session code model first** (`models.code.alias`,
    default `sonnet`). Codex is opt-in only through `--exec-codex`, `--code-model
    codex[:<model>]`, or `defaultCoder: "codex"`. When requested, Codex runs in an Orca
@@ -193,6 +197,9 @@ either, regardless of what the operator's standing override says.
 Codex is the only external coder and is never probed by the default Sonnet route. A
 `worker-start --agent codex` is refused with `codex-not-requested` unless the operator used
 `--exec-codex` / `--code-model codex[:<model>]` or config/env selects Codex as the default.
+The exception is `worker-start --retry-of <id>` for a Codex dispatch this same session
+already started while opted in; returning to Sonnet does not prevent retrying that tracked
+dispatch, but it still prevents a fresh Codex start.
 
 A quota-unknown reading does not by itself make usable Codex ineligible. Quota discovery
 first uses a fresh state-directory cache, then queries `codex app-server` JSON-RPC

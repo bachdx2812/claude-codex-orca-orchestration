@@ -25,6 +25,7 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Sonnet writes code in-ses
 |---|---|---|---|---|
 | Main panel (orchestrator) | Takes the request, delegates, supervises workers, reports; never writes code | Session default model | — | `activation` |
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
+| Unblock advisor | Advises on recurring failures without editing code | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"`; `advisor`/`kongming` types are recognized | `models.review` |
 | Reviewer | Code review — reads code and judges the diff | Opus 5.5 (`claude-opus-5-5`), regardless of which coder wrote it | `Agent` with `model: "opus"` per `models.reviewByCoder` | `models.reviewByCoder`, `models.reviewEffort` |
 | Verifier | Verify-run — runs existing checks (CI gate, screenshots, play-test, post-deploy smoke), not reading/judging the diff | Sonnet 5.5 (`claude-sonnet-5-5`) | `Agent` with `model: "sonnet"` at `models.verify.effort` | `models.verify` |
 | Coder (default) | Every code task class: code, builds, refactors, tests, bulk conversions, and fix loops | Sonnet | `Agent` with `subagent_type: "sonnet-coder"` + `model: "sonnet"` at `models.code.effort` (default medium; brief must name a verify command) | `defaultCoder`, `models.code` (incl. `effort` / `agentType`) |
@@ -46,7 +47,8 @@ they were set and how to return to `defaultCoder`, both per prompt and in the
 
 **Review reads code and judges the diff, always on Opus** (`models.reviewByCoder`, default
 all `opus`): code written by Codex or Sonnet is reviewed on Opus 5.5. Planning
-and red-team stay on Opus. **Verify-run work runs existing checks and always runs on
+and red-team stay on Opus. Unblock/advice dispatches may also use Opus; if the brief asks
+to fix or implement, execution intent wins and the ordinary code route applies. **Verify-run work runs existing checks and always runs on
 Sonnet** (`models.verify`, default `{ alias: "sonnet", id: "claude-sonnet-5-5", effort:
 "medium" }`): the CI gate, UI screenshots, play-testing, post-deploy smoke — not reading
 or judging the diff. An Opus verify is refused unless the dispatch says the mapped Sonnet
@@ -372,7 +374,7 @@ claim in a *shared* workspace only avoids that specific conflict, not the next o
 | `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it, or ask the operator to release a claim, delete a dead session's state file, or raise/disable the cap — never the model's own call |
 | `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
 | `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
-| `codex-not-requested` | `worker-start --agent codex` runs without an explicit Codex request | use `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`; add this gate to `disabledGates` only for a deliberate bypass |
+| `codex-not-requested` | a fresh `worker-start --agent codex` runs without an explicit Codex request | use `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`; `--retry-of` remains allowed for a tracked Codex dispatch this session started while opted in; add this gate to `disabledGates` only for a deliberate bypass |
 
 `max-parallel-agents` counts every live Orca worker group (any agent, not only Codex — the
 Codex-only cap above still applies on top, never instead) plus every live in-session
