@@ -4,8 +4,8 @@ Installable [Claude Code](https://claude.com/claude-code) hooks that turn a desc
 orchestration workflow into a mechanically enforced one: a main panel that only
 dispatches and supervises, planning/red-team pinned to one model, review of code pinned
 to Opus (regardless of which coder wrote it) while verify-run work (running existing
-checks) runs on Sonnet, code sent to Codex in an [Orca](https://orca.dev) worker
-(or an in-session model once Codex is not eligible), every code brief required to name how it will be
+checks) runs on Sonnet, code sent to an in-session Sonnet coder by default with Codex
+available only by explicit opt-in through an [Orca](https://orca.dev) worker, every code brief required to name how it will be
 verified, and a supervision
 loop that will not let the session end with an Orca worker still live and unwatched.
 
@@ -14,10 +14,9 @@ Repo: <https://github.com/bachdx2812/claude-codex-orca-orchestration>
 ## Who does what
 
 ```
-Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
-[Sonnet only once Codex is unusable or has used >= its handoff threshold of quota,
- read live; configurable via codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED and
- disabledCoders / ORCH_DISABLED_CODERS]
+Request -> main panel -> Opus 5.5 plans + red-teams -> Sonnet writes code in-session
+[Codex gpt-5.6-sol only when the operator opts in; requested-but-unusable/exhausted Codex
+ falls back to Sonnet]
 -> review reads code and judges the diff on Opus; verify runs existing checks on Sonnet
 -> main panel reports
 ```
@@ -28,22 +27,21 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) write
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
 | Reviewer | Code review — reads code and judges the diff | Opus 5.5 (`claude-opus-5-5`), regardless of which coder wrote it | `Agent` with `model: "opus"` per `models.reviewByCoder` | `models.reviewByCoder`, `models.reviewEffort` |
 | Verifier | Verify-run — runs existing checks (CI gate, screenshots, play-test, post-deploy smoke), not reading/judging the diff | Sonnet 5.5 (`claude-sonnet-5-5`) | `Agent` with `model: "sonnet"` at `models.verify.effort` | `models.verify` |
-| External coder | Every code task class: code, builds, refactors, tests, bulk conversions, and fix loops | Codex `gpt-5.6-sol` | `worker-start --agent codex --model gpt-5.6-sol` while Codex is eligible. | `models.codex`, `disabledCoders`, `codexHandoffUsedPercent`, `maxParallelCodexWorkers` |
-| Coder (handoff) | Same work once Codex has used >= `codexHandoffUsedPercent` (default 95, override `ORCH_CODEX_HANDOFF_USED`) of its live-read quota or is unusable on this machine | Sonnet | `Agent` with `subagent_type: "sonnet-coder"` + `model: "sonnet"` at `models.code.effort` (default medium; brief must name a verify command) | `codexHandoffUsedPercent`, `models.code` (incl. `effort` / `agentType`), `execFallbackWhenCodexUnavailable` |
+| Coder (default) | Every code task class: code, builds, refactors, tests, bulk conversions, and fix loops | Sonnet | `Agent` with `subagent_type: "sonnet-coder"` + `model: "sonnet"` at `models.code.effort` (default medium; brief must name a verify command) | `defaultCoder`, `models.code` (incl. `effort` / `agentType`) |
+| External coder (opt-in) | Same work when explicitly requested | Codex `gpt-5.6-sol` | `worker-start --agent codex --model gpt-5.6-sol` while requested and eligible. | `models.codex`, `defaultCoder`, `codexHandoffUsedPercent`, `maxParallelCodexWorkers` |
 | Lookups | Find code, read logs / test output, explore | Haiku | `Agent` with `model: "haiku"` (advised, not enforced) | `models.lookup` |
 | Escalation | Only after Opus 5.5 failed even at higher effort; the dispatch must say both | Fable 5.1 (`claude-fable-5-1`) | `Agent` with `model: "fable"` + "escalation: opus failed ... at high effort ..." | `models.escalation` |
 
-Codex is eligible when it is usable on this machine (installed, signed in, and launchable),
-below its handoff threshold, and has a free cap slot. Codex is optional; when it is
-exhausted or unusable, code goes to Sonnet. The threshold defaults to 95 and is configurable
-in `~/.claude/orchestration.config.json` or with `ORCH_CODEX_HANDOFF_USED`.
+Codex is eligible when it is usable on this machine (installed, signed in, and launchable)
+and below its handoff threshold. The default Sonnet route performs no Codex availability or
+quota probe. When requested Codex is exhausted or unusable, code falls back to Sonnet.
 
 ### Override from the main panel
 
 `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto` (session-scoped, last flag
-wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The per-prompt "Model
-routing" line always shows the current coder and why. Active overrides also show when
-they were set and how to return to automatic quota routing, both per prompt and in the
+wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The compact per-prompt
+routing line shows the current coder and why. Active overrides also show when
+they were set and how to return to `defaultCoder`, both per prompt and in the
 `SessionStart` banner.
 
 **Review reads code and judges the diff, always on Opus** (`models.reviewByCoder`, default
@@ -374,7 +372,7 @@ claim in a *shared* workspace only avoids that specific conflict, not the next o
 | `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it, or ask the operator to release a claim, delete a dead session's state file, or raise/disable the cap — never the model's own call |
 | `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
 | `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
-| `coder-disabled` | `worker-start` (including `--retry-of`/`--terminal`) targets a coder in `disabledCoders` / `ORCH_DISABLED_CODERS` | start a fresh dispatch on an enabled coder, or remove the coder from `disabledCoders` / add this gate to `disabledGates` |
+| `codex-not-requested` | `worker-start --agent codex` runs without an explicit Codex request | use `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`; add this gate to `disabledGates` only for a deliberate bypass |
 
 `max-parallel-agents` counts every live Orca worker group (any agent, not only Codex — the
 Codex-only cap above still applies on top, never instead) plus every live in-session
@@ -482,29 +480,25 @@ operator prompt
   plan / red-team / escalate  -->  in-session subagent, model = models.review.alias
       |                             (escalation model only after that failed at high effort)
       v
-  code  ---->  Codex in an Orca worker  (while its quota allows)
-      |            |
-      |            v
-      |     worker-list / worker-read / worker-release, supervised by orca-heartbeat.cjs
+  code  ---->  Sonnet in-session by default
       |
-      +--->  in-session subagent, model = models.code.alias
-                 (once Codex is exhausted, or via --code-model / --exec-sonnet)
+      +--->  Codex in an Orca worker only after explicit opt-in
+                 (falls back to models.code.alias when unusable/exhausted)
+                 worker-list / worker-read / worker-release are supervised by orca-heartbeat.cjs
       |
       v
   review  ---->  in-session subagent, model = models.reviewByCoder[<code author>] (all opus)
   verify  ---->  in-session subagent, model = models.verify.alias (sonnet)
 ```
 
-Automatic routing reads Codex quota live from `codex app-server` without making a model
-call. Successful and failed probes are cached for 60 seconds in the gate state directory
+The default Sonnet route returns before any Codex probe. An explicit Codex route reads quota
+live from `codex app-server` without making a model call. Successful and failed probes are cached for 60 seconds in the gate state directory
 and memoized inside one hook process. Expired-cache refreshes use a short state-directory
 lease, so parallel hooks produce one app-server probe while peers consume the refreshed or
 stale value. If the live probe fails, routing falls back to the
 newest local Codex session-log rate-limit event no older than six hours, then to `unknown`
-(which deliberately keeps Codex as the default). The helper has its own 4.5-second deadline
-and escalates a child that ignores SIGTERM to SIGKILL. Per-turn reminders label a reading
-`(live, <age> ago)`, `(session log, <age> old)`, `(limit reached, live, <age> ago)`, or
-`(unknown)` and show the age of the optional Claude usage cache.
+(which keeps requested Codex eligible when availability is otherwise usable). The helper has its own 4.5-second deadline
+and escalates a child that ignores SIGTERM to SIGKILL.
 
 ## Customise
 
@@ -522,26 +516,16 @@ The file is plain JSON — no comments — parsed as-is:
   "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
-  "coderHeadroomTieBand": 10,
-  "unknownHeadroomAssumed": 30,
+  "defaultCoder": "sonnet",
   "models": { "verify": { "alias": "sonnet", "id": "claude-sonnet-5-5", "effort": "medium" }, "reviewByCoder": { "codex": "opus", "sonnet": "opus" }, "reviewEffort": "medium" },
   "replyLanguage": "Vietnamese",
   "maxParallelCodexWorkers": 5,
   "ownershipClaimTtlMinutes": 60,
   "disabledGates": ["code-brief-needs-verify"],
-  "disabledCoders": [],
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null
 }
 ```
-
-`disabledCoders` removes Codex from
-availability probing, new routing, and routing output. Their operator override is ignored and
-the `coder-disabled` gate refuses a matching `worker-start`. Workers started before their coder
-was disabled remain supervised and quota-checked by heartbeat, and a parked worker may still
-auto-resume after quota reset; release it to stop supervision. The comma-separated
-`ORCH_DISABLED_CODERS` value replaces the config list for one process when it contains a known
-coder; unknown names warn, an all-unknown value falls back to the config list, and blank is unset.
 
 (`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95 and is
 used for new routing and live-worker handover. `models.verify` is the model verify-run work (running existing checks)
@@ -553,10 +537,8 @@ tunable via this file or env (`ORCH_CODEX_HANDOFF_USED`, and
 `coderAvailabilityCacheSeconds`
 (default 600, the per-machine
 "is this coder installed and signed in?" probe TTL) mirror the Codex cache key;
-`coderHeadroomTieBand` (default 10) is the headroom-point band within which two coders tie
-and the pick falls back to fewer live workers; `unknownHeadroomAssumed` (default 30) is the
-headroom a quota-unknown coder is ranked as — below any coder with known headroom >= that
-value, above one with less (both blank/unset = default);
+`defaultCoder` accepts `sonnet` (default) or `codex`; `ORCH_DEFAULT_CODER` overrides it for
+one process;
 `codexQuotaCacheSeconds` controls the cross-process live-reading
 cache TTL (`0` disables file-cache reuse but retains memoization inside one hook process);
 `replyLanguage` accepts any language name, or `null` for no

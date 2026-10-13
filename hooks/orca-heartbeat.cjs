@@ -51,8 +51,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   loadConfig, stateDir, closeDoneWorktreesEnabled, closeDoneWorktreesMode, stallSeconds, handoffUsed,
-  disabledCoders,
-  codexQuotaCacheSeconds, coderAvailabilityCacheSeconds,
+  codexQuotaCacheSeconds,
   autoResumeAfterReset,
 } = require('./lib/config.cjs');
 const {
@@ -63,8 +62,6 @@ const {
   workerProgressSample, observeWorkerProgress, recordsFromJSON,
 } = require('./lib/worker-progress-fingerprint.cjs');
 const QUOTA = require('./lib/exec-route-by-quota.cjs');
-const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
-const CODER_POOL = require('./lib/coder-pool-route.cjs');
 const HANDOVER = require('./lib/worker-quota-handover.cjs');
 const RESUME = require('./lib/quota-reset-resume.cjs');
 const WG = require('./lib/worker-groups.cjs');
@@ -458,10 +455,8 @@ function reportUsageExhausted({ reported, handle, label, coder, now = Date.now()
   savePersistedUsageExhaustedReports(reported);
   onCoderExhausted(coder, { until });
   if (silent) return null;
-  const name = 'Codex';
-  const other = 'Sonnet';
-  return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
-    `route new code to ${other}; follow the WORKER HANDOVER recipe ` +
+  return `CODEX USAGE LIMIT on ${label}: Codex is exhausted - ` +
+    'route new code to Sonnet; follow the WORKER HANDOVER recipe ' +
     'to commit WIP and HANDOVER.md before stopping/releasing this worker; do not retry it until reset';
 }
 
@@ -497,35 +492,6 @@ function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
     if (reading && !reading.failed) result.codex = reading;
   }
   return result;
-}
-
-/** Supplement live-worker readings with fresh cache-only data for destination selection.
- * This keeps an idle/exhausted alternative out of the recommendation without probing it. */
-function cachedCoderQuotas(now = Date.now(), deps = {}) {
-  const codex = (deps.readCodexCache || QUOTA.readFreshCache)(DIR, codexQuotaCacheSeconds(cfg), now);
-  return {
-    codex: codex && !codex.failed ? codex : null,
-  };
-}
-
-function buildHandoverPool(quotas, now = Date.now(), deps = {}) {
-  const disabled = disabledCoders(cfg);
-  const authState = (deps.codexAuthState || QUOTA.codexAuthState)(
-    DIR, now, coderAvailabilityCacheSeconds(cfg) * 1000
-  );
-  const availability = deps.availability || CODER_AVAILABILITY.coderAvailability({
-    stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
-    orcaInstalled: true, env: process.env, codexAuthState: authState, disabled,
-  });
-  return (deps.pickCoderPool || CODER_POOL.pickCoderPool)({
-    availability, quotas, disabled,
-    thresholds: { codex: handoffUsed(cfg) },
-    exhaustion: (deps.readCoderExhaustion || CODER_AVAILABILITY.readCoderExhaustion)(DIR, now),
-    live: { codex: 0 }, caps: { codex: 0 },
-    // Handover must never recommend an unavailable destination. The legacy null fallback
-    // mode applies only to default new-work routing, not recovery of an in-flight task.
-    fallbackEnabled: true,
-  });
 }
 
 /** Run an orca command and return parsed JSON, or null when orca cannot answer. */
@@ -2191,11 +2157,6 @@ function main() {
       const liveCoderAgents = new Set([...activeCoderHandles].map((handle) => handleAgent.get(handle)));
       const liveQuotas = probeLiveCoderQuotas(liveCoderAgents, now);
       beat(started);
-      const cachedQuotas = liveCoderAgents.size ? cachedCoderQuotas(now) : { codex: null };
-      const routingQuotas = {
-        codex: liveQuotas.codex || cachedQuotas.codex,
-      };
-      const handoverPool = liveCoderAgents.size ? buildHandoverPool(routingQuotas, now) : null;
       let handoverChanged = false;
       for (const handle of [...handoverRecords.keys()]) {
         if (!activeCoderHandles.has(handle)) {
@@ -2308,7 +2269,7 @@ function main() {
           // existing episode until a known below-margin reading or worker completion.
           if (exhausted || typeof quota?.usedPercent === 'number') {
             const threshold = handoffUsed(cfg);
-            let target = HANDOVER.pickNextCoder(agent, handoverPool);
+            let target = HANDOVER.pickNextCoder(agent);
             const limited = exhausted || quota.usedPercent >= 100;
             // Sonnet lives inside the panel. If that panel is itself quota-limited, there
             // is no viable handover destination and the resumable worker must be parked.
@@ -2412,7 +2373,7 @@ module.exports = {
   loadPersistedApprovalReports, savePersistedApprovalReports, reportApprovalWaiting,
   parseTerminalScreen, terminalReadArgs, terminalScreen, resolveTerminalScreen, workers,
   parseWorkerRows, workerRowCompletedAt, pruneBoundedMaps,
-  probeLiveCoderQuotas, cachedCoderQuotas, buildHandoverPool,
+  probeLiveCoderQuotas,
   pidAlive, spawnResumeScheduler,
   DONE_WORKER_STATES, FAILED_WORKER_STATES, isFailedWorker, autoCloseDoneWorker, actOnDoneWorktree, isRetainedForReuse,
   loadPersistedAutoClosed, savePersistedAutoClosed,

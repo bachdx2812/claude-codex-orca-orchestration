@@ -11,16 +11,13 @@ the SessionStart banner printed each session as the exact current numbers, not t
 
 - The main panel orchestrates only: it dispatches and supervises, and does not itself
   Edit/Write or run mutating shell commands outside `.claude/`, `plans/`, `docs/`, scratch.
-- Planning, review and verification run on the configured review model, in-session.
-- **Coder pool:** Code goes to Codex in an Orca worker first, then the configured
-  in-session code model once Codex is unusable or has used its configured handoff
-  percentage of quota (default 95). This covers code, builds, refactors, tests, bulk
-  conversions, and fix loops. The operator can override with
+- Planning and review run on the configured review model; verification uses the configured
+  verify model, all in-session.
+- **Sonnet-first:** Code goes to the configured in-session code model by default. Codex is
+  opt-in through `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`.
+  Requested but unusable/exhausted Codex falls back to Sonnet. This covers code, builds,
+  refactors, tests, bulk conversions, and fix loops. The operator can override with
   `--code-model <alias|codex|codex:<model>|auto>` or the `--exec-*` shortcuts.
-- Codex listed in `disabledCoders` (or `ORCH_DISABLED_CODERS`) receives no new work: it is
-  not availability-probed or routed, its `--code-model`/`--exec-*` override is ignored, and
-  its `worker-start` is refused. Existing live workers remain heartbeat quota-checked; parked
-  workers do not auto-resume until the coder is enabled again.
 - Every code brief names a verify command.
 - A heartbeat daemon must supervise any live Orca worker; `Stop` refuses to end the
   session with one still live and unwatched.

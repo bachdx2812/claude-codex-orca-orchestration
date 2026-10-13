@@ -182,26 +182,15 @@ const emptyCheck = run(['--check'], 'check-codex', {
 const emptyOut = `${emptyCheck.stdout}${emptyCheck.stderr}`;
 check('--check exits 0 on a clean machine with no install problems', emptyCheck.status, 0);
 check('--check prints effective Codex thresholds with environment overrides applied',
-  /codexHandoffUsedPercent=80 maxParallelCodexWorkers=2/.test(emptyOut), true);
+  /defaultCoder=sonnet codexHandoffUsedPercent=80 maxParallelCodexWorkers=2/.test(emptyOut), true);
 check('--check reports the codex coder line (stub binary, auth unknown, quota unreadable)',
   /coder codex: usable \[binary [^\]]*stub 1\.0, auth unknown, quota unknown\]/.test(emptyOut), true);
-check('--check prints the coder pool summary',
-  /pool: Codex quota unknown, available \(0\/2 live\); pick Codex/.test(emptyOut), true);
-
-const disabledConfig = path.join(root, 'disabled-coder-config.json');
-fs.writeFileSync(disabledConfig, JSON.stringify({ disabledCoders: ['codex'] }));
-const disabledCheck = run(['--check'], 'check-codex-disabled', {
-  ORCH_CONFIG_PATH: disabledConfig,
-});
-const disabledOut = `${disabledCheck.stdout}${disabledCheck.stderr}`;
-check('--check prints the disabled coder list', /disabledCoders=codex/.test(disabledOut), true);
-check('--check reports a disabled coder without availability details',
-  /coder codex: disabled by config/.test(disabledOut) && !/coder codex: .*binary/.test(disabledOut), true);
+check('--check prints Codex eligibility', /codex eligibility: eligible/.test(emptyOut), true);
 
 {
   const homeName = 'retired-hook-cleanup';
   const installed = run([], homeName);
-  const retired = ['kimi-quota-probe.cjs', 'deepseek-quota-probe.cjs'];
+  const retired = ['kimi-quota-probe.cjs', 'deepseek-quota-probe.cjs', 'coder-pool-route.cjs'];
   for (const name of retired) fs.writeFileSync(path.join(installed.home, '.claude', 'hooks', 'orchestration', 'lib', name), 'stale');
   const upgraded = run([], homeName);
   check('reinstall succeeds while removing retired hook files', upgraded.status, 0);

@@ -7,7 +7,7 @@ const path = require('path');
 
 const quota = require('../hooks/lib/exec-route-by-quota.cjs');
 const availability = require('../hooks/lib/coder-availability.cjs');
-const pool = require('../hooks/lib/coder-pool-route.cjs');
+const eligibility = require('../hooks/lib/codex-eligibility.cjs');
 const CODEX_STUB = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
 try { fs.chmodSync(CODEX_STUB, 0o755); } catch {}
 
@@ -152,18 +152,6 @@ const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
 }
 
 {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'coder-availability-cache-'));
-  const env = { ...baseEnv, ORCH_CODEX_BIN: CODEX_STUB };
-  const disabled = availability.coderAvailability({ stateDir: root, fresh: true, disabled: ['codex'], env });
-  check('disabled Codex is not probed',
-    [disabled.codex.disabled, disabled.codex.usable, disabled.codex.reason],
-    [true, false, 'disabled by config']);
-  const enabled = availability.coderAvailability({ stateDir: root, fresh: true, disabled: [], env, codexAuthState: 'ok' });
-  check('re-enabling Codex changes the availability result', enabled.codex.usable, true);
-  fs.rmSync(root, { recursive: true, force: true });
-}
-
-{
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'coder-exhaustion-'));
   const now = Date.now();
   ok('an exhaustion marker can be written', availability.markCoderExhausted(root, 'codex', {
@@ -176,26 +164,20 @@ const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
 }
 
 {
-  const pick = (overrides = {}) => pool.pickCoderPool({
-    availability: { codex: { usable: true } },
-    quotas: { codex: { usedPercent: 20 } },
-    thresholds: { codex: 95 }, exhaustion: {}, live: { codex: 0 },
-    sessionLive: { codex: 0 }, caps: { codex: 3 }, fallbackEnabled: true,
+  const result = (overrides = {}) => eligibility.codexEligibility({
+    availability: { usable: true }, quota: { usedPercent: 20 }, threshold: 95,
     ...overrides,
   });
-  check('the single eligible coder is selected', [pick().route, pick().pick], ['external', 'codex']);
-  check('threshold exhaustion routes to in-session code',
-    pick({ quotas: { codex: { usedPercent: 95 } } }).route, 'code');
-  const atCap = pick({ live: { codex: 3 }, sessionLive: { codex: 3 } });
-  check('a single coder at its per-session cap stays external', atCap.route, 'external');
-  ok('a single coder at its per-session cap tells the operator to wait', /all at cap, wait/.test(atCap.why));
-  const machineAtCap = pick({ live: { codex: 3 }, sessionLive: { codex: 0 } });
-  check('machine-wide cap does not block a session with a free slot', machineAtCap.route, 'external');
-  ok('machine-wide cap with a free session slot never says wait', !/all at cap, wait/.test(machineAtCap.why));
-  check('unknown headroom keeps the usable single coder eligible',
-    pick({ quotas: { codex: null } }).pick, 'codex');
-  check('an ineligible lastCoder value is ignored',
-    pick({ quotas: { codex: null }, lastCoder: 'sonnet' }).pick, 'codex');
+  check('usable Codex below threshold is eligible', result().state, 'eligible');
+  check('threshold exhaustion is reported', result({ quota: { usedPercent: 95 } }).state, 'exhausted');
+  check('unknown quota keeps usable Codex eligible', result({ quota: null }).state, 'eligible');
+  check('unusable Codex preserves its reason',
+    result({ availability: { usable: false, reason: 'not logged in' }, quota: null }), {
+      state: 'unusable', reason: 'not logged in', leftPct: null, headroom: null,
+      estimated: false, quotaFetchedAt: null,
+    });
+  check('an active exhaustion marker wins over an unknown quota',
+    result({ quota: null, exhaustion: { reason: 'usage limit' } }).state, 'exhausted');
 }
 
 {
@@ -248,11 +230,8 @@ const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
   check('a 97% session-log reading no longer exhausts Codex after the window reset',
     [later.usedPercent, later.estimated], [0, true]);
   check('the post-reset estimate makes the coder eligible rather than exhausted',
-    pool.pickCoderPool({
-      availability: { codex: { usable: true } }, quotas: { codex: later },
-      thresholds: { codex: 95 }, exhaustion: {}, live: { codex: 0 },
-      caps: { codex: 3 }, fallbackEnabled: true,
-    }).coders.codex.state, 'eligible');
+    eligibility.codexEligibility({ availability: { usable: true }, quota: later, threshold: 95 }).state,
+    'eligible');
 
   const resetlessState = path.join(root, 'state-resetless');
   fs.mkdirSync(resetlessState, { recursive: true });

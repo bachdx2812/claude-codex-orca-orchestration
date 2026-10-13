@@ -8,9 +8,9 @@
  *      edits or mutates anything itself (outside .claude/, plans/, docs/, scratch, tmp).
  *   2. Planning / review / verification go to the configured review model in-session;
  *      the escalation model only after the review model failed, even at higher effort.
- *   3. Execution and token-heavy work goes to Codex Orca workers, or the configured
- *      in-session code model once neither external coder is eligible,
- *      or whichever model the operator explicitly picked with --code-model.
+ *   3. Execution and token-heavy work goes to the configured in-session code model by
+ *      default. Codex Orca workers are opt-in, or the operator may explicitly pick
+ *      another model with --code-model.
  *   4. Everything is delegated, parallel wherever ownership allows.
  *   5. Parallel external coder workers hit rate limits; the heartbeat must detect that and retry
  *      with backoff rather than leaving a worker wedged.
@@ -30,7 +30,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const {
-  loadConfig, gateDisabled, disabledCoders, handoffUsed, configPath, stateDir,
+  loadConfig, gateDisabled, defaultCoder, handoffUsed, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
   coderAvailabilityCacheSeconds, reviewModelForCoder, verifyModelAlias, codexAllowPriorityTier,
 } = require('./lib/config.cjs');
@@ -42,7 +42,7 @@ const OC = require('./lib/ownership-claims.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
 const { hasRateLimitError } = require('./lib/terminal-signals.cjs');
 const CODER_AVAILABILITY = require('./lib/coder-availability.cjs');
-const CODER_POOL = require('./lib/coder-pool-route.cjs');
+const CODEX_ELIGIBILITY = require('./lib/codex-eligibility.cjs');
 const EXEC_QUOTA = require('./lib/exec-route-by-quota.cjs');
 const HANDOVER = require('./lib/worker-quota-handover.cjs');
 const CODEX_PRIORITY_TIER = require('./lib/codex-priority-tier.cjs');
@@ -50,7 +50,6 @@ const { fetchWorkerListPages } = require('./lib/orca-worker-list-pages.cjs');
 
 const DIR = stateDir();
 const LOG = path.join(DIR, 'violations.log');
-const CODER_ROUTE_STATE = path.join(DIR, 'coder-route-state.json');
 // ORCA_DOWN_FLAG_PATH lets the test suite use a temp flag instead of the real one.
 const ORCA_DOWN_FLAG = process.env.ORCA_DOWN_FLAG_PATH || path.join(DIR, 'orca-unavailable');
 // ORCA_BIN lets the test suite point at a stub instead of a real `orca` on PATH.
@@ -689,18 +688,13 @@ function describeOverride(cfg, o) {
   return `in-session Agent with model "${o.slice(7)}"`;
 }
 
-/** Human-facing name for an external coder. */
-function coderLabel(coder) {
-  return coder === 'codex' ? 'Codex' : coder;
-}
-
 /** External coder targeted by an override, or null for automatic/in-session routing. */
 function overrideCoder(override) {
   const match = typeof override === 'string' && override.match(/^(codex)(?::|$)/);
   return match ? match[1] : null;
 }
 
-/** The pool coder whose code a worker group carried, or null for a non-code group (a
+/** The external coder whose code a worker group carried, or null for a non-code group (a
  * terminal create, an unknown agent). */
 function codeAuthorOfGroup(workers, group) {
   for (const [key, w] of Object.entries(workers || {})) {
@@ -749,40 +743,12 @@ function settleCodeGroup(s, group) {
   return changed;
 }
 
-function readLastCoder() {
-  try {
-    const value = JSON.parse(fs.readFileSync(CODER_ROUTE_STATE, 'utf8'));
-    return value && value.lastCoder === 'codex' ? value.lastCoder : null;
-  } catch { return null; }
+function codexRequested(cfg, s) {
+  return overrideCoder(s.execAgent) === 'codex' ||
+    (s.execAgent === null && defaultCoder(cfg) === 'codex');
 }
 
-/** Called only while the shared state lock is held. */
-function writeLastCoder(agent) {
-  if (agent !== 'codex') return;
-  writeJsonAtomic(CODER_ROUTE_STATE, { lastCoder: 'codex', updatedAt: Date.now() });
-}
-
-function machineWideCoderLive(s, now = Date.now()) {
-  const result = { codex: 0 };
-  const currentName = `${String(s.session_id).replace(/[^A-Za-z0-9_-]/g, '_')}.json`;
-  for (const file of PAC.recentSessionStateFiles(DIR, now)) {
-    if (path.basename(file) === currentName) continue;
-    const other = PAC.readSessionState(file);
-    if (!other) continue;
-    result.codex += WG.countLiveGroups(other.workers, 'codex');
-  }
-  result.codex += WG.countLiveGroups(s.workers, 'codex');
-  return result;
-}
-
-function sessionCoderLive(s) {
-  return {
-    codex: WG.countLiveGroups(s.workers, 'codex'),
-  };
-}
-
-function coderPoolRoute(cfg, s, now = Date.now()) {
-  const disabled = disabledCoders(cfg);
+function requestedCodexState(cfg, now = Date.now()) {
   const availabilityTtlMs = coderAvailabilityCacheSeconds(cfg) * 1000;
   let authState = EXEC_QUOTA.codexAuthState(DIR, now, availabilityTtlMs);
   const orcaInstalled = orcaOnPath();
@@ -790,10 +756,9 @@ function coderPoolRoute(cfg, s, now = Date.now()) {
   let availability = CODER_AVAILABILITY.coderAvailability({
     stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
     orcaInstalled, env: process.env, codexAuthState: authState,
-    disabled,
     fresh: !orcaInstalled || !codexInstalled,
   });
-  const quotas = { codex: null };
+  let quota = null;
   if (availability.codex?.usable) {
     const reading = EXEC_QUOTA.codexQuota(now, { stateDir: DIR, cacheSeconds: codexQuotaCacheSeconds(cfg) });
     if (reading?.authState === 'logged-out') {
@@ -801,61 +766,55 @@ function coderPoolRoute(cfg, s, now = Date.now()) {
       availability = CODER_AVAILABILITY.coderAvailability({
         stateDir: DIR, cacheSeconds: coderAvailabilityCacheSeconds(cfg), now,
         orcaInstalled, env: process.env, codexAuthState: authState,
-        disabled,
         fresh: true,
       });
     } else if (reading && !reading.failed) {
-      quotas.codex = reading;
+      quota = reading;
     }
   }
-  return CODER_POOL.pickCoderPool({
-    availability, quotas, disabled,
-    thresholds: { codex: handoffUsed(cfg) },
-    tieBand: cfg.coderHeadroomTieBand, unknownAssumed: cfg.unknownHeadroomAssumed,
-    exhaustion: CODER_AVAILABILITY.readCoderExhaustion(DIR, now),
-    live: machineWideCoderLive(s, now),
-    sessionLive: sessionCoderLive(s),
-    caps: { codex: maxParallelCodexWorkers(cfg) },
-    lastCoder: readLastCoder(),
-    fallbackEnabled: cfg.execFallbackWhenCodexUnavailable === 'sonnet' ? true : null,
+  return CODEX_ELIGIBILITY.codexEligibility({
+    availability: availability.codex,
+    quota,
+    threshold: handoffUsed(cfg),
+    exhaustion: CODER_AVAILABILITY.readCoderExhaustion(DIR, now).codex,
   });
 }
 
 /**
  * Who writes code for this session. An operator override wins:
  *   s.execAgent = 'codex' | 'codex:<model>' | 'claude:<alias>'
- * (set by --code-model <value>, or an --exec-* shortcut); otherwise automatic: spread
- * work across eligible external coders, then use the configured in-session code model.
+ * (set by --code-model <value>, or an --exec-* shortcut). With no override, Sonnet is
+ * the default unless config explicitly opts into Codex.
  */
 function currentExecRoute(cfg, s) {
   const a = s.execAgent;
   if (typeof a === 'string' && a.startsWith('claude:')) {
     return { route: 'claude', alias: a.slice(7), why: `operator override (${a.slice(7)})` };
   }
-  let pool;
+  if (!codexRequested(cfg, s)) {
+    return { route: 'code', alias: cfg.models.code.alias, why: 'default: in-session sonnet-coder' };
+  }
+  let coder;
   try {
-    pool = coderPoolRoute(cfg, s);
+    coder = requestedCodexState(cfg);
   } catch {
-    // No path may assume Codex: an unreadable pool fails toward ALLOW, i.e. the in-session
-    // code route, so a machine with no coders (or a config error) never locks code out.
-    pool = { route: 'code', pick: null, order: [], coders: {}, why: 'auto: coder pool unreadable' };
-  }
-  const pick = overrideCoder(a);
-  if (pick && disabledCoders(cfg).includes(pick)) {
-    const automatic = pool.route === 'code' ? { ...pool, alias: cfg.models.code.alias } : pool;
-    return { ...automatic, why: `${automatic.why}; operator override (${a}) ignored: ${coderLabel(pick)} is in disabledCoders` };
-  }
-  if (pick) {
-    const state = pool.coders[pick];
-    const warning = state?.state === 'eligible' || !state ? '' : ` WARNING: ${coderLabel(pick)} unusable: ${state.reason || state.state || 'unavailable'}.`;
     return {
-      route: 'external', pick, order: [pick], coders: pool.coders,
-      ...(pick === 'codex' && a.startsWith('codex:') ? { codexModel: a.slice(6) } : {}),
-      why: `operator override (${a})${warning}`,
+      route: 'code', alias: cfg.models.code.alias,
+      why: 'codex requested but eligibility probe unreadable; using sonnet',
     };
   }
-  if (pool.route === 'code') return { ...pool, route: 'code', alias: cfg.models.code.alias };
-  return pool;
+  const requestWhy = overrideCoder(a) === 'codex' ? 'operator override (codex)' : 'config defaultCoder codex';
+  if (coder.state === 'eligible') {
+    return {
+      route: 'external', pick: 'codex', order: ['codex'], coders: { codex: coder },
+      ...(typeof a === 'string' && a.startsWith('codex:') ? { codexModel: a.slice(6) } : {}),
+      why: requestWhy,
+    };
+  }
+  return {
+    route: 'code', alias: cfg.models.code.alias, coders: { codex: coder },
+    why: `codex requested but ${coder.reason || coder.state}; using sonnet`,
+  };
 }
 
 /**
@@ -1227,8 +1186,7 @@ function activeOverrideLines(cfg, s) {
       target = s.execAgent.slice(7);
       flag = `--code-model ${target}`;
     }
-    const ignored = disabledCoders(cfg).includes(overrideCoder(s.execAgent)) ? ' (ignored: disabled by config)' : '';
-    lines.push(`code forced to ${target} since ${s.execAgentSince || s.created} (${flag}); --code-model auto to return to quota routing${ignored}`);
+    lines.push(`code forced to ${target} since ${s.execAgentSince || s.created} (${flag}); --code-model auto to return to default (${defaultCoder(cfg)})`);
   }
   return lines;
 }
@@ -1252,26 +1210,18 @@ function onSessionStart(p, s, cfg) {
   const escalation = cfg.models.escalation.alias;
   const lookup = cfg.models.lookup.alias;
   const code = cfg.models.code.alias;
-  const codexThreshold = handoffUsed(cfg);
   const route = currentExecRoute(cfg, s);
   const priorityTierWarningText = codexAllowPriorityTier(cfg) ? null
     : CODEX_PRIORITY_TIER.formatCodexPriorityTierWarning();
   const priorityTierWarning = priorityTierWarningText ? `- CODEX WARNING: ${priorityTierWarningText}\n` : '';
   const warnings = (cfg.warnings || []).map((w) => `- CONFIG WARNING: ${w}\n`).join('');
   const overrideWarnings = activeOverrideLines(cfg, s).map((line) => `- ACTIVE OVERRIDE: ${line}\n`).join('');
-  // Every coder is optional: the banner names only the coders usable on THIS machine
-  // (operator decision, 2026-10-01) — a machine with none routes code in-session.
-  const usableCoders = ['codex'].filter((c) => route.coders?.[c]?.state === 'eligible');
-  const enabledCoders = CODER_AVAILABILITY.CODERS.filter((coder) => !disabledCoders(cfg).includes(coder));
-  const externalOverrideTokens = enabledCoders.flatMap((coder) => [coder, `${coder}:<model>`]);
-  const externalShortcuts = enabledCoders.map((coder) => `--exec-${coder}`);
-  const thresholdText = { codex: codexThreshold };
-  const peerList = usableCoders.length
-    ? usableCoders.map((c) => `${coderLabel(c)} (handoff >= ${thresholdText[c]}% used)`).join(', ')
-    : 'no external coder usable on this machine';
+  const codexIsRequested = codexRequested(cfg, s);
   const dispatchLines = [
-    usableCoders.includes('codex') ? '    Codex -> Orca worker: orca orchestration task-create ... && worker-start --agent codex --model ...\n' : '',
-    usableCoders.length ? '             then worker-list | worker-read | worker-release\n' : '',
+    codexIsRequested && route.route === 'external'
+      ? '    Codex -> Orca worker: orca orchestration task-create ... && worker-start --agent codex --model ...\n' : '',
+    codexIsRequested && route.route === 'external'
+      ? '             then worker-list | worker-read | worker-release\n' : '',
   ].join('');
   process.stdout.write(
     'ORCHESTRATION CONTRACT (enforced by orchestrator-gate.cjs):\n' +
@@ -1281,16 +1231,17 @@ function onSessionStart(p, s, cfg) {
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
-    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams -> ${usableCoders.map(coderLabel).join(' + ') || 'in-session'} coder${usableCoders.length === 1 ? '' : 's'} -> reviews; verify -> ${verifyModelAlias(cfg)}.\n` +
+    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams; code -> ${route.route === 'external' ? 'Codex' : code}; reviews -> ${reviewRouteText(cfg, s)}; verify -> ${verifyModelAlias(cfg)}.\n` +
     `- Planning / red-team -> in-session subagent on model ${modelLabel(cfg.models.review)}. Review -> model ${reviewRouteText(cfg, s)} (review model follows the code's author). Verify -> model ${verifyModelAlias(cfg)}.\n` +
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (external spec or in-session prompt) names the exact test / build command to run green.\n' +
-    `- Code: split across ${peerList}; next -> ${route.pick ? coderLabel(route.pick) : code}.\n` +
+    `- Code -> ${route.route === 'external' ? 'Codex' : code} [${route.why}].\n` +
     dispatchLines +
     `    ${code[0].toUpperCase()}${code.slice(1)} -> ${codeModelDispatchText(cfg)}.\n` +
-    `  Operator-only override from the main panel: --code-model <${[review, code, lookup, escalation, ...externalOverrideTokens, 'auto'].join('|')}>\n` +
-    `  (session-scoped, last flag wins; ${['--exec-sonnet', ...externalShortcuts].join(' / ')} are shortcuts, --exec-auto = --code-model auto).\n` +
+    `  Operator-only override from the main panel: --code-model <${[review, code, lookup, escalation, 'codex', 'codex:<model>', 'auto'].join('|')}>\n` +
+    '  (session-scoped, last flag wins; --exec-sonnet / --exec-codex are shortcuts, --exec-auto = --code-model auto).\n' +
+    '- Codex is opt-in: --exec-codex | --code-model codex[:<model>] | defaultCoder:"codex".\n' +
     '  If Orca itself is unreachable: `touch ~/.claude/orchestrator-gate/orca-unavailable` (15 min) permits in-session code\n' +
     `  (even an external-coder override falls back to "${code}" while that flag is active).\n` +
     `- Poll every live worker at least every ${cfg.heartbeat.idleSeconds}s. Never let one sit IDLE unattended.\n` +
@@ -1363,6 +1314,27 @@ function remindBackgroundShells(s) {
   if (line) process.stdout.write(`${line}\n`);
 }
 
+function liveWorkerReminderParts(s, cfg, live) {
+  if (!live.length) return [];
+  const parts = [];
+  const baseline = s.last_heartbeat || Math.min(...live.map(([, w]) => w.started || Date.now()));
+  const stale = Math.round((Date.now() - baseline) / 1000);
+  parts.push(`${live.length} live worker(s): ${live.map(([k, w]) => `${k}(${w.role})`).join(', ')}.`);
+  const hb = heartbeatAlive(s.session_id);
+  if (hb) {
+    parts.push(`Heartbeat daemon alive (pid ${hb.pid}, last tick ${Math.round((Date.now() - hb.last_tick) / 1000)}s ago): keep working on other things; it wakes you on any worker event.`);
+  } else {
+    parts.push(`NO heartbeat daemon: start it now so no worker waits on you unnoticed: ${heartbeatStartCommand()}.`);
+    parts.push(s.last_heartbeat ? `Last manual poll ${stale}s ago.` : `Never polled since dispatch (${stale}s).`);
+  }
+  if (!hb && stale > cfg.heartbeat.idleSeconds) {
+    parts.push('OVERDUE: run `orca orchestration worker-list` and `worker-read` on each now; a worker sitting IDLE is wasted wall-clock.');
+  }
+  const limited = live.filter(([, w]) => w.rate_limited_until && w.rate_limited_until > Date.now());
+  if (limited.length) parts.push(`Rate-limited, retry after backoff: ${limited.map(([k]) => k).join(', ')}.`);
+  return parts;
+}
+
 function onUserPromptSubmit(p, s, cfg) {
   maybeReconcilePendingPlaceholders(p.session_id, p.hook_event_name);
   // CRITICAL: reload fresh under the lock, same reasoning as onPostToolUse — this handler
@@ -1416,7 +1388,20 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (purgedAny) save(s);
   }
 
-  const prompt = isNonOperatorTurn(raw) ? '' : raw;
+  const nonOperatorTurn = isNonOperatorTurn(raw);
+  const live = liveWorkers(s);
+  const activeHandoverIds = new Set(live.flatMap(([key, worker]) => [
+    key, worker.group, worker.dispatchId, worker.taskId, worker.terminalHandle,
+  ].filter(Boolean)));
+  const handoverReminder = HANDOVER.reminder(DIR, s.session_id, activeHandoverIds);
+  if (nonOperatorTurn) {
+    const notificationParts = [];
+    if (handoverReminder) notificationParts.push(handoverReminder);
+    notificationParts.push(...liveWorkerReminderParts(s, cfg, live));
+    if (notificationParts.length) process.stdout.write(`${notificationParts.join(' ')}\n`);
+    return;
+  }
+  const prompt = raw;
   const promptLower = prompt.toLowerCase();
   const bypassFlags = ['--no-orchestrate', '--orchestrate']
     .map((flag) => [flag, operatorFlag(prompt, flag) ? promptLower.lastIndexOf(flag) : -1])
@@ -1466,16 +1451,12 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   else if (lastFlag === '--exec-codex') override = 'codex';
   else if (lastFlag === '--exec-auto') override = null;
   else if (lastFlag === '--code-model') override = parseCodeModel(cfg, cm[2]);
-  const disabledOverride = overrideCoder(override);
-  if (disabledOverride && disabledCoders(cfg).includes(disabledOverride)) {
-    const shownFlag = lastFlag === '--code-model' ? `--code-model ${cm[2]}` : lastFlag;
-    process.stdout.write(`orchestrator-gate: ignored ${shownFlag}: ${coderLabel(disabledOverride)} is disabled by config (disabledCoders / ORCH_DISABLED_CODERS); nothing changed.\n`);
-  } else if (override !== undefined && override !== 'invalid') {
+  if (override !== undefined && override !== 'invalid') {
     s.execAgent = override;
     s.execAgentSince = override === null ? null : new Date().toISOString();
     save(s);
     process.stdout.write(override === null
-      ? `orchestrator-gate: coding model back to automatic (external coders load-balanced, "${cfg.models.code.alias}" when none is eligible).\n`
+      ? `orchestrator-gate: coding model back to default (${defaultCoder(cfg)}).\n`
       : `orchestrator-gate: coding model set by the operator for this session: ${describeOverride(cfg, override)}. Revert with --code-model auto.\n`);
   } else if (override === 'invalid') {
     process.stdout.write(`orchestrator-gate: ignored --code-model ${cm[2]} (use ${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | auto).\n`);
@@ -1519,7 +1500,6 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     else process.stdout.write(`orchestrator-gate: --release-claims ${target} matched no tracked claim.\n`);
   }
 
-  const live = liveWorkers(s);
   const parts = [languageSentence(cfg, false) + 'Delegate; do not implement here.'];
   parts.push(...activeOverrideLines(cfg, s));
   const ex = currentExecRoute(cfg, s);
@@ -1533,58 +1513,11 @@ function onUserPromptSubmitLocked(p, s, cfg) {
       ? `in-session: ${codeModelDispatchText(cfg)}`
       : `in-session subagent (Agent model ${modelLabel(roleByAlias(ex.alias))})`;
   } else {
-    const reasons = ex.coders
-      ? (['codex'].filter((coder) => ex.coders[coder]?.state !== 'disabled')
-        .map((coder) => `${coderLabel(coder)} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ') || 'no external coder enabled')
-      : ex.why;
-    codeRoute = `${codeModelDispatchText(cfg)} [${reasons}]`;
+    codeRoute = codeModelDispatchText(cfg);
   }
-  if (ex.route === 'external' && ex.order?.length > 1 && ex.coders) {
-    const coderText = (coder) => {
-      const c = ex.coders[coder];
-      const liveText = `${c.live} live`;
-      let quotaText;
-      if (c.headroom === null || c.headroom === undefined) {
-        quotaText = 'quota unknown';
-      } else if (c.estimated) {
-        const readAgo = c.quotaFetchedAt ? EXEC_QUOTA.formatAge(Math.max(0, Date.now() - c.quotaFetchedAt)) : 'unknown';
-        quotaText = `~${Math.max(0, Math.round(100 - c.leftPct))}% used (est., read ${readAgo} ago)`;
-      } else {
-        quotaText = `${Math.max(0, Math.round(c.headroom))}% headroom`;
-      }
-      return `${coderLabel(coder)} (${liveText}, ${quotaText})`;
-    };
-    codeRoute = `split: ${['codex'].filter((c) => ex.order.includes(c)).map(coderText).join(' + ')}; next -> ${coderLabel(ex.pick)}`;
-  } else if (ex.route === 'external' && ex.coders) {
-    const others = ['codex'].filter((c) => c !== ex.pick && ex.coders[c]?.state !== 'disabled');
-    codeRoute += `; ${others.map((c) => `${coderLabel(c)} ${ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable'}`).join('; ')}; next -> ${coderLabel(ex.pick)}`;
-  }
-  parts.push(`Model routing: plan/red-team -> model ${modelLabel(cfg.models.review)}; review -> ${reviewRouteText(cfg, s)}; verify -> ${verifyModelAlias(cfg)}; code -> ${codeRoute} [${ex.why}].`);
-  parts.push(`${parallelBudgetLine(cfg, s)}.`);
-  const activeHandoverIds = new Set(live.flatMap(([key, worker]) => [
-    key, worker.group, worker.dispatchId, worker.taskId, worker.terminalHandle,
-  ].filter(Boolean)));
-  const handoverReminder = HANDOVER.reminder(DIR, s.session_id, activeHandoverIds);
+  parts.push(`code -> ${codeRoute} [${ex.why}]; plan/red-team/review/unblock -> ${cfg.models.review.alias}; lookup -> ${cfg.models.lookup.alias}; ${parallelBudgetLine(cfg, s)}.`);
   if (handoverReminder) parts.push(handoverReminder);
-  if (live.length) {
-    const baseline = s.last_heartbeat || Math.min(...live.map(([, w]) => w.started || Date.now()));
-    const stale = Math.round((Date.now() - baseline) / 1000);
-    parts.push(`${live.length} live worker(s): ${live.map(([k, w]) => `${k}(${w.role})`).join(', ')}.`);
-    const hb = heartbeatAlive(s.session_id);
-    if (hb) {
-      parts.push(`Heartbeat daemon alive (pid ${hb.pid}, last tick ${Math.round((Date.now() - hb.last_tick) / 1000)}s ago): keep working on other things; it wakes you on any worker event.`);
-    } else {
-      parts.push(`NO heartbeat daemon: start it now so no worker waits on you unnoticed: ${heartbeatStartCommand()}.`);
-      parts.push(s.last_heartbeat ? `Last manual poll ${stale}s ago.` : `Never polled since dispatch (${stale}s).`);
-    }
-    if (!hb && stale > cfg.heartbeat.idleSeconds) {
-      parts.push('OVERDUE: run `orca orchestration worker-list` and `worker-read` on each now; a worker sitting IDLE is wasted wall-clock.');
-    }
-    const limited = live.filter(([, w]) => w.rate_limited_until && w.rate_limited_until > Date.now());
-    if (limited.length) {
-      parts.push(`Rate-limited, retry after backoff: ${limited.map(([k]) => k).join(', ')}.`);
-    }
-  }
+  parts.push(...liveWorkerReminderParts(s, cfg, live));
   process.stdout.write(`${parts.join(' ')}\n`);
 }
 
@@ -1710,22 +1643,12 @@ function onPreToolUse(p, s, cfg) {
       }
     }
 
-    const disabled = disabledCoders(cfg);
     for (const inv of orcaInvocations(cmd)) {
       if (inv.sub !== 'orchestration worker-start' || hasFlag(inv.args, '--help')) continue;
       const agent = resolveWorkerStartAgent(inv, s);
-      const coder = agent;
-      if (!disabled.includes(coder)) continue;
-      const enabled = CODER_AVAILABILITY.CODERS.filter((name) => !disabled.includes(name));
-      const route = enabled.length ? enabled.join(', ') : cfg.models.code.alias;
-      const envSuffix = process.env.ORCH_DISABLED_CODERS?.trim() ? ' / ORCH_DISABLED_CODERS' : '';
-      const replacementFlag = hasFlag(inv.args, '--retry-of') ? '--retry-of'
-        : hasFlag(inv.args, '--terminal') ? '--terminal' : null;
-      const replacement = replacementFlag
-        ? `Start a fresh dispatch on an enabled coder instead of ${replacementFlag}. Enabled coders: ${route}.`
-        : `Route this brief to an enabled coder. Enabled coders: ${route}.`;
-      d('coder-disabled', `${coderLabel(coder)} is disabled by config (disabledCoders${envSuffix}): refusing worker-start --agent ${agent}.\n` +
-        `${replacement} Or remove "${coder}" from disabledCoders in ${configPath()}.`);
+      if (agent !== 'codex' || codexRequested(cfg, s)) continue;
+      d('codex-not-requested', 'Codex is opt-in. Code goes to sonnet-coder in-session. ' +
+        'Operator only: --exec-codex / --code-model codex[:<model>] / defaultCoder:"codex".');
     }
 
     // Gate A (max-parallel-codex-workers) + Gate B (code-brief-needs-owns /
@@ -2255,7 +2178,6 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           worktreeIds, readinessTimeout: true,
         };
         if (inv.sub === 'orchestration worker-start') {
-          writeLastCoder(agent);
           recordCodeAuthor(s, agent, Date.now());
         }
         dirty = true;
@@ -2301,7 +2223,6 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
         };
       }
       if (inv.sub === 'orchestration worker-start') {
-        writeLastCoder(agent);
         recordCodeAuthor(s, agent, Date.now());
       }
       dirty = true;

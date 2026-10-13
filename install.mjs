@@ -52,10 +52,12 @@ const HOOK_FILES = [
   'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
   'lib/terminal-signals.cjs', 'lib/worker-progress-fingerprint.cjs', 'lib/worker-quota-handover.cjs', 'lib/quota-reset-resume.cjs', 'lib/live-probe-cache.cjs',
-  'lib/coder-availability.cjs', 'lib/coder-pool-route.cjs', 'lib/codex-priority-tier.cjs',
+  'lib/coder-availability.cjs', 'lib/codex-eligibility.cjs', 'lib/codex-priority-tier.cjs',
   'lib/orca-worker-list-pages.cjs',
 ];
-const RETIRED_HOOK_FILES = ['lib/kimi-quota-probe.cjs', 'lib/deepseek-quota-probe.cjs'];
+const RETIRED_HOOK_FILES = [
+  'lib/kimi-quota-probe.cjs', 'lib/deepseek-quota-probe.cjs', 'lib/coder-pool-route.cjs',
+];
 const EVENTS = {
   SessionStart: '*',
   UserPromptSubmit: '*',
@@ -803,7 +805,7 @@ function versionOf(bin, args = ['--version']) {
 }
 
 function hookLibBase() {
-  const needed = ['lib/coder-availability.cjs', 'lib/coder-pool-route.cjs',
+  const needed = ['lib/coder-availability.cjs', 'lib/codex-eligibility.cjs',
     'lib/exec-route-by-quota.cjs', 'lib/config.cjs', 'lib/codex-priority-tier.cjs'];
   for (const base of [HOOKS_DIR, path.join(REPO_ROOT, 'hooks')]) {
     if (needed.every((rel) => fs.existsSync(path.join(base, rel)))) return base;
@@ -811,7 +813,7 @@ function hookLibBase() {
   return null;
 }
 
-/** Report Codex availability on this machine, the effective threshold/cap, and routing. */
+/** Report Codex availability on this machine, effective settings, and eligibility. */
 function checkCoders(hasOrca) {
   log('\n--- coder availability ---');
   const base = hookLibBase();
@@ -820,7 +822,7 @@ function checkCoders(hasOrca) {
     return;
   }
   const availLib = require(path.join(base, 'lib/coder-availability.cjs'));
-  const poolLib = require(path.join(base, 'lib/coder-pool-route.cjs'));
+  const eligibilityLib = require(path.join(base, 'lib/codex-eligibility.cjs'));
   const quotaLib = require(path.join(base, 'lib/exec-route-by-quota.cjs'));
   const cfgLib = require(path.join(base, 'lib/config.cjs'));
   let probeStateDir = null;
@@ -828,45 +830,34 @@ function checkCoders(hasOrca) {
     const cfg = cfgLib.loadConfig();
     const now = Date.now();
     const stateDir = cfgLib.stateDir();
-    const thresholds = { codex: cfgLib.handoffUsed(cfg) };
-    const caps = { codex: cfgLib.maxParallelCodexWorkers(cfg) };
-    const disabled = cfgLib.disabledCoders(cfg);
-    log(`thresholds: codexHandoffUsedPercent=${thresholds.codex} maxParallelCodexWorkers=${caps.codex} ` +
-      `disabledCoders=${disabled.join(',') || 'none'}`);
+    const threshold = cfgLib.handoffUsed(cfg);
+    const cap = cfgLib.maxParallelCodexWorkers(cfg);
+    log(`routing: defaultCoder=${cfgLib.defaultCoder(cfg)} codexHandoffUsedPercent=${threshold} ` +
+      `maxParallelCodexWorkers=${cap}`);
     const authState = quotaLib.codexAuthState(stateDir, now, cfgLib.coderAvailabilityCacheSeconds(cfg) * 1000);
     const availability = availLib.coderAvailability({
-      fresh: true, env: process.env, orcaInstalled: !!hasOrca, codexAuthState: authState, now, disabled,
+      fresh: true, env: process.env, orcaInstalled: !!hasOrca, codexAuthState: authState, now,
     });
     probeStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-check-'));
-    const quotas = { codex: null };
+    let quota = null;
     if (availability.codex && availability.codex.usable) {
       const q = quotaLib.codexQuota(now, { stateDir: probeStateDir, cacheSeconds: 0 });
-      quotas.codex = q && !q.failed ? q : null;
+      quota = q && !q.failed ? q : null;
     }
     for (const coder of ['codex']) {
-      if (disabled.includes(coder)) {
-        log(`coder ${coder}: disabled by config`);
-        continue;
-      }
       const a = availability[coder] || { usable: false, reason: 'unknown', auth: 'unknown', binPath: null };
-      const q = quotas[coder];
+      const q = quota;
       const quotaText = q && typeof q.usedPercent === 'number' ? `${Math.round(100 - q.usedPercent)}% left` : 'unknown';
       const binText = a.binPath ? `${a.binPath} ${versionOf(a.binPath) || 'present'}`.trim() : 'none';
       const authText = a.auth === 'logged-out' ? 'logged out' : a.auth;
       log(`coder ${coder}: ${a.usable ? 'usable' : `UNUSABLE (${a.reason})`} ` +
         `[binary ${binText}, auth ${authText}, quota ${quotaText}]`);
     }
-    const pool = poolLib.pickCoderPool({
-      availability, quotas, thresholds, disabled,
-      exhaustion: availLib.readCoderExhaustion(stateDir, now),
-      live: { codex: 0 }, caps,
-      fallbackEnabled: cfg.execFallbackWhenCodexUnavailable === null ? null : true,
+    const eligibility = eligibilityLib.codexEligibility({
+      availability: availability.codex, quota, threshold,
+      exhaustion: availLib.readCoderExhaustion(stateDir, now).codex,
     });
-    log(`pool: ${pool.summary}`);
-    if (pool.route === 'code') {
-      warn(`no coder usable -> code routes to ${cfg.models?.code?.alias || 'the configured code model'} in-session. ` +
-        'Fix a coder (install/sign in) or accept the in-session model.');
-    }
+    log(`codex eligibility: ${eligibility.state}${eligibility.reason ? ` (${eligibility.reason})` : ''}`);
   } catch (err) {
     warn(`could not evaluate coder availability: ${err.message}`);
   } finally {
@@ -908,9 +899,8 @@ function check() {
     }
   }
   if (!hasOrca || !hasCodex) {
-    warn('Without both Orca and a usable Codex quota reading, automatic routing degrades to the in-session coder. ' +
-      'Use --exec-sonnet (or --code-model <your code alias>) to route code in-session instead, ' +
-      'or see "Coder availability (no Orca / no Codex)" in rules/orchestration-contract.md.');
+    warn('Codex opt-in will fall back to the in-session coder without both Orca and a usable Codex quota reading. ' +
+      'See "Coder availability (no Orca / no Codex)" in rules/orchestration-contract.md.');
   }
 
   checkCoders(hasOrca);

@@ -55,6 +55,10 @@ const FLAG = path.join(RUN_DIR, 'orca-unavailable');
 const DEFAULT_CFG = {
   activation: 'always',
   replyLanguage: null,
+  // Most legacy routing cases in this broad suite intentionally exercise the explicit
+  // Codex-default configuration. The product default (Sonnet, zero probes) is covered by
+  // test-codex-opt-in.cjs and the dedicated zero-probe case below overrides this field.
+  defaultCoder: 'codex',
   models: {
     review: { alias: 'opus', id: 'claude-opus-5-5' },
     escalation: { alias: 'fable', id: 'claude-fable-5-1' },
@@ -242,9 +246,7 @@ expect('running the unit suite is allowed',
   rmState(sid);
 }
 
-// A single Agent PreToolUse evaluates routing twice along the execution path. A failed
-// live lookup is process-local memoized, so this one hook process may spawn at most one
-// quota probe. The real Codex CLI is never touched: ORCH_CODEX_BIN points at the stub.
+// The default Sonnet route returns before any Codex availability or quota probe.
 {
   const dir = path.join(RUN_DIR, 'failed-quota-one-probe');
   const callsLog = path.join(dir, 'codex-calls.log');
@@ -254,7 +256,7 @@ expect('running the unit suite is allowed',
   const env = {
     ...BASE_ENV,
     ORCH_STATE_DIR: stateDir,
-    ORCH_CONFIG_PATH: CONFIG_FILE,
+    ORCH_CONFIG_PATH: path.join(dir, 'sonnet-default.json'),
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_SESSIONS_DIR: sessionsDir,
@@ -262,6 +264,7 @@ expect('running the unit suite is allowed',
     STUB_CODEX_CALLS_LOG: callsLog,
     ORCA_BIN: STUB,
   };
+  fs.writeFileSync(env.ORCH_CONFIG_PATH, JSON.stringify({ ...DEFAULT_CFG, defaultCoder: 'sonnet' }));
   const r = spawnSync(process.execPath, [GATE], {
     input: JSON.stringify(dispatch({
       subagent_type: 'fullstack-developer', description: 'implement x', model: 'sonnet',
@@ -269,9 +272,10 @@ expect('running the unit suite is allowed',
     }, 'failed-quota-one-probe')),
     encoding: 'utf8', env,
   });
-  const calls = fs.readFileSync(callsLog, 'utf8').trim().split('\n').filter(Boolean).length;
-  if (r.status === DENY && calls === 1) pass += 1;
-  else failures.push(`one Agent PreToolUse should pay at most one failed quota probe; exit=${r.status}, probes=${calls}`);
+  const calls = fs.existsSync(callsLog)
+    ? fs.readFileSync(callsLog, 'utf8').trim().split('\n').filter(Boolean).length : 0;
+  if (r.status === ALLOW && calls === 0) pass += 1;
+  else failures.push(`default Agent PreToolUse should allow Sonnet without a Codex probe; exit=${r.status}, probes=${calls}`);
 }
 
 // A state-lock filesystem error is not lock contention. Both a missing parent and a path
@@ -472,11 +476,11 @@ expect('a neutral first verb still classifies code-reviewer as review work',
       dispatch({ subagent_type: t, description: 'make sure nothing regressed', model: 'opus' }, sid, { tool_use_id: `toolu_rvs_ty_${++seq}` }), DENY, env);
   }
 
-  // The per-prompt reminder names the split between review and verification.
+  // The compact per-prompt reminder names the code and higher-reasoning routes.
   {
     const r = invoke(promptSubmit(sid, 'status check'), env);
-    if (/review -> opus \(coder: codex\); verify -> sonnet/.test(r.out)) pass += 1;
-    else failures.push(`reminder must name "review -> opus (coder: codex); verify -> sonnet"\n    ${r.out.slice(0, 300)}`);
+    if (/code -> Codex.*plan\/red-team\/review\/unblock -> opus/.test(r.out)) pass += 1;
+    else failures.push(`compact reminder must name code and review routes\n    ${r.out.slice(0, 300)}`);
   }
 
   invoke(postBash('orca orchestration worker-release --dispatch ctx_rvs_codex --json', '{"ok":true,"result":{}}', { sid }), env);
@@ -1017,7 +1021,7 @@ expect('fable escalation naming opus (xhigh) is allowed',
   expect('--code-model fable: fable for non-code work still needs escalation',
     d({ subagent_type: 'planner', description: 'plan it', model: 'fable' }), DENY, CODEX_WINS);
   invoke(promptSubmit(OSID, '--code-model codex:gpt-5-custom'), SONNET_WINS);
-  expect('--code-model codex:<m>: in-session code refused even when quota favours the code model', code('sonnet'), DENY, SONNET_WINS);
+  expect('--code-model codex:<m>: exhausted Codex falls back to in-session code', code('sonnet'), ALLOW, SONNET_WINS);
   {
     const st = readState(OSID);
     if (st && st.execAgent === 'codex:gpt-5-custom') pass += 1; else failures.push(`codex model override not stored (${st && st.execAgent})`);
@@ -1039,7 +1043,7 @@ expect('fable escalation naming opus (xhigh) is allowed',
 {
   const RS = `${SID}-rv`;
   const out = spawnGate(promptSubmit(RS, 'status?'), SONNET_WINS).stdout;
-  if (/code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[Codex quota 97% used/.test(out) && !/undefined/.test(out)) pass += 1;
+  if (/code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[codex requested but quota 97% used \(threshold 95%\); using sonnet\]/.test(out) && !/undefined/.test(out)) pass += 1;
   else failures.push(`auto route to the code model must name model "sonnet", never "undefined": ${out.slice(0, 200)}`);
   const bare = spawnGate(promptSubmit(RS, 'please --code-model'), CODEX_WINS).stdout;
   if (/needs a value/.test(bare)) pass += 1; else failures.push('a bare --code-model must print a notice');
@@ -1097,10 +1101,10 @@ expect('--exec-sonnet prompt is accepted',
   if (st && !Number.isNaN(Date.parse(st.execAgentSince))) pass += 1;
   else failures.push(`--exec-sonnet did not persist an ISO execAgentSince timestamp (${JSON.stringify(st && st.execAgentSince)})`);
   const reminder = spawnGate(promptSubmit(SID, 'status?'), CODEX_WINS).stdout;
-  if (st && reminder.includes(`code forced to Sonnet since ${st.execAgentSince} (--exec-sonnet); --code-model auto to return to quota routing`)) pass += 1;
+  if (st && reminder.includes(`code forced to Sonnet since ${st.execAgentSince} (--exec-sonnet); --code-model auto to return to default (codex)`)) pass += 1;
   else failures.push(`per-prompt reminder did not expose the active --exec-sonnet override: ${reminder.slice(0, 240)}`);
   const banner = spawnGate({ session_id: SID, hook_event_name: 'SessionStart' }, CODEX_WINS).stdout;
-  if (st && banner.includes(`code forced to Sonnet since ${st.execAgentSince} (--exec-sonnet); --code-model auto to return to quota routing`)) pass += 1;
+  if (st && banner.includes(`code forced to Sonnet since ${st.execAgentSince} (--exec-sonnet); --code-model auto to return to default (codex)`)) pass += 1;
   else failures.push(`SessionStart did not expose the active --exec-sonnet override: ${banner.slice(0, 240)}`);
 }
 expect('exec-intent dispatch on sonnet is allowed once --exec-sonnet is set',
@@ -1244,10 +1248,8 @@ expect('auto: Codex at/over 95% used -> code on another model is refused',
 expect('a neutral scouting dispatch is allowed',
   dispatch({ subagent_type: 'scout', description: 'search docs for the config key' }), ALLOW);
 
-// execFallbackWhenCodexUnavailable: fires ONLY when `orca` or `codex` itself is missing
-// from PATH - Codex is the deliberately-preferred default, so an unknown quota reading
-// alone (a fresh Codex install that has not run a first turn yet) must never fall back;
-// both binaries present, no quota file at all, still routes to Codex.
+// Requested Codex falls back only when `orca` or `codex` itself is missing from PATH.
+// An unknown quota reading alone does not make an otherwise usable Codex ineligible.
 {
   const dir = path.join(RUN_DIR, 'no-codex-data');
   fs.mkdirSync(path.join(dir, 'empty-codex'), { recursive: true });
@@ -1283,12 +1285,12 @@ expect('a neutral scouting dispatch is allowed',
   rmState(FSID);
 }
 
-// The per-turn banner names the exact configured model id alongside its alias.
+// The per-turn reminder stays compact and names aliases without repeating exact ids.
 {
   const RSID = `${SID}-modelid`;
   const out = spawnGate(promptSubmit(RSID, 'status?'), CODEX_WINS).stdout;
-  if (/model "opus" \(claude-opus-5-5\)/.test(out)) pass += 1;
-  else failures.push(`banner must show the review model's exact id: ${out.slice(0, 200)}`);
+  if (/plan\/red-team\/review\/unblock -> opus/.test(out) && !/claude-opus-5-5/.test(out)) pass += 1;
+  else failures.push(`compact reminder must show review alias without exact id: ${out.slice(0, 200)}`);
   rmState(RSID);
 }
 
@@ -1312,12 +1314,13 @@ expect('a neutral scouting dispatch is allowed',
   rmState(RSID);
 }
 
-// A changed handoff threshold changes the banner text (amendment 6).
+// The SessionStart banner omits threshold detail and always explains Codex opt-in.
 {
   const t60Env = quotaEnv('threshold-60', 10, 30, { codexHandoffUsedPercent: 60 });
   const RSID = `${SID}-threshold`;
   const out = spawnGate({ session_id: RSID, hook_event_name: 'SessionStart' }, t60Env).stdout;
-  if (/>= 60% used/.test(out)) pass += 1; else failures.push(`SessionStart banner must reflect a configured threshold of 60: ${out.slice(0, 200)}`);
+  if (/Codex is opt-in/.test(out) && !/>= 60% used/.test(out)) pass += 1;
+  else failures.push(`SessionStart banner must explain opt-in without threshold detail: ${out.slice(0, 200)}`);
   rmState(RSID);
 }
 

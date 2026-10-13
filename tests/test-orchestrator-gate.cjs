@@ -1541,25 +1541,22 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('currentExecRoute: operator override "claude:opus" carries the alias',
     gate.currentExecRoute(cfg, { execAgent: 'claude:opus' }).alias, 'opus');
 
-  // Review, High 5: when the coder pool cannot be read, the route must fail toward ALLOW
-  // (in-session code) — never assume Codex, which would refuse in-session code on a machine
-  // with no coders and lock code out entirely.
+  // An unreadable explicit Codex eligibility check fails toward in-session code.
   {
-    const throwingCfg = Object.create(cfg);
-    Object.defineProperty(throwingCfg, 'coderHeadroomTieBand', { get() { throw new Error('boom'); } });
+    const throwingCfg = { ...cfg, defaultCoder: 'codex' };
+    Object.defineProperty(throwingCfg, 'codexHandoffUsedPercent', { get() { throw new Error('boom'); } });
     const keys = ['ORCA_BIN', 'ORCH_CODEX_BIN'];
     const saved = {};
     for (const key of keys) { saved[key] = process.env[key]; process.env[key] = path.join(os.tmpdir(), `missing-${key}`); }
     let route;
     try {
-      route = gate.currentExecRoute(throwingCfg, { session_id: 'unit-pool-throw', workers: {} });
+      route = gate.currentExecRoute(throwingCfg, { execAgent: null, session_id: 'unit-eligibility-throw', workers: {} });
     } finally {
       for (const key of keys) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
     }
-    check('currentExecRoute: a pool exception routes to in-session code',
-      [route.route, route.pick, route.order], ['code', null, []]);
-    check('currentExecRoute: a pool exception never names Codex',
-      /codex/i.test(String(route.why || '')), false);
+    check('currentExecRoute: an eligibility exception routes to in-session code', route.route, 'code');
+    check('currentExecRoute: an eligibility exception explains Sonnet fallback',
+      /codex requested but .*unreadable; using sonnet/i.test(route.why), true);
   }
 
   check('activationApplies: off is never active', gate.activationApplies({ activation: 'off' }), false);

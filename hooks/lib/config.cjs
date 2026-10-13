@@ -12,8 +12,6 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { CODERS } = require('./coder-availability.cjs');
-
 // Every gate id `disabledGates` may name. Kept here (not scattered across the gate) so
 // validation and documentation stay in sync with what can actually be disabled.
 const GATE_NAMES = [
@@ -34,7 +32,7 @@ const GATE_NAMES = [
   'code-brief-needs-owns',
   'ownership-overlap',
   'max-parallel-agents',
-  'coder-disabled',
+  'codex-not-requested',
 ];
 
 const RETIRED_CONFIG_KEYS = [
@@ -50,8 +48,12 @@ const RETIRED_CONFIG_KEYS = [
   'deepseekQuotaCacheSeconds',
   'maxParallelKimiWorkers',
   'maxParallelDeepseekWorkers',
+  'disabledCoders',
+  'coderHeadroomTieBand',
+  'unknownHeadroomAssumed',
+  'execFallbackWhenCodexUnavailable',
 ];
-const RETIRED_GATE_NAMES = ['max-parallel-kimi-workers', 'max-parallel-deepseek-workers'];
+const RETIRED_GATE_NAMES = ['max-parallel-kimi-workers', 'max-parallel-deepseek-workers', 'coder-disabled'];
 
 const DEFAULT_CONFIG = {
   replyLanguage: null,
@@ -88,9 +90,7 @@ const DEFAULT_CONFIG = {
   autoResumePanel: true,
   codexQuotaCacheSeconds: 60,
   coderAvailabilityCacheSeconds: 600,
-  coderHeadroomTieBand: 10, // headroom points within which two coders tie (falls back to fewer live workers)
-  unknownHeadroomAssumed: 30, // headroom points a quota-unknown coder is ranked as
-  execFallbackWhenCodexUnavailable: 'sonnet',
+  defaultCoder: 'sonnet', // 'sonnet' | 'codex'; Codex is opt-in
   heartbeat: {
     intervalSeconds: 20,
     idleSeconds: 60,
@@ -109,7 +109,6 @@ const DEFAULT_CONFIG = {
   maxParallelCodexWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
-  disabledCoders: [], // coders switched off entirely: 'codex'
   // heartbeat done-worktree handling: 'remove' (run `orca worktree rm` itself), 'remind'
   // (wake the panel with the rm command, never run it) or 'off'. Legacy booleans still
   // load: true -> 'remind', false -> 'off'.
@@ -338,28 +337,14 @@ function loadConfig() {
     merged.coderAvailabilityCacheSeconds = availabilityCache;
   }
 
-  // Blank (null / empty string) counts as unset and silently takes the default; any other
-  // non-integer or out-of-range value warns and defaults.
-  const tieBand = configuredNumber(merged.coderHeadroomTieBand);
-  if (merged.coderHeadroomTieBand === null ||
-      (typeof merged.coderHeadroomTieBand === 'string' && merged.coderHeadroomTieBand.trim() === '')) {
-    merged.coderHeadroomTieBand = DEFAULT_CONFIG.coderHeadroomTieBand;
-  } else if (!Number.isInteger(tieBand) || tieBand < 0 || tieBand > 100) {
-    warnings.push(`coderHeadroomTieBand "${merged.coderHeadroomTieBand}" is not an integer 0-100; using ${DEFAULT_CONFIG.coderHeadroomTieBand}.`);
-    merged.coderHeadroomTieBand = DEFAULT_CONFIG.coderHeadroomTieBand;
-  } else {
-    merged.coderHeadroomTieBand = tieBand;
+  if (!['sonnet', 'codex'].includes(merged.defaultCoder)) {
+    warnings.push(`defaultCoder "${merged.defaultCoder}" is not sonnet|codex; using "${DEFAULT_CONFIG.defaultCoder}".`);
+    merged.defaultCoder = DEFAULT_CONFIG.defaultCoder;
   }
-
-  const unknownAssumed = configuredNumber(merged.unknownHeadroomAssumed);
-  if (merged.unknownHeadroomAssumed === null ||
-      (typeof merged.unknownHeadroomAssumed === 'string' && merged.unknownHeadroomAssumed.trim() === '')) {
-    merged.unknownHeadroomAssumed = DEFAULT_CONFIG.unknownHeadroomAssumed;
-  } else if (!Number.isInteger(unknownAssumed) || unknownAssumed < 0 || unknownAssumed > 100) {
-    warnings.push(`unknownHeadroomAssumed "${merged.unknownHeadroomAssumed}" is not an integer 0-100; using ${DEFAULT_CONFIG.unknownHeadroomAssumed}.`);
-    merged.unknownHeadroomAssumed = DEFAULT_CONFIG.unknownHeadroomAssumed;
-  } else {
-    merged.unknownHeadroomAssumed = unknownAssumed;
+  const defaultCoderOverride = process.env.ORCH_DEFAULT_CODER;
+  if (defaultCoderOverride !== undefined && defaultCoderOverride.trim() !== '' &&
+      !['sonnet', 'codex'].includes(defaultCoderOverride.trim().toLowerCase())) {
+    warnings.push(`ORCH_DEFAULT_CODER "${defaultCoderOverride}" is not sonnet|codex; using defaultCoder from config.`);
   }
 
   if (!isPlainObject(merged.heartbeat)) {
@@ -426,38 +411,6 @@ function loadConfig() {
     merged.disabledGates = merged.disabledGates.filter((g) => !RETIRED_GATE_NAMES.includes(g));
   }
 
-  if (!Array.isArray(merged.disabledCoders)) {
-    warnings.push('disabledCoders must be an array of coder names (codex); ignoring.');
-    merged.disabledCoders = [];
-  } else {
-    const unknown = merged.disabledCoders.filter((coder) =>
-      typeof coder !== 'string' || !CODERS.includes(coder.trim().toLowerCase()));
-    if (unknown.length) {
-      warnings.push(`disabledCoders has unknown coder name(s): ${unknown.map((coder) =>
-        typeof coder === 'string' ? coder.trim().toLowerCase() : JSON.stringify(coder)).join(', ')} (known: ${CODERS.join(', ')}).`);
-    }
-    merged.disabledCoders = [...new Set(merged.disabledCoders
-      .filter((coder) => typeof coder === 'string')
-      .map((coder) => coder.trim().toLowerCase())
-      .filter((coder) => CODERS.includes(coder)))];
-  }
-
-  const disabledCoderOverride = process.env.ORCH_DISABLED_CODERS;
-  if (disabledCoderOverride !== undefined && disabledCoderOverride.trim() !== '') {
-    const parsed = parsedDisabledCoderNames(disabledCoderOverride);
-    if (parsed.unknown.length) {
-      warnings.push(`ORCH_DISABLED_CODERS has unknown coder name(s): ${parsed.unknown.join(', ')} (known: ${CODERS.join(', ')}).`);
-    }
-    if (!parsed.known.length) {
-      warnings.push('ORCH_DISABLED_CODERS has no known coder names; using disabledCoders from config.');
-    }
-  }
-
-  if (merged.execFallbackWhenCodexUnavailable !== 'sonnet' && merged.execFallbackWhenCodexUnavailable !== null) {
-    warnings.push(`execFallbackWhenCodexUnavailable "${merged.execFallbackWhenCodexUnavailable}" is not "sonnet" or null; using "sonnet".`);
-    merged.execFallbackWhenCodexUnavailable = 'sonnet';
-  }
-
   const maxParallel = configuredNumber(merged.maxParallelCodexWorkers);
   if (!Number.isInteger(maxParallel) || maxParallel < 0 || maxParallel > 32) {
     warnings.push(`maxParallelCodexWorkers "${merged.maxParallelCodexWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelCodexWorkers}.`);
@@ -521,26 +474,14 @@ function gateDisabled(cfg, gate) {
   return Array.isArray(cfg.disabledGates) && cfg.disabledGates.includes(gate);
 }
 
-function parsedDisabledCoderNames(value) {
-  const names = String(value).split(',').map((coder) => coder.trim().toLowerCase()).filter(Boolean);
-  return {
-    known: [...new Set(names.filter((coder) => CODERS.includes(coder)))],
-    unknown: [...new Set(names.filter((coder) => !CODERS.includes(coder)))],
-  };
-}
-
-/**
- * Coders switched off entirely. A non-blank env value with at least one known coder
- * replaces the config list. An all-unknown value is treated as a typo and falls back to
- * the validated config list rather than silently re-enabling every configured coder.
- */
-function disabledCoders(cfg) {
-  const override = process.env.ORCH_DISABLED_CODERS;
+/** The default code route. A valid non-blank env value overrides one process. */
+function defaultCoder(cfg) {
+  const override = process.env.ORCH_DEFAULT_CODER;
   if (override !== undefined && override.trim() !== '') {
-    const parsed = parsedDisabledCoderNames(override);
-    if (parsed.known.length) return parsed.known;
+    const normalized = override.trim().toLowerCase();
+    if (['sonnet', 'codex'].includes(normalized)) return normalized;
   }
-  return [...(Array.isArray(cfg.disabledCoders) ? cfg.disabledCoders : [])];
+  return cfg.defaultCoder;
 }
 
 /**
@@ -751,7 +692,7 @@ function maxParallelAgents(cfg) {
 }
 
 module.exports = {
-  GATE_NAMES, RETIRED_CONFIG_KEYS, RETIRED_GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, disabledCoders, handoffUsed, configPath, stateDir,
+  GATE_NAMES, RETIRED_CONFIG_KEYS, RETIRED_GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, defaultCoder, handoffUsed, configPath, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   closeDoneWorktreesMode,
   janitorEnabled,

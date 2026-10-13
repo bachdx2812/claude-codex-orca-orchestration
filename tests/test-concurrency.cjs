@@ -39,6 +39,7 @@ seedQuota(STATE_DIR);
 const CONFIG_FILE = path.join(RUN_DIR, 'orchestration.config.json');
 fs.writeFileSync(CONFIG_FILE, JSON.stringify({
   activation: 'always',
+  defaultCoder: 'codex',
   maxParallelCodexWorkers: 2,
   disabledGates: [],
 }));
@@ -93,7 +94,9 @@ async function raceReconcileTest() {
   fs.mkdirSync(stateDir, { recursive: true });
   seedQuota(stateDir);
   const configFile = path.join(dir, 'orchestration.config.json');
-  fs.writeFileSync(configFile, JSON.stringify({ activation: 'always', maxParallelCodexWorkers: 1, disabledGates: [] }));
+  fs.writeFileSync(configFile, JSON.stringify({
+    activation: 'always', defaultCoder: 'codex', maxParallelCodexWorkers: 1, disabledGates: [],
+  }));
   const slowOrca = path.join(dir, 'slow-orca.cjs');
   fs.writeFileSync(slowOrca,
     '#!/usr/bin/env node\n' +

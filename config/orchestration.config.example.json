@@ -22,9 +22,7 @@
   "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
-  "coderHeadroomTieBand": 10,
-  "unknownHeadroomAssumed": 30,
-  "execFallbackWhenCodexUnavailable": "sonnet",
+  "defaultCoder": "sonnet",
   "heartbeat": {
     "intervalSeconds": 20,
     "idleSeconds": 60,
@@ -43,7 +41,6 @@
   "maxParallelCodexWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
-  "disabledCoders": [],
   "closeDoneWorktrees": "remove",
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null

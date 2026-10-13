@@ -39,9 +39,7 @@ function handoverStage({ usedPercent, threshold, warnMargin, exhausted = false }
   return usedPercent >= Math.max(0, threshold - warnMargin) ? 'warning' : null;
 }
 
-function pickNextCoder(agent, pool) {
-  if (agent !== 'codex' && (pool?.order || []).includes('codex')) return 'codex';
-  if (agent !== 'codex' && pool?.coders?.codex?.state === 'eligible') return 'codex';
+function pickNextCoder() {
   return 'sonnet';
 }
 
@@ -50,7 +48,8 @@ function targetLabel(target) {
 }
 
 function handoverRecipe(agent, target, worktreePath) {
-  const source = agent === 'codex' ? 'Codex' : 'Sonnet';
+  const rawSource = String(agent || 'worker');
+  const source = rawSource[0].toUpperCase() + rawSource.slice(1);
   const destination = targetLabel(target);
   const sameTree = worktreePath ? ` at ${worktreePath}` : '';
   return 'If responsive, terminal send: "Stop now: commit all work-in-progress as `wip: handover` and write ' +

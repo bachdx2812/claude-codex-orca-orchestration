@@ -36,12 +36,12 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
    / `escalation: sonnet verify could not decide ...`). The
    configured escalation model (`models.escalation.alias`, default `fable`) is reserved for
    work the review model could not do, even at higher effort — a dispatch to it must say so.
-3. **Code goes to Codex in an Orca worker first**, and
-   to the configured in-session code
-   model (`models.code.alias`, default `sonnet`) once Codex has exhausted its quota at
-   `codexHandoffUsedPercent` (default 95) or is unusable. This covers code, builds,
-   refactors, tests, bulk conversions, and fix loops. Codex is optional: when it is not
-   installed, signed in, or launchable, code goes to Sonnet. The
+3. **Code goes to the configured in-session code model first** (`models.code.alias`,
+   default `sonnet`). Codex is opt-in only through `--exec-codex`, `--code-model
+   codex[:<model>]`, or `defaultCoder: "codex"`. When requested, Codex runs in an Orca
+   worker while usable and below `codexHandoffUsedPercent` (default 95); otherwise the
+   request falls back to Sonnet. This covers code, builds, refactors, tests, bulk
+   conversions, and fix loops. The
    operator can pick the coding model directly with `--code-model
    <alias|codex|codex:<model>|auto>`, or use the `--exec-sonnet` / `--exec-codex` /
    `--exec-auto` shortcuts.
@@ -172,7 +172,7 @@ The operator (only) can pick who writes code for the rest of the session:
 --code-model fable         # the configured escalation model, for code work specifically
 --code-model codex         # Codex in an Orca worker, no pinned model (same as --exec-codex)
 --code-model codex:gpt-5-custom   # Codex in an Orca worker, pinned to this model
---code-model auto          # back to automatic routing (same as --exec-auto)
+--code-model auto          # back to defaultCoder (same as --exec-auto)
 ```
 
 The last matching flag in a prompt wins. An invalid value (unknown word, or anything
@@ -181,7 +181,7 @@ notice; nothing changes. Picking a Claude alias for code work exempts that dispa
 the review-model/escalation-model scope gates for code specifically — the operator asked
 for it by name, so the gate does not then refuse it for being the "wrong" model doing code.
 Every active override is repeated on each prompt and in the `SessionStart` banner with
-the time it was set and the command that returns routing to automatic quota selection.
+the time it was set and the command that returns routing to `defaultCoder`.
 
 **With a `codex` (or `codex:<model>`) override while the Orca-unreachable fallback is
 active**, in-session code still runs on the configured code model, not Codex — the
@@ -190,11 +190,9 @@ either, regardless of what the operator's standing override says.
 
 ## Coder availability (no Orca / no Codex)
 
-Codex is the only external coder. It is optional and may be excluded through
-`disabledCoders`, just like an unusable coder, from availability probing and new routing;
-its override and matching `worker-start` are then refused. A worker started before Codex
-was disabled remains supervised, quota-checked by heartbeat, and eligible for automatic
-resume after quota reset.
+Codex is the only external coder and is never probed by the default Sonnet route. A
+`worker-start --agent codex` is refused with `codex-not-requested` unless the operator used
+`--exec-codex` / `--code-model codex[:<model>]` or config/env selects Codex as the default.
 
 A quota-unknown reading does not by itself make usable Codex ineligible. Quota discovery
 first uses a fresh state-directory cache, then queries `codex app-server` JSON-RPC
@@ -203,8 +201,8 @@ call), then scans local Codex session logs no older than six hours. If all sourc
 unavailable, routing uses a reset-aware estimate of the last successful reading from
 `codex-quota-last-known.json`. A window whose reset time passed counts as 0% used; other
 windows retain their last reading. Codex that was never read successfully is quota-unknown,
-not unusable. When Codex is ineligible, `execFallbackWhenCodexUnavailable: "sonnet"`
-(the default) routes to the configured in-session code model.
+not unusable. When requested Codex is ineligible, routing falls back to the configured
+in-session code model.
 
 Availability (binary present? signed in?) is cached in `coder-availability.json` for
 `coderAvailabilityCacheSeconds` (default 600). Codex is unusable when its binary is missing,
@@ -228,8 +226,8 @@ Independent of that automatic fallback, the operator can always route explicitly
 
 `node install.mjs --check` reports whether `orca` and `codex` are on `PATH`, whether Codex
 looks logged in, and the effective
-config (including `execFallbackWhenCodexUnavailable`) as the installed hooks would actually
-read it. It also reports any registered foreign
+config (including `defaultCoder`) as the installed hooks would actually read it. It also
+reports any registered foreign
 `orchestrator-gate.cjs` as a problem. Install preserves such registrations with a warning
 unless the operator explicitly supplies `--replace-foreign-gate`; the ordinary settings
 backup precedes their removal. Help and unknown options never enter the install path.
@@ -261,9 +259,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   "autoResumePanel": true,
   "codexQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
-  "coderHeadroomTieBand": 10,
-  "unknownHeadroomAssumed": 30,
-  "execFallbackWhenCodexUnavailable": "sonnet",
+  "defaultCoder": "sonnet",
   "heartbeat": {
     "intervalSeconds": 20,
     "idleSeconds": 60,
@@ -274,7 +270,6 @@ backup precedes their removal. Help and unknown options never enter the install 
   "maxParallelCodexWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
   "disabledGates": [],
-  "disabledCoders": [],
   "closeDoneWorktrees": "remove",
   "parallelCoreFraction": 0.8,
   "maxParallelAgents": null
@@ -298,8 +293,10 @@ backup precedes their removal. Help and unknown options never enter the install 
   specific set (`agents.lookup` ships with `["Explore"]`; `agents.escalation` ships
   empty) — add your own team's advisory-agent names here rather than expecting the gate
   to guess them.
-- `codexHandoffUsedPercent`: integer 0-100, default 95. Codex leaves the eligible coder
-  pool once it has used this much of its tightest quota window. Overridable for one
+- `defaultCoder`: `"sonnet"` (default) or `"codex"`. Sonnet returns before any Codex
+  availability/quota probe. `ORCH_DEFAULT_CODER` overrides it for one process.
+- `codexHandoffUsedPercent`: integer 0-100, default 95. Requested Codex falls back to
+  Sonnet once it has used this much of its tightest quota window. Overridable for one
   process with `ORCH_CODEX_HANDOFF_USED`.
 - `codexAllowPriorityTier`: boolean, default `false`. Silences the warning (`install.mjs
   --check` and the `SessionStart` banner) when the operator's own `~/.codex/config.toml`
@@ -325,12 +322,6 @@ backup precedes their removal. Help and unknown options never enter the install 
   coder availability probe (binary present? signed in?) is reused from
   `coder-availability.json`. Overridable for one process with
   `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`.
-- `coderHeadroomTieBand`: integer 0-100, default 10 (blank/unset = default). Retained with
-  the one-member coder-pool configuration until the pool shape is simplified.
-- `unknownHeadroomAssumed`: integer 0-100, default 30 (blank/unset = default). The headroom
-  a quota-unknown coder is ranked as: below any coder with known headroom >= this value,
-  above one with less. A reset-aware estimate of the last successful reading counts as
-  known, not unknown.
 - `models.reviewByCoder`: author coder -> review model alias (a string per entry). Default
   `{ "codex": "opus", "sonnet": "opus" }` — code by any coder is reviewed on Opus.
   `ORCH_REVIEW_MODEL_EXTERNAL` / `ORCH_REVIEW_MODEL_SONNET` override the external
@@ -350,14 +341,6 @@ backup precedes their removal. Help and unknown options never enter the install 
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
   names are kept (in case a future gate adds that id) but produce a one-line warning in
   the SessionStart banner.
-- `disabledCoders`: normalized list containing `codex` to exclude
-  from availability probes, new quota routing, banners, overrides, dispatch, and handover
-  destinations. Workers already running remain heartbeat-supervised and quota-checked; parked
-  workers may still auto-resume because disabling affects only new routing and dispatch.
-  `ORCH_DISABLED_CODERS` is a
-  comma-separated process override when it contains a known coder; unknown names warn, an
-  all-unknown value falls back to this config list, and a blank value is unset. The
-  `coder-disabled` gate controls worker-start refusal.
 - `maxParallelCodexWorkers`: integer 0-32, default 3. How many live Codex worker *groups*
   (see "Section 0 fixes" below — one worker-start reply's dispatch id, task id and
   terminal handle together are one group, never three) this session may hold at once; `0`
@@ -407,9 +390,10 @@ keys under `models.kimi`, `models.deepseek`, `models.reviewByCoder.kimi`, and
 `models.reviewByCoder.deepseek`, plus `kimiHandoffUsedPercent`,
 `kimiQuotaCacheSeconds`, `deepseekHandoffUsedPercent`, `deepseekQuotaCacheSeconds`,
 `deepseekRole`, `deepseekDailySpendCapUsd`, `maxParallelKimiWorkers`, and
-`maxParallelDeepseekWorkers`, are ignored. The gate emits one warning naming all retired
+`maxParallelDeepseekWorkers`, plus `disabledCoders`, `coderHeadroomTieBand`,
+`unknownHeadroomAssumed`, and `execFallbackWhenCodexUnavailable`, are ignored. The gate emits one warning naming all retired
 keys it found and asks the operator to remove them. Retired disabled-gate names
-`max-parallel-kimi-workers` and `max-parallel-deepseek-workers` are reported as retired,
+`max-parallel-kimi-workers`, `max-parallel-deepseek-workers`, and `coder-disabled` are reported as retired,
 not unknown. The old `--exec-kimi` and `--exec-deepseek` flags print a retirement notice
 without changing routing; retired `--code-model` values are ignored.
 
@@ -418,7 +402,7 @@ state, the violations log and heartbeat liveness files live — default
 `~/.claude/orchestrator-gate/`), `ORCA_BIN` (which `orca` executable to invoke — mainly
 for tests), `ORCH_CODEX_BIN` (which `codex` executable the live quota probe invokes —
 and which executable the routing fallback checks; legacy `CODEX_BIN` remains a lower-priority
-alias), `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
+alias), `ORCH_DEFAULT_CODER`, `ORCH_CODEX_HANDOFF_USED`, `ORCH_CODEX_QUOTA_CACHE_SECONDS`,
 `ORCH_REVIEW_MODEL_EXTERNAL`, `ORCH_REVIEW_MODEL_SONNET`, `ORCH_VERIFY_MODEL`,
 `ORCH_CODER_AVAILABILITY_CACHE_SECONDS`, `ORCH_STALL_SECONDS`,
 `ORCH_CLOSE_DONE_WORKTREES`. An invalid or missing config value never crashes
@@ -603,10 +587,6 @@ remaining alive. At reset plus 90 seconds it re-probes; once quota is below the 
 handoff threshold it sends `Quota has reset. Continue the task from where you stopped;
 check git status/log (and HANDOVER.md if present) first; do not redo finished steps.` and
 verifies a new terminal turn.
-
-The scheduler treats `disabledCoders` as a new-routing setting only. A parked external
-worker may still resume after quota reset while its coder is disabled; release the worker
-to end supervision instead.
 
 Attempts and the first-attempt time are persisted. A scheduler expires after 768 attempts or
 eight days. A successfully delivered resume is never typed again when turn verification is
@@ -974,7 +954,7 @@ Per session, at `<ORCH_STATE_DIR>/<session_id>.json`:
   "last_heartbeat": 0, "rate_limit_hits": 0 }
 ```
 
-`execAgent` is one of `null` (automatic, by coder pool), `"codex"`, `"codex:<model>"`,
+`execAgent` is one of `null` (use `defaultCoder`), `"codex"`, `"codex:<model>"`,
 or `"claude:<alias>"`. Any other persisted value is reset to `null` and reported once. The
 `*Since` fields contain ISO-8601 timestamps only while their corresponding override is
 active.
@@ -986,12 +966,6 @@ stamp, so a worker group that settles after a newer dispatch started never clobb
 newer author. A review dispatch is routed by this value (`models.reviewByCoder`); a
 verify-run dispatch is routed to `models.verify` regardless of author. A `null` author
 allows either the review or the code model for review.
-
-Machine-wide coder routing state lives at `<ORCH_STATE_DIR>/coder-route-state.json` as
-`{ "lastCoder": "codex", "updatedAt": 0 }`. The gate writes `lastCoder`
-atomically
-under the shared state lock only when a `worker-start` reply registers a real coder worker.
-The one-member coder pool retains this state shape until pool routing is simplified.
 
 `group`/`kind`/`agent`/`owns`/`ws` on a worker entry, `reservations`, `agentClaims` and
 `tasks` are the parallel-Codex-worker cap and file-ownership bookkeeping (see "Parallel
@@ -1061,6 +1035,7 @@ node tests/test-orchestrator-gate-e2e.cjs            # real payloads through the
 node tests/test-concurrency.cjs                      # genuine multi-process races (caps + quota probe)
 node tests/test-install.cjs                          # CLI safety + foreign-gate handling
 node tests/test-coder-availability.cjs               # Codex usability probes (no live Orca/Codex)
+node tests/test-codex-opt-in.cjs                     # Sonnet default, Codex opt-in, silent notifications
 node tests/test-worker-stall.cjs                     # heartbeat stall/liveness
 node tests/test-retired-coders.cjs                   # retired coder compatibility behavior
 node tests/test-released-groups.cjs                  # released-group accounting
