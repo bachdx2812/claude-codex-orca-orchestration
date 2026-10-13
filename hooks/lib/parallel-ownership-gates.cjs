@@ -837,10 +837,12 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
       const reservation = {
         ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, newSlot,
-        codexOptedIn: agent === 'codex' && (
-          (typeof deps.codexRequested === 'function' && deps.codexRequested(cfg, s)) ||
-          s.workers[flagValue(inv.args, '--retry-of')]?.codexOptedIn === true
-        ),
+        // Only a currently active operator choice grants provenance to the new dispatch.
+        // A permitted retry may run after switching away from Codex, but it cannot pass the
+        // old opt-in onward to another retry or to a different task.
+        codexOptedIn: agent === 'codex' &&
+          typeof deps.codexRequested === 'function' && deps.codexRequested(cfg, s),
+        taskId: flagValue(inv.args, '--task') || null,
         commandHash,
       };
       localReservations[`${baseId}#${idx}`] = reservation;

@@ -312,7 +312,8 @@ const REVIEW_NOUN = /\b(diff|pull\s+request|commits?|implementation)\b/i;
 const VERIFY_THEN_EXEC = /\b(?:verify|verification|test|tests|check|checks|ci)\b[^.;]*?\b(?:and|then|also)\s+(?:then\s+)?(?:implement|refactor|migrate|scaffold|fix|write\s+(?:the\s+)?code|codegen|generate\s+(?:code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
 const ADVISE_FIRST_VERB = /^(advise|advice|unblock|consult)\b/i;
-const ADVICE_TYPE_HINT = /advisor|kongming/i;
+const ADVICE_TYPE_HINT = /^(advisor|kongming)$/i;
+const ADVICE_MUTATION_INTENT = /\b(update|edit|change)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
 // 'Write' + a CODE OBJECT is code intent, not the operational write (operator decision,
@@ -475,6 +476,7 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   const execAt = hay.search(EXEC_INTENT);
   const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(t);
   const typeWantsVerify = VERIFY_TYPE_HINT.test(t);
+  const typeWantsAdvice = ADVICE_TYPE_HINT.test(t);
   const typeIsLookup = Array.isArray(lookupTypes) &&
     lookupTypes.some((n) => String(n).toLowerCase() === t.toLowerCase());
   // Planning / red-team is always the review model (never verify), whatever the first verb.
@@ -490,9 +492,11 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   // browser-verifier / e2e-runner) is never code from a neutral or verify-first summary, but
   // a code verb as the summary's FIRST verb is still code: "Implement the payment module"
   // from a tester is execution, not verify-run.
-  const wantsExec = firstIntent === 'exec' || (!typeWantsVerify && (
+  const wantsExec = firstIntent === 'exec' ||
+    (typeWantsAdvice && firstIntent !== 'review' && firstIntent !== 'verify' && ADVICE_MUTATION_INTENT.test(desc)) ||
+    (!typeWantsVerify && (
     (firstIntent !== 'review' && firstIntent !== 'verify' && execAt >= 0 &&
-      (firstIntent === 'neutral' || planAt < 0 || execAt < planAt)) ||
+      (firstIntent === 'neutral' || firstIntent === 'advice' || planAt < 0 || execAt < planAt)) ||
     (firstIntent === 'verify' && VERIFY_THEN_EXEC.test(hay))));
 
   // B2: review beats verify — a reviewer type, a review verb, or a code noun next to a
@@ -514,7 +518,8 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
     (firstIntent !== 'review' && typeWantsVerify) ||
     (!firstIntent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt) && (planAt < 0 || verifyAt < planAt))
   );
-  const wantsAdvice = !wantsExec && (firstIntent === 'advice' || ADVICE_TYPE_HINT.test(t));
+  const wantsAdvice = !wantsExec && execAt < 0 &&
+    (firstIntent === 'advice' || typeWantsAdvice);
 
   return { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning };
 }
@@ -528,6 +533,17 @@ function stateFile(sid) {
   return path.join(DIR, `${String(sid || 'default').replace(/[^A-Za-z0-9_-]/g, '_')}.json`);
 }
 
+// A post-opt-in Codex retry is deliberately narrower than a fresh worker start: it must
+// name the exact task Orca associated with the tracked dispatch, and it may not replace
+// that task with a new inline spec. Retry-created workers do not inherit this provenance.
+function allowedTrackedCodexRetry(inv, s) {
+  const retryOf = flagValue(inv.args, '--retry-of');
+  const taskId = flagValue(inv.args, '--task');
+  if (!retryOf || !taskId || hasFlag(inv.args, '--spec')) return false;
+  const original = s.workers[retryOf];
+  return original?.codexOptedIn === true && original.taskId === taskId;
+}
+
 function blank(sid) {
   return {
     session_id: sid || 'default',
@@ -538,7 +554,7 @@ function blank(sid) {
     execAgentSince: null,
     workers: {},            // label -> { role, started, status, last_seen, rate_limited_until,
                              //            group, kind, agent, owns, ws }
-    reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot, newSlot, commandHash } —
+    reservations: {},       // "<toolUseId>#<idx>" -> { ts, agent, owns, ws, codexSlot, newSlot, taskId, commandHash } —
                              // the gap between a Bash dispatch being admitted and its PostToolUse resolving it
     agentClaims: {},        // toolUseId -> { owns, ws, ts } — in-session Agent/Task Owns: claims
     agents: {},             // toolUseId -> { ts, background, type, model } — EVERY main-panel
@@ -1653,13 +1669,12 @@ function onPreToolUse(p, s, cfg) {
     for (const inv of orcaInvocations(cmd)) {
       if (inv.sub !== 'orchestration worker-start' || hasFlag(inv.args, '--help')) continue;
       const agent = resolveWorkerStartAgent(inv, s);
-      const retryOf = flagValue(inv.args, '--retry-of');
-      const retryingSessionCodexDispatch = !!retryOf && agent === 'codex' &&
-        s.workers[retryOf]?.codexOptedIn === true;
+      const retryingSessionCodexDispatch = agent === 'codex' && allowedTrackedCodexRetry(inv, s);
       if (agent !== 'codex' || codexRequested(cfg, s) || retryingSessionCodexDispatch) continue;
       d('codex-not-requested', 'Codex is opt-in. Code goes to sonnet-coder in-session. ' +
         'Operator only: --exec-codex / --code-model codex[:<model>] / defaultCoder:"codex". ' +
-        'A --retry-of is allowed only for a Codex dispatch this session already started while opted in.');
+        'A --retry-of is allowed only with --task equal to the original task id, no --spec, ' +
+        'for a Codex dispatch this session started while opted in.');
     }
 
     // Gate A (max-parallel-codex-workers) + Gate B (code-brief-needs-owns /
@@ -2178,6 +2193,8 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
     const agent = reservation ? reservation.agent
       : (inv.sub === 'orchestration worker-start' ? resolveWorkerStartAgent(inv, s) : null);
     const worktreeIds = reply ? WG.fieldValuesFromReply(reply, 'worktreeId') : [];
+    const taskId = (reply && WG.fieldValuesFromReply(reply, 'taskId')
+      .find((id) => /^task_[A-Za-z0-9_-]+$/.test(id))) || reservation?.taskId || null;
 
     if (failed) {
       const readiness = inv.sub === 'orchestration worker-start' && readinessTimeoutDetails(replyText);
@@ -2187,7 +2204,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           rate_limited_until: 0, group: readiness.dispatch, kind: WG.kindOf(readiness.dispatch), agent,
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
           codexOptedIn: reservation ? reservation.codexOptedIn === true : false,
-          worktreeIds, readinessTimeout: true,
+          taskId, worktreeIds, readinessTimeout: true,
         };
         if (inv.sub === 'orchestration worker-start') {
           recordCodeAuthor(s, agent, Date.now());
@@ -2217,7 +2234,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
         rate_limited_until: 0, unverified: true, group: pendingId, kind: 'worker', agent,
         owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
         codexOptedIn: reservation ? reservation.codexOptedIn === true : false,
-        worktreeIds,
+        taskId, worktreeIds,
       };
       recordCodeAuthor(s, agent, s.workers[pendingId].started);
       dirty = true;
@@ -2233,7 +2250,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           rate_limited_until: 0, group, kind: WG.kindOf(id), agent,
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
           codexOptedIn: reservation ? reservation.codexOptedIn === true : false,
-          worktreeIds,
+          taskId, worktreeIds,
         };
       }
       if (inv.sub === 'orchestration worker-start') {
