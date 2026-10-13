@@ -1580,6 +1580,8 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   check('hasFlag: does not match a longer flag name as a prefix', gate.hasFlag(['--spectacular'], '--spec'), false);
   check('flagValue: space-separated form', gate.flagValue(['--agent', 'codex'], '--agent'), 'codex');
   check('flagValue: =-joined form', gate.flagValue(['--agent=codex'], '--agent'), 'codex');
+  check('flagValue: repeated flags follow Orca last-wins semantics',
+    gate.flagValue(['--agent', 'kimi', '--agent=codex'], '--agent'), 'codex');
   check('flagValue: absent is undefined', gate.flagValue(['--other'], '--agent'), undefined);
 }
 

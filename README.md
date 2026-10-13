@@ -25,7 +25,7 @@ Request -> main panel -> Opus 5.5 plans + red-teams -> Sonnet writes code in-ses
 |---|---|---|---|---|
 | Main panel (orchestrator) | Takes the request, delegates, supervises workers, reports; never writes code | Session default model | — | `activation` |
 | Planner / red-team | Plans, red-teams plans | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
-| Unblock advisor | Advises on recurring failures without editing code | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"`; `advisor`/`kongming` types are recognized | `models.review` |
+| Unblock advisor | Advises on recurring failures without editing code | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` and a description or prompt line starting `Read-only:` | `models.review` |
 | Reviewer | Code review — reads code and judges the diff | Opus 5.5 (`claude-opus-5-5`), regardless of which coder wrote it | `Agent` with `model: "opus"` per `models.reviewByCoder` | `models.reviewByCoder`, `models.reviewEffort` |
 | Verifier | Verify-run — runs existing checks (CI gate, screenshots, play-test, post-deploy smoke), not reading/judging the diff | Sonnet 5.5 (`claude-sonnet-5-5`) | `Agent` with `model: "sonnet"` at `models.verify.effort` | `models.verify` |
 | Coder (default) | Every code task class: code, builds, refactors, tests, bulk conversions, and fix loops | Sonnet | `Agent` with `subagent_type: "sonnet-coder"` + `model: "sonnet"` at `models.code.effort` (default medium; brief must name a verify command) | `defaultCoder`, `models.code` (incl. `effort` / `agentType`) |
@@ -47,9 +47,12 @@ they were set and how to return to `defaultCoder`, both per prompt and in the
 
 **Review reads code and judges the diff, always on Opus** (`models.reviewByCoder`, default
 all `opus`): code written by Codex or Sonnet is reviewed on Opus 5.5. Planning
-and red-team stay on Opus. Unblock/advice dispatches may also use Opus only when their brief
-contains no code verb; implementation and build intent anywhere wins. Exact `advisor` and
-`kongming` roles also route update/edit/change briefs as code. **Verify-run work runs existing checks and always runs on
+and red-team stay on Opus. Unblock/advice dispatches may also use Opus only when their
+description or prompt contains an explicit line starting `Read-only:` (case-insensitive),
+for example `Read-only: advice only, no edits.`. That marker is a read-only contract: even
+when the brief discusses a possible mutation, the agent may analyze it but may not edit.
+Without the marker, advice verbs and `advisor`/`kongming` role names receive no exemption;
+mutation briefs follow the code route. **Verify-run work runs existing checks and always runs on
 Sonnet** (`models.verify`, default `{ alias: "sonnet", id: "claude-sonnet-5-5", effort:
 "medium" }`): the CI gate, UI screenshots, play-testing, post-deploy smoke — not reading
 or judging the diff. An Opus verify is refused unless the dispatch says the mapped Sonnet
@@ -96,6 +99,9 @@ orca orchestration worker-start --task <originalTaskId> --retry-of <dispatchId> 
 ```
 
 — and reduce how many Codex workers run in parallel.
+Each dispatch identity flag (`--agent`, `--task`, `--retry-of`, `--terminal`, `--spec`) may
+appear at most once, in either `--flag value` or `--flag=value` form. Repeated flags are
+refused instead of relying on Orca's last-wins behavior.
 
 **Readiness timeout with a live terminal.** `worker-start` can report
 `stage: agent_readiness` / `lastError: timeout` even though the Codex terminal started and

@@ -139,11 +139,12 @@ function hasFlag(args, flag) {
   return args.some((a) => a === flag || a.startsWith(`${flag}=`));
 }
 function flagValue(args, flag) {
+  let value;
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === flag) return args[i + 1];
-    if (args[i].startsWith(`${flag}=`)) return args[i].slice(flag.length + 1);
+    if (args[i] === flag) value = args[i + 1];
+    else if (args[i].startsWith(`${flag}=`)) value = args[i].slice(flag.length + 1);
   }
-  return undefined;
+  return value;
 }
 
 // --- classification ---------------------------------------------------------
@@ -312,8 +313,8 @@ const REVIEW_NOUN = /\b(diff|pull\s+request|commits?|implementation)\b/i;
 const VERIFY_THEN_EXEC = /\b(?:verify|verification|test|tests|check|checks|ci)\b[^.;]*?\b(?:and|then|also)\s+(?:then\s+)?(?:implement|refactor|migrate|scaffold|fix|write\s+(?:the\s+)?code|codegen|generate\s+(?:code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
 const ADVISE_FIRST_VERB = /^(advise|advice|unblock|consult)\b/i;
-const ADVICE_TYPE_HINT = /^(advisor|kongming)$/i;
-const ADVICE_MUTATION_INTENT = /\b(update|edit|change)\b/i;
+const READ_ONLY_MARKER = /^[ \t]*read-only\s*:/im;
+const MUTATION_INTENT = /\b(?:updat\w*|edit\w*|chang\w*|modif\w*|patch\w*|rewrit\w*|renam\w*|remov\w*|delet\w*|add\w*|creat\w*|appl\w*)\b|\bmake\b[^.;\n]*\bedits?\b|\bwrite\s+(?:the\s+)?(?:module|function|class|component|tests?|code|implementation|endpoint|handler|script|migration|hook|parser|layer|service|feature)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
 // 'Write' + a CODE OBJECT is code intent, not the operational write (operator decision,
@@ -450,15 +451,19 @@ function isPlanningReview(description, type, prompt) {
  *   3. VERIFY — running existing checks on the verify model, never a lookup role type
  *      (agents.lookup), which is advisory lookup work and never blocks.
  *
- * Advice/unblock work is allowed on the review model, but explicit execution intent still
- * wins so a brief such as "Unblock and fix the parser" cannot bypass the code route.
+ * Advice is allowed on the review model only when the description or prompt contains an
+ * explicit `Read-only:` marker line. The marker is a contract that the agent will not edit,
+ * so it wins even when the brief discusses a possible code mutation.
  *
  * Returns { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning }.
  */
 function classifyDispatch(description, type, prompt, lookupTypes) {
   const desc = String(description || '').trim();
   const t = String(type || '');
-  const hay = `${t} ${desc}`.trim() || String(prompt || '').slice(0, 400);
+  const promptText = String(prompt || '');
+  const promptHead = promptText.slice(0, 400);
+  const hay = `${t} ${desc}`.trim() || promptHead;
+  const mutationHay = `${desc} ${promptHead}`.trim();
   // 'Write' + a code object is a code first verb (operator decision, 2026-10-02): the
   // verifier type hint must not override it, so "Write the payment module" from a tester /
   // "Write e2e tests for checkout" from an e2e-runner routes to the coder, never the verify
@@ -476,13 +481,25 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   const execAt = hay.search(EXEC_INTENT);
   const typeWantsPlanReview = PLAN_REVIEW_INTENT.test(t);
   const typeWantsVerify = VERIFY_TYPE_HINT.test(t);
-  const typeWantsAdvice = ADVICE_TYPE_HINT.test(t);
   const typeIsLookup = Array.isArray(lookupTypes) &&
     lookupTypes.some((n) => String(n).toLowerCase() === t.toLowerCase());
   // Planning / red-team is always the review model (never verify), whatever the first verb.
   const planning = isPlanningReview(desc, t, prompt);
   const reviewVerbPresent = REVIEW_VERB.test(desc);
   const reviewNounPresent = REVIEW_NOUN.test(desc);
+  const adviceOnly = READ_ONLY_MARKER.test(desc) || READ_ONLY_MARKER.test(promptText);
+  const adviceContextMutation = (EXEC_INTENT.test(mutationHay) || MUTATION_INTENT.test(mutationHay)) &&
+    (firstIntent === 'advice' || /^(advisor|kongming)$/i.test(t));
+
+  // Advice is a declared read-only contract, not an inference from verbs or role names.
+  // The marker wins even when the brief discusses mutations: the dispatched agent must
+  // analyze those changes without making them.
+  if (adviceOnly) {
+    return {
+      firstIntent, wantsExec: false, wantsPlanReview: false, wantsVerify: false,
+      wantsAdvice: true, planning,
+    };
+  }
 
   // B1: exec intent behind a verify/test first verb is still execution, so it routes to the
   // coder pool, records the author, and requires a verify command — never the verify model.
@@ -493,7 +510,7 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   // a code verb as the summary's FIRST verb is still code: "Implement the payment module"
   // from a tester is execution, not verify-run.
   const wantsExec = firstIntent === 'exec' ||
-    (typeWantsAdvice && firstIntent !== 'review' && firstIntent !== 'verify' && ADVICE_MUTATION_INTENT.test(desc)) ||
+    adviceContextMutation ||
     (!typeWantsVerify && (
     (firstIntent !== 'review' && firstIntent !== 'verify' && execAt >= 0 &&
       (firstIntent === 'neutral' || firstIntent === 'advice' || planAt < 0 || execAt < planAt)) ||
@@ -518,8 +535,7 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
     (firstIntent !== 'review' && typeWantsVerify) ||
     (!firstIntent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt) && (planAt < 0 || verifyAt < planAt))
   );
-  const wantsAdvice = !wantsExec && execAt < 0 &&
-    (firstIntent === 'advice' || typeWantsAdvice);
+  const wantsAdvice = false;
 
   return { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning };
 }
@@ -537,6 +553,7 @@ function stateFile(sid) {
 // name the exact task Orca associated with the tracked dispatch, and it may not replace
 // that task with a new inline spec. Retry-created workers do not inherit this provenance.
 function allowedTrackedCodexRetry(inv, s) {
+  if (PARALLEL_OWNERSHIP.repeatedWorkerIdentityFlags(inv.args).length) return false;
   const retryOf = flagValue(inv.args, '--retry-of');
   const taskId = flagValue(inv.args, '--task');
   if (!retryOf || !taskId || hasFlag(inv.args, '--spec')) return false;
@@ -1254,8 +1271,8 @@ function onSessionStart(p, s, cfg) {
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
-    `- Model routing: code -> ${route.route === 'external' ? 'Codex' : (cfg.models.code.agentType || 'sonnet-coder')}; plan/red-team/review/unblock -> ${review}; lookup -> ${lookup}; verify -> ${verifyModelAlias(cfg)}.\n` +
-    `- Planning / red-team / unblock advice -> in-session subagent on model ${modelLabel(cfg.models.review)}. Review -> model ${reviewRouteText(cfg, s)} (review model follows the code's author). Verify -> model ${verifyModelAlias(cfg)}.\n` +
+    `- Model routing: code -> ${route.route === 'external' ? 'Codex' : (cfg.models.code.agentType || 'sonnet-coder')}; plan/red-team/review/advice with Read-only: marker -> ${review}; lookup -> ${lookup}; verify -> ${verifyModelAlias(cfg)}.\n` +
+    `- Planning / red-team / marked read-only advice -> in-session subagent on model ${modelLabel(cfg.models.review)}. Write a line starting "Read-only:" in every advice dispatch. Review -> model ${reviewRouteText(cfg, s)} (review model follows the code's author). Verify -> model ${verifyModelAlias(cfg)}.\n` +
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (external spec or in-session prompt) names the exact test / build command to run green.\n' +
@@ -1538,7 +1555,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   } else {
     codeRoute = codeModelDispatchText(cfg);
   }
-  parts.push(`code -> ${codeRoute} [${ex.why}]; plan/red-team/review/unblock -> ${cfg.models.review.alias}; lookup -> ${cfg.models.lookup.alias}; ${parallelBudgetLine(cfg, s)}.`);
+  parts.push(`code -> ${codeRoute} [${ex.why}]; plan/red-team/review/advice with Read-only: marker -> ${cfg.models.review.alias}; lookup -> ${cfg.models.lookup.alias}; ${parallelBudgetLine(cfg, s)}.`);
   if (handoverReminder) parts.push(handoverReminder);
   parts.push(...liveWorkerReminderParts(s, cfg, live));
   process.stdout.write(`${parts.join(' ')}\n`);
@@ -1642,6 +1659,19 @@ function onPreToolUse(p, s, cfg) {
         `Refusing a mutating shell command from the main panel: ${(offending || cmd).slice(0, 120)}\n` +
         'Integration and repository mutations belong to a worker, not the orchestrator panel.\n' +
         'Moving or deleting files under .claude/, plans/, docs/ or a temp dir is still allowed.');
+    }
+    // Orca uses last-wins flag semantics. Repeated dispatch identity flags are ambiguous
+    // to readers and previously let the gate validate one value while Orca executed another,
+    // so refuse them before any routing, ownership or reservation logic runs.
+    for (const inv of orcaInvocations(cmd)) {
+      if (!['orchestration worker-start', 'orchestration dispatch', 'orchestration worker-retain'].includes(inv.sub) ||
+          hasFlag(inv.args, '--help')) continue;
+      const repeated = PARALLEL_OWNERSHIP.repeatedWorkerIdentityFlags(inv.args);
+      if (repeated.length) {
+        d('orca-duplicate-flag',
+          `Refusing ${inv.sub} because identity flag(s) ${repeated.join(', ')} were repeated. ` +
+          'Pass each of --agent, --task, --retry-of, --terminal and --spec at most once.');
+      }
     }
     // Code briefs handed to Codex through Orca must let it check itself. Judged on each
     // real orca invocation's own args and its OWN --spec text (quoted mentions in

@@ -479,7 +479,7 @@ expect('a neutral first verb still classifies code-reviewer as review work',
   // The compact per-prompt reminder names the code and higher-reasoning routes.
   {
     const r = invoke(promptSubmit(sid, 'status check'), env);
-    if (/code -> Codex.*plan\/red-team\/review\/unblock -> opus/.test(r.out)) pass += 1;
+    if (/code -> Codex.*plan\/red-team\/review\/advice with Read-only: marker -> opus/.test(r.out)) pass += 1;
     else failures.push(`compact reminder must name code and review routes\n    ${r.out.slice(0, 300)}`);
   }
 
@@ -1289,7 +1289,7 @@ expect('a neutral scouting dispatch is allowed',
 {
   const RSID = `${SID}-modelid`;
   const out = spawnGate(promptSubmit(RSID, 'status?'), CODEX_WINS).stdout;
-  if (/plan\/red-team\/review\/unblock -> opus/.test(out) && !/claude-opus-5-5/.test(out)) pass += 1;
+  if (/plan\/red-team\/review\/advice with Read-only: marker -> opus/.test(out) && !/claude-opus-5-5/.test(out)) pass += 1;
   else failures.push(`compact reminder must show review alias without exact id: ${out.slice(0, 200)}`);
   rmState(RSID);
 }

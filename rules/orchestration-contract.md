@@ -36,13 +36,13 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
    / `escalation: sonnet verify could not decide ...`). The
    configured escalation model (`models.escalation.alias`, default `fable`) is reserved for
    work the review model could not do, even at higher effort — a dispatch to it must say so.
-   Unblock/advice work may also use the review model only when its brief contains no code
-   verb. A description beginning with `advise`, `advice`, `unblock`, or `consult`, or an
-   exact `advisor`/`kongming` subagent type, is exempt from `review-model-scope` only under
-   that condition. Explicit code intent anywhere still wins, so `Advise on the plan, then
-   implement it` and `Unblock the design and build the parser` follow the execution route.
-   Exact `advisor`/`kongming` roles also treat update/edit/change briefs as execution; for
-   example, `Update the auth module` cannot use the advice exemption.
+   Unblock/advice work may also use the review model only when its description or prompt
+   contains an explicit line starting `Read-only:` (case-insensitive), for example
+   `Read-only: advice only, no edits.`. The marker is the sole advice exemption; advice
+   verbs and exact `advisor`/`kongming` subagent types do not grant it. Without the marker,
+   mutation briefs follow the execution route. With the marker, even a brief that discusses
+   implementing or editing remains advice-only: the agent is contractually read-only and
+   must analyze the proposed mutation without making it.
 3. **Code goes to the configured in-session code model first** (`models.code.alias`,
    default `sonnet`). Codex is opt-in only through `--exec-codex`, `--code-model
    codex[:<model>]`, or `defaultCoder: "codex"`. When requested, Codex runs in an Orca
@@ -89,6 +89,11 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
     live Orca worker group of any agent (on top of, never instead of, the Codex-only cap
     above) plus every live main-panel `Agent`/`Task` dispatch. A dispatch that would exceed
     it is refused; wait for one to finish and release it, or raise the limit.
+11. **Dispatch identity flags are single-use.** `orchestration worker-start` refuses a
+    repeated `--agent`, `--task`, `--retry-of`, `--terminal`, or `--spec`, including mixed
+    `--flag value` / `--flag=value` forms. The same refusal applies to `orchestration
+    dispatch` and `orchestration worker-retain` when those shared identity flags are used.
+    This prevents the gate from validating one value while Orca executes its last value.
 
 Agent/Task intent classification gives a recognized first verb in the description priority
 over later nouns: `Review ...`/`Plan ...` are review work, `Verify ...`/`Test ...`/`Smoke ...`/
@@ -116,6 +121,9 @@ A brief that both reviews and verifies (`Review and verify X`) counts as review 
 model — so it is never locked out of the review model. Code intent
 inside ordinary hyphenated verbs such as `Re-implement` and `Hot-fix` counts; only review-style
 prefixes such as `review-fix` are excluded, so `Commit review-fix round` remains operational.
+Advice is not inferred by this verb classifier. It is opted into only by a description or
+prompt line starting `Read-only:`; role names such as `advisor` and `kongming` do not change
+that rule.
 
 A review-intent dispatch is then routed by author. Plan, red-team and design work — a
 planning noun (`plan`/`planning`/`design`/`architecture`/`architect`/`phase`/`red-team`) or a

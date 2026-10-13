@@ -36,6 +36,12 @@ const OWNS_BRIEF_HELP =
 // byte-for-byte identical tool call. Only an older unresolved reservation is evidence of
 // the later-hook-denial retry case this replacement path exists to recover from.
 const SAME_COMMAND_RETRY_AGE_MS = 2000;
+const WORKER_IDENTITY_FLAGS = ['--agent', '--task', '--retry-of', '--terminal', '--spec'];
+
+function repeatedWorkerIdentityFlags(args) {
+  return WORKER_IDENTITY_FLAGS.filter((flag) =>
+    args.reduce((count, arg) => count + (arg === flag || arg.startsWith(`${flag}=`) ? 1 : 0), 0) > 1);
+}
 
 /**
  * The agent a `worker-start` invocation targets: the explicit `--agent`; else the tracked
@@ -536,6 +542,17 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     !hasFlag(inv.args, '--help'));
   if (!invs.length) return;
 
+  for (const inv of invs) {
+    if (inv.sub !== 'orchestration worker-start') continue;
+    const repeated = repeatedWorkerIdentityFlags(inv.args);
+    if (repeated.length && !gateDisabled(cfg, 'orca-duplicate-flag')) {
+      d('orca-duplicate-flag',
+        `Refusing orchestration worker-start because identity flag(s) ${repeated.join(', ')} were repeated. ` +
+        'Pass each of --agent, --task, --retry-of, --terminal and --spec at most once.');
+      return;
+    }
+  }
+
   const lockDir = path.join(DIR, '.lock');
   const repoRootDir = OWN.repoRoot(p.cwd);
   const sessionId = s.session_id;
@@ -875,4 +892,5 @@ module.exports = {
   fetchOrcaWorkerRows, applyOrcaReconciliation, applyOwnershipHolderReconciliation,
   rowReportsReleased, rowReportsReconciled, rowIsTerminal,
   reconcilePendingPlaceholders, handleOrcaDispatchGates, resolveSpecText,
+  repeatedWorkerIdentityFlags,
 };
