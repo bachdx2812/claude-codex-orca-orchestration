@@ -30,7 +30,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const {
-  loadConfig, gateDisabled, disabledCoders, handoffUsed, stateDir,
+  loadConfig, gateDisabled, disabledCoders, handoffUsed, configPath, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
   kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
   deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
@@ -706,6 +706,11 @@ function poolCoderForAgent(agent) {
   return agent === 'opencode' ? 'deepseek' : agent;
 }
 
+/** Human-facing name for an external coder. */
+function coderLabel(coder) {
+  return coder === 'codex' ? 'Codex' : coder === 'kimi' ? 'Kimi' : 'DeepSeek';
+}
+
 /** External coder targeted by an override, or null for automatic/in-session routing. */
 function overrideCoder(override) {
   const match = typeof override === 'string' && override.match(/^(codex|kimi|deepseek)(?::|$)/);
@@ -880,14 +885,12 @@ function currentExecRoute(cfg, s) {
   }
   const pick = overrideCoder(a);
   if (pick && disabledCoders(cfg).includes(pick)) {
-    const pickLabel = pick === 'codex' ? 'Codex' : pick === 'kimi' ? 'Kimi' : 'DeepSeek';
     const automatic = pool.route === 'code' ? { ...pool, alias: cfg.models.code.alias } : pool;
-    return { ...automatic, why: `${automatic.why}; operator override (${a}) ignored: ${pickLabel} is in disabledCoders` };
+    return { ...automatic, why: `${automatic.why}; operator override (${a}) ignored: ${coderLabel(pick)} is in disabledCoders` };
   }
   if (pick) {
-    const pickLabel = pick === 'codex' ? 'Codex' : pick === 'kimi' ? 'Kimi' : 'DeepSeek';
     const state = pool.coders[pick];
-    const warning = state?.state === 'eligible' || !state ? '' : ` WARNING: ${pickLabel} unusable: ${state.reason || state.state || 'unavailable'}.`;
+    const warning = state?.state === 'eligible' || !state ? '' : ` WARNING: ${coderLabel(pick)} unusable: ${state.reason || state.state || 'unavailable'}.`;
     return {
       route: 'external', pick, order: [pick], coders: pool.coders,
       ...(pick === 'codex' && a.startsWith('codex:') ? { codexModel: a.slice(6) } : {}),
@@ -1318,7 +1321,6 @@ function onSessionStart(p, s, cfg) {
   const overrideWarnings = activeOverrideLines(cfg, s).map((line) => `- ACTIVE OVERRIDE: ${line}\n`).join('');
   // Every coder is optional: the banner names only the coders usable on THIS machine
   // (operator decision, 2026-10-01) — a machine with none routes code in-session.
-  const coderLabel = (c) => c === 'codex' ? 'Codex' : c === 'kimi' ? 'Kimi' : 'DeepSeek';
   const usableCoders = ['codex', 'kimi', 'deepseek'].filter((c) => route.coders?.[c]?.state === 'eligible');
   const enabledCoders = CODER_AVAILABILITY.CODERS.filter((coder) => !disabledCoders(cfg).includes(coder));
   const externalOverrideTokens = enabledCoders.flatMap((coder) => [coder, `${coder}:<model>`]);
@@ -1524,9 +1526,8 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   else if (lastFlag === '--code-model') override = parseCodeModel(cfg, cm[2]);
   const disabledOverride = overrideCoder(override);
   if (disabledOverride && disabledCoders(cfg).includes(disabledOverride)) {
-    const label = disabledOverride === 'codex' ? 'Codex' : disabledOverride === 'kimi' ? 'Kimi' : 'DeepSeek';
     const shownFlag = lastFlag === '--code-model' ? `--code-model ${cm[2]}` : lastFlag;
-    process.stdout.write(`orchestrator-gate: ignored ${shownFlag}: ${label} is disabled by config (disabledCoders / ORCH_DISABLED_CODERS); nothing changed.\n`);
+    process.stdout.write(`orchestrator-gate: ignored ${shownFlag}: ${coderLabel(disabledOverride)} is disabled by config (disabledCoders / ORCH_DISABLED_CODERS); nothing changed.\n`);
   } else if (override !== undefined && override !== 'invalid') {
     s.execAgent = override;
     s.execAgentSince = override === null ? null : new Date().toISOString();
@@ -1581,7 +1582,6 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   parts.push(...activeOverrideLines(cfg, s));
   const ex = currentExecRoute(cfg, s);
   const codexModelShown = ex.codexModel || cfg.models.codex.id;
-  const coderName = (c) => c === 'codex' ? 'Codex' : c === 'kimi' ? 'Kimi' : 'DeepSeek';
   const roleByAlias = (alias) => Object.values(cfg.models).find((m) => m && m.alias === alias) || { alias, id: null };
   let codeRoute;
   if (ex.route === 'external' && ex.pick === 'codex') {
@@ -1597,7 +1597,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   } else {
     const reasons = ex.coders
       ? (['codex', 'kimi', 'deepseek'].filter((coder) => ex.coders[coder]?.state !== 'disabled')
-        .map((coder) => `${coderName(coder)} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ') || 'no external coder enabled')
+        .map((coder) => `${coderLabel(coder)} ${ex.coders[coder]?.reason || ex.coders[coder]?.state}`).join(', ') || 'no external coder enabled')
       : ex.why;
     codeRoute = `${codeModelDispatchText(cfg)} [${reasons}]`;
   }
@@ -1614,12 +1614,12 @@ function onUserPromptSubmitLocked(p, s, cfg) {
       } else {
         quotaText = `${Math.max(0, Math.round(c.headroom))}% headroom`;
       }
-      return `${coderName(coder)} (${liveText}, ${quotaText})`;
+      return `${coderLabel(coder)} (${liveText}, ${quotaText})`;
     };
-    codeRoute = `split: ${['codex', 'kimi', 'deepseek'].filter((c) => ex.order.includes(c)).map(coderText).join(' + ')}; next -> ${coderName(ex.pick)}`;
+    codeRoute = `split: ${['codex', 'kimi', 'deepseek'].filter((c) => ex.order.includes(c)).map(coderText).join(' + ')}; next -> ${coderLabel(ex.pick)}`;
   } else if (ex.route === 'external' && ex.coders) {
     const others = ['codex', 'kimi', 'deepseek'].filter((c) => c !== ex.pick && ex.coders[c]?.state !== 'disabled');
-    codeRoute += `; ${others.map((c) => `${coderName(c)} ${ex.coders[c]?.standby ? 'overflow standby' : (ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable')}`).join('; ')}; next -> ${coderName(ex.pick)}`;
+    codeRoute += `; ${others.map((c) => `${coderLabel(c)} ${ex.coders[c]?.standby ? 'overflow standby' : (ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable')}`).join('; ')}; next -> ${coderLabel(ex.pick)}`;
   }
   parts.push(`Model routing: plan/red-team -> model ${modelLabel(cfg.models.review)}; review -> ${reviewRouteText(cfg, s)}; verify -> ${verifyModelAlias(cfg)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);
@@ -1778,12 +1778,16 @@ function onPreToolUse(p, s, cfg) {
       const agent = resolveWorkerStartAgent(inv, s);
       const coder = poolCoderForAgent(agent);
       if (!disabled.includes(coder)) continue;
-      const label = coder === 'codex' ? 'Codex' : coder === 'kimi' ? 'Kimi' : 'DeepSeek';
       const enabled = CODER_AVAILABILITY.CODERS.filter((name) => !disabled.includes(name));
       const route = enabled.length ? enabled.join(', ') : cfg.models.code.alias;
       const envSuffix = process.env.ORCH_DISABLED_CODERS?.trim() ? ' / ORCH_DISABLED_CODERS' : '';
-      d('coder-disabled', `${label} is disabled by config (disabledCoders${envSuffix}): refusing worker-start --agent ${agent}.\n` +
-        `Route this brief to an enabled coder (current pick: ${route}) or remove "${coder}" from disabledCoders in ~/.claude/orchestration.config.json.`);
+      const replacementFlag = hasFlag(inv.args, '--retry-of') ? '--retry-of'
+        : hasFlag(inv.args, '--terminal') ? '--terminal' : null;
+      const replacement = replacementFlag
+        ? `Start a fresh dispatch on an enabled coder instead of ${replacementFlag}. Enabled coders: ${route}.`
+        : `Route this brief to an enabled coder. Enabled coders: ${route}.`;
+      d('coder-disabled', `${coderLabel(coder)} is disabled by config (disabledCoders${envSuffix}): refusing worker-start --agent ${agent}.\n` +
+        `${replacement} Or remove "${coder}" from disabledCoders in ${configPath()}.`);
     }
 
     // Gate A (max-parallel-codex-workers) + Gate B (code-brief-needs-owns /

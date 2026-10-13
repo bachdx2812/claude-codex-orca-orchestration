@@ -423,6 +423,9 @@ function attemptResume(job, deps = {}) {
   const now = deps.now === undefined ? Date.now() : deps.now;
   if (!job || isSettledJob(job)) return { resumed: false, reason: 'settled' };
   let delivered = false;
+  if (typeof deps.coderDisabled === 'function' && deps.coderDisabled(job)) {
+    return { resumed: false, reason: 'coder-disabled' };
+  }
   const authorization = typeof deps.isAuthorized === 'function' ? deps.isAuthorized(job) : null;
   if (authorization === null || authorization === undefined) {
     return { resumed: false, reason: 'authorization-unknown' };

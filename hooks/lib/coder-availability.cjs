@@ -159,8 +159,8 @@ function validateAvailability(entry, _now, expectedCodexAuth, disabled = []) {
     if ((item.disabled === true) !== disabled.includes(coder)) return null;
     result[coder] = { ...item };
   }
-  if (expectedCodexAuth === 'logged-out' && result.codex.auth !== 'logged-out') return null;
-  if (expectedCodexAuth === 'ok' && result.codex.auth === 'logged-out') return null;
+  if (!result.codex.disabled && expectedCodexAuth === 'logged-out' && result.codex.auth !== 'logged-out') return null;
+  if (!result.codex.disabled && expectedCodexAuth === 'ok' && result.codex.auth === 'logged-out') return null;
   return result;
 }
 

@@ -467,6 +467,17 @@ function loadConfig() {
       .filter((coder) => CODERS.includes(coder)))];
   }
 
+  const disabledCoderOverride = process.env.ORCH_DISABLED_CODERS;
+  if (disabledCoderOverride !== undefined && disabledCoderOverride.trim() !== '') {
+    const parsed = parsedDisabledCoderNames(disabledCoderOverride);
+    if (parsed.unknown.length) {
+      warnings.push(`ORCH_DISABLED_CODERS has unknown coder name(s): ${parsed.unknown.join(', ')} (known: ${CODERS.join(', ')}).`);
+    }
+    if (!parsed.known.length) {
+      warnings.push('ORCH_DISABLED_CODERS has no known coder names; using disabledCoders from config.');
+    }
+  }
+
   if (merged.execFallbackWhenCodexUnavailable !== 'sonnet' && merged.execFallbackWhenCodexUnavailable !== null) {
     warnings.push(`execFallbackWhenCodexUnavailable "${merged.execFallbackWhenCodexUnavailable}" is not "sonnet" or null; using "sonnet".`);
     merged.execFallbackWhenCodexUnavailable = 'sonnet';
@@ -551,13 +562,24 @@ function gateDisabled(cfg, gate) {
   return Array.isArray(cfg.disabledGates) && cfg.disabledGates.includes(gate);
 }
 
-/** Coders switched off entirely. A non-blank env value replaces the config list. */
+function parsedDisabledCoderNames(value) {
+  const names = String(value).split(',').map((coder) => coder.trim().toLowerCase()).filter(Boolean);
+  return {
+    known: [...new Set(names.filter((coder) => CODERS.includes(coder)))],
+    unknown: [...new Set(names.filter((coder) => !CODERS.includes(coder)))],
+  };
+}
+
+/**
+ * Coders switched off entirely. A non-blank env value with at least one known coder
+ * replaces the config list. An all-unknown value is treated as a typo and falls back to
+ * the validated config list rather than silently re-enabling every configured coder.
+ */
 function disabledCoders(cfg) {
   const override = process.env.ORCH_DISABLED_CODERS;
   if (override !== undefined && override.trim() !== '') {
-    return [...new Set(override.split(',')
-      .map((coder) => coder.trim().toLowerCase())
-      .filter((coder) => CODERS.includes(coder)))];
+    const parsed = parsedDisabledCoderNames(override);
+    if (parsed.known.length) return parsed.known;
   }
   return [...(Array.isArray(cfg.disabledCoders) ? cfg.disabledCoders : [])];
 }

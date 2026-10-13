@@ -217,8 +217,11 @@ The file is plain JSON — no comments — parsed as-is:
 }
 ```
 
-`disabledCoders` removes named external coders from probing and routing; `ORCH_DISABLED_CODERS`
-is a comma-separated process override. Matching overrides are ignored and `worker-start` is refused.
+`disabledCoders` removes named external coders from availability probing and new routing;
+`ORCH_DISABLED_CODERS` is a comma-separated process override (unknown names warn, and an
+all-unknown value falls back to config). Matching overrides are ignored and `worker-start` is
+refused. Existing live workers remain heartbeat-supervised and quota-checked; parked workers
+do not auto-resume while their coder is disabled.
 
 (`codexHandoffUsedPercent: 90` hands Codex off slightly earlier than the default 95;
 `kimiHandoffUsedPercent` is Kimi's own, separate threshold (default 95) — both tunable via

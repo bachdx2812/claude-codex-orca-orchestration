@@ -5,7 +5,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const RESUME = require('./lib/quota-reset-resume.cjs');
 const QUOTA = require('./lib/exec-route-by-quota.cjs');
-const { stateDir } = require('./lib/config.cjs');
+const { loadConfig, disabledCoders, stateDir } = require('./lib/config.cjs');
 const { fetchWorkerListPages } = require('./lib/orca-worker-list-pages.cjs');
 
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -92,6 +92,12 @@ function probeQuota(agent) {
   return { usedPercent: 0, resetsAt: 0 };
 }
 
+function coderDisabled(job) {
+  if (!job || job.panel || job.agent === 'claude') return false;
+  const coder = job.agent === 'opencode' ? 'deepseek' : job.agent;
+  return disabledCoders(loadConfig()).includes(coder);
+}
+
 function send(handle, text, enter) {
   const args = ['terminal', 'send', '--terminal', handle, '--text', text];
   if (enter) args.push('--enter');
@@ -167,7 +173,7 @@ function schedule(file, expectedToken = '') {
       return result.owned && result.value;
     };
     const result = RESUME.attemptResume(current, {
-      now: Date.now(), isAuthorized, probeQuota, readScreen: terminalScreen,
+      now: Date.now(), coderDisabled, isAuthorized, probeQuota, readScreen: terminalScreen,
       send: guardedSend, verifyStarted,
     });
     if (lostOwnership) return;
@@ -190,5 +196,5 @@ if (require.main === module) main();
 
 module.exports = {
   terminalScreen, authorizedWorkerHandles, workerHandles, isAuthorized,
-  probeQuota, send, verifyStarted, schedule,
+  probeQuota, coderDisabled, send, verifyStarted, schedule,
 };

@@ -414,6 +414,7 @@ claim in a *shared* workspace only avoids that specific conflict, not the next o
 | `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it, or ask the operator to release a claim, delete a dead session's state file, or raise/disable the cap — never the model's own call |
 | `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
 | `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
+| `coder-disabled` | `worker-start` (including `--retry-of`/`--terminal`) targets a coder in `disabledCoders` / `ORCH_DISABLED_CODERS` | start a fresh dispatch on an enabled coder, or remove the coder from `disabledCoders` / add this gate to `disabledGates` |
 
 `max-parallel-agents` counts every live Orca worker group (any agent, not only Codex — the
 Codex-only cap above still applies on top, never instead) plus every live in-session
@@ -582,10 +583,13 @@ The file is plain JSON — no comments — parsed as-is:
 }
 ```
 
-`disabledCoders` switches listed external coders (`codex`, `kimi`, or `deepseek`) off
-entirely: they are not probed, routed, or shown in routing output. Their operator override
-is ignored and the `coder-disabled` gate refuses a matching `worker-start`. The comma-separated
-`ORCH_DISABLED_CODERS` value replaces the config list for one process; blank means unset.
+`disabledCoders` removes listed external coders (`codex`, `kimi`, or `deepseek`) from
+availability probing, new routing, and routing output. Their operator override is ignored and
+the `coder-disabled` gate refuses a matching `worker-start`. Workers started before their coder
+was disabled remain supervised and quota-checked by heartbeat, but a parked worker is not
+auto-resumed while its coder is disabled; release it to stop supervision. The comma-separated
+`ORCH_DISABLED_CODERS` value replaces the config list for one process when it contains a known
+coder; unknown names warn, an all-unknown value falls back to the config list, and blank is unset.
 
 (`codexHandoffUsedPercent: 90` hands off slightly earlier than the default 95;
 `kimiHandoffUsedPercent` and `deepseekHandoffUsedPercent` are each coder's own, separate
