@@ -311,6 +311,8 @@ const REVIEW_NOUN = /\b(diff|pull\s+request|commits?|implementation)\b/i;
 // coordinated shape (a bare comma is not a coordinator).
 const VERIFY_THEN_EXEC = /\b(?:verify|verification|test|tests|check|checks|ci)\b[^.;]*?\b(?:and|then|also)\s+(?:then\s+)?(?:implement|refactor|migrate|scaffold|fix|write\s+(?:the\s+)?code|codegen|generate\s+(?:code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
+const ADVISE_FIRST_VERB = /^(advise|advice|unblock|consult)\b/i;
+const ADVICE_TYPE_HINT = /advisor|kongming/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
 // 'Write' + a CODE OBJECT is code intent, not the operational write (operator decision,
@@ -447,7 +449,10 @@ function isPlanningReview(description, type, prompt) {
  *   3. VERIFY — running existing checks on the verify model, never a lookup role type
  *      (agents.lookup), which is advisory lookup work and never blocks.
  *
- * Returns { firstIntent, wantsExec, wantsPlanReview, wantsVerify, planning }.
+ * Advice/unblock work is allowed on the review model, but explicit execution intent still
+ * wins so a brief such as "Unblock and fix the parser" cannot bypass the code route.
+ *
+ * Returns { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning }.
  */
 function classifyDispatch(description, type, prompt, lookupTypes) {
   const desc = String(description || '').trim();
@@ -462,6 +467,7 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   const firstIntent = PLAN_REVIEW_FIRST_VERB.test(desc) ? 'review'
     : VERIFY_FIRST_VERB.test(desc) ? 'verify'
       : (EXEC_FIRST_VERB.test(desc) || writeCodeFirstVerb) ? 'exec'
+        : ADVISE_FIRST_VERB.test(desc) ? 'advice'
         : NEUTRAL_FIRST_VERB.test(desc) ? 'neutral'
           : null;
   const planAt = hay.search(PLAN_REVIEW_INTENT);
@@ -508,8 +514,9 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
     (firstIntent !== 'review' && typeWantsVerify) ||
     (!firstIntent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt) && (planAt < 0 || verifyAt < planAt))
   );
+  const wantsAdvice = !wantsExec && (firstIntent === 'advice' || ADVICE_TYPE_HINT.test(t));
 
-  return { firstIntent, wantsExec, wantsPlanReview, wantsVerify, planning };
+  return { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning };
 }
 
 // Markers that an orca command itself failed, which justifies the in-session fallback.
@@ -600,7 +607,7 @@ function repairInvalidPersistedExecAgent(sid, eventName) {
     fresh.execAgentSince = null;
     writeJsonAtomic(stateFile(sid), fresh);
     emitHookNotice(
-      `orchestrator-gate: invalid persisted execAgent ${JSON.stringify(invalid)}; using automatic quota routing.`,
+      `orchestrator-gate: invalid persisted execAgent ${JSON.stringify(invalid)}; using defaultCoder.`,
       eventName);
   } finally {
     releaseLock(lockDir);
@@ -1095,7 +1102,7 @@ function handleOrcaDispatchGates(p, s, cfg, cmd, d) {
     p, s, cfg, cmd, d,
     deps: {
       hasFlag, flagValue, briefText, EXEC_INTENT, DIR, ORCA_BIN, maxParallelCodexWorkers,
-      ownershipClaimTtlMinutes, save, load, gateDisabled,
+      ownershipClaimTtlMinutes, save, load, gateDisabled, codexRequested,
       agentParallelLimit, maxParallelAgents, machineWideLiveUnits: PAC.machineWideLiveUnits,
       formatParallelAgentsRefusal: PAC.formatParallelAgentsRefusal, cores: PAC.cores, parallelCoreFraction,
       lockContentionMessage: PAC.LOCK_CONTENTION_MESSAGE, capLockOpts: CAP_LOCK_OPTS,
@@ -1231,8 +1238,8 @@ function onSessionStart(p, s, cfg) {
     languageSentence(cfg, true) +
     '- The main panel may read and dispatch only. It may not Edit/Write outside .claude/, plans/, docs/, scratch,\n' +
     '  and may not run mutating shell commands. Delegate those to a worker.\n' +
-    `- Model routing: ${modelLabel(cfg.models.review)} plans + red-teams; code -> ${route.route === 'external' ? 'Codex' : code}; reviews -> ${reviewRouteText(cfg, s)}; verify -> ${verifyModelAlias(cfg)}.\n` +
-    `- Planning / red-team -> in-session subagent on model ${modelLabel(cfg.models.review)}. Review -> model ${reviewRouteText(cfg, s)} (review model follows the code's author). Verify -> model ${verifyModelAlias(cfg)}.\n` +
+    `- Model routing: code -> ${route.route === 'external' ? 'Codex' : (cfg.models.code.agentType || 'sonnet-coder')}; plan/red-team/review/unblock -> ${review}; lookup -> ${lookup}; verify -> ${verifyModelAlias(cfg)}.\n` +
+    `- Planning / red-team / unblock advice -> in-session subagent on model ${modelLabel(cfg.models.review)}. Review -> model ${reviewRouteText(cfg, s)} (review model follows the code's author). Verify -> model ${verifyModelAlias(cfg)}.\n` +
     `  Model ${modelLabel(cfg.models.escalation)} only after "${review}" failed even at high effort; say both in the dispatch.\n` +
     `- Light lookups (find/locate code, read logs or test output, explore) -> model ${modelLabel(cfg.models.lookup)}.\n` +
     '- Every code brief (external spec or in-session prompt) names the exact test / build command to run green.\n' +
@@ -1646,9 +1653,13 @@ function onPreToolUse(p, s, cfg) {
     for (const inv of orcaInvocations(cmd)) {
       if (inv.sub !== 'orchestration worker-start' || hasFlag(inv.args, '--help')) continue;
       const agent = resolveWorkerStartAgent(inv, s);
-      if (agent !== 'codex' || codexRequested(cfg, s)) continue;
+      const retryOf = flagValue(inv.args, '--retry-of');
+      const retryingSessionCodexDispatch = !!retryOf && agent === 'codex' &&
+        s.workers[retryOf]?.codexOptedIn === true;
+      if (agent !== 'codex' || codexRequested(cfg, s) || retryingSessionCodexDispatch) continue;
       d('codex-not-requested', 'Codex is opt-in. Code goes to sonnet-coder in-session. ' +
-        'Operator only: --exec-codex / --code-model codex[:<model>] / defaultCoder:"codex".');
+        'Operator only: --exec-codex / --code-model codex[:<model>] / defaultCoder:"codex". ' +
+        'A --retry-of is allowed only for a Codex dispatch this session already started while opted in.');
     }
 
     // Gate A (max-parallel-codex-workers) + Gate B (code-brief-needs-owns /
@@ -1726,7 +1737,7 @@ function onPreToolUse(p, s, cfg) {
     const description = String(input.description || '').trim();
     const type = String(input.subagent_type || '');
     const hay = `${type} ${description}`.trim() || String(input.prompt || '').slice(0, 400);
-    const { wantsExec, wantsPlanReview, wantsVerify, planning } =
+    const { wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning } =
       classifyDispatch(description, type, input.prompt, cfg.agents.lookup);
     // A lookup role type (agents.lookup, e.g. Explore/scout) is advisory lookup work: it never
     // blocks and never runs on the review/verify model, so it is exempt from review-model-scope
@@ -1825,7 +1836,7 @@ function onPreToolUse(p, s, cfg) {
     const exNow = currentExecRoute(cfg, s);
     const operatorPicked = wantsExec && exNow.route === 'claude' && !!exNow.alias &&
       (exNow.alias === escalationAlias ? isEscalation : model.toLowerCase().includes(String(exNow.alias).toLowerCase()));
-    if (isReviewModel && !wantsPlanReview && !wantsVerify && !typeIsLookup && !operatorPicked) {
+    if (isReviewModel && !wantsPlanReview && !wantsVerify && !wantsAdvice && !typeIsLookup && !operatorPicked) {
       d('review-model-scope',
         `model "${reviewAlias}" is reserved for planning / review.\n` +
         `Code goes to Codex or "${cfg.models.code.alias}" per the current exec route; other in-session work runs on model "${cfg.models.code.alias}".\n` +
@@ -2175,6 +2186,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           role: `${agent || 'worker'}-exec`, started: Date.now(), status: 'live', last_seen: Date.now(),
           rate_limited_until: 0, group: readiness.dispatch, kind: WG.kindOf(readiness.dispatch), agent,
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+          codexOptedIn: reservation ? reservation.codexOptedIn === true : false,
           worktreeIds, readinessTimeout: true,
         };
         if (inv.sub === 'orchestration worker-start') {
@@ -2204,6 +2216,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
         role: `${agent || 'worker'}-exec`, started: Date.now(), status: 'live', last_seen: Date.now(),
         rate_limited_until: 0, unverified: true, group: pendingId, kind: 'worker', agent,
         owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+        codexOptedIn: reservation ? reservation.codexOptedIn === true : false,
         worktreeIds,
       };
       recordCodeAuthor(s, agent, s.workers[pendingId].started);
@@ -2219,6 +2232,7 @@ function registerDispatchReplies(s, p, cmd, out, { assumeDispatched }) {
           role: `${agent || 'worker'}-exec`, started: Date.now(), status: 'live', last_seen: Date.now(),
           rate_limited_until: 0, group, kind: WG.kindOf(id), agent,
           owns: reservation ? reservation.owns : null, ws: reservation ? reservation.ws : null,
+          codexOptedIn: reservation ? reservation.codexOptedIn === true : false,
           worktreeIds,
         };
       }

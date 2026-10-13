@@ -837,6 +837,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
       const reservation = {
         ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, newSlot,
+        codexOptedIn: agent === 'codex' && (
+          (typeof deps.codexRequested === 'function' && deps.codexRequested(cfg, s)) ||
+          s.workers[flagValue(inv.args, '--retry-of')]?.codexOptedIn === true
+        ),
         commandHash,
       };
       localReservations[`${baseId}#${idx}`] = reservation;

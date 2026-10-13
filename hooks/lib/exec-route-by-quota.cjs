@@ -1,9 +1,10 @@
 /**
- * exec-route-by-quota.cjs — decides who writes code: Codex (in an Orca worker) or the
- * configured in-session code model, by which provider has more quota left.
+ * exec-route-by-quota.cjs — reads Codex quota for an explicitly requested Codex route and
+ * falls back to the configured in-session code model when Codex is exhausted or unusable.
  *
- * Codex is the default coder; the in-session code model takes over once Codex has used
- * `handoffUsed(cfg)` percent or more of its tightest rate-limit window (default 95).
+ * The default Sonnet route never calls this probe. When Codex is requested, the in-session
+ * code model takes over once Codex has used `handoffUsed(cfg)` percent or more of its
+ * tightest rate-limit window (default 95).
  *
  * Sources (all local, no model call):
  *   - Claude: OPTIONAL. Read only if a usage-limits cache file exists and parses — either
