@@ -1,6 +1,6 @@
 ---
 name: sonnet-coder
-description: 'In-session code implementation on Sonnet 5.5 at medium effort. Use for code work routed to Claude (Sonnet) by the orchestration gate - when Codex and Kimi are both exhausted/unusable, or the operator picked Sonnet. Give it an exact brief with Owns and a verify command.'
+description: 'In-session code implementation on Sonnet 5.5 at medium effort. Use for code work routed to Claude (Sonnet) by the orchestration gate - when Codex is exhausted/unusable, or the operator picked Sonnet. Give it an exact brief with Owns and a verify command.'
 model: claude-sonnet-5-5
 effort: medium
 tools: Glob, Grep, Read, Edit, MultiEdit, Write, NotebookEdit, Bash, TaskCreate, TaskGet, TaskUpdate, TaskList

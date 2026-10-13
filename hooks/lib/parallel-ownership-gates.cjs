@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * parallel-ownership-gates.cjs — the per-coder parallel caps (`max-parallel-codex-workers`,
- * `max-parallel-kimi-workers`) and Gate B
+ * parallel-ownership-gates.cjs — the per-coder parallel cap (`max-parallel-codex-workers`)
+ * and Gate B
  * (`code-brief-needs-owns` / `ownership-overlap`) for every real `orchestration
  * worker-start` / `orchestration task-create` invocation in one Bash command line.
  *
@@ -43,7 +43,7 @@ const SAME_COMMAND_RETRY_AGE_MS = 2000;
  * or rate-limited group) or `--terminal <handle>` (any status); else `'codex'` for a bare
  * worker-start (this harness's default coder, per the contract's "Codex first" rule).
  * When `--retry-of`/`--terminal` names an id this session never tracked, return `null`
- * ("unknown") — NEVER `'codex'`, or an opencode retry would be mislabeled as Codex, counted
+ * ("unknown") — NEVER `'codex'`, or a non-Codex retry would be mislabeled as Codex, counted
  * against the Codex cap, and raise a false WORKER HANDOVER off Codex's quota. An unknown
  * agent skips the per-coder caps and the handover quota path entirely.
  */
@@ -481,8 +481,6 @@ function reconcileCodexGroupsWithOrca(s, orcaBin) {
  *            maxParallelCodexWorkers, ownershipClaimTtlMinutes, capLockOpts, save }` —
  * all lifted
  * straight from orchestrator-gate.cjs, which still owns `d()` (the actual refusal/exit).
- * `maxParallelKimiWorkers` may also be passed; when absent it falls back to config.cjs's
- * own accessor so the Kimi cap still works before the gate wires the dep through.
  */
 /**
  * This invocation's OWN spec text, scoped as tightly as the shell scanner allows — never
@@ -545,32 +543,11 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
   const baseId = toolUseId || `sid-${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const commandHash = createHash('sha256').update(cmd).digest('hex');
   const cap = maxParallelCodexWorkers(cfg);
-  // Lane B may not pass this dep yet (config.cjs is the single source of truth for it).
-  const maxKimiWorkers = deps.maxParallelKimiWorkers || require('./config.cjs').maxParallelKimiWorkers;
-  const kimiCap = maxKimiWorkers(cfg);
-  const maxDeepseekWorkers = deps.maxParallelDeepseekWorkers || require('./config.cjs').maxParallelDeepseekWorkers;
-  const deepseekCap = maxDeepseekWorkers(cfg);
-  // Resolve each worker-start's target agent the same way the slot accounting does, so a
-  // `--retry-of <id>` (or `--terminal <h>`) dispatch is capped for the coder it actually
-  // retries rather than defaulting to Codex. `null` (an unresolvable id) matches no coder.
-  const dispatchAgents = invs
-    .filter((inv) => inv.sub === 'orchestration worker-start')
-    .map((inv) => resolveWorkerStartAgent(inv, s, flagValue));
-  const hasKimiDispatch = dispatchAgents.includes('kimi');
-  const hasDeepseekDispatch = dispatchAgents.includes('opencode');
-  const hasCodexDispatch = dispatchAgents.includes('codex');
   const ttl = ownershipClaimTtlMinutes(cfg);
   const agentCapActive = !gateDisabled(cfg, 'max-parallel-agents') &&
     Number.isFinite(deps.agentParallelLimit(cfg));
   const codexCapActive = cap > 0 && !gateDisabled(cfg, 'max-parallel-codex-workers');
-  const kimiCapActive = kimiCap > 0 && !gateDisabled(cfg, 'max-parallel-kimi-workers') &&
-    // The Kimi cap only justifies the long cap lock timeout when this command actually
-    // contains a Kimi dispatch — otherwise every Codex/Claude worker-start would pay the
-    // ~10.5s stale-lock wait for a cap that can never apply to it.
-    hasKimiDispatch;
-  const deepseekCapActive = deepseekCap > 0 && !gateDisabled(cfg, 'max-parallel-deepseek-workers') &&
-    hasDeepseekDispatch;
-  const hardCapActive = agentCapActive || codexCapActive || kimiCapActive || deepseekCapActive;
+  const hardCapActive = agentCapActive || codexCapActive;
   const acquireStateLock = deps.acquireLock || acquireLock;
   const releaseStateLock = deps.releaseLock || releaseLock;
   let violation = null;
@@ -625,11 +602,7 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
     if (locked === false && hardCapActive) {
       violation = {
         gate: agentCapActive ? 'max-parallel-agents'
-          : (hasDeepseekDispatch && deepseekCapActive
-              ? 'max-parallel-deepseek-workers'
-              : (!hasCodexDispatch && kimiCapActive
-                  ? 'max-parallel-kimi-workers'
-                  : 'max-parallel-codex-workers')),
+          : 'max-parallel-codex-workers',
         reason: deps.lockContentionMessage,
       };
     }
@@ -773,20 +746,16 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
 
       // --- parallel-coder-worker caps: worker-start only, and only a genuinely new dispatch ---
       let codexSlot = false;
-      let kimiSlot = false;
-      let deepseekSlot = false;
       let agent = null;
       // `newSlot`: this worker-start invocation is neither a task-create (never launches a
       // terminal by itself) nor a replacement of an already-tracked live group
       // (`--terminal <h>` / `--retry-of <id>`) — i.e. it is really about to consume one more
       // unit of the MACHINE-wide max-parallel-agents budget, whatever agent it targets.
-      // `codexSlot`/`kimiSlot` are this same condition narrowed to the per-coder caps.
+      // `codexSlot` is this same condition narrowed to the per-coder cap.
       const newSlot = !isTaskCreate && !replacesGroup;
       if (!isTaskCreate) {
         agent = resolveWorkerStartAgent(inv, s, flagValue);
         codexSlot = newSlot && agent === 'codex';
-        kimiSlot = newSlot && agent === 'kimi';
-        deepseekSlot = newSlot && agent === 'opencode';
 
         // Machine-wide max-parallel-agents budget: checked for EVERY agent's worker-start,
         // on top of (never instead of) the Codex-only cap below. Uses the in-memory `s` for
@@ -864,59 +833,10 @@ function handleOrcaDispatchGates({ p, s, cfg, cmd, d, deps }) {
           }
         }
 
-        // Kimi cap: the same reconcile-then-recount path as the Codex cap above — the Orca
-        // fetch happens outside the lock, its rows are applied to a fresh post-reacquire
-        // load() under the lock, and only the recount decides.
-        if (kimiSlot && kimiCap > 0 && !gateDisabled(cfg, 'max-parallel-kimi-workers')) {
-          let live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
-          if (live >= kimiCap) {
-            if (locked) { releaseStateLock(lockDir); locked = false; }
-            const fetched = fetchOrcaWorkerRows(ORCA_BIN);
-            locked = acquireStateLock(lockDir, deps.capLockOpts);
-            if (locked === null) return;
-            s = load(sessionId);
-            Object.assign(s.reservations, localReservations);
-            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive,
-              fetched.terminalHandles)) reconcileChanged = true;
-            live = WG.countLiveGroups(s.workers, 'kimi') + OC.countPendingReservations(s, 'kimi');
-          }
-          if (live >= kimiCap) {
-            violation = { gate: 'max-parallel-kimi-workers', reason:
-              `${live}/${kimiCap} Kimi workers already live: ${liveGroupIds(s, 'kimi').join(', ') || '(reserved)'}.\n` +
-              'Wait for one to finish and release it (worker-read, then\n' +
-              'worker-release --dispatch <id>), or reuse a finished worker\'s terminal with --terminal <handle>. Raise the\n' +
-              'limit only with maxParallelKimiWorkers / ORCH_MAX_PARALLEL_KIMI_WORKERS.' };
-            break;
-          }
-        }
-
-        // DeepSeek (opencode) cap: the same reconcile-then-recount path as the other coders.
-        if (deepseekSlot && deepseekCap > 0 && !gateDisabled(cfg, 'max-parallel-deepseek-workers')) {
-          let live = WG.countLiveGroups(s.workers, 'opencode') + OC.countPendingReservations(s, 'opencode');
-          if (live >= deepseekCap) {
-            if (locked) { releaseStateLock(lockDir); locked = false; }
-            const fetched = fetchOrcaWorkerRows(ORCA_BIN);
-            locked = acquireStateLock(lockDir, deps.capLockOpts);
-            if (locked === null) return;
-            s = load(sessionId);
-            Object.assign(s.reservations, localReservations);
-            if (fetched !== null && applyOrcaReconciliation(s, fetched.rows, fetched.exhaustive,
-              fetched.terminalHandles)) reconcileChanged = true;
-            live = WG.countLiveGroups(s.workers, 'opencode') + OC.countPendingReservations(s, 'opencode');
-          }
-          if (live >= deepseekCap) {
-            violation = { gate: 'max-parallel-deepseek-workers', reason:
-              `${live}/${deepseekCap} DeepSeek (opencode) workers already live: ${liveGroupIds(s, 'opencode').join(', ') || '(reserved)'}.\n` +
-              'Wait for one to finish and release it (worker-read, then\n' +
-              'worker-release --dispatch <id>), or reuse a finished worker\'s terminal with --terminal <handle>. Raise the\n' +
-              'limit only with maxParallelDeepseekWorkers / ORCH_MAX_PARALLEL_DEEPSEEK_WORKERS.' };
-            break;
-          }
-        }
       }
 
       const reservation = {
-        ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, kimiSlot, deepseekSlot, newSlot,
+        ts: Date.now(), agent, owns: owns && owns.length ? owns : null, ws, codexSlot, newSlot,
         commandHash,
       };
       localReservations[`${baseId}#${idx}`] = reservation;

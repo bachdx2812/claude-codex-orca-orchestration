@@ -28,8 +28,6 @@ const GATE_NAMES = [
   'workers-unwatched',
   'workers-unreconciled',
   'max-parallel-codex-workers',
-  'max-parallel-kimi-workers',
-  'max-parallel-deepseek-workers',
   'review-model-follows-coder',
   'verify-model',
   'route-verify',
@@ -38,6 +36,22 @@ const GATE_NAMES = [
   'max-parallel-agents',
   'coder-disabled',
 ];
+
+const RETIRED_CONFIG_KEYS = [
+  'models.kimi',
+  'models.deepseek',
+  'models.reviewByCoder.kimi',
+  'models.reviewByCoder.deepseek',
+  'kimiHandoffUsedPercent',
+  'kimiQuotaCacheSeconds',
+  'deepseekRole',
+  'deepseekDailySpendCapUsd',
+  'deepseekHandoffUsedPercent',
+  'deepseekQuotaCacheSeconds',
+  'maxParallelKimiWorkers',
+  'maxParallelDeepseekWorkers',
+];
+const RETIRED_GATE_NAMES = ['max-parallel-kimi-workers', 'max-parallel-deepseek-workers'];
 
 const DEFAULT_CONFIG = {
   replyLanguage: null,
@@ -48,18 +62,16 @@ const DEFAULT_CONFIG = {
     code: { alias: 'sonnet', id: null, effort: 'medium', agentType: 'sonnet-coder' },
     lookup: { alias: 'haiku', id: null },
     codex: { alias: null, id: 'gpt-5.6-sol' },
-    kimi: { alias: null, id: null },
-    deepseek: { alias: null, id: null },
     // Verify-run work (running existing checks — CI, screenshots, play-test, post-deploy
     // smoke — rather than reading code and judging a diff) runs on this model (operator
     // decision, 2026-10-02): Sonnet runs the checks, Opus reads and judges the diff.
     verify: { alias: 'sonnet', id: 'claude-sonnet-5-5', effort: 'medium' },
     // Review model follows the code's author (operator decision, 2026-10-02): reading code
     // and judging a diff always runs on the review model — Opus — regardless of which coder
-    // wrote it ("code by deepseek/kimi/codex MUST be reviewed by opus"). Verify-run work
+    // wrote it. Verify-run work
     // does NOT follow the author; it always runs on models.verify. Values are model aliases;
     // tunable per coder.
-    reviewByCoder: { codex: 'opus', kimi: 'opus', deepseek: 'opus', sonnet: 'opus' },
+    reviewByCoder: { codex: 'opus', sonnet: 'opus' },
     // Effort the in-session (code-model) reviewer runs at.
     reviewEffort: 'medium',
   },
@@ -75,15 +87,6 @@ const DEFAULT_CONFIG = {
   autoResumeAfterReset: true,
   autoResumePanel: true,
   codexQuotaCacheSeconds: 60,
-  kimiHandoffUsedPercent: 95,
-  kimiQuotaCacheSeconds: 60,
-  // DeepSeek (opencode) is pay-per-use with no rate-limit window: its "quota" is the share
-  // of a DAILY SPEND CAP already used. 0 = unlimited (operator decision, 2026-10-01): only
-  // an exhausted balance (402 "Insufficient Balance") stops it.
-  deepseekRole: 'overflow', // 'overflow' (only when no subscription coder is eligible) | 'peer'
-  deepseekDailySpendCapUsd: 0,
-  deepseekHandoffUsedPercent: 95,
-  deepseekQuotaCacheSeconds: 60,
   coderAvailabilityCacheSeconds: 600,
   coderHeadroomTieBand: 10, // headroom points within which two coders tie (falls back to fewer live workers)
   unknownHeadroomAssumed: 30, // headroom points a quota-unknown coder is ranked as
@@ -93,7 +96,7 @@ const DEFAULT_CONFIG = {
     idleSeconds: 60,
     maxSeconds: 3600,
     stallSeconds: 900,
-    stallSecondsByAgent: { kimi: 600 },
+    stallSecondsByAgent: {},
   },
   janitor: {
     enabled: true,
@@ -104,11 +107,9 @@ const DEFAULT_CONFIG = {
     ],
   },
   maxParallelCodexWorkers: 3, // 0 = unlimited
-  maxParallelKimiWorkers: 3, // 0 = unlimited
-  maxParallelDeepseekWorkers: 3, // 0 = unlimited
   ownershipClaimTtlMinutes: 120, // background-Agent Owns: claims auto-release after this long
   disabledGates: [],
-  disabledCoders: [], // coders switched off entirely: 'codex' | 'kimi' | 'deepseek'
+  disabledCoders: [], // coders switched off entirely: 'codex'
   // heartbeat done-worktree handling: 'remove' (run `orca worktree rm` itself), 'remind'
   // (wake the panel with the rm command, never run it) or 'off'. Legacy booleans still
   // load: true -> 'remind', false -> 'off'.
@@ -194,6 +195,24 @@ function loadConfig() {
   const { value: raw, parseError } = readRaw();
   const merged = deepMerge(DEFAULT_CONFIG, isPlainObject(raw) ? raw : {});
   const warnings = [];
+
+  const retiredPresent = RETIRED_CONFIG_KEYS.filter((dotted) => {
+    let current = raw;
+    for (const part of dotted.split('.')) {
+      if (!isPlainObject(current) || !Object.hasOwn(current, part)) return false;
+      current = current[part];
+    }
+    return true;
+  });
+  if (retiredPresent.length) {
+    warnings.push(`retired keys ignored: ${retiredPresent.join(', ')} (remove them)`);
+  }
+  for (const dotted of retiredPresent) {
+    const parts = dotted.split('.');
+    let current = merged;
+    for (const part of parts.slice(0, -1)) current = current?.[part];
+    if (isPlainObject(current)) delete current[parts.at(-1)];
+  }
 
   if (parseError) {
     warnings.push(`config unparsable: ${parseError}; using defaults.`);
@@ -311,53 +330,6 @@ function loadConfig() {
     merged.codexQuotaCacheSeconds = quotaCacheSeconds;
   }
 
-  const kimiThreshold = configuredNumber(merged.kimiHandoffUsedPercent);
-  if (!Number.isInteger(kimiThreshold) || kimiThreshold < 0 || kimiThreshold > 100) {
-    warnings.push(`kimiHandoffUsedPercent "${merged.kimiHandoffUsedPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.kimiHandoffUsedPercent}.`);
-    merged.kimiHandoffUsedPercent = DEFAULT_CONFIG.kimiHandoffUsedPercent;
-  } else {
-    merged.kimiHandoffUsedPercent = kimiThreshold;
-  }
-
-  const kimiQuotaCache = configuredNumber(merged.kimiQuotaCacheSeconds);
-  if (!Number.isInteger(kimiQuotaCache) || kimiQuotaCache < 0 || kimiQuotaCache > 3600) {
-    warnings.push(`kimiQuotaCacheSeconds "${merged.kimiQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.kimiQuotaCacheSeconds}.`);
-    merged.kimiQuotaCacheSeconds = DEFAULT_CONFIG.kimiQuotaCacheSeconds;
-  } else {
-    merged.kimiQuotaCacheSeconds = kimiQuotaCache;
-  }
-
-  if (merged.deepseekRole !== 'overflow' && merged.deepseekRole !== 'peer') {
-    warnings.push(`deepseekRole "${merged.deepseekRole}" is not "overflow" or "peer"; using "${DEFAULT_CONFIG.deepseekRole}".`);
-    merged.deepseekRole = DEFAULT_CONFIG.deepseekRole;
-  }
-
-  // 0 is meaningful here (unlimited daily spend), so an empty/blank value must NOT coerce
-  // to it — only an actual finite number >= 0 is accepted.
-  const deepseekCap = configuredNumber(merged.deepseekDailySpendCapUsd);
-  if (!Number.isFinite(deepseekCap) || deepseekCap < 0 || deepseekCap > 100000) {
-    warnings.push(`deepseekDailySpendCapUsd "${merged.deepseekDailySpendCapUsd}" is not a number 0-100000 (0 = unlimited); using ${DEFAULT_CONFIG.deepseekDailySpendCapUsd}.`);
-    merged.deepseekDailySpendCapUsd = DEFAULT_CONFIG.deepseekDailySpendCapUsd;
-  } else {
-    merged.deepseekDailySpendCapUsd = deepseekCap;
-  }
-
-  const deepseekThreshold = configuredNumber(merged.deepseekHandoffUsedPercent);
-  if (!Number.isInteger(deepseekThreshold) || deepseekThreshold < 0 || deepseekThreshold > 100) {
-    warnings.push(`deepseekHandoffUsedPercent "${merged.deepseekHandoffUsedPercent}" is not an integer 0-100; using ${DEFAULT_CONFIG.deepseekHandoffUsedPercent}.`);
-    merged.deepseekHandoffUsedPercent = DEFAULT_CONFIG.deepseekHandoffUsedPercent;
-  } else {
-    merged.deepseekHandoffUsedPercent = deepseekThreshold;
-  }
-
-  const deepseekQuotaCache = configuredNumber(merged.deepseekQuotaCacheSeconds);
-  if (!Number.isInteger(deepseekQuotaCache) || deepseekQuotaCache < 0 || deepseekQuotaCache > 3600) {
-    warnings.push(`deepseekQuotaCacheSeconds "${merged.deepseekQuotaCacheSeconds}" is not an integer 0-3600; using ${DEFAULT_CONFIG.deepseekQuotaCacheSeconds}.`);
-    merged.deepseekQuotaCacheSeconds = DEFAULT_CONFIG.deepseekQuotaCacheSeconds;
-  } else {
-    merged.deepseekQuotaCacheSeconds = deepseekQuotaCache;
-  }
-
   const availabilityCache = configuredNumber(merged.coderAvailabilityCacheSeconds);
   if (!Number.isInteger(availabilityCache) || availabilityCache < 0 || availabilityCache > 86400) {
     warnings.push(`coderAvailabilityCacheSeconds "${merged.coderAvailabilityCacheSeconds}" is not an integer 0-86400; using ${DEFAULT_CONFIG.coderAvailabilityCacheSeconds}.`);
@@ -447,12 +419,15 @@ function loadConfig() {
     warnings.push('disabledGates must be an array; ignoring.');
     merged.disabledGates = [];
   } else {
-    const unknown = merged.disabledGates.filter((g) => !GATE_NAMES.includes(g));
+    const retired = merged.disabledGates.filter((g) => RETIRED_GATE_NAMES.includes(g));
+    if (retired.length) warnings.push(`disabledGates has retired gate name(s): ${retired.join(', ')}; ignored.`);
+    const unknown = merged.disabledGates.filter((g) => !GATE_NAMES.includes(g) && !RETIRED_GATE_NAMES.includes(g));
     if (unknown.length) warnings.push(`disabledGates has unknown gate name(s): ${unknown.join(', ')}.`);
+    merged.disabledGates = merged.disabledGates.filter((g) => !RETIRED_GATE_NAMES.includes(g));
   }
 
   if (!Array.isArray(merged.disabledCoders)) {
-    warnings.push('disabledCoders must be an array of coder names (codex|kimi|deepseek); ignoring.');
+    warnings.push('disabledCoders must be an array of coder names (codex); ignoring.');
     merged.disabledCoders = [];
   } else {
     const unknown = merged.disabledCoders.filter((coder) =>
@@ -489,22 +464,6 @@ function loadConfig() {
     merged.maxParallelCodexWorkers = DEFAULT_CONFIG.maxParallelCodexWorkers;
   } else {
     merged.maxParallelCodexWorkers = maxParallel;
-  }
-
-  const maxKimiParallel = configuredNumber(merged.maxParallelKimiWorkers);
-  if (!Number.isInteger(maxKimiParallel) || maxKimiParallel < 0 || maxKimiParallel > 32) {
-    warnings.push(`maxParallelKimiWorkers "${merged.maxParallelKimiWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelKimiWorkers}.`);
-    merged.maxParallelKimiWorkers = DEFAULT_CONFIG.maxParallelKimiWorkers;
-  } else {
-    merged.maxParallelKimiWorkers = maxKimiParallel;
-  }
-
-  const maxDeepseekParallel = configuredNumber(merged.maxParallelDeepseekWorkers);
-  if (!Number.isInteger(maxDeepseekParallel) || maxDeepseekParallel < 0 || maxDeepseekParallel > 32) {
-    warnings.push(`maxParallelDeepseekWorkers "${merged.maxParallelDeepseekWorkers}" is not an integer 0-32; using ${DEFAULT_CONFIG.maxParallelDeepseekWorkers}.`);
-    merged.maxParallelDeepseekWorkers = DEFAULT_CONFIG.maxParallelDeepseekWorkers;
-  } else {
-    merged.maxParallelDeepseekWorkers = maxDeepseekParallel;
   }
 
   const claimTtl = Number(merged.ownershipClaimTtlMinutes);
@@ -613,35 +572,6 @@ function codexQuotaCacheSeconds(cfg) {
 }
 
 /**
- * Kimi's own handoff threshold — separate from the Codex one (binding operator decision,
- * 2026-09-30): Sonnet takes over once Kimi has used this much (or more) of its tightest
- * quota window. `ORCH_KIMI_HANDOFF_USED` overrides the config value for one process; an
- * invalid override falls back to the config value, exactly like `handoffUsed`.
- */
-function kimiHandoffUsed(cfg) {
-  const envOverride = process.env.ORCH_KIMI_HANDOFF_USED;
-  if (envOverride !== undefined && envOverride.trim() !== '') {
-    const n = Number(envOverride);
-    if (Number.isInteger(n) && n >= 0 && n <= 100) return n;
-  }
-  return cfg.kimiHandoffUsedPercent;
-}
-
-/**
- * Seconds a live Kimi quota reading or failed probe remains fresh (0 disables reuse).
- * `ORCH_KIMI_QUOTA_CACHE_SECONDS` overrides the config for one process; an empty-string
- * override counts as unset (falls back to config), same as the Codex TTL override.
- */
-function kimiQuotaCacheSeconds(cfg) {
-  const envOverride = process.env.ORCH_KIMI_QUOTA_CACHE_SECONDS;
-  if (envOverride !== undefined && envOverride.trim() !== '') {
-    const n = Number(envOverride);
-    if (Number.isInteger(n) && n >= 0 && n <= 3600) return n;
-  }
-  return cfg.kimiQuotaCacheSeconds;
-}
-
-/**
  * Seconds a per-machine coder availability probe (binary present? signed in?) remains
  * fresh before it is re-probed. `ORCH_CODER_AVAILABILITY_CACHE_SECONDS` overrides the
  * config for one process; an empty-string override counts as unset.
@@ -710,96 +640,15 @@ function maxParallelCodexWorkers(cfg) {
 }
 
 /**
- * How many live Kimi worker groups this session may hold at once (0 = unlimited).
- * `ORCH_MAX_PARALLEL_KIMI_WORKERS` overrides the config value for one process; an invalid
- * override falls back to the config value, exactly like `maxParallelCodexWorkers`.
- */
-function maxParallelKimiWorkers(cfg) {
-  const envOverride = process.env.ORCH_MAX_PARALLEL_KIMI_WORKERS;
-  if (envOverride !== undefined && envOverride.trim() !== '') {
-    const n = Number(envOverride);
-    if (Number.isInteger(n) && n >= 0 && n <= 32) return n;
-  }
-  return cfg.maxParallelKimiWorkers;
-}
-
-/**
- * DeepSeek's routing role (binding operator decision, 2026-10-01): 'overflow' (the default)
- * picks it only when no subscription coder (Codex/Kimi) is eligible, but before the
- * in-session code model; 'peer' ranks it by the same headroom/tie-band/live-count/lastCoder
- * rules as Codex and Kimi. `ORCH_DEEPSEEK_ROLE` overrides the config for one process.
- */
-function deepseekRole(cfg) {
-  const envOverride = process.env.ORCH_DEEPSEEK_ROLE;
-  if (envOverride === 'overflow' || envOverride === 'peer') return envOverride;
-  return cfg.deepseekRole;
-}
-
-/**
- * DeepSeek's daily spend cap in USD; 0 = unlimited (stop only on balance exhausted / 402).
- * `ORCH_DEEPSEEK_DAILY_CAP_USD` overrides the config for one process; an invalid override
- * falls back to the config value, exactly like `handoffUsed`.
- */
-function deepseekDailySpendCapUsd(cfg) {
-  const envOverride = process.env.ORCH_DEEPSEEK_DAILY_CAP_USD;
-  if (envOverride !== undefined && envOverride.trim() !== '') {
-    const n = Number(envOverride);
-    if (Number.isFinite(n) && n >= 0 && n <= 100000) return n;
-  }
-  return cfg.deepseekDailySpendCapUsd;
-}
-
-/**
- * DeepSeek's handoff threshold against its own headroom (spend cap used percent, or 100 on
- * an exhausted balance). `ORCH_DEEPSEEK_HANDOFF_USED` overrides the config for one process,
- * exactly like `kimiHandoffUsed`.
- */
-function deepseekHandoffUsed(cfg) {
-  const envOverride = process.env.ORCH_DEEPSEEK_HANDOFF_USED;
-  if (envOverride !== undefined && envOverride.trim() !== '') {
-    const n = Number(envOverride);
-    if (Number.isInteger(n) && n >= 0 && n <= 100) return n;
-  }
-  return cfg.deepseekHandoffUsedPercent;
-}
-
-/**
- * Seconds a live DeepSeek spend/balance reading or failed probe remains fresh (0 disables
- * reuse). `ORCH_DEEPSEEK_QUOTA_CACHE_SECONDS` overrides the config for one process.
- */
-function deepseekQuotaCacheSeconds(cfg) {
-  const envOverride = process.env.ORCH_DEEPSEEK_QUOTA_CACHE_SECONDS;
-  if (envOverride !== undefined && envOverride.trim() !== '') {
-    const n = Number(envOverride);
-    if (Number.isInteger(n) && n >= 0 && n <= 3600) return n;
-  }
-  return cfg.deepseekQuotaCacheSeconds;
-}
-
-/**
- * How many live DeepSeek (opencode) worker groups this session may hold at once
- * (0 = unlimited). `ORCH_MAX_PARALLEL_DEEPSEEK_WORKERS` overrides the config value for one
- * process, exactly like `maxParallelKimiWorkers`.
- */
-function maxParallelDeepseekWorkers(cfg) {
-  const envOverride = process.env.ORCH_MAX_PARALLEL_DEEPSEEK_WORKERS;
-  if (envOverride !== undefined && envOverride.trim() !== '') {
-    const n = Number(envOverride);
-    if (Number.isInteger(n) && n >= 0 && n <= 32) return n;
-  }
-  return cfg.maxParallelDeepseekWorkers;
-}
-
-/**
  * The review model alias mapped to the author of the code under review (operator decision,
- * 2026-10-01): external coders (codex/kimi/deepseek) default to the code model alias,
+ * 2026-10-01): external coders default to the code model alias,
  * in-session code (sonnet) to the review model alias — a model never reviews its own
  * output. `ORCH_REVIEW_MODEL_EXTERNAL` / `ORCH_REVIEW_MODEL_SONNET` override the mapped
- * aliases for one process. `author` may be a worker agent ('opencode' counts as deepseek).
+ * aliases for one process.
  * Returns null for an unknown author (fail open toward review happening).
  */
 function reviewModelForCoder(cfg, author) {
-  const normalized = author === 'opencode' ? 'deepseek' : author;
+  const normalized = author;
   const known = Object.prototype.hasOwnProperty.call(cfg.models.reviewByCoder, normalized);
   if (!known) return null;
   const envOverride = normalized === 'sonnet'
@@ -903,13 +752,11 @@ function maxParallelAgents(cfg) {
 }
 
 module.exports = {
-  GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, disabledCoders, handoffUsed, configPath, stateDir,
+  GATE_NAMES, RETIRED_CONFIG_KEYS, RETIRED_GATE_NAMES, DEFAULT_CONFIG, loadConfig, gateDisabled, disabledCoders, handoffUsed, configPath, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, closeDoneWorktreesEnabled,
   closeDoneWorktreesMode,
   janitorEnabled,
   parallelCoreFraction, maxParallelAgents,
-  kimiHandoffUsed, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds, maxParallelKimiWorkers,
-  deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
-  maxParallelDeepseekWorkers, reviewModelForCoder, verifyModelAlias,
+  coderAvailabilityCacheSeconds, reviewModelForCoder, verifyModelAlias,
   stallSeconds, autoResumeAfterReset, codexAllowPriorityTier,
 };

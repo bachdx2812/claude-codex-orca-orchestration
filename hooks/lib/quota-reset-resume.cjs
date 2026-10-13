@@ -350,39 +350,6 @@ function park({ stateDir, session, handle, identity, agent, resetAt = 0, limitLi
   }
 }
 
-function kimiNeedsNeverAsk(screen) {
-  return /Select\s+permission\s+mode|Permission\s+mode\s*:\s*(?:Ask When Needed|Plan)/i.test(String(screen || '')) &&
-    !/Permission\s+mode\s*:\s*Never Ask/i.test(String(screen || ''));
-}
-
-function kimiPermissionMoves(screen) {
-  const options = String(screen || '').split(/\r?\n/)
-    .map((line) => ({ selected: /[❯›>]/u.test(line), text: line.replace(/^[\s❯›>\d.)-]+/u, '').trim() }))
-    .filter((line) => /^(?:Ask When Needed|Never Ask|Plan)$/i.test(line.text));
-  const selected = options.findIndex((line) => line.selected);
-  const target = options.findIndex((line) => /^Never Ask$/i.test(line.text));
-  if (selected < 0 || target < 0) return null;
-  return (target - selected + options.length) % options.length;
-}
-
-function hasKimiIdleSessionMenu(screen) {
-  const text = String(screen || '');
-  return /\bhas been idle for\b/i.test(text) &&
-    /\bCompact and continue\b/i.test(text) &&
-    /(?:↑↓|up\/down).*navigate\s*[·•-]\s*Enter select/i.test(text);
-}
-
-function kimiIdleCompactMoves(screen) {
-  if (!hasKimiIdleSessionMenu(screen)) return null;
-  const options = String(screen || '').split(/\r?\n/)
-    .map((line) => ({ selected: /[❯›>]/u.test(line), text: line.replace(/^[\s❯›>\d.)-]+/u, '').trim() }))
-    .filter((line) => /^(?:Compact and continue|Start a new session|Continue as-is|Don't ask me again)$/i.test(line.text));
-  const selected = options.findIndex((line) => line.selected);
-  const target = options.findIndex((line) => /^Compact and continue$/i.test(line.text));
-  if (selected < 0 || target < 0) return null;
-  return (target - selected + options.length) % options.length;
-}
-
 function activeTurnEvidence(text) {
   return String(text || '').split(/\r?\n/)
     .filter((line) => /(?:Thinking(?:\.{3}|…)|Working\s*\(|Coder Agent Running|esc\s+to\s+interrupt|background\s+(?:terminal|task).*running|Compact(?:ing|ion)\b)/i.test(line))
@@ -394,7 +361,7 @@ function activeTurnEvidence(text) {
 }
 
 function turnStarted(after, before) {
-  if (String(after || '') === String(before || '') || hasKimiIdleSessionMenu(after)) return false;
+  if (String(after || '') === String(before || '')) return false;
   const previous = new Map();
   for (const line of activeTurnEvidence(before)) previous.set(line, (previous.get(line) || 0) + 1);
   for (const line of activeTurnEvidence(after)) {
@@ -405,27 +372,11 @@ function turnStarted(after, before) {
   return false;
 }
 
-function pollScreen(deps, handle, predicate, attempts = 5) {
-  const wait = typeof deps.wait === 'function' ? deps.wait : (ms) => {
-    try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch {}
-  };
-  let screen = '';
-  for (let attempt = 0; attempt < attempts; attempt++) {
-    if (attempt > 0) wait(200);
-    screen = typeof deps.readScreen === 'function' ? deps.readScreen(handle) : '';
-    if (predicate(screen)) return screen;
-  }
-  return screen;
-}
-
 /** One hermetic scheduler attempt. Callers provide terminal/quota operations. */
 function attemptResume(job, deps = {}) {
   const now = deps.now === undefined ? Date.now() : deps.now;
   if (!job || isSettledJob(job)) return { resumed: false, reason: 'settled' };
   let delivered = false;
-  if (typeof deps.coderDisabled === 'function' && deps.coderDisabled(job)) {
-    return { resumed: false, reason: 'coder-disabled' };
-  }
   const authorization = typeof deps.isAuthorized === 'function' ? deps.isAuthorized(job) : null;
   if (authorization === null || authorization === undefined) {
     return { resumed: false, reason: 'authorization-unknown' };
@@ -441,7 +392,7 @@ function attemptResume(job, deps = {}) {
     const resetAt = quotaResetAt(quota);
     return { resumed: false, reason: 'quota-unavailable', resetAt };
   }
-  let before = typeof deps.readScreen === 'function' ? deps.readScreen(job.handle) : '';
+  const before = typeof deps.readScreen === 'function' ? deps.readScreen(job.handle) : '';
   let beforeLimit = { limited: false, resetAt: 0, line: '', occurrences: 0 };
   if (job.agent === 'claude') {
     beforeLimit = claudeLimitInfo(before, now);
@@ -453,23 +404,6 @@ function attemptResume(job, deps = {}) {
         limitLine: beforeLimit.line };
     }
   }
-  if (job.agent === 'kimi' && kimiNeedsNeverAsk(before) && typeof deps.send === 'function') {
-    if (deps.send(job.handle, '/auto', true) === false) return { resumed: false, reason: 'permission-failed' };
-    delivered = true;
-    const menu = pollScreen(deps, job.handle, (screen) => kimiPermissionMoves(screen) !== null);
-    const moves = kimiPermissionMoves(menu);
-    if (moves === null) return { resumed: false, reason: 'permission-unverified', delivered };
-    if (deps.send(job.handle, '\u001b[B'.repeat(moves), true) === false) {
-      return { resumed: false, reason: 'permission-failed', delivered };
-    }
-    delivered = true;
-    const mode = pollScreen(deps, job.handle,
-      (screen) => /Permission\s+mode\s*:\s*Never Ask/i.test(screen));
-    if (!/Permission\s+mode\s*:\s*Never Ask/i.test(mode)) {
-      return { resumed: false, reason: 'permission-unverified', delivered };
-    }
-    before = mode;
-  }
   const message = job.panel ? PANEL_RESUME_MESSAGE : WORKER_RESUME_MESSAGE;
   const sent = typeof deps.send === 'function' && deps.send(job.handle, message, true) !== false;
   if (!sent) return { resumed: false, reason: 'send-failed', delivered };
@@ -478,33 +412,9 @@ function attemptResume(job, deps = {}) {
     ? deps.verifyStarted(job.handle, before) : true;
   const verified = typeof verification === 'object' ? verification.started : verification;
   if (verified) return { resumed: true, reason: 'started', message, delivered };
-  let after = typeof verification === 'object' && typeof verification.screen === 'string'
+  const after = typeof verification === 'object' && typeof verification.screen === 'string'
     ? verification.screen
     : (typeof deps.readScreen === 'function' ? deps.readScreen(job.handle) : '');
-  if (job.agent === 'kimi' && hasKimiIdleSessionMenu(after) && typeof deps.send === 'function') {
-    const moves = kimiIdleCompactMoves(after);
-    if (moves === null) return { resumed: false, reason: 'idle-menu-unverified', delivered };
-    if (moves > 0) {
-      if (deps.send(job.handle, '\u001b[B'.repeat(moves), false) === false) {
-        return { resumed: false, reason: 'idle-menu-selection-failed', delivered };
-      }
-      delivered = true;
-      after = pollScreen(deps, job.handle, (screen) => kimiIdleCompactMoves(screen) === 0);
-      if (kimiIdleCompactMoves(after) !== 0) {
-        return { resumed: false, reason: 'idle-menu-unverified', delivered };
-      }
-    }
-    if (deps.send(job.handle, '', true) === false) {
-      return { resumed: false, reason: 'idle-menu-selection-failed', delivered };
-    }
-    delivered = true;
-    const compactVerification = typeof deps.verifyStarted === 'function'
-      ? deps.verifyStarted(job.handle, after) : false;
-    const compactStarted = typeof compactVerification === 'object'
-      ? compactVerification.started : compactVerification;
-    if (compactStarted) return { resumed: true, reason: 'started', message, delivered };
-    return { resumed: false, reason: 'resumed-unverified', message, delivered };
-  }
   const limit = job.agent === 'claude' ? claudeLimitInfo(after, now)
     : { limited: false, occurrences: 0 };
   const newLimitResponse = limit.limited &&
@@ -594,6 +504,5 @@ module.exports = {
   clearJob, clearSettledJob, withOwnedJob, isPendingJob, isSettledJob,
   shouldPark, availableHandoverTarget, nextAttemptAt, beginAttempt,
   recordDelivery, recoverDeliveredJob, applyAttemptResult, park,
-  kimiNeedsNeverAsk, kimiPermissionMoves, hasKimiIdleSessionMenu, kimiIdleCompactMoves,
   turnStarted, attemptResume, resumeJobEvents, sweepJobs, clearMissingPendingJobs,
 };

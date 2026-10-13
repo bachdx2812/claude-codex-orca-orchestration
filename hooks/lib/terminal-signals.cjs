@@ -5,34 +5,6 @@ const { normalizeTerminalLine } = require('./worker-progress-fingerprint.cjs');
 const ANSI_ESCAPE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const RATE_LIMIT_MARKER = /(rate.?limit|429\b|quota\s+exceeded|usage\s+limit|too\s+many\s+requests|retry[- ]after|overloaded_error)/i;
 const STRONG_RATE_LIMIT_MARKER = /(HTTP(?:\/\d(?:\.\d)?)?\s+429\b|too\s+many\s+requests|rate_limit_exceeded|you(?:'|’)?ve\s+hit\s+your\s+usage\s+limit|overloaded_error)/i;
-// A leading opencode/box-drawing gutter (`┃`, `│`, `|`) plus any spacing.
-const BOX_GUTTER = /^[┃│|]\s*/u;
-
-// opencode's prompt-box placeholder when no turn is in flight: `Ask anything…` (or the
-// three-dot spelling). It disappears while a turn runs, so its presence means idle input.
-// Anchored to the START of the line (after the box gutter is stripped) so quoted text, grep
-// output, or this repo's README mentioning the phrase can never look like the input box —
-// only a line that literally begins with `Ask anything…`/`Ask anything...` counts.
-const OPENCODE_ASK_ANYTHING = /^ask\s+anything(?:\s*…|\.{3})/i;
-// The welcome/home screen always carries at least one of these: the `opencode v<digit>`
-// version footer, or a `● Tip ...` line.
-const OPENCODE_VERSION_FOOTER = /^opencode\s+v\d/i;
-const OPENCODE_TIP_LINE = /^●\s*tip\b/i;
-// The esc-interrupt footer (`esc interrupt` / `esc to interrupt`) only appears while a turn
-// is running. Used by the approval detector's bottom-line "is this a live run" check.
-const ESC_INTERRUPT_FOOTER = /esc\s+(?:to\s+)?interrupt/i;
-// The real opencode running footer line carries BOTH the esc-interrupt hint and the ctrl+p
-// hint on the same line (`esc interrupt · ctrl+p ...`). A `● Tip` line that only mentions
-// esc/interrupt (a tip, not the footer) must not suppress the welcome signal, so the welcome
-// classifier requires both hints on one line instead of using the loose footer above.
-const OPENCODE_RUNNING_FOOTER = /esc\s+(?:to\s+)?interrupt.*ctrl\s*\+\s*p|ctrl\s*\+\s*p.*esc\s+(?:to\s+)?interrupt/i;
-// A live progress spinner (braille or clock-face glyphs) in a screen's tail means the worker
-// is mid-run, so a permission prompt described above it is not a live waiting dialog.
-const SPINNER_GLYPH = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒⏳⌛⣾⣽⣻⢿⡿⣟⣯⣷]/u;
-// opencode marks each step of a turn with a `▣` glyph (`▣  Build · 3.2s · 21 tokens`).
-// The welcome/home screen never shows one; its absence is the "no turn ever ran" signal.
-const OPENCODE_TURN_MARKER = /▣/u;
-
 function terminalLines(text) {
   return String(text || '').replace(ANSI_ESCAPE, '').split(/\r?\n/);
 }
@@ -58,32 +30,6 @@ function hasRateLimitError(text) {
   return false;
 }
 
-const KIMI_USAGE_LIMIT_SENTENCE = /^you(?:'|’)?ve\s+reached\s+your\s+(?:usage\s+limit\s+for\s+this\s+billing\s+cycle|\d+-hour\s+usage\s+limit)/i;
-const KIMI_IGNORED_LINE_PREFIX = /^\s*(?:["'`>]|\/\/|#|[-*](?:\s|$))/;
-const KIMI_ERROR_PREFIX = /^\s*\+?\s*(?:[■⚠✗]\s*|error\b[:\s]+|(?:HTTP\s*)?403\b[:\s]+)(?:(?:ERROR\b|(?:HTTP\s*)?403\b)[:\s-]*)*/i;
-
-/** The window length in hours when the sentence is the "N-hour usage limit" form, else null. */
-function kimiUsageLimitHours(text) {
-  const match = String(text || '').match(/reached\s+your\s+(\d+)-hour\s+usage\s+limit/i);
-  return match ? Number(match[1]) : null;
-}
-
-/** True only when Kimi's billing-cycle usage-limit sentence appears on an error-shaped
- * line — deliberately NOT a strong marker: the sentence alone, in plain prose (a worker
- * narrating or quoting the very text it handles), must never count. Callers additionally
- * scope this to terminals/workers known to be running Kimi. */
-function hasKimiUsageExhausted(text) {
-  let inFence = false;
-  for (const raw of terminalLines(text)) {
-    const line = raw.trimEnd();
-    if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
-    if (inFence || /^\s*(?:└\s*)?Tip:/i.test(line) || KIMI_IGNORED_LINE_PREFIX.test(line) || isSourceExcerpt(line)) continue;
-    const prefix = line.match(KIMI_ERROR_PREFIX);
-    if (prefix && KIMI_USAGE_LIMIT_SENTENCE.test(line.slice(prefix[0].length))) return true;
-  }
-  return false;
-}
-
 /** Codex's terminal usage-limit screen is a handover signal, unlike a transient generic
  * 429. Keep the matcher error-shaped so prose and source excerpts remain inert. */
 function hasCodexUsageExhausted(text) {
@@ -93,23 +39,6 @@ function hasCodexUsageExhausted(text) {
     if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
     if (inFence || isSourceExcerpt(line)) continue;
     if (/^\s*(?:■|⚠|error:)?\s*you(?:'|’)?ve\s+hit\s+your\s+usage\s+limit\b/i.test(line)) return true;
-  }
-  return false;
-}
-
-const DEEPSEEK_BALANCE_SENTENCE = /insufficient\s+balance/i;
-
-/** DeepSeek's 402 "Insufficient Balance" is terminal until the account is topped up — the
- * pay-per-use equivalent of Kimi's billing-cycle limit. Error-shaped lines only (an opencode
- * worker quoting or narrating the text must never mark the coder exhausted). */
-function hasDeepseekBalanceExhausted(text) {
-  let inFence = false;
-  for (const raw of terminalLines(text)) {
-    const line = raw.trimEnd();
-    if (/^\s*(?:```|~~~)/.test(line)) { inFence = !inFence; continue; }
-    if (inFence || KIMI_IGNORED_LINE_PREFIX.test(line) || isSourceExcerpt(line)) continue;
-    const errorShaped = /^\s*(?:■|⚠|✗|error:)/i.test(line) || /\bERROR\b/.test(line) || /\b402\b/.test(line);
-    if (errorShaped && DEEPSEEK_BALANCE_SENTENCE.test(line)) return true;
   }
   return false;
 }
@@ -136,23 +65,10 @@ function approvalPromptFingerprint(text) {
     const line = raw.trim();
     if (/^(?:```|~~~)/.test(line)) { inFence = !inFence; return []; }
     if (inFence) return [];
-    // opencode draws its permission prompt inside a `┃`/`│` gutter; strip it before the
-    // source-excerpt guard so the prompt block is not discarded as a diff line.
-    const gutterStripped = line.replace(BOX_GUTTER, '');
-    return isSourceExcerpt(gutterStripped) ? [] : [line];
+    return isSourceExcerpt(line) ? [] : [line];
   }).filter(Boolean);
   const normalized = lines.map((raw) => ({ raw, text: normalizeTerminalLine(raw).text })).filter((line) => line.text);
   const texts = normalized.map((line) => line.text);
-  // The screen's last non-empty raw line (gutter stripped): a live spinner, a
-  // "thinking/working" indicator, or the esc-interrupt footer there means the worker is
-  // mid-run, so prose describing a permission prompt above it is not a real waiting dialog.
-  const rawLastNonEmpty = terminalLines(text)
-    .map((line) => line.trim().replace(BOX_GUTTER, '').trim())
-    .filter(Boolean)
-    .pop() || '';
-  const lastLineIsLive = SPINNER_GLYPH.test(rawLastNonEmpty) ||
-    ESC_INTERRUPT_FOOTER.test(rawLastNonEmpty) ||
-    /^(?:thinking|working|running|processing|loading)\b[\s….]*$/i.test(rawLastNonEmpty);
   const navigationPattern = /^[↑↓]+\s*navigate\s*[·•|]\s*Enter\s+select(?:\s*[·•|]\s*Esc\s+cancel)?\s*$/i;
   const confirmPattern = /^Press\s+enter\s+to\s+confirm\s+or\s+esc\s+to\s+cancel\.?$/i;
   // Claude Code's trust dialog ("Quick safety check … Do you trust the files in this
@@ -161,12 +77,6 @@ function approvalPromptFingerprint(text) {
   const trustPattern = /trust\s+this\s+folder|trust\s+the\s+files\s+in\s+this\s+folder|only\s+proceed\s+if\s+you\s+trust\s+this\s+configuration/i;
   const enterConfirmPattern = /^Enter\s+to\s+confirm\s*[·•|]\s*Esc\s+to\s+cancel\.?$/i;
   const permissionPattern = /^Select\s+permission\s+mode\s*$/i;
-  // opencode's tool-permission dialog: a `△ Permission required` header, a `← <target>`
-  // command line, and an `Allow once   Allow always   Reject` options line (trailing
-  // keybinding hints like `ctrl+f fullscreen  ⇆ select  enter confirm` are tolerated).
-  const opencodePermissionHeader = /^△?\s*Permission\s+required\s*$/i;
-  const opencodeTargetPattern = /^←\s+\S/;
-  const opencodeOptionsPattern = /^Allow\s+once\s+Allow\s+always\s+Reject\b/i;
   const codexQuestionPattern = /^Would\s+you\s+like\s+to\s+(?:run|make|apply)\b.*\?$/i;
   const approvalQuestionPattern = /^(?:Do\s+you\s+want\s+to\s+(?:allow|approve|run)\b.*|(?:Allow|Approve)\b.*)\?$/i;
   const codexOptionPattern = /^\d+[.)]\s*(?:Yes,\s*proceed|No,\s*and\s+tell)\b.*$/i;
@@ -176,37 +86,8 @@ function approvalPromptFingerprint(text) {
   const hasTrustDialog = texts.some((line) => trustPattern.test(line));
   const hasEnterConfirm = texts.some((line) => enterConfirmPattern.test(line));
   const hasPermissionMenu = texts.some((line) => permissionPattern.test(line));
-  let opencodeTriple = null;
-  const hasOpencodePermission = (() => {
-    // The live prompt needs the header, the `← <target>` line and the options line ADJACENT
-    // in that order (each within 4 lines of the next) and inside the last 12 non-empty
-    // lines — prose describing the dialog is spread out, scrolled off, or sits above a
-    // running spinner, so it never forms this triple.
-    if (lastLineIsLive) return false;
-    const headerIdx = [];
-    const targetIdx = [];
-    const optionsIdx = [];
-    texts.forEach((line, i) => {
-      if (opencodePermissionHeader.test(line)) headerIdx.push(i);
-      if (opencodeTargetPattern.test(line)) targetIdx.push(i);
-      if (opencodeOptionsPattern.test(line)) optionsIdx.push(i);
-    });
-    for (const i of headerIdx) {
-      if (texts.length - i > 12) continue;
-      for (const j of targetIdx) {
-        if (j <= i || j - i > 4) continue;
-        for (const k of optionsIdx) {
-          if (k <= j || k - j > 4) continue;
-          opencodeTriple = { header: i, target: j, options: k };
-          return true;
-        }
-      }
-    }
-    return false;
-  })();
   const hasCodexQuestion = texts.some((line) => codexQuestionPattern.test(line));
   const hasApprovalQuestion = texts.some((line) => approvalQuestionPattern.test(line));
-  const opencodeTarget = opencodeTriple ? texts[opencodeTriple.target] : null;
   const numberedOptions = texts.filter((line) => codexOptionPattern.test(line));
   const optionNames = new Set(texts.map((line) => line
     .replace(/^\d+[.)]\s*/, '')
@@ -220,12 +101,11 @@ function approvalPromptFingerprint(text) {
     ? texts.slice(questionIndex + 1).find((line) => commandPattern.test(line))
     : null;
   const structured = hasNavigation || hasConfirmHint || hasEnterConfirm || numberedOptions.length > 0 ||
-    hasOpposingOptions || hasOpencodePermission ||
+    hasOpposingOptions ||
     (hasBox && (hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion)) ||
     (hasTrustDialog && (hasEnterConfirm || hasBox));
   const prompt = hasPermissionMenu || hasCodexQuestion || hasApprovalQuestion ||
-    hasOpposingOptions || numberedOptions.length > 0 || hasNavigation || hasTrustDialog || hasEnterConfirm ||
-    hasOpencodePermission;
+    hasOpposingOptions || numberedOptions.length > 0 || hasNavigation || hasTrustDialog || hasEnterConfirm;
 
   if (!structured || !prompt) return null;
 
@@ -234,10 +114,9 @@ function approvalPromptFingerprint(text) {
   const signature = texts
     .filter((line) => permissionPattern.test(line) || codexQuestionPattern.test(line) ||
       approvalQuestionPattern.test(line) || codexOptionPattern.test(line) ||
-      opencodePermissionHeader.test(line) || opencodeOptionsPattern.test(line) ||
       navigationPattern.test(line) || confirmPattern.test(line) ||
       trustPattern.test(line) || enterConfirmPattern.test(line) ||
-      line === promptCommand || line === opencodeTarget ||
+      line === promptCommand ||
       /^(?:\d+[.)]\s*)?(?:allow|deny|approve|never ask|ask when needed)$/i.test(line))
     .map((line) => line.toLowerCase())
     .join('\n')
@@ -249,7 +128,7 @@ function approvalPromptFingerprint(text) {
 // and `#` count bare; `❯`/`›` need a prompt-prefix before them so Claude's bare input
 // caret ("❯ ") and Codex's composer prompt can never look like a shell.
 const SHELL_PROMPT_END = /[%$#]\s*$|^\S.{2,}\s[❯›]\s*$/;
-// Claude Code's "esc to interrupt", opencode's "esc interrupt" footer, permission-mode bars.
+// Agent progress and permission-mode indicators.
 const AGENT_TUI_HINT = /esc\s+(?:to\s+)?interrupt|bypass\s+permissions|accept\s+edits|shift\s*\+\s*tab\s+to\s+cycle|⏵⏵/i;
 
 /**
@@ -277,43 +156,7 @@ function endsAtShellPrompt(text) {
   return true;
 }
 
-/** True when the rendered screen shows an opencode turn marker (a `▣` step status), i.e.
- * at least one turn has started (or is running). Stripped of ANSI so repaints stay inert. */
-function opencodeTurnMarker(text) {
-  return terminalLines(text).some((line) => OPENCODE_TURN_MARKER.test(line));
-}
-
-/**
- * True when the rendered screen is opencode's welcome/home screen with no turn marker: the
- * input box still shows the `Ask anything…` placeholder and no `▣  Build ·`-style status has
- * appeared, so no turn ever ran. The placeholder must START its line (so quoted text, grep
- * output and this repo's README never count), the home screen must also carry a version
- * footer or `● Tip` line, and the real running footer (a line with both `esc interrupt` and
- * `ctrl+p`) rejects the match. A `● Tip` line that only mentions esc/interrupt is NOT a
- * footer and never suppresses the signal. Any tool output implies a `▣` step marker in the
- * same rendered frame, so the single marker
- * check covers both "no turn marker" and "no tool output". A screen that has started a turn
- * therefore never matches, which is what lets the caller mark the brief as delivered.
- */
-function opencodeWelcomeScreen(text) {
-  const lines = terminalLines(text)
-    .map((line) => line.trim().replace(BOX_GUTTER, '').trim())
-    .filter(Boolean);
-  if (!lines.length) return false;
-  if (!lines.some((line) => OPENCODE_ASK_ANYTHING.test(line))) return false;
-  if (lines.some((line) => OPENCODE_TURN_MARKER.test(line))) return false;
-  // A turn running under the input box (the real footer line with both `esc interrupt` and
-  // `ctrl+p`) is not the idle home screen. A `● Tip` line that merely mentions esc/interrupt
-  // must not suppress the welcome signal.
-  if (lines.some((line) => OPENCODE_RUNNING_FOOTER.test(line))) return false;
-  // The home screen carries a version footer or a ● Tip line; require one so a lone quoted
-  // "Ask anything" (grep output, docs) can never count.
-  if (!lines.some((line) => OPENCODE_VERSION_FOOTER.test(line) || OPENCODE_TIP_LINE.test(line))) return false;
-  return true;
-}
-
 module.exports = {
-  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
-  hasDeepseekBalanceExhausted, approvalPromptFingerprint, endsAtShellPrompt,
-  opencodeWelcomeScreen, opencodeTurnMarker,
+  hasRateLimitError, hasCodexDisconnect, hasCodexUsageExhausted,
+  approvalPromptFingerprint, endsAtShellPrompt,
 };

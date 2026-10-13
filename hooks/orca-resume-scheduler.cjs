@@ -5,7 +5,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const RESUME = require('./lib/quota-reset-resume.cjs');
 const QUOTA = require('./lib/exec-route-by-quota.cjs');
-const { loadConfig, disabledCoders, stateDir } = require('./lib/config.cjs');
+const { stateDir } = require('./lib/config.cjs');
 const { fetchWorkerListPages } = require('./lib/orca-worker-list-pages.cjs');
 
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -86,16 +86,7 @@ function isAuthorized(job) {
 
 function probeQuota(agent) {
   if (agent === 'codex') return QUOTA.codexQuota(Date.now(), { stateDir: DIR, cacheSeconds: 0 });
-  if (agent === 'kimi') return QUOTA.kimiQuota(Date.now(), {
-    stateDir: DIR, cacheSeconds: 0, env: process.env,
-  });
   return { usedPercent: 0, resetsAt: 0 };
-}
-
-function coderDisabled(job) {
-  if (!job || job.panel || job.agent === 'claude') return false;
-  const coder = job.agent === 'opencode' ? 'deepseek' : job.agent;
-  return disabledCoders(loadConfig()).includes(coder);
 }
 
 function send(handle, text, enter) {
@@ -113,7 +104,6 @@ function verifyStarted(handle, before) {
   for (let attempt = 0; attempt < 5; attempt++) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);
     screen = terminalScreen(handle);
-    if (RESUME.hasKimiIdleSessionMenu(screen)) return { started: false, screen };
     if (RESUME.turnStarted(screen, before)) return { started: true, screen };
   }
   return { started: false, screen };
@@ -173,7 +163,7 @@ function schedule(file, expectedToken = '') {
       return result.owned && result.value;
     };
     const result = RESUME.attemptResume(current, {
-      now: Date.now(), coderDisabled, isAuthorized, probeQuota, readScreen: terminalScreen,
+      now: Date.now(), isAuthorized, probeQuota, readScreen: terminalScreen,
       send: guardedSend, verifyStarted,
     });
     if (lostOwnership) return;
@@ -196,5 +186,5 @@ if (require.main === module) main();
 
 module.exports = {
   terminalScreen, authorizedWorkerHandles, workerHandles, isAuthorized,
-  probeQuota, coderDisabled, send, verifyStarted, schedule,
+  probeQuota, send, verifyStarted, schedule,
 };

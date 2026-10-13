@@ -12,7 +12,7 @@ const binDir = path.join(root, 'bin');
 fs.mkdirSync(binDir);
 const launchctlLog = path.join(root, 'launchctl.log');
 try { fs.symlinkSync(process.execPath, path.join(binDir, 'node')); } catch {}
-for (const bin of ['claude', 'orca', 'codex', 'kimi']) {
+for (const bin of ['claude', 'orca', 'codex']) {
   const file = path.join(binDir, bin);
   fs.writeFileSync(file, '#!/bin/sh\necho "stub 1.0"\n');
   fs.chmodSync(file, 0o755);
@@ -174,58 +174,42 @@ if (process.platform === 'darwin') {
     fs.readFileSync(preexistingPlist, 'utf8'), 'pre-existing launch agent\n');
 }
 
-// --- coder availability section (stubs only: fake codex/kimi binaries, tmp Kimi homes,
-// an unreachable usage URL; nothing touches real ~/.kimi-code, real codex, or the network)
-const emptyKimiHome = path.join(root, 'kimi-home-empty');
-fs.mkdirSync(emptyKimiHome, { recursive: true });
-const emptyEnv = {
-  ORCH_KIMI_HOME: emptyKimiHome,
-  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-  ORCH_KIMI_HANDOFF_USED: '80',
-  ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
-};
-const emptyCheck = run(['--check'], 'check-kimi-empty', emptyEnv);
+// --- coder availability section (stub only; never touches real Codex state) -----------
+const emptyCheck = run(['--check'], 'check-codex');
 const emptyOut = `${emptyCheck.stdout}${emptyCheck.stderr}`;
 check('--check exits 0 on a clean machine with no install problems', emptyCheck.status, 0);
-check('--check prints the effective thresholds with env overrides applied',
-  /codexHandoffUsedPercent=95 kimiHandoffUsedPercent=80 maxParallelKimiWorkers=3/.test(emptyOut), true);
+check('--check prints the effective Codex threshold and cap',
+  /codexHandoffUsedPercent=95 maxParallelCodexWorkers=3/.test(emptyOut), true);
 check('--check reports the codex coder line (stub binary, auth unknown, quota unreadable)',
   /coder codex: usable \[binary [^\]]*stub 1\.0, auth unknown, quota unknown\]/.test(emptyOut), true);
-check('--check reports kimi unusable when no credentials exist',
-  /coder kimi: UNUSABLE \(not signed in\)/.test(emptyOut), true);
-check('--check reports deepseek unusable when opencode is absent',
-  /coder deepseek: UNUSABLE \(not installed\)/.test(emptyOut), true);
 check('--check prints the coder pool summary',
-  /pool: Codex quota unknown, available \(0\/3 live\) or Kimi \(unusable: not signed in\) or DeepSeek \(unusable: not installed\); pick Codex/.test(emptyOut), true);
+  /pool: Codex quota unknown, available \(0\/3 live\); pick Codex/.test(emptyOut), true);
 
 const disabledConfig = path.join(root, 'disabled-coder-config.json');
-fs.writeFileSync(disabledConfig, JSON.stringify({ disabledCoders: ['kimi'] }));
-const disabledCheck = run(['--check'], 'check-kimi-disabled', {
+fs.writeFileSync(disabledConfig, JSON.stringify({ disabledCoders: ['codex'] }));
+const disabledCheck = run(['--check'], 'check-codex-disabled', {
   ORCH_CONFIG_PATH: disabledConfig,
-  ORCH_KIMI_HOME: emptyKimiHome,
-  ORCH_KIMI_BIN: path.join(binDir, 'kimi'),
-  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-  ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
 });
 const disabledOut = `${disabledCheck.stdout}${disabledCheck.stderr}`;
-check('--check prints the disabled coder list', /disabledCoders=kimi/.test(disabledOut), true);
+check('--check prints the disabled coder list', /disabledCoders=codex/.test(disabledOut), true);
 check('--check reports a disabled coder without availability details',
-  /coder kimi: disabled by config/.test(disabledOut) && !/coder kimi: .*binary/.test(disabledOut), true);
+  /coder codex: disabled by config/.test(disabledOut) && !/coder codex: .*binary/.test(disabledOut), true);
 
-const credsKimiHome = path.join(root, 'kimi-home-creds');
-fs.mkdirSync(path.join(credsKimiHome, 'credentials'), { recursive: true });
-const FIXTURE_TOKEN = 'fixture-token-9f8e7d6c5b4a-never-print';
-fs.writeFileSync(path.join(credsKimiHome, 'credentials', 'kimi-code.json'),
-  JSON.stringify({ access_token: FIXTURE_TOKEN, expires_at: Date.now() + 3600e3 }));
-const credsCheck = run(['--check'], 'check-kimi-creds', {
-  ORCH_KIMI_HOME: credsKimiHome,
-  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-  ORCH_OPENCODE_BIN: path.join(root, 'missing-opencode'),
-});
-const credsOut = `${credsCheck.stdout}${credsCheck.stderr}`;
-check('--check reports kimi usable once credentials exist (quota unknown on an unreachable URL)',
-  /coder kimi: usable \[binary [^\]]*stub 1\.0, auth ok, quota unknown\]/.test(credsOut), true);
-check('--check never prints the Kimi access token', credsOut.includes(FIXTURE_TOKEN), false);
+{
+  const homeName = 'retired-hook-cleanup';
+  const installed = run([], homeName);
+  const retired = ['kimi-quota-probe.cjs', 'deepseek-quota-probe.cjs'];
+  for (const name of retired) fs.writeFileSync(path.join(installed.home, '.claude', 'hooks', 'orchestration', 'lib', name), 'stale');
+  const upgraded = run([], homeName);
+  check('reinstall succeeds while removing retired hook files', upgraded.status, 0);
+  check('reinstall removes all retired hook files', retired.some((name) =>
+    fs.existsSync(path.join(upgraded.home, '.claude', 'hooks', 'orchestration', 'lib', name))), false);
+  for (const name of retired) fs.writeFileSync(path.join(upgraded.home, '.claude', 'hooks', 'orchestration', 'lib', name), 'stale');
+  const uninstalled = run(['--uninstall'], homeName);
+  check('uninstall succeeds while removing retired hook files', uninstalled.status, 0);
+  check('uninstall removes all retired hook files', retired.some((name) =>
+    fs.existsSync(path.join(uninstalled.home, '.claude', 'hooks', 'orchestration', 'lib', name))), false);
+}
 
 // --- Codex service_tier = "priority"/"fast" surfacing (never edits the operator's config) --
 function writeCodexConfig(home, text) {

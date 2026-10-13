@@ -1,5 +1,0 @@
-│  ▣  Thinking · 1.4s · 12 tokens
-│
-│  I'll wait until the input box shows "Ask anything…" again.
-│
-│  ● Tip: Press esc to interrupt

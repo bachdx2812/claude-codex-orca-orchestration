@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * coder-pool-route.cjs — ranks the external coders (Codex, Kimi) and picks who takes
+ * coder-pool-route.cjs — ranks the external coders and picks who takes
  * the next code dispatch.
  *
  * Config -> option mapping (`execFallbackWhenCodexUnavailable` -> `options.fallbackEnabled`):
@@ -9,8 +9,7 @@
  *     a Codex that is merely not installed (or Orca not installed) still routes to Codex,
  *     exactly like the pre-pool routing did.
  *   - config set (e.g. `"sonnet"`, the default) => `fallbackEnabled: true`: an unusable
- *     coder is excluded from the pool. An unusable Kimi is ALWAYS excluded, regardless
- *     of this option.
+ *     coder is excluded from the pool.
  *   - nothing usable => `route: 'code'`: the in-session code model (default alias sonnet).
  *
  * Ranking among eligible coders (binding operator decision, 2026-10-01 — MORE QUOTA LEFT
@@ -35,9 +34,9 @@
  * sessions are running. `sessionLive` defaults to `live` when omitted.
  */
 
-const CODERS = ['codex', 'kimi', 'deepseek'];
+const CODERS = ['codex'];
 
-function label(coder) { return coder === 'codex' ? 'Codex' : coder === 'kimi' ? 'Kimi' : 'DeepSeek'; }
+function label() { return 'Codex'; }
 
 function knownQuota(quota) {
   return quota && quota.failed !== true && typeof quota.usedPercent === 'number' && Number.isFinite(quota.usedPercent);
@@ -78,10 +77,6 @@ function pickCoderPool(options = {}) {
   const caps = options.caps || {};
   const disabled = new Set(Array.isArray(options.disabled) ? options.disabled : []);
   const lastCoder = CODERS.includes(options.lastCoder) ? options.lastCoder : null;
-  // DeepSeek's routing role (binding operator decision, 2026-10-01): 'overflow' (default)
-  // picks it only when NO subscription coder (Codex/Kimi) is eligible, but before the
-  // in-session code model; 'peer' ranks it by the same rules as Codex and Kimi.
-  const deepseekOverflow = !(options.roles && options.roles.deepseek === 'peer');
   const tieBand = Number.isInteger(options.tieBand) && options.tieBand >= 0 ? options.tieBand : 10;
   const unknownAssumed = Number.isInteger(options.unknownAssumed) &&
     options.unknownAssumed >= 0 && options.unknownAssumed <= 100 ? options.unknownAssumed : 30;
@@ -127,17 +122,6 @@ function pickCoderPool(options = {}) {
 
   const order = CODERS.filter((coder) => coders[coder].state === 'eligible');
   const freeSlot = (coder) => coders[coder].cap === 0 || coders[coder].sessionLive < coders[coder].cap;
-  // Overflow DeepSeek stands by only while a subscription coder (Codex/Kimi) is ELIGIBLE
-  // AND has a free per-session slot. When every eligible subscription coder is at its own
-  // worker cap, DeepSeek joins the order and takes the dispatch instead of waiting
-  // (operation decision, 2026-10-01).
-  const subscriptionHasFreeSlot = ['codex', 'kimi'].some((coder) =>
-    coders[coder].state === 'eligible' && freeSlot(coder));
-  if (deepseekOverflow && coders.deepseek.state === 'eligible' &&
-      (coders.codex.state === 'eligible' || coders.kimi.state === 'eligible') && subscriptionHasFreeSlot) {
-    coders.deepseek.standby = true;
-    order.splice(order.indexOf('deepseek'), 1);
-  }
   order.sort((a, b) => {
     const aFree = freeSlot(a); const bFree = freeSlot(b);
     if (aFree !== bFree) return aFree ? -1 : 1;

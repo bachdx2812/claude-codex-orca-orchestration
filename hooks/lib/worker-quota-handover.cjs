@@ -40,27 +40,17 @@ function handoverStage({ usedPercent, threshold, warnMargin, exhausted = false }
 }
 
 function pickNextCoder(agent, pool) {
-  const self = agent === 'opencode' ? 'deepseek' : agent;
-  // Prefer the pool's own ranked order (an overflow-standby coder is not in it); fall back
-  // to any eligible, non-standby coder. Symmetric across every eligible coder.
-  for (const coder of pool?.order || []) {
-    if (coder !== self) return coder;
-  }
-  for (const coder of ['codex', 'kimi', 'deepseek']) {
-    if (coder === self) continue;
-    const state = pool?.coders?.[coder];
-    if (state?.state === 'eligible' && !state.standby) return coder;
-  }
+  if (agent !== 'codex' && (pool?.order || []).includes('codex')) return 'codex';
+  if (agent !== 'codex' && pool?.coders?.codex?.state === 'eligible') return 'codex';
   return 'sonnet';
 }
 
 function targetLabel(target) {
-  return target === 'codex' ? 'Codex' : target === 'kimi' ? 'Kimi'
-    : target === 'deepseek' ? 'DeepSeek' : 'Sonnet';
+  return target === 'codex' ? 'Codex' : 'Sonnet';
 }
 
 function handoverRecipe(agent, target, worktreePath) {
-  const source = agent === 'codex' ? 'Codex' : agent === 'kimi' ? 'Kimi' : 'DeepSeek';
+  const source = agent === 'codex' ? 'Codex' : 'Sonnet';
   const destination = targetLabel(target);
   const sameTree = worktreePath ? ` at ${worktreePath}` : '';
   return 'If responsive, terminal send: "Stop now: commit all work-in-progress as `wip: handover` and write ' +

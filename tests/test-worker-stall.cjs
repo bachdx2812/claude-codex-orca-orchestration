@@ -55,7 +55,7 @@ function withEnv(name, value, fn) {
 {
   const defaults = config.loadConfig();
   check('default stall threshold is 15 minutes', defaults.heartbeat.stallSeconds, 900);
-  check('Kimi default override is 10 minutes', defaults.heartbeat.stallSecondsByAgent, { kimi: 600 });
+  check('per-agent stall overrides default to empty', defaults.heartbeat.stallSecondsByAgent, {});
   check('default handover warning margin is 5 percent', defaults.handoverWarnMarginPercent, 5);
   check('quota reset auto-resume defaults on for workers and panel',
     [defaults.autoResumeAfterReset, defaults.autoResumePanel], [true, true]);
@@ -66,11 +66,11 @@ function withEnv(name, value, fn) {
   check('invalid ORCH_STALL_SECONDS falls back',
     withEnv('ORCH_STALL_SECONDS', 'nope', () => config.stallSeconds(defaults)), 900);
 
-  const invalid = withConfig({ heartbeat: { stallSeconds: 0, stallSecondsByAgent: { kimi: 'bad', codex: -1 } } },
+  const invalid = withConfig({ heartbeat: { stallSeconds: 0, stallSecondsByAgent: { worker: 'bad', codex: -1 } } },
     () => config.loadConfig());
   check('invalid global threshold falls back', invalid.heartbeat.stallSeconds, 900);
   check('invalid known agent override falls back and unknown invalid is dropped',
-    invalid.heartbeat.stallSecondsByAgent, { kimi: 600 });
+    invalid.heartbeat.stallSecondsByAgent, {});
   check('invalid thresholds produce warnings',
     invalid.warnings.filter((warning) => warning.includes('stallSeconds')).length, 3);
 
@@ -79,10 +79,10 @@ function withEnv(name, value, fn) {
   check('invalid handover warning margin warns',
     invalidMargin.warnings.some((warning) => warning.includes('handoverWarnMarginPercent')), true);
 
-  const valid = withConfig({ heartbeat: { stallSeconds: 120, stallSecondsByAgent: { kimi: 30, codex: 90 } } },
+  const valid = withConfig({ heartbeat: { stallSeconds: 120, stallSecondsByAgent: { worker: 30, codex: 90 } } },
     () => config.loadConfig());
   check('valid thresholds are retained',
-    [valid.heartbeat.stallSeconds, valid.heartbeat.stallSecondsByAgent], [120, { kimi: 30, codex: 90 }]);
+    [valid.heartbeat.stallSeconds, valid.heartbeat.stallSecondsByAgent], [120, { worker: 30, codex: 90 }]);
   check('a valid zero handover warning margin is retained',
     withConfig({ handoverWarnMarginPercent: 0 }, () => config.loadConfig()).handoverWarnMarginPercent, 0);
   check('invalid auto-resume booleans fall back independently',
@@ -126,8 +126,8 @@ const fingerprint = (terminalText) => workerProgressFingerprint({
 // Real Orca preview captures: timer/spinner/tip changes in the same frame must hash alike.
 for (const [name, a, b] of [
   ['Codex Working', '• Working (45s • esc to interrupt)', '• Working (1h 02m 3s • esc to interrupt)'],
-  ['Kimi moon tip', '🌔 · Tip: /web: search current docs', '🌘 · Tip: /clear: reset the context'],
-  ['Kimi Thinking tip', '⠦ Thinking… · Tip: /clear: reset', '⠏ Thinking… · Tip: /web: search'],
+  ['worker moon tip', '🌔 · Tip: /web: search current docs', '🌘 · Tip: /clear: reset the context'],
+  ['worker Thinking tip', '⠦ Thinking… · Tip: /clear: reset', '⠏ Thinking… · Tip: /web: search'],
   ['Claude gerund status', '✢ Quantumizing… (19s · ↓ 1.2k tokens)', '✳ Quantumizing… (1m 23s · ↓ 1.3k tokens)'],
 ]) {
   check(`${name} captured frames normalize to empty`,
@@ -171,7 +171,7 @@ check('real rendered Codex screens recognize the background-terminal wait',
   [codexScreenSampleA.activeChild, codexScreenSampleB.activeChild], [true, true]);
 check('two rendered reads of the same Codex wait fingerprint identically',
   codexScreenSampleA.fingerprint, codexScreenSampleB.fingerprint);
-check('Kimi background-task wait is an active child', workerProgressSample({
+check('worker background-task wait is an active child', workerProgressSample({
   terminalText: 'Waiting / · 1 background task still running',
   worktreePath: '/fake/worktree', git: gitStub, stat: statStub,
 }).activeChild, true);
@@ -180,25 +180,25 @@ const records = new Map();
 const start = 2_000_000_000_000;
 const first = fingerprint(repaintA);
 check('first observation arms without reporting', observeWorkerProgress(records, {
-  handle: 'term_kimi', fingerprint: first, now: start, stallSeconds: 600,
+  handle: 'term_worker', fingerprint: first, now: start, stallSeconds: 600,
 }).stalled, false);
 check('spinner-only repaint does not reset progress', fingerprint(repaintB), first);
 check('spinner-only repaint fires at the fake-clock threshold', observeWorkerProgress(records, {
-  handle: 'term_kimi', fingerprint: fingerprint(repaintB), now: start + 600_000, stallSeconds: 600,
+  handle: 'term_worker', fingerprint: fingerprint(repaintB), now: start + 600_000, stallSeconds: 600,
 }), { stalled: true, changed: false, stalledSeconds: 600 });
 check('the same episode reports only once', observeWorkerProgress(records, {
-  handle: 'term_kimi', fingerprint: first, now: start + 900_000, stallSeconds: 600,
+  handle: 'term_worker', fingerprint: first, now: start + 900_000, stallSeconds: 600,
 }).stalled, false);
 
 // Persisted records survive a daemon restart and retain the once-per-episode marker.
 heartbeat.savePersistedStallProgress(records);
 const afterRestart = heartbeat.loadPersistedStallProgress();
-check('reported episode persists across daemon restart', afterRestart.get('term_kimi'), records.get('term_kimi'));
+check('reported episode persists across daemon restart', afterRestart.get('term_worker'), records.get('term_worker'));
 check('restart does not re-report unchanged fingerprint', observeWorkerProgress(afterRestart, {
-  handle: 'term_kimi', fingerprint: first, now: start + 1_200_000, stallSeconds: 600,
+  handle: 'term_worker', fingerprint: first, now: start + 1_200_000, stallSeconds: 600,
 }).stalled, false);
 check('JSON record parser preserves persisted state',
-  recordsFromJSON(JSON.parse(JSON.stringify([...records]))).get('term_kimi'), records.get('term_kimi'));
+  recordsFromJSON(JSON.parse(JSON.stringify([...records]))).get('term_worker'), records.get('term_worker'));
 
 // Either worktree state or real terminal output is progress and starts a new episode.
 gitState = {
@@ -209,13 +209,13 @@ statState = { 'orca-heartbeat.cjs': { size: 100, mtimeMs: 1000 } };
 const fileProgress = fingerprint(repaintB);
 check('file changes alter the fingerprint', fileProgress === first, false);
 check('file changes re-arm the progress clock', observeWorkerProgress(afterRestart, {
-  handle: 'term_kimi', fingerprint: fileProgress, now: start + 1_300_000, stallSeconds: 600,
+  handle: 'term_worker', fingerprint: fileProgress, now: start + 1_300_000, stallSeconds: 600,
 }), { stalled: false, changed: true, stalledSeconds: 0 });
 
 const realOutput = fingerprint('Implemented the stall detector.');
 check('real output alters the fingerprint', realOutput === fileProgress, false);
 check('real output prevents a stall and re-arms', observeWorkerProgress(afterRestart, {
-  handle: 'term_kimi', fingerprint: realOutput, now: start + 1_899_000, stallSeconds: 600,
+  handle: 'term_worker', fingerprint: realOutput, now: start + 1_899_000, stallSeconds: 600,
 }).stalled, false);
 
 // Full diff content and changed-path metadata catch progress missed by --stat/status.
@@ -243,16 +243,16 @@ const timedOutSample = workerProgressSample({
 check('timed-out git probes reuse the last good fingerprint', timedOutSample.fingerprint, goodSample.fingerprint);
 
 // Per-agent override is applied by the same selection used in the daemon.
-const cfg = withConfig({ heartbeat: { stallSeconds: 900, stallSecondsByAgent: { kimi: 60 } } },
+const cfg = withConfig({ heartbeat: { stallSeconds: 900, stallSecondsByAgent: { worker: 60 } } },
   () => config.loadConfig());
 const thresholdFor = (agent) => heartbeat.stallThresholdForAgent(agent, cfg.heartbeat, cfg.heartbeat.stallSeconds);
-check('Kimi uses its per-agent override', thresholdFor('kimi'), 60);
+check('worker uses its per-agent override', thresholdFor('worker'), 60);
 check('Codex uses the global threshold', thresholdFor('codex'), 900);
 check('prototype property names cannot become thresholds', thresholdFor('constructor'), 900);
-const kimiRecords = new Map();
-observeWorkerProgress(kimiRecords, { handle: 'k', fingerprint: 'same', now: start, stallSeconds: thresholdFor('kimi') });
-check('Kimi stalls at its shorter fake-clock threshold', observeWorkerProgress(kimiRecords, {
-  handle: 'k', fingerprint: 'same', now: start + 60_000, stallSeconds: thresholdFor('kimi'),
+const workerRecords = new Map();
+observeWorkerProgress(workerRecords, { handle: 'k', fingerprint: 'same', now: start, stallSeconds: thresholdFor('worker') });
+check('worker stalls at its shorter fake-clock threshold', observeWorkerProgress(workerRecords, {
+  handle: 'k', fingerprint: 'same', now: start + 60_000, stallSeconds: thresholdFor('worker'),
 }).stalled, true);
 
 const childA = workerProgressSample({
@@ -279,8 +279,8 @@ check('hung rendered Codex wait stalls at twice the configured threshold', obser
   activeChild: true, gitParts: codexScreenSampleB.gitParts, screenText: codexScreenB,
 }).stalled, true);
 check('stall wake event identifies the dispatch and recommends nudge or cross-coder retry',
-  heartbeat.formatStallEvent({ dispatchId: 'ctx_stalled', handle: 'term_stalled', agent: 'kimi', stalledSeconds: 601 }),
-  'WORKER STALLED ctx_stalled (kimi, no file change or new output for 10m) - nudge it (terminal send "continue ..."), or stop it and re-dispatch the same brief to the other coder');
+  heartbeat.formatStallEvent({ dispatchId: 'ctx_stalled', handle: 'term_stalled', agent: 'worker', stalledSeconds: 601 }),
+  'WORKER STALLED ctx_stalled (worker, no file change or new output for 10m) - nudge it (terminal send "continue ..."), or stop it and re-dispatch the same brief to the other coder');
 
 // Worktree resolution uses the supervised terminal/worker data and never a global scan.
 check('terminal worktree path wins', heartbeat.terminalWorktreePath(
@@ -307,53 +307,53 @@ check('failed rendered read reuses the last good screen',
 check('first failed rendered read falls back to the list preview',
   heartbeat.resolveTerminalScreen(null, undefined, garbledWaitA), garbledWaitA);
 check('rendered terminal reads request the full screen',
-  heartbeat.terminalReadArgs('term_kimi'),
-  ['terminal', 'read', '--terminal', 'term_kimi', '--screen', '--json']);
+  heartbeat.terminalReadArgs('term_worker'),
+  ['terminal', 'read', '--terminal', 'term_worker', '--screen', '--json']);
 
-const kimiToolScreen172 = [
+const workerToolScreen172 = [
   '⠴ Coder Agent Running · K3 · low · 172 tools · Using Bash (35m 24s)',
   'context: 5% (47.4k/1M)',
 ].join('\n');
-const kimiToolScreen173 = [
+const workerToolScreen173 = [
   '⠦ Coder Agent Running · K3 · low · 173 tools · Using Bash (35m 25s)',
   'context: 5% (47.5k/1M)',
 ].join('\n');
-check('Kimi tool count survives while its context counter is ignored',
-  [meaningfulTerminalOutput(kimiToolScreen172), meaningfulTerminalOutput(kimiToolScreen173)],
+check('worker tool count survives while its context counter is ignored',
+  [meaningfulTerminalOutput(workerToolScreen172), meaningfulTerminalOutput(workerToolScreen173)],
   ['tools:172', 'tools:173']);
-check('Kimi toggling footer hints are ignored like context counters',
+check('worker toggling footer hints are ignored like context counters',
   [meaningfulTerminalOutput('| ! to run a shell command'),
     meaningfulTerminalOutput('| / to open commands'),
     meaningfulTerminalOutput('| shift+tab to cycle modes')], ['', '', '']);
-check('Kimi footer hint toggles do not change the fingerprint',
-  fingerprint(`${kimiToolScreen173}\n| ! to run a shell command`),
-  fingerprint(`${kimiToolScreen173}\n| / to open commands`));
+check('worker footer hint toggles do not change the fingerprint',
+  fingerprint(`${workerToolScreen173}\n| ! to run a shell command`),
+  fingerprint(`${workerToolScreen173}\n| / to open commands`));
 check('ordinary prose containing a tool count is preserved',
   meaningfulTerminalOutput('Reviewed output from 173 tools before summarizing.'),
   'Reviewed output from 173 tools before summarizing.');
-check('only the delimited Kimi status shape collapses to a tool counter',
+check('only the delimited worker status shape collapses to a tool counter',
   meaningfulTerminalOutput('173 tools · Using Bash'), '173 tools · Using Bash');
-check('Kimi context counters alone do not change the fingerprint',
+check('worker context counters alone do not change the fingerprint',
   fingerprint('context: 5% (47.4k/1M)'), fingerprint('context: 5% (47.5k/1M)'));
-const kimiToolRecords = new Map();
-observeWorkerProgress(kimiToolRecords, {
-  handle: 'term_kimi_tools', fingerprint: fingerprint(kimiToolScreen172),
+const workerToolRecords = new Map();
+observeWorkerProgress(workerToolRecords, {
+  handle: 'term_worker_tools', fingerprint: fingerprint(workerToolScreen172),
   now: start, stallSeconds: 600,
 });
-check('increasing Kimi tool count after the threshold is progress, not a stall',
-  observeWorkerProgress(kimiToolRecords, {
-    handle: 'term_kimi_tools', fingerprint: fingerprint(kimiToolScreen173),
+check('increasing worker tool count after the threshold is progress, not a stall',
+  observeWorkerProgress(workerToolRecords, {
+    handle: 'term_worker_tools', fingerprint: fingerprint(workerToolScreen173),
     now: start + 700_000, stallSeconds: 600,
   }), { stalled: false, changed: true, stalledSeconds: 0 });
 
 // Approval/question prompts wake immediately, while prose mentioning their vocabulary does not.
-const kimiApproval = [
+const workerApproval = [
   'Select permission mode',
   '  1. Ask When Needed',
   '❯ 2. Never Ask',
   '↑↓ navigate · Enter select',
 ].join('\n');
-const kimiApprovalMoved = [
+const workerApprovalMoved = [
   'Select permission mode',
   '❯ 1. Ask When Needed',
   '  2. Never Ask',
@@ -366,9 +366,9 @@ const codexApproval = [
   '  2. No, and tell Codex what to do differently (esc)',
   'Press enter to confirm or esc to cancel',
 ].join('\n');
-check('real Kimi permission menu is detected', typeof approvalPromptFingerprint(kimiApproval), 'string');
+check('real worker permission menu is detected', typeof approvalPromptFingerprint(workerApproval), 'string');
 check('moving the selection does not create a new prompt episode',
-  approvalPromptFingerprint(kimiApprovalMoved), approvalPromptFingerprint(kimiApproval));
+  approvalPromptFingerprint(workerApprovalMoved), approvalPromptFingerprint(workerApproval));
 check('real Codex command confirmation is detected', typeof approvalPromptFingerprint(codexApproval), 'string');
 check('different Codex commands create different approval episodes',
   approvalPromptFingerprint(codexApproval) ===
@@ -377,12 +377,12 @@ check('real Codex edit confirmation is detected', typeof approvalPromptFingerpri
   codexApproval.replace('run the following command', 'make the following edits')), 'string');
 check('captured selection navigation is sufficient UI evidence',
   typeof approvalPromptFingerprint('↑↓ navigate · Enter select'), 'string');
-check('Kimi navigation with Esc cancel is detected',
+check('worker navigation with Esc cancel is detected',
   typeof approvalPromptFingerprint('↑↓ navigate · Enter select · Esc cancel'), 'string');
-const kimiApprovalWithNoiseA = `🌒 · Tip: /web: search\n⠦ Thinking…\n${kimiApproval}`;
-const kimiApprovalWithNoiseB = `🌘 · Tip: /clear: reset\n⠏ Thinking…\n${kimiApprovalMoved}`;
+const workerApprovalWithNoiseA = `🌒 · Tip: /web: search\n⠦ Thinking…\n${workerApproval}`;
+const workerApprovalWithNoiseB = `🌘 · Tip: /clear: reset\n⠏ Thinking…\n${workerApprovalMoved}`;
 check('approval signature ignores rotating tips, spinners, and selection movement',
-  approvalPromptFingerprint(kimiApprovalWithNoiseA), approvalPromptFingerprint(kimiApprovalWithNoiseB));
+  approvalPromptFingerprint(workerApprovalWithNoiseA), approvalPromptFingerprint(workerApprovalWithNoiseB));
 check('approval signature includes only the prompt block, not ordinary surrounding output',
   approvalPromptFingerprint(`Updated hooks/x.cjs\n${codexApproval}`),
   approvalPromptFingerprint(`Running a different explanation\n${codexApproval}`));
@@ -398,63 +398,14 @@ for (const prose of [
   check(`ordinary prose is not approval UI: ${prose}`, approvalPromptFingerprint(prose), null);
 }
 
-// opencode draws its permission prompt inside a box gutter; the exact live screen must be
-// detected, and the `← <target>` line must re-arm the episode when the command changes.
-const opencodeApproval = [
-  '┃  △ Permission required',
-  '┃    ← Access external directory /private/tmp/claude-501/…/scratchpad',
-  '┃   Allow once   Allow always   Reject        ctrl+f fullscreen  ⇆ select  enter confirm',
-].join('\n');
-const opencodeApprovalMoved = opencodeApproval.replace('scratchpad', 'other-scratchpad');
-check('real opencode permission prompt is detected',
-  typeof approvalPromptFingerprint(opencodeApproval), 'string');
-check('the opencode permission target re-arms a new episode',
-  approvalPromptFingerprint(opencodeApproval) ===
-    approvalPromptFingerprint(opencodeApprovalMoved), false);
-check('opencode permission chrome ignored above the prompt',
-  approvalPromptFingerprint(`⏺ Bash result\n${opencodeApproval}`),
-  approvalPromptFingerprint(`⏺ Different result\n${opencodeApproval}`));
-check('prose quoting the opencode permission dialog is inert',
-  approvalPromptFingerprint('The Permission required dialog offers Allow once, Allow always, or Reject.'), null);
-check('prose naming the opencode prompt without options is inert',
-  approvalPromptFingerprint('A worker hit the "Permission required" prompt while reading an external dir.'), null);
-
-// The header + `← target` + options must be ADJACENT in order and the screen's last
-// non-empty line must not be a spinner or esc-interrupt footer: doc text describing the
-// prompt while the worker runs npm test is not a waiting dialog.
-const opencodePermissionDocSpinner = fs.readFileSync(
-  path.join(__dirname, 'fixtures', 'screen-opencode-permission-doc-spinner.txt'), 'utf8');
-check('doc text describing the permission prompt above a live spinner is not approval',
-  approvalPromptFingerprint(opencodePermissionDocSpinner), null);
-check('doc text describing the prompt above an esc-interrupt footer is not approval',
-  approvalPromptFingerprint([
-    '┃  The dialog asks:',
-    '┃  △ Permission required',
-    '┃  ← Run bash "npm test"',
-    '┃  Allow once   Allow always   Reject',
-    '┃  ● Tip: Press esc to interrupt',
-  ].join('\n')), null);
-check('a real live opencode permission prompt at the bottom is approval',
-  typeof approvalPromptFingerprint([
-    '┃  △ Permission required',
-    '┃  ← Run bash "npm test"',
-    '┃  Allow once   Allow always   Reject',
-  ].join('\n')), 'string');
-check('the opencode prompt scrolled more than 12 lines up is not approval',
-  approvalPromptFingerprint([
-    '┃  △ Permission required',
-    '┃  ← Run bash "npm test"',
-    '┃  Allow once   Allow always   Reject',
-    ...Array.from({ length: 13 }, (_, i) => `┃  output line ${i}`),
-  ].join('\n')), null);
 
 const approvalCtx = {
   baseHandles: new Set(), ownHandles: new Set(['term_approval']), retainedHandles: new Set(),
-  handleAgent: new Map([['term_approval', 'kimi']]), started: start - 1000,
+  handleAgent: new Map([['term_approval', 'worker']]), started: start - 1000,
   now: start, idleSeconds: 60,
 };
 check('supervised approval screen classifies before idle/stall', heartbeat.classifyTerminal({
-  handle: 'term_approval', preview: kimiApproval, lastOutputAt: start,
+  handle: 'term_approval', preview: workerApproval, lastOutputAt: start,
 }, approvalCtx).kind, 'approval_waiting');
 check('prose with approval words remains ordinary working output', heartbeat.classifyTerminal({
   handle: 'term_approval', preview: 'Implemented Allow and Deny parsing.', lastOutputAt: start,
@@ -471,40 +422,14 @@ check('a terminal with old rate-limit scrollback remains eligible for stall trac
   heartbeat.shouldTrackWorkerProgress(scopedSignalVerdict.kind, 'running'), true);
 check('rendered approval UI is still detected when the list preview is working', heartbeat.classifyTerminal({
   handle: 'term_approval', preview: '• Working (45s • esc to interrupt)', lastOutputAt: start,
-}, { ...approvalCtx, approvalText: kimiApproval }).kind, 'approval_waiting');
-check('an opencode permission screen classifies as approval_waiting', heartbeat.classifyTerminal({
-  handle: 'term_opencode', preview: opencodeApproval, lastOutputAt: start,
-}, {
-  ...approvalCtx, ownHandles: new Set(['term_opencode']),
-  handleAgent: new Map([['term_opencode', 'opencode']]),
-}).kind, 'approval_waiting');
-{
-  const opencodeReports = new Map();
-  check('an opencode permission screen emits the exact wake event', heartbeat.reportApprovalWaiting({
-    reported: opencodeReports, handle: 'term_opencode',
-    fingerprint: approvalPromptFingerprint(opencodeApproval),
-    identity: 'ctx_opencode', agent: 'opencode',
-  }), 'WORKER WAITING FOR APPROVAL ctx_opencode (opencode)');
-}
-// A tracked opencode 402 balance screen is DeepSeek usage exhaustion (RT-3: only for a
-// terminal whose tracked agent is opencode).
-check('an opencode 402 balance screen classifies as usage_exhausted for deepseek',
-  heartbeat.classifyTerminal({ handle: 'term_opencode', preview: '■ 402 Insufficient Balance', lastOutputAt: start },
-    { ...approvalCtx, ownHandles: new Set(['term_opencode']),
-      handleAgent: new Map([['term_opencode', 'opencode']]) }),
-  { kind: 'usage_exhausted', coder: 'deepseek' });
-check('the same 402 from a non-opencode terminal is not DeepSeek exhaustion',
-  heartbeat.classifyTerminal({ handle: 'term_opencode', preview: '■ 402 Insufficient Balance', lastOutputAt: start },
-    { ...approvalCtx, ownHandles: new Set(['term_opencode']),
-      handleAgent: new Map([['term_opencode', 'codex']]) }).kind === 'usage_exhausted',
-  false);
+}, { ...approvalCtx, approvalText: workerApproval }).kind, 'approval_waiting');
 
 const approvalReports = new Map();
-const approvalFingerprint = approvalPromptFingerprint(kimiApproval);
+const approvalFingerprint = approvalPromptFingerprint(workerApproval);
 check('first approval episode emits the exact wake event', heartbeat.reportApprovalWaiting({
   reported: approvalReports, handle: 'term_approval', fingerprint: approvalFingerprint,
-  identity: 'ctx_approval', agent: 'kimi', now: start,
-}), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
+  identity: 'ctx_approval', agent: 'worker', now: start,
+}), 'WORKER WAITING FOR APPROVAL ctx_approval (worker)');
 const persistedApproval = heartbeat.loadPersistedApprovalReports().get('term_approval');
 check('approval report persists the signature and report time for a daemon restart',
   persistedApproval && persistedApproval.fingerprint === approvalFingerprint && persistedApproval.at === start,
@@ -512,18 +437,18 @@ check('approval report persists the signature and report time for a daemon resta
 const approvalAfterRestart = heartbeat.loadPersistedApprovalReports();
 check('the same approval inside the 120s window is silent across restart', heartbeat.reportApprovalWaiting({
   reported: approvalAfterRestart, handle: 'term_approval', fingerprint: approvalFingerprint,
-  identity: 'ctx_approval', agent: 'kimi', now: start + 60 * 1000,
+  identity: 'ctx_approval', agent: 'worker', now: start + 60 * 1000,
 }), null);
 check('the same approval after the 120s window is reported again', heartbeat.reportApprovalWaiting({
   reported: approvalAfterRestart, handle: 'term_approval', fingerprint: approvalFingerprint,
-  identity: 'ctx_approval', agent: 'kimi', now: start + 121 * 1000,
-}), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
+  identity: 'ctx_approval', agent: 'worker', now: start + 121 * 1000,
+}), 'WORKER WAITING FOR APPROVAL ctx_approval (worker)');
 approvalAfterRestart.delete('term_approval');
 heartbeat.savePersistedApprovalReports(approvalAfterRestart);
 check('clearing the disappeared prompt re-arms the same future prompt', heartbeat.reportApprovalWaiting({
   reported: approvalAfterRestart, handle: 'term_approval', fingerprint: approvalFingerprint,
-  identity: 'ctx_approval', agent: 'kimi', now: start + 121 * 1000,
-}), 'WORKER WAITING FOR APPROVAL ctx_approval (kimi)');
+  identity: 'ctx_approval', agent: 'worker', now: start + 121 * 1000,
+}), 'WORKER WAITING FOR APPROVAL ctx_approval (worker)');
 
 // Legacy bare-signature entries (no persisted time) load as "reported now": still silent
 // inside the 120s window but re-armed after it, so a prompt that waited through the old
@@ -535,12 +460,12 @@ check('a legacy bare signature loads with a finite report time',
   legacyEntry && legacyEntry.fingerprint === 'legacy-signature' && Number.isFinite(legacyEntry.at), true);
 check('a legacy signature is still silent inside the window', heartbeat.reportApprovalWaiting({
   reported: legacyLoaded, handle: 'term_legacy', fingerprint: 'legacy-signature',
-  identity: 'ctx_legacy', agent: 'kimi', now: legacyEntry.at + 1000,
+  identity: 'ctx_legacy', agent: 'worker', now: legacyEntry.at + 1000,
 }), null);
 check('a legacy signature re-arms after the window', heartbeat.reportApprovalWaiting({
   reported: legacyLoaded, handle: 'term_legacy', fingerprint: 'legacy-signature',
-  identity: 'ctx_legacy', agent: 'kimi', now: legacyEntry.at + 121 * 1000,
-}), 'WORKER WAITING FOR APPROVAL ctx_legacy (kimi)');
+  identity: 'ctx_legacy', agent: 'worker', now: legacyEntry.at + 121 * 1000,
+}), 'WORKER WAITING FOR APPROVAL ctx_legacy (worker)');
 
 // --- Claude trust dialog + WORKER EXITED ---------------------------------------
 
@@ -618,7 +543,7 @@ const exitedReports = new Map();
 check('the first exit episode emits the WORKER EXITED event', heartbeat.reportWorkerExited({
   reported: exitedReports, handle: 'term_approval', lastOutputAt: start,
   identity: 'ctx_exited', agent: 'claude',
-}), 'WORKER EXITED ctx_exited (claude process gone, terminal at shell prompt) - read the terminal for the cause (e.g. Claude Code\'s trust dialog defaulting to exit in an untrusted worktree), then re-dispatch: Kimi/Codex, or headless `claude -p` launched via worker-start');
+}), 'WORKER EXITED ctx_exited (claude process gone, terminal at shell prompt) - read the terminal for the cause (e.g. Claude Code\'s trust dialog defaulting to exit in an untrusted worktree), then re-dispatch: Codex, or headless `claude -p` launched via worker-start');
 check('the exit report is persisted for daemon restart',
   heartbeat.loadPersistedExitedReports().get('term_approval'), start);
 check('the same exit episode is not re-reported', heartbeat.reportWorkerExited({
@@ -631,157 +556,15 @@ check('fresh output after the report re-arms the episode',
     identity: 'ctx_exited', agent: 'claude',
   }) === 'string', true);
 
-// Live quota handover is symmetric, cached-probe friendly, and persisted per episode.
+// Live quota handover probes Codex only and falls back to Sonnet.
 let codexProbeCalls = 0;
-let kimiProbeCalls = 0;
-const stubQuotas = heartbeat.probeLiveCoderQuotas(new Set(['kimi']), start, {
-  codexQuota: () => { codexProbeCalls += 1; return { usedPercent: 20 }; },
-  kimiQuota: () => { kimiProbeCalls += 1; return { usedPercent: 91, source: 'stub' }; },
+const stubQuotas = heartbeat.probeLiveCoderQuotas(new Set(["codex"]), start, {
+  codexQuota: () => { codexProbeCalls += 1; return { usedPercent: 91, source: "stub" }; },
 });
-check('quota probing only calls coders with live supervised workers',
-  [codexProbeCalls, kimiProbeCalls, stubQuotas.codex, stubQuotas.kimi.usedPercent],
-  [0, 1, null, 91]);
-check('failed stub quota probes stay unknown', heartbeat.probeLiveCoderQuotas(new Set(['codex']), start, {
-  codexQuota: () => ({ failed: true }),
-}).codex, null);
-check('destination selection can read both quota caches without live probes',
-  heartbeat.cachedCoderQuotas(start, {
-    readCodexCache: () => ({ usedPercent: 30, source: 'cache' }),
-    readKimiCache: () => ({ usedPercent: 97, source: 'cache' }),
-    readDeepseekCache: () => ({ failed: true }),
-  }), {
-    codex: { usedPercent: 30, source: 'cache' },
-    kimi: { usedPercent: 97, source: 'cache' },
-    deepseek: null,
-  });
-
-const bothEligiblePool = {
-  order: ['codex', 'kimi'],
-  coders: { codex: { state: 'eligible' }, kimi: { state: 'eligible' } },
-};
-check('Kimi handover selects Codex while excluding Kimi',
-  handover.pickNextCoder('kimi', bothEligiblePool), 'codex');
-check('Codex handover selects Kimi while excluding Codex',
-  handover.pickNextCoder('codex', bothEligiblePool), 'kimi');
-check('Kimi handover falls back to Sonnet when Codex is unavailable', handover.pickNextCoder('kimi', {
-  order: [], coders: { codex: { state: 'exhausted' }, kimi: { state: 'eligible' } },
-}), 'sonnet');
-check('Codex handover falls back to Sonnet when Kimi is unavailable', handover.pickNextCoder('codex', {
-  order: [], coders: { codex: { state: 'eligible' }, kimi: { state: 'unusable' } },
-}), 'sonnet');
-const cachedExhaustionPool = heartbeat.buildHandoverPool({
-  codex: { usedPercent: 30 }, kimi: { usedPercent: 97 },
-}, start, {
-  codexAuthState: () => 'ok',
-  availability: {
-    codex: { usable: true }, kimi: { usable: true },
-  },
-  readCoderExhaustion: () => ({}),
-});
-check('a cached exhausted alternative is excluded from the handover target',
-  handover.pickNextCoder('codex', cachedExhaustionPool), 'sonnet');
-const unavailableCodexPool = heartbeat.buildHandoverPool({ codex: null, kimi: { usedPercent: 95 } }, start, {
-  codexAuthState: () => 'unknown',
-  availability: {
-    codex: { usable: false, reason: 'not installed' }, kimi: { usable: true },
-  },
-  readCoderExhaustion: () => ({}),
-});
-check('handover never uses legacy routing semantics to select an unavailable Codex',
-  handover.pickNextCoder('kimi', unavailableCodexPool), 'sonnet');
-
-const handoverRecords = new Map();
-check('below the warning margin emits no handover event', handover.observe(handoverRecords, {
-  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 89,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex', now: start,
-}).event, null);
-const warningEvent = handover.observe(handoverRecords, {
-  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 90,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex', now: start + 1,
-}).event;
-check('crossing the warning margin emits a warning once',
-  /^WORKER HANDOVER WARNING ctx_kimi_quota \(kimi 90% >= 90% warning; handover at 95%\)/.test(warningEvent), true);
-check('the same warning episode does not emit twice', handover.observe(handoverRecords, {
-  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 91,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex', now: start + 2,
-}).event, null);
-check('a destination change updates the same episode without another wake event', handover.observe(handoverRecords, {
-  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 92,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet', now: start + 2,
-}).event, null);
-const kimiHandoverEvent = handover.observe(handoverRecords, {
-  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 95,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex',
-  worktreePath: '/work/kimi-task', now: start + 3,
-}).event;
-check('Kimi threshold crossing hands over to Codex with the required recipe',
-  /^WORKER HANDOVER ctx_kimi_quota \(kimi 95% >= 95%\) -> hand over to Codex\./.test(kimiHandoverEvent) &&
-    kimiHandoverEvent.includes('HANDOVER.md') && kimiHandoverEvent.includes('SAME worktree/branch'), true);
-handover.saveRecords(stateDir, 'worker-stall-test', handoverRecords);
-const handoverAfterRestart = handover.loadRecords(stateDir, 'worker-stall-test');
-check('handover episode persists across heartbeat restart', handover.observe(handoverAfterRestart, {
-  handle: 'term_kimi_quota', identity: 'ctx_kimi_quota', agent: 'kimi', usedPercent: 96,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'codex',
-  worktreePath: '/work/kimi-task', now: start + 4,
-}).event, null);
-check('gate reminder lists persisted workers needing handover',
-  handover.reminder(stateDir, 'worker-stall-test').includes('ctx_kimi_quota (kimi 95%, handover -> Codex)'), true);
-check('gate drops a saved handover record after its worker is gone',
-  handover.reminder(stateDir, 'worker-stall-test', new Set()), '');
-check('stale handover removal is persisted without a heartbeat',
-  handover.loadRecords(stateDir, 'worker-stall-test').size, 0);
-
-const codexHandoverEvent = handover.observe(new Map(), {
-  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 97,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'kimi', now: start,
-}).event;
-check('Codex threshold crossing symmetrically hands over to Kimi',
-  /^WORKER HANDOVER ctx_codex_quota \(codex 97% >= 95%\) -> hand over to Kimi\./.test(codexHandoverEvent), true);
-
-const kimiExhaustedCtx = { ...approvalCtx, handleAgent: new Map([['term_approval', 'kimi']]) };
-const kimiExhaustedVerdict = heartbeat.classifyTerminal({
-  handle: 'term_approval', preview: '■ 403 You\'ve reached your usage limit for this billing cycle', lastOutputAt: start,
-}, kimiExhaustedCtx);
-check('Kimi 403 billing-cycle output is a handover exhaustion trigger',
-  [kimiExhaustedVerdict.kind, kimiExhaustedVerdict.coder], ['usage_exhausted', 'kimi']);
-check('Kimi exhaustion names the usage-limit signal instead of inventing a percentage',
-  /^WORKER HANDOVER ctx_kimi_403 \(kimi usage-limit signal\)/.test(handover.observe(new Map(), {
-    handle: 'term_kimi_403', identity: 'ctx_kimi_403', agent: 'kimi', usedPercent: undefined,
-    threshold: 95, warnMargin: 5, exhausted: true, target: 'codex', now: start,
-  }).event), true);
-check('a signal-triggered handover ignores a contradictory low live percentage in its text',
-  /^WORKER HANDOVER ctx_kimi_low \(kimi usage-limit signal\)/.test(handover.observe(new Map(), {
-    handle: 'term_kimi_low', identity: 'ctx_kimi_low', agent: 'kimi', usedPercent: 40,
-    threshold: 95, warnMargin: 5, exhausted: true, target: 'codex', now: start,
-  }).event), true);
-const aliasedSignalRecords = new Map();
-handover.observe(aliasedSignalRecords, {
-  handle: 'term_alias', identity: 'ctx_alias', aliases: ['task_alias'],
-  agent: 'kimi', usedPercent: 40, threshold: 95, warnMargin: 5,
-  exhausted: true, target: 'codex', now: start,
-});
-handover.saveRecords(stateDir, 'aliased-handover', aliasedSignalRecords);
-check('usage-limit gate reminder never shows the contradictory live percentage',
-  handover.reminder(stateDir, 'aliased-handover', new Set(['task_alias']))
-    .includes('ctx_alias (kimi usage-limit signal, handover -> Codex)'), true);
-check('a live task alias preserves the persisted terminal/dispatch handover record',
-  handover.loadRecords(stateDir, 'aliased-handover').size, 1);
-check('the same aliased record is dropped once no worker alias remains live',
-  handover.reminder(stateDir, 'aliased-handover', new Set()), '');
-
-const usageReport = heartbeat.reportUsageExhausted({
-  reported: new Map(), handle: 'term_usage_recipe', label: 'term_usage_recipe', coder: 'kimi',
-});
-check('usage-limit report points to committing WIP and HANDOVER.md before release',
-  usageReport.includes('follow the WORKER HANDOVER recipe') &&
-    usageReport.includes('commit WIP and HANDOVER.md before stopping/releasing'), true);
-
-const repeatedSignalHandover = handover.observe(new Map(), {
-  handle: 'term_rate_loop', identity: 'ctx_rate_loop', agent: 'codex', usedPercent: 96,
-  threshold: 95, warnMargin: 5, exhausted: false, target: 'kimi', now: start,
-}).event;
-check('handover remains evaluable for an already-reported terminal signal',
-  /^WORKER HANDOVER ctx_rate_loop \(codex 96% >= 95%\)/.test(repeatedSignalHandover), true);
+check("quota probing calls Codex for a live supervised Codex worker",
+  [codexProbeCalls, stubQuotas.codex.usedPercent], [1, 91]);
+check("Codex handover falls back to Sonnet",
+  handover.pickNextCoder("codex", { order: ["codex"], coders: { codex: { state: "eligible" } } }), "sonnet");
 
 const codexUsageLine = '■ You\'ve hit your usage limit. Try again later.';
 check('Codex usage-limit output is distinguished from a transient generic 429',
@@ -805,7 +588,7 @@ check('Codex usage-limit output symmetrically triggers handover',
 const resetNow = new Date(2026, 9, 1, 12, 0, 0, 0).getTime();
 check('Codex reset seconds convert to epoch milliseconds',
   resume.quotaResetAt({ resetsAt: (resetNow + 3_600_000) / 1000 }), resetNow + 3_600_000);
-check('Kimi resetTime-derived seconds use the same reset conversion',
+check('worker resetTime-derived seconds use the same reset conversion',
   resume.quotaResetAt({ resetsAt: (resetNow + 7_200_000) / 1000 }), resetNow + 7_200_000);
 check('Claude local 5pm reset text is parsed',
   resume.parseClaudeResetAt('Limit reached — resets 5pm', resetNow),
@@ -847,12 +630,12 @@ check('a missing or limited panel removes the Sonnet fallback', [
 let schedulerSpawns = 0;
 const parkedResetAt = resetNow + 3_600_000;
 const firstPark = resume.park({
-  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'worker',
   resetAt: parkedResetAt, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow,
   spawnScheduler: () => { schedulerSpawns += 1; return 4321; }, pidAlive: () => false,
 });
 check('first park emits and persists scheduler pid/reset time', [
-  /^WORKER PARKED ctx_park \(kimi limit, resets .+\) - will auto-resume$/.test(firstPark.event),
+  /^WORKER PARKED ctx_park \(worker limit, resets .+\) - will auto-resume$/.test(firstPark.event),
   firstPark.scheduled, resume.readJob(firstPark.file).pid, resume.readJob(firstPark.file).resetAt,
 ], [true, true, 4321, parkedResetAt]);
 check('new park episodes persist bounded-attempt counters', [
@@ -860,7 +643,7 @@ check('new park episodes persist bounded-attempt counters', [
   resume.readJob(firstPark.file).firstAttemptAt,
 ], [0, 0]);
 const duplicatePark = resume.park({
-  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'worker',
   resetAt: parkedResetAt, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 1,
   spawnScheduler: () => { schedulerSpawns += 1; return 9876; }, pidAlive: (pid) => pid === 4321,
 });
@@ -877,7 +660,7 @@ completedParkJob.pid = 0;
 completedParkJob.resumedAt = resetNow + 2;
 resume.writeJob(firstPark.file, completedParkJob);
 check('a successfully resumed terminal can park for a second limit episode', typeof resume.park({
-  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'worker',
   resetAt: 0, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 2,
   spawnScheduler: () => { schedulerSpawns += 1; return 2222; }, pidAlive: () => false,
 }).event, 'string');
@@ -916,7 +699,7 @@ resume.clearJob(stateDir, 'panel-sliding', 'term_panel_sliding');
 check('clearing a park invalidates the scheduler ownership token',
   resume.withOwnedJob(firstPark.file, firstParkToken, 4321, () => true).owned, false);
 check('clearing a recovered episode re-arms a later park', typeof resume.park({
-  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'kimi',
+  stateDir, session: 'park-test', handle: 'term_park', identity: 'ctx_park', agent: 'worker',
   resetAt: parkedResetAt + 5000, threshold: 95, authorizedHandles: new Set(['term_park']), now: resetNow + 3,
   spawnScheduler: () => { schedulerSpawns += 1; return 3333; }, pidAlive: () => false,
 }).event, 'string');
@@ -1047,138 +830,6 @@ check('a delivered resume with no confirmed turn becomes terminal and is never a
   [unverified.reason, unverified.delivered, unverifiedSends.length],
   ['resumed-unverified', true, 1]);
 
-const kimiSends = [];
-const kimiScreens = [
-  'Permission mode: Ask When Needed',
-  'Permission mode: Ask When Needed',
-  '❯ 1. Ask When Needed\n  2. Never Ask',
-  '❯ 1. Ask When Needed\n  2. Never Ask',
-  'Permission mode: Never Ask',
-];
-check('Kimi resume re-asserts Never Ask before continuing when needed', resume.attemptResume({
-  ...resumeJob, handle: 'term_kimi_resume', agent: 'kimi', threshold: 95,
-}, {
-  now: resetNow + 1000 + resume.RESET_GRACE_MS,
-  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
-  readScreen: () => kimiScreens.shift() || 'Permission mode: Never Ask',
-  send: (...args) => { kimiSends.push(args); return true; }, verifyStarted: () => true, wait: () => {},
-}).resumed, true);
-check('Kimi permission sequence precedes its resume message',
-  kimiSends.map((entry) => entry[1]), ['/auto', '\u001b[B', resume.WORKER_RESUME_MESSAGE]);
-check('Kimi option parser moves once in a two-option Ask-to-Never-Ask menu',
-  resume.kimiPermissionMoves('❯ 1. Ask When Needed\n  2. Never Ask'), 1);
-const failedPermissionSends = [];
-check('Kimi never resumes when Never Ask cannot be verified', resume.attemptResume({
-  ...resumeJob, handle: 'term_kimi_unverified', agent: 'kimi', threshold: 95,
-}, {
-  now: resetNow + 1000 + resume.RESET_GRACE_MS,
-  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
-  readScreen: () => 'Permission mode: Ask When Needed',
-  send: (...args) => { failedPermissionSends.push(args); return true; }, verifyStarted: () => true,
-  wait: () => {},
-}).reason, 'permission-unverified');
-check('unverified permission mode never receives the resume message',
-  failedPermissionSends.some((entry) => entry[1] === resume.WORKER_RESUME_MESSAGE), false);
-check('a delivered Kimi permission interaction is marked delivered instead of blindly retried',
-  resume.attemptResume({
-    ...resumeJob, handle: 'term_kimi_unverified_2', agent: 'kimi', threshold: 95,
-  }, {
-    now: resetNow + 1000 + resume.RESET_GRACE_MS,
-    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
-    readScreen: () => 'Permission mode: Ask When Needed', send: () => true,
-    verifyStarted: () => true, wait: () => {},
-  }).delivered, true);
-
-const kimiIdleMenuDefault = [
-  'This session has been idle for 2h 2m and is ~200k tokens.',
-  '❯ Compact and continue',
-  '  Start a new session',
-  '  Continue as-is',
-  "  Don't ask me again",
-  '↑↓ navigate · Enter select',
-].join('\n');
-const kimiIdleMenuWithHistory = `• Working (4000s • esc to interrupt)\n${kimiIdleMenuDefault}`;
-check('visible Kimi idle menu overrides historical active-turn text in the viewport',
-  resume.turnStarted(kimiIdleMenuWithHistory, 'Ready'), false);
-const kimiIdleDefaultSends = [];
-let kimiIdleDefaultVerify = 0;
-check('Kimi idle-session prompt selects the captured default Compact and continue option',
-  resume.attemptResume({
-    ...resumeJob, handle: 'term_kimi_idle_default', agent: 'kimi', threshold: 95,
-  }, {
-    now: resetNow + 1000 + resume.RESET_GRACE_MS,
-    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }), readScreen: () => 'Ready',
-    send: (...args) => { kimiIdleDefaultSends.push(args); return true; },
-    verifyStarted: () => ++kimiIdleDefaultVerify === 1
-      ? { started: false, screen: kimiIdleMenuDefault }
-      : { started: true, screen: 'Compacting conversation context…' },
-  }).resumed, true);
-check('default idle-session cursor needs only one Enter after the resume message',
-  kimiIdleDefaultSends.map((entry) => [entry[1], entry[2]]), [
-    [resume.WORKER_RESUME_MESSAGE, true], ['', true],
-  ]);
-const kimiHistoricalSends = [];
-let kimiHistoricalVerify = 0;
-check('historical Working text cannot bypass idle-menu selection', resume.attemptResume({
-  ...resumeJob, handle: 'term_kimi_idle_history', agent: 'kimi', threshold: 95,
-}, {
-  now: resetNow + 1000 + resume.RESET_GRACE_MS,
-  isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }), readScreen: () => 'Ready',
-  send: (...args) => { kimiHistoricalSends.push(args); return true; },
-  verifyStarted: () => ++kimiHistoricalVerify === 1
-    ? { started: resume.turnStarted(kimiIdleMenuWithHistory, 'Ready'), screen: kimiIdleMenuWithHistory }
-    : { started: true, screen: 'Compacting conversation context…' },
-}).resumed, true);
-check('historical Working text still leads to one Compact selection Enter',
-  kimiHistoricalSends.map((entry) => [entry[1], entry[2]]), [
-    [resume.WORKER_RESUME_MESSAGE, true], ['', true],
-  ]);
-const kimiIdleMenuMoved = kimiIdleMenuDefault
-  .replace('❯ Compact and continue', '  Compact and continue')
-  .replace('  Continue as-is', '❯ Continue as-is');
-const kimiIdleMenuTarget = kimiIdleMenuDefault;
-const kimiIdleMovedSends = [];
-let kimiIdleMovedVerify = 0;
-check('Kimi idle-session prompt moves to Compact and continue and verifies the cursor before Enter',
-  resume.attemptResume({
-    ...resumeJob, handle: 'term_kimi_idle_moved', agent: 'kimi', threshold: 95,
-  }, {
-    now: resetNow + 1000 + resume.RESET_GRACE_MS,
-    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
-    readScreen: () => kimiIdleMenuTarget, wait: () => {},
-    send: (...args) => { kimiIdleMovedSends.push(args); return true; },
-    verifyStarted: () => ++kimiIdleMovedVerify === 1
-      ? { started: false, screen: kimiIdleMenuMoved }
-      : { started: true, screen: '• Working (1s • esc to interrupt)' },
-  }).resumed, true);
-check('moved idle-session cursor sends two Downs without Enter, then one Enter',
-  kimiIdleMovedSends.map((entry) => [entry[1], entry[2]]), [
-    [resume.WORKER_RESUME_MESSAGE, true], ['\u001b[B\u001b[B', false], ['', true],
-  ]);
-const kimiIdleUnverifiedSends = [];
-check('Kimi idle-session prompt never presses Enter when the moved cursor cannot be verified',
-  resume.attemptResume({
-    ...resumeJob, handle: 'term_kimi_idle_unverified', agent: 'kimi', threshold: 95,
-  }, {
-    now: resetNow + 1000 + resume.RESET_GRACE_MS,
-    isAuthorized: () => true, probeQuota: () => ({ usedPercent: 1 }),
-    readScreen: () => kimiIdleMenuMoved, wait: () => {},
-    send: (...args) => { kimiIdleUnverifiedSends.push(args); return true; },
-    verifyStarted: () => ({ started: false, screen: kimiIdleMenuMoved }),
-  }).reason, 'idle-menu-unverified');
-check('unverified idle-session cursor receives no selection Enter',
-  kimiIdleUnverifiedSends.some((entry) => entry[1] === '' && entry[2] === true), false);
-check('retained historical activity without new evidence cannot verify post-menu resumption',
-  resume.turnStarted('• Working (4001s • esc to interrupt)',
-    '• Working (4000s • esc to interrupt)\n' + kimiIdleMenuDefault), false);
-check('spinner and timer repaint on historical activity is not new turn evidence',
-  resume.turnStarted('⠋ Working (4001s • esc to interrupt)',
-    '• Working (4000s • esc to interrupt)'), false);
-check('captured Kimi spinner and inline Tip repaint is not new turn evidence',
-  resume.turnStarted('⠏ Thinking… · Tip: /web searches the internet',
-    '⠦ Thinking… · Tip: /clear starts fresh'), false);
-check('normal output merely mentioning idle compaction words is not treated as the menu',
-  resume.hasKimiIdleSessionMenu('The session has been idle for a while; compact later.'), false);
 
 const panelSends = [];
 check('panel self-resume uses its orchestration-specific message', resume.attemptResume({
@@ -1360,7 +1011,7 @@ check('orphaned resume lock directories older than one day are swept',
     heartbeat.parseWorkerRows({ ok: true, result: [{ dispatchId: 'ctx_b',
       workerState: 'done', completedAt: 1_700_000_000 }] })[0].completedAt, 1_700_000_000_000);
 
-  // Retain-after-done vs the Kimi readiness recovery recipe: retainedAt vs doneAt.
+  // Retain-after-done vs the worker readiness recovery recipe: retainedAt vs doneAt.
   check('a retain strictly before done is the mid-run recovery recipe (eligible)',
     heartbeat.isRetainedForReuse({ retainedReason: 'user_requested' },
       { retained: true, retainedAt: 100, doneAt: 200 }), false);

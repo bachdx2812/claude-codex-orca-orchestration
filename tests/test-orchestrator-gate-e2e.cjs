@@ -35,12 +35,7 @@ try { fs.chmodSync(CODEX_APP_SERVER_STUB, 0o755); } catch {}
 const BASE_ENV = {
   ...Object.fromEntries(Object.entries(process.env).filter(([k]) =>
     !/^(ORCHESTRATOR_GATE|ORCH_|ORCA_TERMINAL_HANDLE|CODEX_HOME|CLAUDE_CODE_)/.test(k))),
-  ORCH_KIMI_HOME: path.join(os.tmpdir(), `orch-e2e-empty-kimi-${process.pid}`),
-  ORCH_KIMI_BIN: path.join(os.tmpdir(), `orch-e2e-missing-kimi-${process.pid}`),
-  ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-  ORCH_OPENCODE_BIN: path.join(os.tmpdir(), `orch-e2e-missing-opencode-${process.pid}`),
 };
-fs.mkdirSync(BASE_ENV.ORCH_KIMI_HOME, { recursive: true });
 
 const SID = `e2e-${process.pid}`;
 const SRC = '/work/proj/src/app.py'; // synthetic, not under any real tmp/home path
@@ -48,8 +43,6 @@ const SRC = '/work/proj/src/app.py'; // synthetic, not under any real tmp/home p
 const RUN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-e2e-'));
 const STATE_DIR = path.join(RUN_DIR, 'state');
 fs.mkdirSync(STATE_DIR, { recursive: true });
-const EMPTY_KIMI_HOME = path.join(RUN_DIR, 'empty-kimi-home');
-fs.mkdirSync(EMPTY_KIMI_HOME, { recursive: true });
 // Temp Orca-fallback flag: never the real machine's ~/.claude/orchestrator-gate/orca-unavailable.
 const FLAG = path.join(RUN_DIR, 'orca-unavailable');
 
@@ -112,10 +105,6 @@ function quotaEnv(name, claudeUsed, codexUsed, extraCfg) {
     ORCH_STATE_DIR: STATE_DIR,
     ORCH_CONFIG_PATH: configFile,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     STUB_CODEX_PRIMARY_USED: String(codexUsed),
     ORCA_BIN: STUB, CODEX_BIN: STUB,
   };
@@ -413,10 +402,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -430,10 +415,10 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     Object.assign({ subagent_type: 'tester', description: 'verify the build' }, extra),
     sid, { tool_use_id: `toolu_rvs_v${++seq}` });
 
-  const start = 'orca orchestration worker-start --agent kimi --json';
+  const start = 'orca orchestration worker-start --agent codex --model gpt-5.6-sol --json';
   invoke(mainBash(start, { sid, tool_use_id: 'toolu_rvs_start' }), env);
-  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_rvs_kimi"}}', { sid, tool_use_id: 'toolu_rvs_start' }), env);
-  checkBool('a registered Kimi worker becomes the session code author', stateOf().lastCodeAuthor, 'kimi');
+  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_rvs_codex"}}', { sid, tool_use_id: 'toolu_rvs_start' }), env);
+  checkBool('a registered Codex worker becomes the session code author', stateOf().lastCodeAuthor, 'codex');
 
   // Review reads code and judges the diff -> opus (all-opus default), never sonnet.
   expect('review of external-coder code runs on the review model', review({ model: 'opus' }), ALLOW, env);
@@ -487,15 +472,15 @@ expect('a neutral first verb still classifies code-reviewer as review work',
       dispatch({ subagent_type: t, description: 'make sure nothing regressed', model: 'opus' }, sid, { tool_use_id: `toolu_rvs_ty_${++seq}` }), DENY, env);
   }
 
-  // The per-prompt reminder names the split: review -> opus (coder: kimi); verify -> sonnet.
+  // The per-prompt reminder names the split between review and verification.
   {
     const r = invoke(promptSubmit(sid, 'status check'), env);
-    if (/review -> opus \(coder: kimi\); verify -> sonnet/.test(r.out)) pass += 1;
-    else failures.push(`reminder must name "review -> opus (coder: kimi); verify -> sonnet"\n    ${r.out.slice(0, 300)}`);
+    if (/review -> opus \(coder: codex\); verify -> sonnet/.test(r.out)) pass += 1;
+    else failures.push(`reminder must name "review -> opus (coder: codex); verify -> sonnet"\n    ${r.out.slice(0, 300)}`);
   }
 
-  invoke(postBash('orca orchestration worker-release --dispatch ctx_rvs_kimi --json', '{"ok":true,"result":{}}', { sid }), env);
-  checkBool('releasing the external group does not clear its recorded author', stateOf().lastCodeAuthor, 'kimi');
+  invoke(postBash('orca orchestration worker-release --dispatch ctx_rvs_codex --json', '{"ok":true,"result":{}}', { sid }), env);
+  checkBool('releasing the external group does not clear its recorded author', stateOf().lastCodeAuthor, 'codex');
 
   // In-session code on the code model (no external coder eligible) records "sonnet", whose
   // review the review model owns.
@@ -505,7 +490,7 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     dispatch({ subagent_type: 'fullstack-developer', description: 'implement the parser fix', model: 'sonnet',
       prompt: 'Verify: npm test' }, sid, { tool_use_id: 'toolu_rvs_sonnet_refused' }), DENY, sonnetEnv);
   checkBool('a refused in-session code dispatch does not record sonnet as the author',
-    stateOf().lastCodeAuthor, 'kimi');
+    stateOf().lastCodeAuthor, 'codex');
   expect('in-session code on the code model is admitted when no external coder is eligible',
     dispatch({ subagent_type: 'fullstack-developer', description: 'implement the parser fix', model: 'sonnet',
       prompt: 'Owns: n/a isolated\nVerify: npm test', isolation: 'worktree' }, sid, { tool_use_id: 'toolu_rvs_sonnet' }),
@@ -531,10 +516,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -564,10 +545,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -604,10 +581,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -670,10 +643,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -702,10 +671,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -723,7 +688,7 @@ expect('a neutral first verb still classifies code-reviewer as review work',
 }
 
 // Low 2: bare "code"/"branch" are not review nouns — running checks on a branch or checking
-// code compiles stays verify-run (sonnet). With DeepSeek as the last code author (whose review
+// code compiles stays verify-run (sonnet). With Codex as the last code author (whose review
 // maps to opus), a misclassification as review would refuse sonnet, so ALLOW on sonnet proves
 // these stay verify.
 {
@@ -737,19 +702,15 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
   const sid = 'verify-not-review';
-  const start = 'orca orchestration worker-start --agent opencode --json';
+  const start = 'orca orchestration worker-start --agent codex --model gpt-5.6-sol --json';
   invoke(mainBash(start, { sid, tool_use_id: 'toolu_vnr_start' }), env);
-  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_vnr_deepseek"}}', { sid, tool_use_id: 'toolu_vnr_start' }), env);
-  checkBool('a registered opencode worker records deepseek as the session code author',
-    JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor, 'deepseek');
+  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_vnr_codex"}}', { sid, tool_use_id: 'toolu_vnr_start' }), env);
+  checkBool('a registered Codex worker records codex as the session code author',
+    JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor, 'codex');
   let seq = 0;
   for (const desc of ['Run tests on the PR branch', 'Verify the code compiles']) {
     expect(`Low 2 verify-not-review stays verify (sonnet allowed): ${desc}`,
@@ -771,10 +732,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -782,7 +739,7 @@ expect('a neutral first verb still classifies code-reviewer as review work',
   let seq = 0;
   for (const row of [
     { subagent_type: 'code-reviewer', description: 'Verify the PR diff is correct' },
-    { subagent_type: 'code-reviewer', description: 'Verify DeepSeek commits against spec' },
+    { subagent_type: 'code-reviewer', description: 'Verify Codex commits against spec' },
     { subagent_type: 'general-purpose', description: 'Check the PR diff; verify tests pass' },
   ]) {
     expect(`a reviewer/code-noun dispatch that starts "Verify" is review (opus allowed): ${row.description}`,
@@ -805,10 +762,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -835,10 +788,6 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
@@ -849,7 +798,7 @@ expect('a neutral first verb still classifies code-reviewer as review work',
 }
 
 // A bare `plan` inside a hyphenated word is not a plan object: a review of the
-// "plan-detection narrowing commit" is a review OF CODE. With DeepSeek as the last code
+// "plan-detection narrowing commit" is a review OF CODE. With Codex as the last code
 // author, it follows the review model (opus, all-opus default) and refuses the code model.
 {
   const dir = path.join(RUN_DIR, 'plan-detection-code-review');
@@ -862,20 +811,16 @@ expect('a neutral first verb still classifies code-reviewer as review work',
     ORCH_CONFIG_PATH: CONFIG_FILE,
     ORCH_CODEX_BIN: CODEX_APP_SERVER_STUB,
     CODEX_BIN: CODEX_APP_SERVER_STUB,
-    ORCH_KIMI_HOME: EMPTY_KIMI_HOME,
-    ORCH_KIMI_BIN: path.join(RUN_DIR, 'missing-kimi'),
-    ORCH_KIMI_USAGE_URL: 'http://127.0.0.1:9/usages',
-    ORCH_OPENCODE_BIN: path.join(RUN_DIR, 'missing-opencode'),
     ORCA_BIN: STUB,
     STUB_CODEX_PRIMARY_USED: '5',
   };
   const sid = 'plan-detection-code-review';
-  const start = 'orca orchestration worker-start --agent opencode --json';
+  const start = 'orca orchestration worker-start --agent codex --model gpt-5.6-sol --json';
   invoke(mainBash(start, { sid, tool_use_id: 'toolu_pdc_start' }), env);
-  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_pdc_deepseek"}}', { sid, tool_use_id: 'toolu_pdc_start' }), env);
-  checkBool('a registered opencode worker records deepseek as the session code author',
-    JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor, 'deepseek');
-  expect('a "plan-detection" review of DeepSeek code runs on the review model',
+  invoke(postBash(start, '{"ok":true,"result":{"dispatchId":"ctx_pdc_codex"}}', { sid, tool_use_id: 'toolu_pdc_start' }), env);
+  checkBool('a registered Codex worker records codex as the session code author',
+    JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8')).lastCodeAuthor, 'codex');
+  expect('a "plan-detection" review of Codex code runs on the review model',
     dispatch({ subagent_type: 'reviewer', description: 'Review plan-detection narrowing commit', model: 'opus' },
       sid, { tool_use_id: 'toolu_pdc_opus' }), ALLOW, env);
   expect('a "plan-detection" review refuses the code model',
@@ -1094,7 +1039,7 @@ expect('fable escalation naming opus (xhigh) is allowed',
 {
   const RS = `${SID}-rv`;
   const out = spawnGate(promptSubmit(RS, 'status?'), SONNET_WINS).stdout;
-  if (/code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[Codex quota 97% used .*Kimi not installed/.test(out) && !/undefined/.test(out)) pass += 1;
+  if (/code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[Codex quota 97% used/.test(out) && !/undefined/.test(out)) pass += 1;
   else failures.push(`auto route to the code model must name model "sonnet", never "undefined": ${out.slice(0, 200)}`);
   const bare = spawnGate(promptSubmit(RS, 'please --code-model'), CODEX_WINS).stdout;
   if (/needs a value/.test(bare)) pass += 1; else failures.push('a bare --code-model must print a notice');
@@ -4093,7 +4038,7 @@ async function heartbeatWorktreeTests() {
       calls.includes('worker-release'), false);
   }
 
-  // 6m-2. 2026-10-01 re-review: the standard Kimi readiness-recovery recipe runs
+  // 6m-2. 2026-10-01 re-review: the standard readiness-recovery recipe runs
   // `worker-retain` BEFORE the worker finishes, which Orca records with the very same
   // 'user_requested' reason as a deliberate "keep this finished worker" decision (6m). A
   // retain the gate recorded strictly BEFORE this worker was first seen done stays
@@ -4604,7 +4549,7 @@ async function heartbeatWorktreeTests() {
       } },
       workerRows: [
         { dispatchId: 'ctx_truncated_terminal', taskId: 'task_truncated_terminal',
-          workerState: 'running', dispatchStatus: 'running', terminalState: 'active', agent: 'opencode',
+          workerState: 'running', dispatchStatus: 'running', terminalState: 'active', agent: 'codex',
           agentTerminalHandle: 'term_truncated_terminal' },
         { dispatchId: 'ctx_truncated_retained', taskId: 'task_truncated_retained',
           workerState: 'succeeded', dispatchStatus: 'completed', terminalState: 'retained', agent: 'claude',
@@ -4612,10 +4557,11 @@ async function heartbeatWorktreeTests() {
           resource: { id: 'resource_truncated_retained', retainedReason: 'user_requested' } },
       ],
       terminalRows: [{ handle: 'term_truncated_terminal', title: 'approval worker',
-        agentIdentity: 'opencode', lastOutputAt: Date.now(), preview: [
-          '┃  △ Permission required',
-          '┃  ← Run bash "npm test"',
-          '┃  Allow once   Allow always   Reject',
+        agentIdentity: 'codex', lastOutputAt: Date.now(), preview: [
+          'Would you like to run the following command?',
+          '$ npm test',
+          '1. Yes, proceed',
+          '2. No, and tell Codex what to do differently',
         ].join('\n') }],
       envOverrides: { STUB_TERMINALS_TRUNCATED: '1', STUB_ORCA_CALLS_LOG: callsFile },
       args: ['--interval', '1', '--idle', '60', '--max', '2'],
@@ -4629,7 +4575,7 @@ async function heartbeatWorktreeTests() {
     } catch {}
     const terminalListCalls = calls.split('\n').filter((line) => line.startsWith('terminal list '));
     checkBool('a truncated terminal list still supervises the partial rows',
-      out.includes('WORKER WAITING FOR APPROVAL ctx_truncated_terminal (opencode)'), true);
+      out.includes('WORKER WAITING FOR APPROVAL ctx_truncated_terminal (codex)'), true);
     checkBool('a truncated terminal list cannot settle an omitted retained terminal',
       !!st && st.workers.ctx_truncated_retained.status === 'live' &&
         st.workers.task_truncated_retained.status === 'live' &&
@@ -4887,7 +4833,7 @@ async function heartbeatH1RealGitTests() {
   // A worker-list row for a DIFFERENT agent (projection.provider.id) must never be adopted
   // by a codex placeholder; neither must a released terminal or an already-done row.
   for (const [caseName, row] of [
-    ['different agent', rowShape({ dispatchId: 'ctx_other_agent', projection: { role: 'worker', provider: { id: 'kimi' } } })],
+    ['different agent', rowShape({ dispatchId: 'ctx_other_agent', projection: { role: 'worker', provider: { id: 'custom' } } })],
     ['released terminal', rowShape({ dispatchId: 'ctx_released_row', terminalState: 'released' })],
     ['done row', rowShape({ dispatchId: 'ctx_done_row', workerState: 'succeeded' })],
   ]) {
@@ -4969,7 +4915,7 @@ async function heartbeatH1RealGitTests() {
     if (st.workers[`pending-${relStarted}-0`] && st.workers[`pending-${relStarted}-0`].status === 'settled') pass += 1;
     else failures.push(`a matching-agent release target must still settle the placeholder (${JSON.stringify(st.workers)})`);
   }
-  // Agent mismatch: the released target is a KIMI worker — the codex placeholder is some
+  // Agent mismatch: the released target is a custom worker — the codex placeholder is some
   // other, still-running dispatch and must NOT be settled.
   rmState(P_SID);
   fs.writeFileSync(path.join(STATE_DIR, `${P_SID}.json`), JSON.stringify({
@@ -4981,7 +4927,7 @@ async function heartbeatH1RealGitTests() {
   }));
   invoke(postBash('orca orchestration worker-release --dispatch ctx_never_tracked --json', '{"ok":true}', { sid: P_SID }),
     { ...CODEX_WINS, STUB_WORKERS_JSON: JSON.stringify([
-      rowShape({ dispatchId: 'ctx_never_tracked', projection: { role: 'worker', provider: { id: 'kimi' } } }),
+      rowShape({ dispatchId: 'ctx_never_tracked', projection: { role: 'worker', provider: { id: 'custom' } } }),
     ]) });
   {
     const st = readState(P_SID) || { workers: {} };

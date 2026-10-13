@@ -50,18 +50,14 @@ const { execFileSync, spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const {
-  loadConfig, stateDir, closeDoneWorktreesEnabled, closeDoneWorktreesMode, stallSeconds, handoffUsed, kimiHandoffUsed,
+  loadConfig, stateDir, closeDoneWorktreesEnabled, closeDoneWorktreesMode, stallSeconds, handoffUsed,
   disabledCoders,
-  codexQuotaCacheSeconds, kimiQuotaCacheSeconds, coderAvailabilityCacheSeconds,
-  deepseekRole, deepseekDailySpendCapUsd, deepseekHandoffUsed, deepseekQuotaCacheSeconds,
-  maxParallelDeepseekWorkers,
+  codexQuotaCacheSeconds, coderAvailabilityCacheSeconds,
   autoResumeAfterReset,
 } = require('./lib/config.cjs');
 const {
-  hasRateLimitError, hasCodexDisconnect, hasKimiUsageExhausted, kimiUsageLimitHours, hasCodexUsageExhausted,
-  hasDeepseekBalanceExhausted,
+  hasRateLimitError, hasCodexDisconnect, hasCodexUsageExhausted,
   approvalPromptFingerprint, endsAtShellPrompt,
-  opencodeWelcomeScreen, opencodeTurnMarker,
 } = require('./lib/terminal-signals.cjs');
 const {
   workerProgressSample, observeWorkerProgress, recordsFromJSON,
@@ -126,10 +122,6 @@ const IDLE_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-idle-reported.js
 // repainting its TUI forever after the session is unrecoverable. Report each affected
 // terminal once for this session, including across heartbeat daemon restarts.
 const DISCONNECT_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-disconnect-reported.json`);
-// Kimi's "usage limit for this billing cycle" 403 is terminal for this billing cycle, not a
-// back-off-and-retry: report each affected terminal once per session (surviving daemon
-// restarts, same mechanism as the disconnect report) so a restart never re-marks Kimi
-// exhausted.
 const USAGE_EXHAUSTED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-usage-exhausted-reported.json`);
 // Per-terminal fingerprint, last real progress time and once-per-episode report marker.
 // This survives daemon restarts because emitting any wake event intentionally exits.
@@ -139,11 +131,6 @@ const APPROVAL_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-approval-rep
 // (handle -> lastOutputAt at report time; fresh output afterwards re-arms it), surviving
 // daemon restarts like the idle report.
 const EXITED_REPORTED_FILE = path.join(DIR, `heartbeat-${SESSION}-exited-reported.json`);
-// An opencode worker whose rendered screen is still the welcome/home screen with no turn
-// marker for this long after it was first seen has never had its brief delivered. Reported
-// once per episode (persisted like other episodes) and re-armed when a turn marker appears.
-const NEVER_STARTED_SECONDS = 90;
-const NEVER_STARTED_FILE = path.join(DIR, `heartbeat-${SESSION}-never-started.json`);
 // Persists which done-but-open worktree paths this SESSION has already reported (via the
 // one-time startup summary or a wake event), surviving a daemon restart within the session —
 // see processDoneWorktrees()'s doc comment for why this file exists.
@@ -426,88 +413,7 @@ function reportWorkerExited({ reported, handle, lastOutputAt, identity, agent })
   savePersistedExitedReports(reported);
   return `WORKER EXITED ${identity || handle} (${agent || 'unknown'} process gone, terminal at shell prompt) - ` +
     'read the terminal for the cause (e.g. Claude Code\'s trust dialog defaulting to exit in an ' +
-    'untrusted worktree), then re-dispatch: Kimi/Codex, or headless `claude -p` launched via worker-start';
-}
-
-function loadPersistedNeverStarted() {
-  try {
-    const pairs = JSON.parse(fs.readFileSync(NEVER_STARTED_FILE, 'utf8'));
-    if (!Array.isArray(pairs)) return new Map();
-    return new Map(pairs.filter((pair) => Array.isArray(pair) && pair.length === 2 &&
-      typeof pair[0] === 'string' && pair[1] && typeof pair[1] === 'object' &&
-      Number.isFinite(pair[1].firstSeenAt) && typeof pair[1].reported === 'boolean'));
-  } catch {
-    return new Map();
-  }
-}
-
-function savePersistedNeverStarted(map) {
-  try {
-    fs.mkdirSync(DIR, { recursive: true });
-    const tmp = `${NEVER_STARTED_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify([...map]));
-    fs.renameSync(tmp, NEVER_STARTED_FILE);
-  } catch {}
-}
-
-/**
- * The opencode "never started" report: a live opencode worker whose rendered screen is still
- * the welcome/home screen (no turn marker) for >= NEVER_STARTED_SECONDS after it was first
- * seen emits once per episode. The episode starts on the first welcome-screen observation
- * (`firstSeenAt`), and the report is persisted before emitting so a daemon restart never
- * re-fires mid-episode. Returns null while the grace window is still open, the episode is
- * already reported, or the worker's brief has already been delivered (`delivered`: a `▣`
- * turn marker / finished message was seen) — a `/new` back to the home screen after delivery
- * is not "brief not delivered".
- */
-function reportNeverStarted({ reported, handle, now = Date.now(), identity }) {
-  const previous = reported.get(handle);
-  if (previous && previous.delivered) return null;
-  if (!previous) {
-    reported.set(handle, { firstSeenAt: now, reported: false, delivered: false });
-    savePersistedNeverStarted(reported);
-    return null;
-  }
-  if (previous.reported || now - previous.firstSeenAt < NEVER_STARTED_SECONDS * 1000) return null;
-  reported.set(handle, { firstSeenAt: previous.firstSeenAt, reported: true, delivered: false });
-  savePersistedNeverStarted(reported);
-  return `WORKER NEVER STARTED ${identity || handle} (opencode, brief not delivered) - resend the brief: ` +
-    `orca terminal send --terminal ${handle} --text '<one-line brief>' --enter`;
-}
-
-/** Clear an UNREPORTED never-started episode: the screen has left the welcome screen, so the
- * NEVER_STARTED_SECONDS window is no longer continuous. A delivered record is left alone —
- * once a finished message has been seen the worker is never reported again until it is
- * pruned. */
-function clearNeverStartedEpisode({ reported, handle }) {
-  const previous = reported.get(handle);
-  if (!previous || previous.delivered || previous.reported) return false;
-  reported.delete(handle);
-  savePersistedNeverStarted(reported);
-  return true;
-}
-
-/** Record that the worker's brief was delivered (a `▣` turn marker / finished message has
- * appeared): the worker is running, so it must never emit WORKER NEVER STARTED again — even
- * after a later `/new` back to the welcome screen. */
-function markNeverStartedDelivered({ reported, handle }) {
-  const previous = reported.get(handle);
-  if (previous && previous.delivered) return false;
-  reported.set(handle, { firstSeenAt: 0, reported: true, delivered: true });
-  savePersistedNeverStarted(reported);
-  return true;
-}
-
-/** Drop never-started records for handles this tick no longer supervises (worker done,
- * released, terminal gone, or agent no longer opencode), so a later re-use of the terminal
- * starts a fresh episode. */
-function pruneNeverStarted({ reported, keepHandles }) {
-  let changed = false;
-  for (const handle of reported.keys()) {
-    if (!keepHandles.has(handle)) { reported.delete(handle); changed = true; }
-  }
-  if (changed) savePersistedNeverStarted(reported);
-  return changed;
+    'untrusted worktree), then re-dispatch: Codex, or headless `claude -p` launched via worker-start';
 }
 
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
@@ -521,9 +427,6 @@ function pruneNeverStarted({ reported, keepHandles }) {
  */
 function exhaustionUntilMs(coder, windowHours, now) {
   const hours = Number.isFinite(windowHours) ? windowHours : null;
-  if (coder === 'kimi' && hours) {
-    return QUOTA.kimiWindowResetMs(DIR, hours * 60, now) || now + hours * 60 * 60 * 1000;
-  }
   if (hours) return now + hours * 60 * 60 * 1000;
   return now + 6 * 60 * 60 * 1000;
 }
@@ -551,7 +454,7 @@ function setOnCoderExhausted(fn) {
  * The usage-exhausted report: persists the handle with its episode end BEFORE emitting so
  * a daemon restart never re-marks or re-reports mid-episode, calls the (injectable)
  * exhaustion-marker hook, and returns the event text. A handle re-arms once its episode
- * ends (`until` passes), so a Kimi terminal re-used after the window reset marks again on
+ * ends (`until` passes), so a terminal re-used after the window reset marks again on
  * the next limit. `silent` writes the marker without an event — for terminals outside
  * this session's fleet, whose exhaustion is a machine-wide fact but not this session's
  * wake event. Returns null when the handle's episode is still open.
@@ -566,8 +469,8 @@ function reportUsageExhausted({ reported, handle, label, coder, windowHours, now
     windowHours: Number.isFinite(windowHours) ? windowHours : null, until,
   });
   if (silent) return null;
-  const name = coder === 'codex' ? 'Codex' : coder === 'kimi' ? 'Kimi' : 'DeepSeek';
-  const other = coder === 'codex' ? 'Kimi or DeepSeek' : coder === 'kimi' ? 'Codex or DeepSeek' : 'Codex or Kimi';
+  const name = 'Codex';
+  const other = 'Sonnet';
   return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
     `route new code to ${other} (or Sonnet if none is eligible); follow the WORKER HANDOVER recipe ` +
     'to commit WIP and HANDOVER.md before stopping/releasing this worker; do not retry it until reset';
@@ -594,33 +497,19 @@ function spawnResumeScheduler(file) {
   } catch { return 0; }
 }
 
-/** The pool/quota coder key for a worker agent (opencode runs DeepSeek). */
 function quotaKeyForAgent(agent) {
-  return agent === 'opencode' ? 'deepseek' : agent;
+  return agent;
 }
 
 /** Probe only coders with live supervised workers. The existing quota helpers own the
  * shared cache and single-flight lock, so a fresh gate reading makes this effectively free. */
 function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
-  const result = { codex: null, kimi: null, deepseek: null };
+  const result = { codex: null };
   if (agents.has('codex')) {
     const reading = (deps.codexQuota || QUOTA.codexQuota)(now, {
       stateDir: DIR, cacheSeconds: codexQuotaCacheSeconds(cfg),
     });
     if (reading && !reading.failed) result.codex = reading;
-  }
-  if (agents.has('kimi')) {
-    const reading = (deps.kimiQuota || QUOTA.kimiQuota)(now, {
-      stateDir: DIR, cacheSeconds: kimiQuotaCacheSeconds(cfg), env: process.env,
-    });
-    if (reading && !reading.failed) result.kimi = reading;
-  }
-  if (agents.has('deepseek') || agents.has('opencode')) {
-    const reading = (deps.deepseekQuota || QUOTA.deepseekQuota)(now, {
-      stateDir: DIR, cacheSeconds: deepseekQuotaCacheSeconds(cfg), env: process.env,
-      dailyCapUsd: deepseekDailySpendCapUsd(cfg),
-    });
-    if (reading && !reading.failed) result.deepseek = reading;
   }
   return result;
 }
@@ -629,12 +518,8 @@ function probeLiveCoderQuotas(agents, now = Date.now(), deps = {}) {
  * This keeps an idle/exhausted alternative out of the recommendation without probing it. */
 function cachedCoderQuotas(now = Date.now(), deps = {}) {
   const codex = (deps.readCodexCache || QUOTA.readFreshCache)(DIR, codexQuotaCacheSeconds(cfg), now);
-  const kimi = (deps.readKimiCache || QUOTA.readFreshKimiCache)(DIR, kimiQuotaCacheSeconds(cfg), now);
-  const deepseek = (deps.readDeepseekCache || QUOTA.readFreshDeepseekCache)(DIR, deepseekQuotaCacheSeconds(cfg), now);
   return {
     codex: codex && !codex.failed ? codex : null,
-    kimi: kimi && !kimi.failed ? kimi : null,
-    deepseek: deepseek && !deepseek.failed ? deepseek : null,
   };
 }
 
@@ -649,10 +534,9 @@ function buildHandoverPool(quotas, now = Date.now(), deps = {}) {
   });
   return (deps.pickCoderPool || CODER_POOL.pickCoderPool)({
     availability, quotas, disabled,
-    thresholds: { codex: handoffUsed(cfg), kimi: kimiHandoffUsed(cfg), deepseek: deepseekHandoffUsed(cfg) },
-    roles: { deepseek: deepseekRole(cfg) },
+    thresholds: { codex: handoffUsed(cfg) },
     exhaustion: (deps.readCoderExhaustion || CODER_AVAILABILITY.readCoderExhaustion)(DIR, now),
-    live: { codex: 0, kimi: 0, deepseek: 0 }, caps: { codex: 0, kimi: 0, deepseek: 0 },
+    live: { codex: 0 }, caps: { codex: 0 },
     // Handover must never recommend an unavailable destination. The legacy null fallback
     // mode applies only to default new-work routing, not recovery of an in-flight task.
     fallbackEnabled: true,
@@ -980,17 +864,13 @@ function machineTerminalAgents(stateDir = DIR) {
  * identity is never enough: it could be another session's Codex/Claude pane, the
  * operator panel, or a plain shell. The terminal title is deliberately NOT a signal:
  * Claude Code titles itself after its conversation topic, so a Claude session working
- * on Kimi would false-positive (RT-3 again).
+ * on another coder would false-positive (RT-3 again).
  */
 function isNonOwnAgentTerminal({ handle, ownHandles, panelHandle, machineAgents, orcaAgents, agent }) {
   if (!handle || (ownHandles && ownHandles.has(handle)) || handle === panelHandle) return false;
   const recorded = machineAgents && machineAgents.get(handle);
   if (recorded) return recorded === agent;
   return !!(orcaAgents && orcaAgents.get(handle) === agent);
-}
-
-function isNonOwnKimiTerminal(ctx) {
-  return isNonOwnAgentTerminal({ ...ctx, agent: 'kimi' });
 }
 
 /** A worker still consuming machine resources, whatever its task status says. */
@@ -1606,7 +1486,7 @@ function isWorktreeClean(w, git, ctx = {}) {
  *     operator decision, eligible for auto-close;
  *   - no reason at all (older Orca), and no session-recorded retain flag either: nothing
  *     is held, eligible for auto-close;
- *   - 'user_requested': ambiguous by itself — the standard Kimi readiness-recovery recipe
+ *   - 'user_requested': ambiguous by itself — the standard readiness-recovery recipe
  *     (`orca terminal send` + `worker-retain`, see orchestration-contract.md's "Codex rate
  *     limits" / Orca-recovery guidance) runs `worker-retain` on a worker that has not
  *     finished yet, and Orca records that same 'user_requested' reason for it as it would
@@ -2011,18 +1891,8 @@ function processDoneWorktrees(data, events, started, ownedWorktreePaths, rmFaile
  */
 function classifyTerminal(t, ctx) {
   if (!ctx.ownHandles || !ctx.ownHandles.has(t.handle)) return { kind: 'ignored' };
-  // Kimi's billing-cycle usage limit is checked before the generic rate-limit backoff: it
-  // is terminal for the billing cycle, not a retry-soon condition. Only ever applied to a
-  // terminal whose tracked worker agent IS kimi (RT-3: a codex worker quoting the sentence,
-  // or prose narrating it, must never mark Kimi exhausted).
-  if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'kimi' &&
-      hasKimiUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'kimi' };
   if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'codex' &&
       hasCodexUsageExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'codex' };
-  // DeepSeek's 402 "Insufficient Balance" is terminal until the account is topped up —
-  // the pay-per-use equivalent of the billing-cycle limits above (same RT-3 scoping).
-  if (ctx.handleAgent && ctx.handleAgent.get(t.handle) === 'opencode' &&
-      hasDeepseekBalanceExhausted(t.preview || '')) return { kind: 'usage_exhausted', coder: 'deepseek' };
   if (hasRateLimitError(t.preview || '')) return { kind: 'rate_limit' };
   if (hasCodexDisconnect(t.preview || '')) return { kind: 'connection_lost' };
   // A terminal whose tracked agent dropped back to a shell prompt (agent process gone)
@@ -2124,7 +1994,6 @@ function main() {
     .map(([handle, record]) => [handle, record.screenText]));
   const reportedApproval = loadPersistedApprovalReports();
   const reportedExited = loadPersistedExitedReports();
-  const reportedNeverStarted = loadPersistedNeverStarted();
   const autoClosed = loadPersistedAutoClosed();
   const doneAtMap = loadPersistedTimestampMap(DONE_AT_FILE);
   const rmFailed = loadPersistedTimestampMap(RM_FAILED_FILE);
@@ -2214,7 +2083,7 @@ function main() {
       for (const handle of sessionTerminalHandles(ws || [])) ownTerminalHandles.add(handle);
       for (const key of sessionWorktreeKeys(ws || [], ts, ownTerminalHandles)) ownedWorktreePaths.add(key);
       // Which coder each supervised terminal runs — the usage-exhausted signal is only ever
-      // attributed to a terminal whose tracked worker agent is kimi (RT-3).
+      // attributed to the tracked worker terminal (RT-3).
       const handleAgent = new Map();
       const handleDispatch = new Map();
       const handleAliases = new Map();
@@ -2328,8 +2197,6 @@ function main() {
         retainedHandles: explicitRetainedHandles, started, now, idleSeconds: IDLE_SECONDS,
         handleAgent,
       };
-      const machineAgents = machineTerminalAgents();
-      const orcaAgents = new Map(ts.map((t) => [t.handle, t.agentIdentity]));
       const panelHandle = process.env.ORCA_TERMINAL_HANDLE || '';
       let panelLimited = false;
       let panelAvailable = false;
@@ -2366,18 +2233,10 @@ function main() {
       const activeResumeHandles = new Set(ts.filter((terminal) =>
         ownTerminalHandles.has(terminal.handle) &&
         liveWorkerHandles.has(terminal.handle) &&
-        ['codex', 'kimi', 'opencode', 'claude'].includes(handleAgent.get(terminal.handle))
+        ['codex', 'claude'].includes(handleAgent.get(terminal.handle))
       ).map((terminal) => terminal.handle));
       const activeCoderHandles = new Set([...activeResumeHandles]
-        .filter((handle) => ['codex', 'kimi', 'opencode'].includes(handleAgent.get(handle))));
-      // Handles this tick still supervises for the "never started" signal: an opencode
-      // terminal whose worker has not reached a terminal state. Anything else (done,
-      // released, gone, re-purposed) is pruned so a later re-use starts a fresh episode.
-      const supervisedNeverStartedHandles = new Set(ts.filter((terminal) =>
-        handleAgent.get(terminal.handle) === 'opencode' &&
-        !TERMINAL_WORKER_STATES.has(handleWorkerState.get(terminal.handle))
-      ).map((terminal) => terminal.handle));
-      pruneNeverStarted({ reported: reportedNeverStarted, keepHandles: supervisedNeverStartedHandles });
+        .filter((handle) => handleAgent.get(handle) === 'codex'));
       const authorizedResumeHandles = new Set(activeResumeHandles);
       if (panelHandle && ts.some((terminal) => terminal.handle === panelHandle)) {
         authorizedResumeHandles.add(panelHandle);
@@ -2386,11 +2245,9 @@ function main() {
       const liveCoderAgents = new Set([...activeCoderHandles].map((handle) => handleAgent.get(handle)));
       const liveQuotas = probeLiveCoderQuotas(liveCoderAgents, now);
       beat(started);
-      const cachedQuotas = liveCoderAgents.size ? cachedCoderQuotas(now) : { codex: null, kimi: null, deepseek: null };
+      const cachedQuotas = liveCoderAgents.size ? cachedCoderQuotas(now) : { codex: null };
       const routingQuotas = {
         codex: liveQuotas.codex || cachedQuotas.codex,
-        kimi: liveQuotas.kimi || cachedQuotas.kimi,
-        deepseek: liveQuotas.deepseek || cachedQuotas.deepseek,
       };
       const handoverPool = liveCoderAgents.size ? buildHandoverPool(routingQuotas, now) : null;
       let handoverChanged = false;
@@ -2413,42 +2270,10 @@ function main() {
         }
         let verdict = classifyTerminal(t, { ...ctx, approvalText: screenText });
         const label = `${t.handle} (${t.title.slice(0, 40)})`;
-        // Kimi exhaustion is a machine-wide fact: a Kimi terminal showing the limit marks
-        // the coder exhausted even when it is not a tracked worker of this session. But a
-        // terminal OUTSIDE this session's fleet only ever marks it when positively
-        // identified as Kimi (another session's worker records or Orca's own
-        // agentIdentity) — never on an absent identity or a Kimi-mentioning title,
-        // which could be another session's Codex/Claude pane, the operator panel, or
-        // a plain shell quoting the error (RT-3). The marker is
-        // written without a wake event: wake events stay scoped to this session's fleet.
-        const terminalAgent = handleAgent.get(t.handle);
-        if (verdict.kind !== 'usage_exhausted' && !terminalAgent &&
-            hasKimiUsageExhausted(t.preview || '') &&
-            isNonOwnKimiTerminal({
-              handle: t.handle, ownHandles: ownTerminalHandles,
-              panelHandle, machineAgents, orcaAgents,
-            })) {
-          reportUsageExhausted({
-            reported: reportedUsageExhausted, handle: t.handle, label, coder: 'kimi',
-            windowHours: kimiUsageLimitHours(t.preview || ''), now, silent: true,
-          });
-        }
-        // Same machine-wide fact, same RT-3 scoping, for DeepSeek's 402 balance signal.
-        if (verdict.kind !== 'usage_exhausted' && !terminalAgent &&
-            hasDeepseekBalanceExhausted(t.preview || '') &&
-            isNonOwnAgentTerminal({
-              handle: t.handle, ownHandles: ownTerminalHandles,
-              panelHandle, machineAgents, orcaAgents, agent: 'opencode',
-            })) {
-          reportUsageExhausted({
-            reported: reportedUsageExhausted, handle: t.handle, label, coder: 'deepseek',
-            windowHours: null, now, silent: true,
-          });
-        }
         if (verdict.kind === 'usage_exhausted') {
           const event = reportUsageExhausted({
             reported: reportedUsageExhausted, handle: t.handle, label, coder: verdict.coder,
-            windowHours: verdict.coder === 'kimi' ? kimiUsageLimitHours(t.preview || '') : null,
+            windowHours: null,
           });
           if (event) events.push(event);
         } else if (verdict.kind === 'rate_limit') {
@@ -2514,25 +2339,6 @@ function main() {
         }
 
         const agent = handleAgent.get(t.handle) || 'unknown';
-        // opencode "never started": a live opencode worker whose rendered screen is still
-        // the welcome/home screen (no `▣` turn marker) has never had its brief delivered.
-        // Fires once per episode after NEVER_STARTED_SECONDS of CONTINUOUS welcome-screen
-        // time. Any non-welcome screen clears an unreported episode (the 90s must be
-        // continuous), and a `▣` turn marker marks the brief delivered for good — a later
-        // `/new` back to home is never reported again.
-        if (agent === 'opencode' && !TERMINAL_WORKER_STATES.has(workerState)) {
-          if (opencodeWelcomeScreen(screenText)) {
-            const neverStarted = reportNeverStarted({
-              reported: reportedNeverStarted, handle: t.handle, now,
-              identity: handleDispatch.get(t.handle) || t.handle,
-            });
-            if (neverStarted) events.push(neverStarted);
-          } else if (opencodeTurnMarker(screenText)) {
-            markNeverStartedDelivered({ reported: reportedNeverStarted, handle: t.handle });
-          } else {
-            clearNeverStartedEpisode({ reported: reportedNeverStarted, handle: t.handle });
-          }
-        }
         if (agent === 'claude' && activeResumeHandles.has(t.handle)) {
           const claudeLimit = RESUME.claudeLimitInfo(screenText, now);
           if (claudeLimit.limited && AUTO_RESUME) {
@@ -2556,8 +2362,7 @@ function main() {
           // An unknown/failed probe is absence of evidence, not recovery. Preserve an
           // existing episode until a known below-margin reading or worker completion.
           if (exhausted || typeof quota?.usedPercent === 'number') {
-            const threshold = agent === 'kimi' ? kimiHandoffUsed(cfg)
-              : agent === 'opencode' ? deepseekHandoffUsed(cfg) : handoffUsed(cfg);
+            const threshold = handoffUsed(cfg);
             let target = HANDOVER.pickNextCoder(agent, handoverPool);
             const limited = exhausted || quota.usedPercent >= 100;
             // Sonnet lives inside the panel. If that panel is itself quota-limited, there
@@ -2653,10 +2458,8 @@ module.exports = {
   isWorktreeIdle, isWorktreeClean, ignoredPathAllowed, cleanStatus, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit, detachedCommitsReachableFromRemotes,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
-  machineTerminalAgents, isNonOwnKimiTerminal, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
+  machineTerminalAgents, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
   loadPersistedExitedReports, savePersistedExitedReports, reportWorkerExited,
-  loadPersistedNeverStarted, savePersistedNeverStarted, reportNeverStarted, clearNeverStartedEpisode,
-  markNeverStartedDelivered, pruneNeverStarted, NEVER_STARTED_SECONDS,
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,
   shouldTrackWorkerProgress,

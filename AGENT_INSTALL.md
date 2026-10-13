@@ -6,41 +6,39 @@ Read `rules/orchestration-contract.md` first for what gets enforced and why.
 ## Who does what
 
 ```
-Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) | Kimi writes code
-[Sonnet only once BOTH coders are unusable or past their handoff threshold, read live;
- separate thresholds via codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED and
- kimiHandoffUsedPercent / ORCH_KIMI_HANDOFF_USED] -> Opus 5.5 reviews -> main panel reports
+Request -> main panel -> Opus 5.5 plans + red-teams -> Codex (gpt-5.6-sol) writes code
+[Sonnet only once Codex is unusable or past its handoff threshold, read live;
+ configured via codexHandoffUsedPercent / ORCH_CODEX_HANDOFF_USED]
+-> Opus 5.5 reviews -> main panel reports
 ```
 
 | Role | Model | Dispatched as | Config key |
 |---|---|---|---|
 | Main panel | session default; never writes code | — | `activation` |
 | Planner / red-team / reviewer / verifier | Opus 5.5 (`claude-opus-5-5`) | `Agent` with `model: "opus"` | `models.review` |
-| Coder pool (peers) | Codex `gpt-5.6-sol` + Kimi (`default_model` in `~/.kimi-code/config.toml`) for code, builds, refactors, tests, bulk conversions, and fix loops | Spread across eligible Orca workers: fewer live workers, then more threshold headroom, then not `lastCoder`, then Codex as the final tie-break. Codex uses `worker-start --agent codex --model gpt-5.6-sol`; Kimi uses `worker-start --agent kimi` without `--model`. | `models.codex`, `models.kimi`, per-coder caps and thresholds |
-| Coder (handoff) | Sonnet, once every usable coder is at/past its handoff threshold (Codex `codexHandoffUsedPercent` / Kimi `kimiHandoffUsedPercent`, both default 95) of its live-read quota or is unusable; overrides `ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED` | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `kimiHandoffUsedPercent`, `models.code` |
+| External coder | Codex `gpt-5.6-sol` for code, builds, refactors, tests, bulk conversions, and fix loops | `worker-start --agent codex --model gpt-5.6-sol` | `models.codex`, `codexHandoffUsedPercent`, `maxParallelCodexWorkers` |
+| Coder (handoff) | Sonnet, once Codex is at/past `codexHandoffUsedPercent` (default 95) of its live-read quota or is unusable; override `ORCH_CODEX_HANDOFF_USED` | `Agent` with `model: "sonnet"` | `codexHandoffUsedPercent`, `models.code` |
 | Lookups | Haiku (advised, not enforced) | `Agent` with `model: "haiku"` | `models.lookup` |
 | Escalation | Fable 5.1 (`claude-fable-5-1`), only after Opus 5.5 failed at high effort | `Agent` with `model: "fable"` | `models.escalation` |
 
-Eligibility means installed, signed in, launchable, below the coder's own threshold, and
-within its cap. An unusable coder is excluded; both unusable or exhausted means Sonnet.
-The independent Codex/Kimi thresholds default to 95 and are configurable in
-`~/.claude/orchestration.config.json` or through `ORCH_CODEX_HANDOFF_USED` /
-`ORCH_KIMI_HANDOFF_USED`.
+Codex eligibility means installed, signed in, launchable, below its threshold, and within
+its cap. Unusable or exhausted Codex means Sonnet. The threshold defaults to 95 and is
+configurable in `~/.claude/orchestration.config.json` or through
+`ORCH_CODEX_HANDOFF_USED`.
 
-Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|kimi|kimi:<model>|auto`. Full
+Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto`. Full
 detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
 
 **Subagents and parallel work.** In-session subagents (`Agent` tool) return their result
 directly and are never tracked by these hooks for supervision purposes — no heartbeat
-needed. Orca workers (Codex or Kimi) run in their own terminal/worktree and must be supervised by
+needed. Codex Orca workers run in their own terminal/worktree and must be supervised by
 `orca-heartbeat.cjs`, which wakes the panel on a state change, IDLE, a finished-but-held
 terminal, a lost Codex app-server connection, an orphan, a rate limit, or one of this session's worktrees whose PR already
 merged/closed with no live terminal left on it; `Stop` refuses to end the session with one live and
 unwatched, or finished and unreleased (an explicitly retained worker Orca reports done is
 informational). A terminal reported disconnected skips idle/orphan classification for that poll.
 No more than `maxParallelCodexWorkers` (default 3)
-live Codex workers at once, and no more than `maxParallelKimiWorkers` (default 3) live
-Kimi workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget
+live Codex workers at once; on top of that, a MACHINE-wide `maxParallelAgents` budget
 (default `max(1, floor(0.8 x cores))`, `0` = unlimited) caps every live Orca worker group
 (any agent) plus every live in-session Agent/Task dispatch, summed across every recent
 session on this machine — this one IS registered for every main-panel Agent/Task dispatch
@@ -207,9 +205,7 @@ The file is plain JSON — no comments — parsed as-is:
 ```json
 {
   "codexHandoffUsedPercent": 90,
-  "kimiHandoffUsedPercent": 95,
   "codexQuotaCacheSeconds": 60,
-  "kimiQuotaCacheSeconds": 60,
   "coderAvailabilityCacheSeconds": 600,
   "replyLanguage": "Vietnamese",
   "disabledGates": ["code-brief-needs-verify"],
@@ -221,22 +217,19 @@ The file is plain JSON — no comments — parsed as-is:
 `ORCH_DISABLED_CODERS` is a comma-separated process override (unknown names warn, and an
 all-unknown value falls back to config). Matching overrides are ignored and `worker-start` is
 refused. Existing live workers remain heartbeat-supervised and quota-checked; parked workers
-do not auto-resume while their coder is disabled.
+may still auto-resume because disabling affects only new routing and dispatch.
 
-(`codexHandoffUsedPercent: 90` hands Codex off slightly earlier than the default 95;
-`kimiHandoffUsedPercent` is Kimi's own, separate threshold (default 95) — both tunable via
-json or env (`ORCH_CODEX_HANDOFF_USED` / `ORCH_KIMI_HANDOFF_USED`); `codexQuotaCacheSeconds`
-controls the live-reading cache TTL and accepts `0` to disable reuse (`kimiQuotaCacheSeconds`
-mirrors it for Kimi, `coderAvailabilityCacheSeconds` (default 600) is the per-machine
+(`codexHandoffUsedPercent: 90` hands Codex off slightly earlier than the default 95 and is
+tunable via JSON or `ORCH_CODEX_HANDOFF_USED`; `codexQuotaCacheSeconds`
+controls the live-reading cache TTL and accepts `0` to disable reuse;
+`coderAvailabilityCacheSeconds` (default 600) is the per-machine
 "installed and signed in?" probe TTL); `replyLanguage`
 accepts any language name, or `null` for no language sentence at all.)
 
 Several more keys gate parallel work: `maxParallelCodexWorkers` (integer 0-32, default 3,
 `0` = unlimited) caps how many live Codex `worker-start` dispatches this session may hold
 at once — a `--terminal`/`--retry-of` that replaces an existing worker does not count as
-new, and a non-Codex agent is never counted; `maxParallelKimiWorkers` (integer 0-32,
-default 3, `0` = unlimited) is the same cap for Kimi worker-starts, overridable with
-`ORCH_MAX_PARALLEL_KIMI_WORKERS`; `parallelCoreFraction` (number 0.1-1, default
+new, and a non-Codex agent is never counted; `parallelCoreFraction` (number 0.1-1, default
 0.8) and `maxParallelAgents` (integer 0-256 or `null`, default `null`) together derive the
 MACHINE-wide `max-parallel-agents` budget — `null` means `max(1, floor(parallelCoreFraction
 x cores))`, an explicit integer overrides that derivation outright, `0` means unlimited;
@@ -261,9 +254,8 @@ and requires one heartbeat per session: stop finished or idle tasks with `TaskSt
 never leave `sleep`/`until` wait loops behind. `parallelCoreFraction`/`maxParallelAgents`'s env overrides treat an empty or
 whitespace-only value as unset (never coerced to `0`), and their config-file values accept
 only an actual JSON number (or `null` for `maxParallelAgents`) — never a numeric string.
-The same empty/whitespace-is-unset rule applies to `ORCH_CODEX_HANDOFF_USED` /
-`ORCH_KIMI_HANDOFF_USED`, `ORCH_MAX_PARALLEL_CODEX_WORKERS` /
-`ORCH_MAX_PARALLEL_KIMI_WORKERS`, and the `ORCH_*_CACHE_SECONDS` overrides, and a `null`
+The same empty/whitespace-is-unset rule applies to `ORCH_CODEX_HANDOFF_USED`,
+`ORCH_MAX_PARALLEL_CODEX_WORKERS`, and the `ORCH_*_CACHE_SECONDS` overrides, and a `null`
 (or any other non-number) in the config file for a numeric key falls back to that key's
 default with a banner warning. Every code brief that already
 needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` dispatch)
@@ -283,8 +275,6 @@ The operator can pick who writes code for the rest of the session directly from 
 --code-model fable           # the configured escalation model, for code work specifically
 --code-model codex           # Codex in an Orca worker (same as --exec-codex)
 --code-model codex:gpt-5-custom   # Codex in an Orca worker, pinned to this model
---code-model kimi            # Kimi in an Orca worker (same as --exec-kimi); no --model, Kimi uses default_model from ~/.kimi-code/config.toml
---code-model kimi:<model>    # Kimi, recorded model preference (Orca cannot pin it)
 --code-model auto            # back to automatic routing (same as --exec-auto)
 ```
 
@@ -301,8 +291,8 @@ standing override.
 
 Automatic routing excludes any coder that is not usable on this machine: `orca` or its
 binary is missing, authentication is absent, or Orca cannot launch it. A failed quota read
-alone does not make an otherwise usable coder unavailable. If only one coder is eligible,
-all code goes to it; if neither Codex nor Kimi is eligible, code falls back to Sonnet. You
+alone does not make otherwise usable Codex unavailable. If Codex is ineligible, code falls
+back to Sonnet. You
 can also:
 
 - pass `--exec-sonnet` (or `--code-model <your configured code alias>`) — an honest,
@@ -311,14 +301,12 @@ can also:
   ~/.claude/orchestrator-gate/orca-unavailable` (expires after 15 minutes on purpose).
 
 `node install.mjs --check` reports this directly: its "coder availability" section prints
-the effective `codexHandoffUsedPercent` / `kimiHandoffUsedPercent` /
-`maxParallelKimiWorkers` / `maxParallelCodexWorkers` values (env overrides applied), one
-`coder codex:` / `coder kimi:` line each with usability and reason, the binary path and
-version, the auth state (`ok` / `logged out` / `unknown`), and the live quota when it is
-readable (`unknown` otherwise), and finally a `pool:` line with the pick those states
-produce. Availability is probed fresh and quota caches are written to a throwaway
-directory, so `--check` never mutates the gate's real state; the Kimi access token is
-read only inside the quota helper and is never printed. An unusable or exhausted coder
+the effective `codexHandoffUsedPercent` / `maxParallelCodexWorkers` values (env overrides
+applied), a `coder codex:` line with usability and reason, the binary path and version, the
+auth state (`ok` / `logged out` / `unknown`), and the live quota when it is readable
+(`unknown` otherwise), and finally a `pool:` line with the pick that state produces.
+Availability is probed fresh and quota caches are written to a throwaway directory, so
+`--check` never mutates the gate's real state. An unusable or exhausted coder
 never fails `--check` — only missing install artifacts, foreign gates, and Node < 18 do.
 
 ## 7. Escape hatches, uninstall, rollback

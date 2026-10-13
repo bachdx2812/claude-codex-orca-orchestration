@@ -19,11 +19,6 @@ const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-unit-state-'));
 process.env.ORCH_STATE_DIR = STATE_DIR;
 process.env.ORCH_CONFIG_PATH = path.join(STATE_DIR, 'no-such-config.json'); // -> defaults
 process.env.ORCH_CODEX_BIN = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
-process.env.ORCH_KIMI_HOME = path.join(STATE_DIR, 'empty-kimi-home');
-process.env.ORCH_KIMI_BIN = path.join(STATE_DIR, 'missing-kimi');
-process.env.ORCH_KIMI_USAGE_URL = 'http://127.0.0.1:9/usages';
-process.env.ORCH_OPENCODE_BIN = path.join(STATE_DIR, 'missing-opencode');
-fs.mkdirSync(process.env.ORCH_KIMI_HOME, { recursive: true });
 
 const gate = require('../hooks/orchestrator-gate.cjs');
 const heartbeat = require('../hooks/orca-heartbeat.cjs');
@@ -961,7 +956,7 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     // Blocker 4 (original) / Blocker 2 (re-review) / 2026-10-01 re-review refinement:
     // Orca's own retainedReason distinguishes an automatic readiness-timeout retain
     // ('identity_unproven', always eligible) from 'user_requested', which is ambiguous by
-    // itself — the standard Kimi readiness-recovery recipe runs `worker-retain` on a
+    // itself — the standard readiness-recovery recipe runs `worker-retain` on a
     // worker that has not finished yet, and Orca records the very same 'user_requested'
     // reason for that as for a deliberate "keep this finished worker open" decision. The
     // two are told apart by comparing this session's own gate-recorded retainedAt against
@@ -972,7 +967,7 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'identity_unproven', doneAt: 1000, retainedAt: 500,
           runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
-    check('user_requested retain recorded BEFORE the done transition (the Kimi readiness recipe) is eligible for auto-close',
+    check('user_requested retain recorded BEFORE the done transition is eligible for auto-close',
       heartbeat.autoCloseDoneWorker(doneRow({ terminalState: 'retained' }),
         { retainedReason: 'user_requested', doneAt: 1000, retainedAt: 500,
           runOrca: recordingOrca().run, git: fakeGit() })?.kind, 'closed');
@@ -1543,10 +1538,6 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     gate.currentExecRoute(cfg, { execAgent: 'codex', session_id: 'unit-route', workers: {} }).route, 'external');
   check('currentExecRoute: operator override "codex:<model>" carries the model',
     gate.currentExecRoute(cfg, { execAgent: 'codex:gpt-5-custom', session_id: 'unit-route', workers: {} }).codexModel, 'gpt-5-custom');
-  check('currentExecRoute: operator override "kimi" is external',
-    gate.currentExecRoute(cfg, { execAgent: 'kimi', session_id: 'unit-route', workers: {} }).pick, 'kimi');
-  check('currentExecRoute: operator override "kimi:<model>" carries the preference',
-    gate.currentExecRoute(cfg, { execAgent: 'kimi:k3', session_id: 'unit-route', workers: {} }).kimiModel, 'k3');
   check('currentExecRoute: operator override "claude:opus" carries the alias',
     gate.currentExecRoute(cfg, { execAgent: 'claude:opus' }).alias, 'opus');
 
@@ -1555,7 +1546,7 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
   // with no coders and lock code out entirely.
   {
     const throwingCfg = Object.create(cfg);
-    Object.defineProperty(throwingCfg, 'deepseekRole', { get() { throw new Error('boom'); } });
+    Object.defineProperty(throwingCfg, 'coderHeadroomTieBand', { get() { throw new Error('boom'); } });
     const keys = ['ORCA_BIN', 'ORCH_CODEX_BIN'];
     const saved = {};
     for (const key of keys) { saved[key] = process.env[key]; process.env[key] = path.join(os.tmpdir(), `missing-${key}`); }
@@ -1567,8 +1558,6 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     }
     check('currentExecRoute: a pool exception routes to in-session code',
       [route.route, route.pick, route.order], ['code', null, []]);
-    check('currentExecRoute: a pool exception never names Codex',
-      /codex/i.test(String(route.why || '')), false);
   }
 
   check('activationApplies: off is never active', gate.activationApplies({ activation: 'off' }), false);
@@ -2150,19 +2139,19 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
       gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_unknown'), s), null);
   }
   {
-    const s = { workers: { ctx_oc: { status: 'live', group: 'ctx_oc', agent: 'opencode' } } };
-    check('resolveWorkerStartAgent: --retry-of an opencode group stays opencode',
-      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_oc'), s), 'opencode');
+    const s = { workers: { ctx_other: { status: 'live', group: 'ctx_other', agent: 'custom' } } };
+    check('resolveWorkerStartAgent: --retry-of a generic group keeps its agent',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_other'), s), 'custom');
   }
   {
-    const s = { workers: { ctx_oc: { status: 'settled', group: 'ctx_oc', agent: 'opencode' } } };
-    check('resolveWorkerStartAgent: --retry-of a settled opencode group still resolves its agent',
-      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_oc'), s), 'opencode');
+    const s = { workers: { ctx_other: { status: 'settled', group: 'ctx_other', agent: 'custom' } } };
+    check('resolveWorkerStartAgent: --retry-of a settled generic group still resolves its agent',
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --retry-of ctx_other'), s), 'custom');
   }
   {
-    const s = { workers: { term_x: { status: 'settled', group: 'ctx_x', agent: 'kimi' } } };
+    const s = { workers: { term_x: { status: 'settled', group: 'ctx_x', agent: 'custom' } } };
     check('resolveWorkerStartAgent: --terminal of a settled tracked group still resolves its agent',
-      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_x'), s), 'kimi');
+      gate.resolveWorkerStartAgent(inv('orca orchestration worker-start --terminal term_x'), s), 'custom');
   }
   {
     const s = { workers: {} };
@@ -2652,11 +2641,9 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
 
 {
   const cfg = config.loadConfig();
-  check('reviewByCoder defaults: every author -> opus (review reads and judges the diff)',
-    ['codex', 'kimi', 'deepseek', 'sonnet'].map((a) => config.reviewModelForCoder(cfg, a)),
-    ['opus', 'opus', 'opus', 'opus']);
-  check('opencode maps to deepseek for the review model',
-    config.reviewModelForCoder(cfg, 'opencode'), 'opus');
+  check('reviewByCoder defaults: Codex and Sonnet authors -> opus',
+    ['codex', 'sonnet'].map((a) => config.reviewModelForCoder(cfg, a)),
+    ['opus', 'opus']);
   check('an unknown author maps to no review model (fail open)',
     config.reviewModelForCoder(cfg, 'claude'), null);
   check('verify model defaults to sonnet', config.verifyModelAlias(cfg), 'sonnet');
@@ -2666,7 +2653,7 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   delete process.env.ORCH_VERIFY_MODEL;
   process.env.ORCH_REVIEW_MODEL_EXTERNAL = 'haiku';
   check('ORCH_REVIEW_MODEL_EXTERNAL overrides the external mapping',
-    config.reviewModelForCoder(cfg, 'kimi'), 'haiku');
+    config.reviewModelForCoder(cfg, 'codex'), 'haiku');
   delete process.env.ORCH_REVIEW_MODEL_EXTERNAL;
   process.env.ORCH_REVIEW_MODEL_SONNET = 'fable';
   check('ORCH_REVIEW_MODEL_SONNET overrides the sonnet mapping',
@@ -2714,10 +2701,10 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   check('a code review with no planning object is not planning', gate.isPlanningReview('review the diff', 'reviewer'), false);
   check('an implementation review is not planning', gate.isPlanningReview('audit the implementation for races', 'reviewer'), false);
   // A code review that only cites a plan / phase / design doc for context stays on the coder's
-  // mapped reviewer (sonnet for codex/kimi/deepseek code): when the description names code
+  // mapped reviewer: when the description names code
   // work, the prompt body is context and a bare "phase"/"design" never counts as planning.
   check('review of a phase implementation diff is not planning', gate.isPlanningReview('Review phase 2 implementation diff', 'reviewer'), false);
-  check('kimi worker output with a plan path in the prompt is not planning', gate.isPlanningReview('Review kimi worker output', 'reviewer', 'Plan: plans/x/plan.md'), false);
+  check('worker output with a plan path in the prompt is not planning', gate.isPlanningReview('Review worker output', 'reviewer', 'Plan: plans/x/plan.md'), false);
   check('a codex fix with a design mention in the prompt is not planning', gate.isPlanningReview('Verify codex fix', 'reviewer', 'against the design of the cache layer'), false);
   check('a PR review citing a design doc in the prompt is not planning', gate.isPlanningReview('Review the PR', 'reviewer', 'Read docs/design-guidelines.md'), false);
   // A bare `plan` inside a hyphenated word is not a plan object: a review of the
@@ -2745,7 +2732,7 @@ check('worker-groups: kindOf a dispatch id', WG.kindOf('ctx_x'), 'worker');
   // B2: a reviewer type or a code noun next to a verify verb is review, never verify.
   for (const [desc, type] of [
     ['Verify the PR diff is correct', 'code-reviewer'],
-    ['Verify DeepSeek commits against spec', 'code-reviewer'],
+    ['Verify Codex commits against spec', 'code-reviewer'],
     ['Check the PR diff; verify tests pass', 'general-purpose'],
   ]) {
     const c = gate.classifyDispatch(desc, type, '');

@@ -36,14 +36,6 @@ const DEFAULT_CACHE_SECONDS = 60;
 const LIVE_CACHE_FILE = 'codex-quota-live.json';
 const LIVE_PROBE_LOCK = '.codex-quota-probe.lock';
 const LIVE_PROBE = path.join(__dirname, 'codex-quota-probe.cjs');
-const KIMI_LIVE_TIMEOUT_MS = 3500;
-const KIMI_LIVE_CACHE_FILE = 'kimi-quota-live.json';
-const KIMI_LIVE_PROBE_LOCK = '.kimi-quota-probe.lock';
-const KIMI_LIVE_PROBE = path.join(__dirname, 'kimi-quota-probe.cjs');
-const DEEPSEEK_LIVE_TIMEOUT_MS = 4000;
-const DEEPSEEK_LIVE_CACHE_FILE = 'deepseek-quota-live.json';
-const DEEPSEEK_LIVE_PROBE_LOCK = '.deepseek-quota-probe.lock';
-const DEEPSEEK_LIVE_PROBE = path.join(__dirname, 'deepseek-quota-probe.cjs');
 const authStateCache = new Map();
 
 function codexSessionsDir() {
@@ -235,154 +227,12 @@ function parseLiveQuota(result, now = Date.now()) {
   ));
 }
 
-function resetSeconds(value) {
-  if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? value / 1000 : value;
-  if (typeof value !== 'string') return 0;
-  const numeric = Number(value);
-  if (Number.isFinite(numeric) && value.trim() !== '') return numeric > 1e12 ? numeric / 1000 : numeric;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed / 1000 : 0;
-}
-
-/** Kimi returns counts as numbers or numeric strings; anything else is unusable. */
-function kimiNumber(value) {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (typeof value === 'string' && value.trim() !== '') {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-/**
- * One quota window from a limit block. An exhausted window carries `used` and no
- * `remaining`, so `used` wins; otherwise usage derives from `remaining`. The ratio-only
- * form is the last resort because it can stay 0 while the real window is full.
- */
-function kimiWindow(block, now, durationMinutes, usedRatio) {
-  const limit = kimiNumber(block && block.limit);
-  const used = kimiNumber(block && block.used);
-  const remaining = kimiNumber(block && block.remaining);
-  const ratio = kimiNumber(usedRatio);
-  let usedPercent = null;
-  if (limit !== null && limit > 0 && used !== null) {
-    usedPercent = (used * 100) / limit;
-  } else if (limit !== null && limit > 0 && remaining !== null) {
-    usedPercent = ((limit - remaining) * 100) / limit;
-  } else if (ratio !== null && ratio >= 0) {
-    usedPercent = ratio <= 1 ? ratio * 100 : ratio;
-  }
-  if (usedPercent === null) return null;
-  usedPercent = Math.max(0, Math.min(100, usedPercent));
-  const resetsAt = resetSeconds(block && (block.resetTime || block.reset_time));
-  const duration = kimiNumber(durationMinutes);
-  const extra = duration !== null && duration > 0 ? { durationMinutes: duration } : {};
-  return resetsAt && resetsAt * 1000 <= now
-    ? { usedPercent: 0, resetsAt: 0, ...extra }
-    : { usedPercent, resetsAt, ...extra };
-}
-
-/** Every usable window of a Kimi /usages response (unreduced). */
-function kimiQuotaWindows(body, now = Date.now()) {
-  if (!body || typeof body !== 'object') return [];
-  const windows = [];
-  if (body.usage && typeof body.usage === 'object') windows.push(kimiWindow(body.usage, now));
-  if (Array.isArray(body.limits)) {
-    for (const item of body.limits) {
-      const detail = item && item.detail;
-      if (detail && typeof detail === 'object') {
-        windows.push(kimiWindow(detail, now, item.window && item.window.duration));
-      }
-    }
-  }
-  const counted = windows.filter(Boolean);
-  if (counted.length) return counted;
-  if (body.usages && typeof body.usages === 'object') {
-    for (const item of Object.values(body.usages)) {
-      if (item && typeof item === 'object') windows.push(kimiWindow(item, now, undefined, item.used_ratio));
-    }
-  }
-  return windows.filter(Boolean);
-}
-
-/** Convert Kimi's /usages response to the tightest usable quota window. */
-function parseKimiUsages(body, now = Date.now()) {
-  const valid = kimiQuotaWindows(body, now);
-  return valid.length ? valid.reduce((a, b) => b.usedPercent > a.usedPercent ? b : a) : null;
-}
-
-/**
- * When the Kimi window of the given length next resets (epoch ms), or null when no such
- * future reset is known. Cache-only: never probes. Reads the live cache first, then the
- * persisted last-known reading — the live cache is usually a `{failed:...}` entry (the
- * token expires whenever no Kimi CLI runs), while the last SUCCESSFUL reading still
- * carries the real window resets.
- */
-function kimiWindowResetMs(stateDir, durationMinutes, now = Date.now()) {
-  const futureResets = (file) => {
-    try {
-      const entry = JSON.parse(fs.readFileSync(path.join(stateDir, file), 'utf8'));
-      return (Array.isArray(entry.windows) ? entry.windows : [])
-        .filter((w) => w && w.durationMinutes === durationMinutes &&
-          typeof w.resetsAt === 'number' && w.resetsAt * 1000 > now)
-        .map((w) => w.resetsAt * 1000);
-    } catch { return []; }
-  };
-  const resets = [...futureResets(KIMI_LIVE_CACHE_FILE), ...futureResets(LAST_KNOWN_FILE.kimi)];
-  return resets.length ? Math.max(...resets) : null;
-}
-
-function kimiProbeEnv(env = process.env) {
-  const out = {};
-  for (const key of ['ORCH_KIMI_HOME', 'ORCH_KIMI_USAGE_URL', 'KIMI_CODE_BASE_URL', 'HOME']) {
-    if (Object.prototype.hasOwnProperty.call(env, key)) out[key] = String(env[key]);
-  }
-  return out;
-}
-
-function kimiLiveResult(now, env) {
-  const probe = spawnSync(process.execPath, [KIMI_LIVE_PROBE], {
-    encoding: 'utf8',
-    timeout: KIMI_LIVE_TIMEOUT_MS,
-    maxBuffer: 3 * 1024 * 1024,
-    env: kimiProbeEnv(env),
-    stdio: ['ignore', 'pipe', 'ignore'],
-  });
-  const stdout = String(probe.stdout || '').trim();
-  if (probe.error || !stdout) return { failed: true, kind: 'timeout' };
-  try {
-    const reply = JSON.parse(stdout);
-    if (probe.status !== 0 || reply.ok !== true) {
-      return { failed: true, kind: typeof reply.kind === 'string' ? reply.kind : 'http' };
-    }
-    const quota = parseKimiUsages(reply.body, now);
-    return quota ? { ...quota, windows: kimiQuotaWindows(reply.body, now) } : { failed: true, kind: 'parse' };
-  } catch {
-    return { failed: true, kind: 'parse' };
-  }
-}
-
-function cachedKimiResult(entry, now) {
-  if (!entry || typeof entry.fetchedAt !== 'number' || !Number.isFinite(entry.fetchedAt)) return null;
-  if (entry.failed === true) return {
-    failed: true, fetchedAt: entry.fetchedAt,
-    ...(typeof entry.kind === 'string' ? { kind: entry.kind } : {}),
-  };
-  if (typeof entry.usedPercent !== 'number' || !Number.isFinite(entry.usedPercent) ||
-      entry.usedPercent < 0 || entry.usedPercent > 100 ||
-      typeof entry.resetsAt !== 'number' || !Number.isFinite(entry.resetsAt) || entry.resetsAt < 0 ||
-      (entry.resetsAt && entry.resetsAt * 1000 <= now)) return null;
-  return { usedPercent: entry.usedPercent, resetsAt: entry.resetsAt, fetchedAt: entry.fetchedAt, source: 'live',
-    ...(Array.isArray(entry.windows) ? { windows: entry.windows } : {}) };
-}
-
 // --- last-known quota + reset-aware estimate ---------------------------------
-// A live read often fails (Kimi's access token expires whenever no Kimi CLI is running).
-// The last SUCCESSFUL reading per coder is therefore persisted on its own — used% per
+// The last successful reading is persisted on its own — used% per
 // window, resetAt per window, readAt — so a later failure can still produce an ESTIMATE:
 // a window whose reset time has passed counts as 0% used, every other window keeps its last
-// reading, and the tightest window wins. Unknown only when a coder was never read at all.
-const LAST_KNOWN_FILE = { codex: 'codex-quota-last-known.json', kimi: 'kimi-quota-last-known.json', deepseek: 'deepseek-quota-last-known.json' };
+// reading, and the tightest window wins. Unknown only when Codex was never read at all.
+const LAST_KNOWN_FILE = { codex: 'codex-quota-last-known.json' };
 // A persisted window with NO reset time is only trusted for this long; past it the window
 // is dropped (a reading that old says nothing about current usage), and if no windows are
 // left the estimate is unknown rather than pinning a coder as exhausted forever (B1).
@@ -406,10 +256,6 @@ function persistLastKnownQuota(stateDir, coder, quota, now = Date.now()) {
   const windows = raw.filter(validKnownWindow)
     .map((w) => ({
       usedPercent: w.usedPercent, resetsAt: w.resetsAt || 0,
-      // durationMinutes lets kimiWindowResetMs match this window to a "5-hour limit"
-      // terminal signal even when the live cache only holds a failed reading.
-      ...(typeof w.durationMinutes === 'number' && Number.isFinite(w.durationMinutes) && w.durationMinutes > 0
-        ? { durationMinutes: w.durationMinutes } : {}),
     }));
   if (!windows.length) return;
   const readAt = typeof quota.fetchedAt === 'number' && Number.isFinite(quota.fetchedAt) ? quota.fetchedAt : now;
@@ -446,145 +292,6 @@ function estimatedQuota(stateDir, coder, now = Date.now()) {
     .filter((v) => v !== null);
   if (!used.length) return null;
   return { usedPercent: Math.max(...used), resetsAt: 0, fetchedAt: entry.readAt, estimated: true, source: 'estimate' };
-}
-
-function kimiQuota(now = Date.now(), options = {}) {
-  const stateDir = options.stateDir || process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
-  const cacheSeconds = options.cacheSeconds === undefined ? DEFAULT_CACHE_SECONDS : options.cacheSeconds;
-  const result = liveCache().cachedLiveProbe({
-    stateDir,
-    cacheFile: KIMI_LIVE_CACHE_FILE,
-    lockName: KIMI_LIVE_PROBE_LOCK,
-    cacheSeconds,
-    now,
-    probe: () => kimiLiveResult(now, options.env || process.env),
-    validate: cachedKimiResult,
-    probeTimeoutMs: KIMI_LIVE_TIMEOUT_MS,
-  });
-  if (result && !result.failed) {
-    persistLastKnownQuota(stateDir, 'kimi', result, now);
-    return result;
-  }
-  // Live read unavailable: fall back to the reset-aware estimate of the last known reading.
-  return estimatedQuota(stateDir, 'kimi', now) || result;
-}
-
-/** Cache-only Kimi read for handover destination selection. Never starts a network probe. */
-function readFreshKimiCache(stateDir, cacheSeconds, now = Date.now()) {
-  return liveCache().readFresh({
-    stateDir, cacheFile: KIMI_LIVE_CACHE_FILE, cacheSeconds, now, validate: cachedKimiResult,
-  });
-}
-
-// --- DeepSeek (opencode): daily spend cap + optional balance check -------------
-// DeepSeek is pay-per-use with no 5-hour window (operator decision, 2026-10-01): headroom
-// is the remaining share of a DAILY SPEND CAP (`deepseekDailySpendCapUsd`, 0 = unlimited —
-// only an exhausted balance stops it). Today's spend comes from opencode via the spawned
-// probe; unreadable spend with a positive cap counts as UNKNOWN (ranked
-// `unknownHeadroomAssumed` by the pool), never as exhausted.
-
-function deepseekProbeEnv(env = process.env) {
-  const out = {};
-  for (const key of ['ORCH_OPENCODE_BIN', 'ORCH_OPENCODE_DB', 'ORCH_DEEPSEEK_BALANCE_URL', 'DEEPSEEK_API_KEY', 'XDG_DATA_HOME', 'PATH', 'HOME']) {
-    if (Object.prototype.hasOwnProperty.call(env, key)) out[key] = String(env[key]);
-  }
-  return out;
-}
-
-function deepseekLiveResult(now, env) {
-  const probe = spawnSync(process.execPath, [DEEPSEEK_LIVE_PROBE], {
-    encoding: 'utf8',
-    timeout: DEEPSEEK_LIVE_TIMEOUT_MS,
-    maxBuffer: 1024 * 1024,
-    env: deepseekProbeEnv(env),
-    stdio: ['ignore', 'pipe', 'ignore'],
-  });
-  const stdout = String(probe.stdout || '').trim();
-  if (probe.error || !stdout) return { failed: true, kind: 'timeout' };
-  try {
-    const reply = JSON.parse(stdout);
-    if (probe.status !== 0 || reply.ok !== true) return { failed: true, kind: 'http' };
-    return {
-      spendUsd: typeof reply.spendUsd === 'number' && Number.isFinite(reply.spendUsd) ? reply.spendUsd : null,
-      balanceExhausted: reply.balanceExhausted === true ? true : reply.balanceExhausted === false ? false : null,
-    };
-  } catch {
-    return { failed: true, kind: 'parse' };
-  }
-}
-
-/** Seconds at which the current local day ends — a spend reading's natural reset time. */
-function nextMidnightSeconds(now) {
-  const d = new Date(now);
-  d.setHours(24, 0, 0, 0);
-  return Math.floor(d.getTime() / 1000);
-}
-
-/**
- * A cached DeepSeek reading is valid only within the same local day: spend resets at
- * midnight, so yesterday's cached percentage must never carry into today.
- */
-function cachedDeepseekResult(entry, now) {
-  if (!entry || typeof entry.fetchedAt !== 'number' || !Number.isFinite(entry.fetchedAt)) return null;
-  if (entry.failed === true) return {
-    failed: true, fetchedAt: entry.fetchedAt,
-    ...(typeof entry.kind === 'string' ? { kind: entry.kind } : {}),
-  };
-  if (typeof entry.usedPercent !== 'number' || !Number.isFinite(entry.usedPercent) ||
-      entry.usedPercent < 0 || entry.usedPercent > 100 ||
-      nextMidnightSeconds(entry.fetchedAt) * 1000 <= now) return null;
-  return {
-    usedPercent: entry.usedPercent, fetchedAt: entry.fetchedAt, source: 'live',
-    limitReached: entry.limitReached === true,
-    ...(entry.unlimited === true ? { unlimited: true } : {}),
-    ...(typeof entry.spendUsd === 'number' ? { spendUsd: entry.spendUsd } : {}),
-  };
-}
-
-function deepseekQuota(now = Date.now(), options = {}) {
-  const stateDir = options.stateDir || process.env.ORCH_STATE_DIR || path.join(os.homedir(), '.claude', 'orchestrator-gate');
-  const cacheSeconds = options.cacheSeconds === undefined ? DEFAULT_CACHE_SECONDS : options.cacheSeconds;
-  const capUsd = typeof options.dailyCapUsd === 'number' && Number.isFinite(options.dailyCapUsd) && options.dailyCapUsd >= 0
-    ? options.dailyCapUsd : 0;
-  const result = liveCache().cachedLiveProbe({
-    stateDir,
-    cacheFile: DEEPSEEK_LIVE_CACHE_FILE,
-    lockName: DEEPSEEK_LIVE_PROBE_LOCK,
-    cacheSeconds,
-    now,
-    probe: () => {
-      const live = deepseekLiveResult(now, options.env || process.env);
-      if (live.failed) return live;
-      // An exhausted balance always reads as fully used, whatever the spend picture is.
-      if (live.balanceExhausted === true) {
-        return { usedPercent: 100, limitReached: true, source: 'balance', spendUsd: live.spendUsd };
-      }
-      // Unlimited cap: no spend-based headroom at all — 0% used, spend recorded when known.
-      if (capUsd === 0) return { usedPercent: 0, unlimited: true, spendUsd: live.spendUsd };
-      if (live.spendUsd === null) return { failed: true, kind: 'spend' };
-      return { usedPercent: Math.min(100, (live.spendUsd / capUsd) * 100), spendUsd: live.spendUsd };
-    },
-    validate: cachedDeepseekResult,
-    probeTimeoutMs: DEEPSEEK_LIVE_TIMEOUT_MS,
-  });
-  if (result && !result.failed) {
-    // Persist with a midnight reset so the estimate ages out daily instead of pinning the
-    // coder exhausted across a day boundary.
-    persistLastKnownQuota(stateDir, 'deepseek', {
-      ...result,
-      windows: [{ usedPercent: result.usedPercent, resetsAt: nextMidnightSeconds(now) }],
-    }, now);
-    return result;
-  }
-  // Live read unavailable: fall back to the reset-aware estimate of the last known reading.
-  return estimatedQuota(stateDir, 'deepseek', now) || result;
-}
-
-/** Cache-only DeepSeek read for handover destination selection. Never starts a probe. */
-function readFreshDeepseekCache(stateDir, cacheSeconds, now = Date.now()) {
-  return liveCache().readFresh({
-    stateDir, cacheFile: DEEPSEEK_LIVE_CACHE_FILE, cacheSeconds, now, validate: cachedDeepseekResult,
-  });
 }
 
 function liveQuotaResult(now = Date.now()) {
@@ -674,7 +381,7 @@ function codexQuota(now = Date.now(), options = {}) {
     persistLastKnownQuota(stateDir, 'codex', sessionQuota, now);
     return sessionQuota;
   }
-  // Same fallback as Kimi: estimate from the last known reading when nothing live answers.
+  // Estimate from the last known reading when nothing live answers.
   return estimatedQuota(stateDir, 'codex', now);
 }
 
@@ -752,8 +459,7 @@ function execRoute(handoffUsedPct = 95, now = Date.now(), options = {}) {
 
 module.exports = {
   pickExecRoute, execRoute, claudeRemaining, codexRemaining, newestSessionFiles,
-  parseLiveQuota, parseKimiUsages, kimiWindowResetMs, liveQuotaWindows, kimiQuotaWindows,
-  liveQuota, codexQuota, kimiQuota, deepseekQuota, codexAuthState,
-  readFreshCache, readFreshKimiCache, readFreshDeepseekCache, formatAge,
+  parseLiveQuota, liveQuotaWindows, liveQuota, codexQuota, codexAuthState,
+  readFreshCache, formatAge,
   persistLastKnownQuota, estimatedQuota, ESTIMATE_RESETLESS_WINDOW_MAX_AGE_MS,
 };
