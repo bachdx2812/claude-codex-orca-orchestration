@@ -58,6 +58,11 @@ function codexWorker(env, sid) {
     tool_use_id: `toolu_${sid}`, cwd: ROOT, tool_input: { command:
       'orca orchestration worker-start --agent codex --worktree new-child --spec "Implement change. Owns: n/a isolated worktree. Verify: npm test."' } });
 }
+function postWorker(env, sid, command, stdout) {
+  return gate(env, { session_id: sid, hook_event_name: 'PostToolUse', tool_name: 'Bash',
+    tool_use_id: `toolu_${sid}`, cwd: ROOT, tool_input: { command },
+    tool_response: { stdout, stderr: '' } });
+}
 function seedState(stateDir, sid, extra = {}) {
   fs.writeFileSync(path.join(stateDir, `${sid}.json`), JSON.stringify({
     session_id: sid, created: new Date().toISOString(), execAgent: null, workers: {},
@@ -74,6 +79,11 @@ function seedState(stateDir, sid, extra = {}) {
   check('default routing does not probe Codex', fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').filter(Boolean).length : 0, 0);
   const worker = codexWorker(f.env, 'default-worker');
   ok('default Codex worker is denied by codex-not-requested', worker.status === 2 && /codex-not-requested/.test(worker.stderr));
+  ok('Codex refusal explains the tracked retry exception', /--retry-of.*this session already started/i.test(worker.stderr));
+  prompt(f.env, 'positive-control', '--exec-codex');
+  codeAgent(f.env, 'positive-control');
+  ok('explicit Codex routing positively controls the probe counter',
+    fs.existsSync(calls) && fs.readFileSync(calls, 'utf8').trim().split('\n').filter(Boolean).length > 0);
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 
@@ -92,7 +102,45 @@ function seedState(stateDir, sid, extra = {}) {
   const agent = codeAgent(f.env, 'exhausted');
   check('exhausted explicit Codex falls back to Sonnet', agent.status, 0);
   const reminder = prompt(f.env, 'exhausted', 'status');
-  ok('exhausted fallback explains the request', /codex requested but/i.test(reminder.stdout));
+  ok('exhausted fallback names the measured quota', /codex requested but quota 97% used/i.test(reminder.stdout));
+  fs.rmSync(f.root, { recursive: true, force: true });
+}
+
+{
+  const f = fixture('tracked-retry');
+  const sid = 'tracked-retry';
+  prompt(f.env, sid, '--exec-codex');
+  const command = 'orca orchestration worker-start --agent codex --worktree new-child --spec "Implement change. Owns: n/a isolated worktree. Verify: npm test."';
+  check('opted-in Codex dispatch is initially allowed', gate(f.env, {
+    session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: `toolu_${sid}`,
+    cwd: ROOT, tool_input: { command },
+  }).status, 0);
+  postWorker(f.env, sid, command, JSON.stringify({ ok: true, result: {
+    dispatchId: 'ctx_tracked_retry', taskId: 'task_tracked_retry', handle: 'term_tracked_retry',
+  } }));
+  prompt(f.env, sid, '--exec-sonnet');
+  const retry = gate(f.env, { session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_use_id: 'toolu_retry', cwd: ROOT, tool_input: {
+      command: 'orca orchestration worker-start --retry-of ctx_tracked_retry',
+    } });
+  check('tracked Codex dispatch may be retried after switching back to Sonnet', retry.status, 0);
+  const fresh = codexWorker(f.env, sid);
+  ok('fresh Codex dispatch stays refused after switching back to Sonnet',
+    fresh.status === 2 && /codex-not-requested/.test(fresh.stderr));
+  fs.rmSync(f.root, { recursive: true, force: true });
+}
+
+{
+  const f = fixture('unproven-retry');
+  seedState(f.stateDir, 'unproven-retry', { workers: {
+    ctx_legacy_codex: { status: 'settled', group: 'ctx_legacy_codex', agent: 'codex' },
+  } });
+  const retry = gate(f.env, { session_id: 'unproven-retry', hook_event_name: 'PreToolUse',
+    tool_name: 'Bash', tool_use_id: 'toolu_unproven_retry', cwd: ROOT, tool_input: {
+      command: 'orca orchestration worker-start --retry-of ctx_legacy_codex',
+    } });
+  ok('tracked Codex retry without opt-in provenance is refused',
+    retry.status === 2 && /codex-not-requested/.test(retry.stderr));
   fs.rmSync(f.root, { recursive: true, force: true });
 }
 

@@ -1501,10 +1501,10 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
 
   const first = run();
   const repaired = JSON.parse(fs.readFileSync(file, 'utf8'));
-  check('invalid persisted execAgent is reset to automatic routing', repaired.execAgent, null);
+  check('invalid persisted execAgent is reset to default routing', repaired.execAgent, null);
   check('invalid persisted execAgent clears its timestamp', repaired.execAgentSince, null);
   check('invalid persisted execAgent is reported on the repairing hook',
-    /invalid persisted execAgent "code".*automatic quota routing/.test(first.stdout), true);
+    /invalid persisted execAgent "code".*using defaultCoder/.test(first.stdout), true);
   const second = run();
   check('a repaired persisted execAgent is not reported again',
     /invalid persisted execAgent/.test(second.stdout), false);
