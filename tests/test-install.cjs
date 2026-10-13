@@ -175,15 +175,18 @@ if (process.platform === 'darwin') {
 }
 
 // --- coder availability section (stub only; never touches real Codex state) -----------
-const emptyCheck = run(['--check'], 'check-codex');
+const emptyCheck = run(['--check'], 'check-codex', {
+  ORCH_CODEX_HANDOFF_USED: '80',
+  ORCH_MAX_PARALLEL_CODEX_WORKERS: '2',
+});
 const emptyOut = `${emptyCheck.stdout}${emptyCheck.stderr}`;
 check('--check exits 0 on a clean machine with no install problems', emptyCheck.status, 0);
-check('--check prints the effective Codex threshold and cap',
-  /codexHandoffUsedPercent=95 maxParallelCodexWorkers=3/.test(emptyOut), true);
+check('--check prints effective Codex thresholds with environment overrides applied',
+  /codexHandoffUsedPercent=80 maxParallelCodexWorkers=2/.test(emptyOut), true);
 check('--check reports the codex coder line (stub binary, auth unknown, quota unreadable)',
   /coder codex: usable \[binary [^\]]*stub 1\.0, auth unknown, quota unknown\]/.test(emptyOut), true);
 check('--check prints the coder pool summary',
-  /pool: Codex quota unknown, available \(0\/3 live\); pick Codex/.test(emptyOut), true);
+  /pool: Codex quota unknown, available \(0\/2 live\); pick Codex/.test(emptyOut), true);
 
 const disabledConfig = path.join(root, 'disabled-coder-config.json');
 fs.writeFileSync(disabledConfig, JSON.stringify({ disabledCoders: ['codex'] }));

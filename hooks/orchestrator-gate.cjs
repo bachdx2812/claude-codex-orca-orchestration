@@ -1267,7 +1267,7 @@ function onSessionStart(p, s, cfg) {
   const externalShortcuts = enabledCoders.map((coder) => `--exec-${coder}`);
   const thresholdText = { codex: codexThreshold };
   const peerList = usableCoders.length
-    ? usableCoders.map((c) => `${coderLabel(c)} (handoff >= ${thresholdText[c]}% used${route.coders[c].standby ? ', overflow' : ''})`).join(', ')
+    ? usableCoders.map((c) => `${coderLabel(c)} (handoff >= ${thresholdText[c]}% used)`).join(', ')
     : 'no external coder usable on this machine';
   const dispatchLines = [
     usableCoders.includes('codex') ? '    Codex -> Orca worker: orca orchestration task-create ... && worker-start --agent codex --model ...\n' : '',
@@ -1557,7 +1557,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     codeRoute = `split: ${['codex'].filter((c) => ex.order.includes(c)).map(coderText).join(' + ')}; next -> ${coderLabel(ex.pick)}`;
   } else if (ex.route === 'external' && ex.coders) {
     const others = ['codex'].filter((c) => c !== ex.pick && ex.coders[c]?.state !== 'disabled');
-    codeRoute += `; ${others.map((c) => `${coderLabel(c)} ${ex.coders[c]?.standby ? 'overflow standby' : (ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable')}`).join('; ')}; next -> ${coderLabel(ex.pick)}`;
+    codeRoute += `; ${others.map((c) => `${coderLabel(c)} ${ex.coders[c]?.reason || ex.coders[c]?.state || 'unavailable'}`).join('; ')}; next -> ${coderLabel(ex.pick)}`;
   }
   parts.push(`Model routing: plan/red-team -> model ${modelLabel(cfg.models.review)}; review -> ${reviewRouteText(cfg, s)}; verify -> ${verifyModelAlias(cfg)}; code -> ${codeRoute} [${ex.why}].`);
   parts.push(`${parallelBudgetLine(cfg, s)}.`);

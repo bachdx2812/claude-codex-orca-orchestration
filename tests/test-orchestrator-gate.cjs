@@ -1558,6 +1558,8 @@ check('heartbeat event snapshots exclude unsupervised context-only rows',
     }
     check('currentExecRoute: a pool exception routes to in-session code',
       [route.route, route.pick, route.order], ['code', null, []]);
+    check('currentExecRoute: a pool exception never names Codex',
+      /codex/i.test(String(route.why || '')), false);
   }
 
   check('activationApplies: off is never active', gate.activationApplies({ activation: 'off' }), false);

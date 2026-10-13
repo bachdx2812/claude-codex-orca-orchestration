@@ -566,6 +566,86 @@ check("quota probing calls Codex for a live supervised Codex worker",
 check("Codex handover falls back to Sonnet",
   handover.pickNextCoder("codex", { order: ["codex"], coders: { codex: { state: "eligible" } } }), "sonnet");
 
+const handoverRecords = new Map();
+check('below the warning margin emits no handover event', handover.observe(handoverRecords, {
+  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 89,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet', now: start,
+}).event, null);
+const warningEvent = handover.observe(handoverRecords, {
+  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 90,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet', now: start + 1,
+}).event;
+check('crossing the warning margin emits a warning once',
+  /^WORKER HANDOVER WARNING ctx_codex_quota \(codex 90% >= 90% warning; handover at 95%\)/.test(warningEvent), true);
+check('the same warning episode does not emit twice', handover.observe(handoverRecords, {
+  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 91,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet', now: start + 2,
+}).event, null);
+check('a destination refresh updates the same episode without another wake event', handover.observe(handoverRecords, {
+  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 92,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet', now: start + 2,
+}).event, null);
+const handoverEvent = handover.observe(handoverRecords, {
+  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 95,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet',
+  worktreePath: '/work/codex-task', now: start + 3,
+}).event;
+check('Codex threshold crossing hands over to Sonnet with the required recipe',
+  /^WORKER HANDOVER ctx_codex_quota \(codex 95% >= 95%\) -> hand over to Sonnet\./.test(handoverEvent) &&
+    handoverEvent.includes('HANDOVER.md') && handoverEvent.includes('SAME worktree/branch'), true);
+handover.saveRecords(stateDir, 'worker-stall-test', handoverRecords);
+const handoverAfterRestart = handover.loadRecords(stateDir, 'worker-stall-test');
+check('handover episode persists across heartbeat restart', handover.observe(handoverAfterRestart, {
+  handle: 'term_codex_quota', identity: 'ctx_codex_quota', agent: 'codex', usedPercent: 96,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet',
+  worktreePath: '/work/codex-task', now: start + 4,
+}).event, null);
+check('gate reminder lists persisted workers needing handover',
+  handover.reminder(stateDir, 'worker-stall-test').includes('ctx_codex_quota (codex 95%, handover -> Sonnet)'), true);
+check('gate drops a saved handover record after its worker is gone',
+  handover.reminder(stateDir, 'worker-stall-test', new Set()), '');
+check('stale handover removal is persisted without a heartbeat',
+  handover.loadRecords(stateDir, 'worker-stall-test').size, 0);
+
+check('Codex exhaustion names the usage-limit signal instead of inventing a percentage',
+  /^WORKER HANDOVER ctx_codex_signal \(codex usage-limit signal\)/.test(handover.observe(new Map(), {
+    handle: 'term_codex_signal', identity: 'ctx_codex_signal', agent: 'codex', usedPercent: undefined,
+    threshold: 95, warnMargin: 5, exhausted: true, target: 'sonnet', now: start,
+  }).event), true);
+check('a signal-triggered handover ignores a contradictory low live percentage in its text',
+  /^WORKER HANDOVER ctx_codex_low \(codex usage-limit signal\)/.test(handover.observe(new Map(), {
+    handle: 'term_codex_low', identity: 'ctx_codex_low', agent: 'codex', usedPercent: 40,
+    threshold: 95, warnMargin: 5, exhausted: true, target: 'sonnet', now: start,
+  }).event), true);
+const aliasedSignalRecords = new Map();
+handover.observe(aliasedSignalRecords, {
+  handle: 'term_alias', identity: 'ctx_alias', aliases: ['task_alias'],
+  agent: 'codex', usedPercent: 40, threshold: 95, warnMargin: 5,
+  exhausted: true, target: 'sonnet', now: start,
+});
+handover.saveRecords(stateDir, 'aliased-handover', aliasedSignalRecords);
+check('usage-limit gate reminder never shows the contradictory live percentage',
+  handover.reminder(stateDir, 'aliased-handover', new Set(['task_alias']))
+    .includes('ctx_alias (codex usage-limit signal, handover -> Sonnet)'), true);
+check('a live task alias preserves the persisted terminal handover record',
+  handover.loadRecords(stateDir, 'aliased-handover').size, 1);
+check('the aliased record is dropped once no worker alias remains live',
+  handover.reminder(stateDir, 'aliased-handover', new Set()), '');
+
+const usageReport = heartbeat.reportUsageExhausted({
+  reported: new Map(), handle: 'term_usage_recipe', label: 'term_usage_recipe', coder: 'codex',
+});
+check('usage-limit report points to committing WIP and HANDOVER.md before release',
+  usageReport.includes('follow the WORKER HANDOVER recipe') &&
+    usageReport.includes('commit WIP and HANDOVER.md before stopping/releasing'), true);
+
+const repeatedSignalHandover = handover.observe(new Map(), {
+  handle: 'term_rate_loop', identity: 'ctx_rate_loop', agent: 'codex', usedPercent: 96,
+  threshold: 95, warnMargin: 5, exhausted: false, target: 'sonnet', now: start,
+}).event;
+check('handover remains evaluable for an already-reported terminal signal',
+  /^WORKER HANDOVER ctx_rate_loop \(codex 96% >= 95%\)/.test(repeatedSignalHandover), true);
+
 const codexUsageLine = '■ You\'ve hit your usage limit. Try again later.';
 check('Codex usage-limit output is distinguished from a transient generic 429',
   [hasCodexUsageExhausted(codexUsageLine), hasCodexUsageExhausted('HTTP/1.1 429 Too Many Requests')],

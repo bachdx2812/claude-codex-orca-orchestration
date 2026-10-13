@@ -419,15 +419,8 @@ function reportWorkerExited({ reported, handle, lastOutputAt, identity, agent })
 // What to do when a coder's output shows it is exhausted for this billing cycle: record an
 // exhaustion marker the routing code reads to exclude that coder until reset. A
 // missing/failing marker write degrades to a no-op; the report event itself is still emitted.
-/**
- * The exhaustion episode's end time: a windowed limit lasts until that window's known
- * reset (else one window length from now); the billing-cycle form keeps the long default.
- * Shared by the marker write and the report de-duplication so both agree on when an
- * episode is over and a re-used terminal may re-mark.
- */
-function exhaustionUntilMs(coder, windowHours, now) {
-  const hours = Number.isFinite(windowHours) ? windowHours : null;
-  if (hours) return now + hours * 60 * 60 * 1000;
+/** The conservative episode end used when Codex output has no precise reset time. */
+function exhaustionUntilMs(now) {
   return now + 6 * 60 * 60 * 1000;
 }
 
@@ -435,12 +428,10 @@ let onCoderExhausted = defaultOnCoderExhausted;
 function defaultOnCoderExhausted(coder, info = {}) {
   try {
     const now = Date.now();
-    const hours = Number.isFinite(info.windowHours) ? info.windowHours : null;
-    const until = Number.isFinite(info.until) ? info.until : exhaustionUntilMs(coder, info.windowHours, now);
+    const until = Number.isFinite(info.until) ? info.until : exhaustionUntilMs(now);
     require('./lib/coder-availability.cjs').markCoderExhausted(DIR, coder, {
       now, until,
-      reason: hours ? `${hours}-hour usage limit reached (worker output)`
-        : 'usage limit reached for this billing cycle (worker output)',
+      reason: 'usage limit reached for this billing cycle (worker output)',
     });
   } catch {}
 }
@@ -459,20 +450,18 @@ function setOnCoderExhausted(fn) {
  * this session's fleet, whose exhaustion is a machine-wide fact but not this session's
  * wake event. Returns null when the handle's episode is still open.
  */
-function reportUsageExhausted({ reported, handle, label, coder, windowHours, now = Date.now(), silent = false }) {
-  const until = exhaustionUntilMs(coder, windowHours, now);
+function reportUsageExhausted({ reported, handle, label, coder, now = Date.now(), silent = false }) {
+  const until = exhaustionUntilMs(now);
   const previous = reported.get(handle);
   if (previous && previous.until > now) return null;
   reported.set(handle, { coder, until });
   savePersistedUsageExhaustedReports(reported);
-  onCoderExhausted(coder, {
-    windowHours: Number.isFinite(windowHours) ? windowHours : null, until,
-  });
+  onCoderExhausted(coder, { until });
   if (silent) return null;
   const name = 'Codex';
   const other = 'Sonnet';
   return `${name.toUpperCase()} USAGE LIMIT on ${label}: ${name} is exhausted - ` +
-    `route new code to ${other} (or Sonnet if none is eligible); follow the WORKER HANDOVER recipe ` +
+    `route new code to ${other}; follow the WORKER HANDOVER recipe ` +
     'to commit WIP and HANDOVER.md before stopping/releasing this worker; do not retry it until reset';
 }
 
@@ -495,10 +484,6 @@ function spawnResumeScheduler(file) {
     child.unref();
     return child.pid || 0;
   } catch { return 0; }
-}
-
-function quotaKeyForAgent(agent) {
-  return agent;
 }
 
 /** Probe only coders with live supervised workers. The existing quota helpers own the
@@ -832,45 +817,6 @@ function sessionTerminalHandles(workerRows, state = loadSessionState()) {
     }
   } catch {}
   return handles;
-}
-
-/**
- * Machine-wide terminal-handle -> agent map from EVERY session's gate state file
- * (~/.claude/orchestrator-gate/<session>.json), so a terminal this session does not own
- * can still be attributed to the agent another session registered for it.
- */
-function machineTerminalAgents(stateDir = DIR) {
-  const agents = new Map();
-  let files = [];
-  try { files = fs.readdirSync(stateDir); } catch { return agents; }
-  for (const file of files) {
-    if (!file.endsWith('.json') || file.startsWith('heartbeat-')) continue;
-    let state;
-    try { state = JSON.parse(fs.readFileSync(path.join(stateDir, file), 'utf8')); } catch { continue; }
-    for (const [id, worker] of Object.entries(state && state.workers || {})) {
-      if (worker && typeof worker.agent === 'string' && worker.agent &&
-          (worker.kind === 'terminal' || /^term_/.test(id))) {
-        agents.set(id, worker.agent);
-      }
-    }
-  }
-  return agents;
-}
-
-/**
- * RT-3 scope guard for terminals OUTSIDE this session's fleet: such a terminal may mark a
- * coder exhausted only when positively identified as that coder's terminal — via another
- * session's worker records or Orca's own `terminal list` agentIdentity. An absent
- * identity is never enough: it could be another session's Codex/Claude pane, the
- * operator panel, or a plain shell. The terminal title is deliberately NOT a signal:
- * Claude Code titles itself after its conversation topic, so a Claude session working
- * on another coder would false-positive (RT-3 again).
- */
-function isNonOwnAgentTerminal({ handle, ownHandles, panelHandle, machineAgents, orcaAgents, agent }) {
-  if (!handle || (ownHandles && ownHandles.has(handle)) || handle === panelHandle) return false;
-  const recorded = machineAgents && machineAgents.get(handle);
-  if (recorded) return recorded === agent;
-  return !!(orcaAgents && orcaAgents.get(handle) === agent);
 }
 
 /** A worker still consuming machine resources, whatever its task status says. */
@@ -2273,7 +2219,6 @@ function main() {
         if (verdict.kind === 'usage_exhausted') {
           const event = reportUsageExhausted({
             reported: reportedUsageExhausted, handle: t.handle, label, coder: verdict.coder,
-            windowHours: null,
           });
           if (event) events.push(event);
         } else if (verdict.kind === 'rate_limit') {
@@ -2357,7 +2302,7 @@ function main() {
           }
         }
         if (activeCoderHandles.has(t.handle)) {
-          const quota = liveQuotas[quotaKeyForAgent(agent)];
+          const quota = liveQuotas[agent];
           const exhausted = verdict.kind === 'usage_exhausted';
           // An unknown/failed probe is absence of evidence, not recovery. Preserve an
           // existing episode until a known below-margin reading or worker completion.
@@ -2458,7 +2403,7 @@ module.exports = {
   isWorktreeIdle, isWorktreeClean, ignoredPathAllowed, cleanStatus, resolveBaseRef, isAncestorOf, runGit,
   statMtimeMs, headCommitTimeMs, hasProducedMergedWork, hasOwnCommit, detachedCommitsReachableFromRemotes,
   setOnCoderExhausted, reportUsageExhausted, loadPersistedUsageExhaustedReports, savePersistedUsageExhaustedReports,
-  machineTerminalAgents, isNonOwnAgentTerminal, quotaKeyForAgent, exhaustionUntilMs,
+  exhaustionUntilMs,
   loadPersistedExitedReports, savePersistedExitedReports, reportWorkerExited,
   terminalWorktreePath, runProgressGit, loadPersistedStallProgress, savePersistedStallProgress,
   formatStallEvent, terminalWorkerStates, stallThresholdForAgent, TERMINAL_WORKER_STATES,

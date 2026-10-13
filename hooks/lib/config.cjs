@@ -648,14 +648,13 @@ function maxParallelCodexWorkers(cfg) {
  * Returns null for an unknown author (fail open toward review happening).
  */
 function reviewModelForCoder(cfg, author) {
-  const normalized = author;
-  const known = Object.prototype.hasOwnProperty.call(cfg.models.reviewByCoder, normalized);
+  const known = Object.prototype.hasOwnProperty.call(cfg.models.reviewByCoder, author);
   if (!known) return null;
-  const envOverride = normalized === 'sonnet'
+  const envOverride = author === 'sonnet'
     ? process.env.ORCH_REVIEW_MODEL_SONNET
     : process.env.ORCH_REVIEW_MODEL_EXTERNAL;
   if (envOverride !== undefined && envOverride.trim() !== '') return envOverride.trim();
-  return cfg.models.reviewByCoder[normalized];
+  return cfg.models.reviewByCoder[author];
 }
 
 /**

@@ -35,8 +35,7 @@
  */
 
 const CODERS = ['codex'];
-
-function label() { return 'Codex'; }
+const CODER_LABEL = 'Codex';
 
 function knownQuota(quota) {
   return quota && quota.failed !== true && typeof quota.usedPercent === 'number' && Number.isFinite(quota.usedPercent);
@@ -55,7 +54,7 @@ function markerActive(marker, quota, threshold) {
 }
 
 function formatCoderState(coderName, coder) {
-  const name = label(String(coderName).toLowerCase());
+  const name = CODER_LABEL;
   if (coder.state === 'disabled') return `${name} (disabled by config)`;
   if (coder.state === 'unusable') return `${name} (unusable: ${coder.reason})`;
   if (coder.state === 'exhausted') return `${name} (exhausted${coder.reason ? `: ${coder.reason}` : ''})`;
@@ -151,7 +150,7 @@ function pickCoderPool(options = {}) {
         why: 'auto: every coder disabled by config',
       };
     }
-    const states = shown.map((coder) => `${label(coder)} ${coders[coder].reason || coders[coder].state}`);
+    const states = shown.map((coder) => `${CODER_LABEL} ${coders[coder].reason || coders[coder].state}`);
     return {
       route: 'code', order, pick: null, coders,
       summary: shown.map((coder) => formatCoderState(coder, coders[coder])).join(' or '),
@@ -173,19 +172,18 @@ function pickCoderPool(options = {}) {
     else if (headroomDecided) pickReason = `more quota left: ${fmtH(pickH)} vs ${fmtH(otherH)}`;
     else if (coders[pick].live !== coders[other].live) pickReason = 'fewer live';
     else if (lastCoder === other) pickReason = 'alternation';
-    else pickReason = `${label(pick).toLowerCase()} first`;
+    else pickReason = `${CODER_LABEL.toLowerCase()} first`;
   }
   const shown = CODERS.filter((coder) => coders[coder].state !== 'disabled');
   const summary = `${shown.map((coder) => {
     const state = coders[coder];
     if (state.state !== 'eligible') return formatCoderState(coder, state);
-    if (state.standby) return `${label(coder)} (overflow standby)`;
     const quotaText = state.leftPct === null ? 'quota unknown, available'
       : state.estimated ? `~${Math.round(100 - state.leftPct)}% used (est.)`
         : `${Math.round(state.leftPct)}% left`;
-    return `${label(coder)} ${quotaText} (${liveText(state)})`;
-  }).join(' or ')}; pick ${label(pick)}`;
-  return { route: 'external', order, pick, coders, summary, why: `auto: spread, pick ${label(pick)} (${pickReason})` };
+    return `${CODER_LABEL} ${quotaText} (${liveText(state)})`;
+  }).join(' or ')}; pick ${CODER_LABEL}`;
+  return { route: 'external', order, pick, coders, summary, why: `auto: spread, pick ${CODER_LABEL} (${pickReason})` };
 }
 
 module.exports = { pickCoderPool, formatCoderState };
