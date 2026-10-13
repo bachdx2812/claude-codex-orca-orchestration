@@ -47,8 +47,9 @@ they were set and how to return to `defaultCoder`, both per prompt and in the
 
 **Review reads code and judges the diff, always on Opus** (`models.reviewByCoder`, default
 all `opus`): code written by Codex or Sonnet is reviewed on Opus 5.5. Planning
-and red-team stay on Opus. Unblock/advice dispatches may also use Opus; if the brief asks
-to fix or implement, execution intent wins and the ordinary code route applies. **Verify-run work runs existing checks and always runs on
+and red-team stay on Opus. Unblock/advice dispatches may also use Opus only when their brief
+contains no code verb; implementation and build intent anywhere wins. Exact `advisor` and
+`kongming` roles also route update/edit/change briefs as code. **Verify-run work runs existing checks and always runs on
 Sonnet** (`models.verify`, default `{ alias: "sonnet", id: "claude-sonnet-5-5", effort:
 "medium" }`): the CI gate, UI screenshots, play-testing, post-deploy smoke — not reading
 or judging the diff. An Opus verify is refused unless the dispatch says the mapped Sonnet
@@ -91,7 +92,7 @@ The correct response is to wait, then retry the *same* dispatch — never re-dis
 immediately or start a replacement, both of which deepen the limit:
 
 ```
-orca orchestration worker-start --retry-of <dispatchId> ...
+orca orchestration worker-start --task <originalTaskId> --retry-of <dispatchId> ...
 ```
 
 — and reduce how many Codex workers run in parallel.
@@ -374,7 +375,7 @@ claim in a *shared* workspace only avoids that specific conflict, not the next o
 | `max-parallel-agents` | a new Agent/Task dispatch, `worker-start`, or `terminal create` would exceed the machine-wide budget | wait for one to finish and release it, or ask the operator to release a claim, delete a dead session's state file, or raise/disable the cap — never the model's own call |
 | `code-brief-needs-owns` | a shared-workspace code brief has no `Owns:`/`Owns: n/a` | declare it, or isolate the dispatch |
 | `ownership-overlap` | a claim overlaps another live claim in the same workspace | narrow the claim, wait/release the holder, or isolate |
-| `codex-not-requested` | a fresh `worker-start --agent codex` runs without an explicit Codex request | use `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`; `--retry-of` remains allowed for a tracked Codex dispatch this session started while opted in; add this gate to `disabledGates` only for a deliberate bypass |
+| `codex-not-requested` | a fresh `worker-start --agent codex` runs without an explicit Codex request | use `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`; a tracked retry is allowed only as `--retry-of <dispatch-id> --task <original-task-id>` with no `--spec`, and does not propagate opt-in; add this gate to `disabledGates` only for a deliberate bypass |
 
 `max-parallel-agents` counts every live Orca worker group (any agent, not only Codex — the
 Codex-only cap above still applies on top, never instead) plus every live in-session

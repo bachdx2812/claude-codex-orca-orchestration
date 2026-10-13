@@ -36,10 +36,13 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
    / `escalation: sonnet verify could not decide ...`). The
    configured escalation model (`models.escalation.alias`, default `fable`) is reserved for
    work the review model could not do, even at higher effort — a dispatch to it must say so.
-   Unblock/advice work may also use the review model. A description beginning with
-   `advise`, `advice`, `unblock`, or `consult`, or an `advisor`/`kongming` subagent type,
-   is exempt from `review-model-scope`. Explicit code intent still wins, so `Unblock and
-   fix the parser` follows the execution route.
+   Unblock/advice work may also use the review model only when its brief contains no code
+   verb. A description beginning with `advise`, `advice`, `unblock`, or `consult`, or an
+   exact `advisor`/`kongming` subagent type, is exempt from `review-model-scope` only under
+   that condition. Explicit code intent anywhere still wins, so `Advise on the plan, then
+   implement it` and `Unblock the design and build the parser` follow the execution route.
+   Exact `advisor`/`kongming` roles also treat update/edit/change briefs as execution; for
+   example, `Update the auth module` cannot use the advice exemption.
 3. **Code goes to the configured in-session code model first** (`models.code.alias`,
    default `sonnet`). Codex is opt-in only through `--exec-codex`, `--code-model
    codex[:<model>]`, or `defaultCoder: "codex"`. When requested, Codex runs in an Orca
@@ -64,11 +67,13 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
    brief launched via `worker-start` (a bare `orca terminal create` terminal is gated as
    a main panel, not a worker).
 7. **Codex rate-limits under parallel load.** On a rate-limit signal the correct response
-   is to back off and retry the *same* dispatch (`worker-start --retry-of <id>`), never to
+   is to back off and retry the *same* task and dispatch
+   (`worker-start --task <original-task-id> --retry-of <dispatch-id>`), never to
    re-dispatch immediately or start a replacement.
 8. **No more than `maxParallelCodexWorkers` (default 3) live Codex workers at once.** A
    `worker-start` that would exceed the cap is refused; wait for one to finish and release it,
-   reuse its terminal (`--terminal <handle>`), or retry it (`--retry-of <id>`) — neither
+   reuse its terminal (`--terminal <handle>`), or retry it
+   (`--task <original-task-id> --retry-of <dispatch-id>`) — neither
    replaces an existing group, so neither counts as a new dispatch against the cap.
 9. **A code brief in a shared workspace declares the files it will touch.** `Owns: <paths>`
    (repo-relative, globs ok) or `Owns: n/a <reason>`, on its own line, for every code
@@ -197,9 +202,11 @@ either, regardless of what the operator's standing override says.
 Codex is the only external coder and is never probed by the default Sonnet route. A
 `worker-start --agent codex` is refused with `codex-not-requested` unless the operator used
 `--exec-codex` / `--code-model codex[:<model>]` or config/env selects Codex as the default.
-The exception is `worker-start --retry-of <id>` for a Codex dispatch this same session
-already started while opted in; returning to Sonnet does not prevent retrying that tracked
-dispatch, but it still prevents a fresh Codex start.
+The exception is `worker-start --retry-of <dispatch-id> --task <original-task-id>` for a
+Codex dispatch this same session already started while opted in. The task id must exactly
+match the task recorded for that dispatch and `--spec` must be absent. Returning to Sonnet
+does not prevent that one retry, but the retry does not inherit opt-in provenance and cannot
+extend the exception to a different task or another retry generation.
 
 A quota-unknown reading does not by itself make usable Codex ineligible. Quota discovery
 first uses a fresh state-directory cache, then queries `codex app-server` JSON-RPC
@@ -932,7 +939,7 @@ gate marks every live worker as backing off for ~120s. The correct response is t
 then retry the *same* dispatch:
 
 ```
-orca orchestration worker-start --retry-of <dispatchId> ...
+orca orchestration worker-start --task <originalTaskId> --retry-of <dispatchId> ...
 ```
 
 Re-dispatching immediately deepens the limit; starting a *replacement* worker doubles the
