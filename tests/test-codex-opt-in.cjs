@@ -58,9 +58,9 @@ function codexWorker(env, sid) {
     tool_use_id: `toolu_${sid}`, cwd: ROOT, tool_input: { command:
       'orca orchestration worker-start --agent codex --worktree new-child --spec "Implement change. Owns: n/a isolated worktree. Verify: npm test."' } });
 }
-function postWorker(env, sid, command, stdout) {
+function postWorker(env, sid, command, stdout, toolUseId = `toolu_${sid}`) {
   return gate(env, { session_id: sid, hook_event_name: 'PostToolUse', tool_name: 'Bash',
-    tool_use_id: `toolu_${sid}`, cwd: ROOT, tool_input: { command },
+    tool_use_id: toolUseId, cwd: ROOT, tool_input: { command },
     tool_response: { stdout, stderr: '' } });
 }
 function seedState(stateDir, sid, extra = {}) {
@@ -79,7 +79,8 @@ function seedState(stateDir, sid, extra = {}) {
   check('default routing does not probe Codex', fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').filter(Boolean).length : 0, 0);
   const worker = codexWorker(f.env, 'default-worker');
   ok('default Codex worker is denied by codex-not-requested', worker.status === 2 && /codex-not-requested/.test(worker.stderr));
-  ok('Codex refusal explains the tracked retry exception', /--retry-of.*this session already started/i.test(worker.stderr));
+  ok('Codex refusal explains the task-bound tracked retry exception',
+    /--retry-of.*--task equal to the original task id.*no --spec/i.test(worker.stderr));
   prompt(f.env, 'positive-control', '--exec-codex');
   codeAgent(f.env, 'positive-control');
   ok('explicit Codex routing positively controls the probe counter',
@@ -119,11 +120,33 @@ function seedState(stateDir, sid, extra = {}) {
     dispatchId: 'ctx_tracked_retry', taskId: 'task_tracked_retry', handle: 'term_tracked_retry',
   } }));
   prompt(f.env, sid, '--exec-sonnet');
+  const retryCommand = 'orca orchestration worker-start --agent codex --task task_tracked_retry --retry-of ctx_tracked_retry';
   const retry = gate(f.env, { session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash',
-    tool_use_id: 'toolu_retry', cwd: ROOT, tool_input: {
-      command: 'orca orchestration worker-start --retry-of ctx_tracked_retry',
-    } });
+    tool_use_id: 'toolu_retry', cwd: ROOT, tool_input: { command: retryCommand } });
   check('tracked Codex dispatch may be retried after switching back to Sonnet', retry.status, 0);
+  const newSpec = gate(f.env, { session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_use_id: 'toolu_retry_new_spec', cwd: ROOT, tool_input: { command:
+      'orca orchestration worker-start --agent codex --spec "Implement another change. Owns: n/a. Verify: npm test." --retry-of ctx_tracked_retry' } });
+  ok('retry-of cannot launder a fresh Codex spec',
+    newSpec.status === 2 && /codex-not-requested/.test(newSpec.stderr));
+  const differentTask = gate(f.env, { session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_use_id: 'toolu_retry_different_task', cwd: ROOT, tool_input: { command:
+      'orca orchestration worker-start --agent codex --task task_different --retry-of ctx_tracked_retry' } });
+  ok('retry-of must carry the original task id',
+    differentTask.status === 2 && /codex-not-requested/.test(differentTask.stderr));
+  const missingTask = gate(f.env, { session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_use_id: 'toolu_retry_missing_task', cwd: ROOT, tool_input: { command:
+      'orca orchestration worker-start --agent codex --retry-of ctx_tracked_retry' } });
+  ok('retry-of without a task id is refused',
+    missingTask.status === 2 && /codex-not-requested/.test(missingTask.stderr));
+  postWorker(f.env, sid, retryCommand, JSON.stringify({ ok: true, result: {
+    dispatchId: 'ctx_retry_child', taskId: 'task_tracked_retry', handle: 'term_retry_child',
+  } }), 'toolu_retry');
+  const chainedRetry = gate(f.env, { session_id: sid, hook_event_name: 'PreToolUse', tool_name: 'Bash',
+    tool_use_id: 'toolu_retry_chain', cwd: ROOT, tool_input: { command:
+      'orca orchestration worker-start --agent codex --task task_tracked_retry --retry-of ctx_retry_child' } });
+  ok('a retry does not extend opt-in provenance to another retry',
+    chainedRetry.status === 2 && /codex-not-requested/.test(chainedRetry.stderr));
   const fresh = codexWorker(f.env, sid);
   ok('fresh Codex dispatch stays refused after switching back to Sonnet',
     fresh.status === 2 && /codex-not-requested/.test(fresh.stderr));
@@ -137,7 +160,7 @@ function seedState(stateDir, sid, extra = {}) {
   } });
   const retry = gate(f.env, { session_id: 'unproven-retry', hook_event_name: 'PreToolUse',
     tool_name: 'Bash', tool_use_id: 'toolu_unproven_retry', cwd: ROOT, tool_input: {
-      command: 'orca orchestration worker-start --retry-of ctx_legacy_codex',
+      command: 'orca orchestration worker-start --agent codex --task task_legacy --retry-of ctx_legacy_codex',
     } });
   ok('tracked Codex retry without opt-in provenance is refused',
     retry.status === 2 && /codex-not-requested/.test(retry.stderr));

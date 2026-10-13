@@ -26,6 +26,7 @@ const env = {
 };
 
 let passed = 0;
+let dispatchCounter = 0;
 const failures = [];
 function check(name, actual, expected) {
   if (JSON.stringify(actual) === JSON.stringify(expected)) passed += 1;
@@ -33,13 +34,14 @@ function check(name, actual, expected) {
 }
 
 function dispatch(description, model, subagentType = 'general-purpose') {
+  dispatchCounter += 1;
   return spawnSync(process.execPath, [GATE], {
     input: JSON.stringify({
-      session_id: `role-${passed}-${failures.length}`,
+      session_id: `role-${dispatchCounter}`,
       hook_event_name: 'PreToolUse',
       tool_name: 'Agent',
       cwd: ROOT,
-      tool_use_id: `toolu_role_${passed}_${failures.length}`,
+      tool_use_id: `toolu_role_${dispatchCounter}`,
       tool_input: { description, model, subagent_type: subagentType, prompt: 'Read-only advice.' },
     }),
     encoding: 'utf8',
@@ -55,6 +57,10 @@ const roleCases = [
   ['Review plan phase-02', 'opus', 0, null, 'general-purpose'],
   ['Unblock: parser tests keep failing after 3 fixes', 'opus', 0, null, 'general-purpose'],
   ['Find a way forward', 'opus', 0, null, 'kongming'],
+  ['Advise on the plan, then implement it', 'opus', 2, 'review-model-scope', 'general-purpose'],
+  ['Unblock the design and build the parser', 'opus', 2, 'review-model-scope', 'general-purpose'],
+  ['Update the auth module', 'opus', 2, 'review-model-scope', 'advisor'],
+  ['Update the auth module', 'opus', 2, 'review-model-scope', 'kongming'],
 ];
 
 for (const [description, model, status, refusal, subagentType] of roleCases) {
@@ -72,9 +78,19 @@ check('kongming type is advice', [typedAdvice.wantsAdvice, typedAdvice.wantsExec
 
 const execWins = gateModule.classifyDispatch('Unblock and fix the parser', 'advisor', '', []);
 check('explicit fix intent wins over advice', [execWins.wantsExec, execWins.wantsAdvice], [true, false]);
+for (const [description, subagentType] of [
+  ['Advise on the plan, then implement it', 'general-purpose'],
+  ['Unblock the design and build the parser', 'general-purpose'],
+  ['Update the auth module', 'advisor'],
+  ['Update the auth module', 'kongming'],
+]) {
+  const classified = gateModule.classifyDispatch(description, subagentType, '', []);
+  check(`${JSON.stringify(description)} on ${subagentType} is execution, not advice`,
+    [classified.wantsExec, classified.wantsAdvice], [true, false]);
+}
 const execResult = dispatch('Unblock and fix the parser', 'opus', 'advisor');
 check('advice wording cannot bypass execution routing',
-  execResult.status === 2 && /review-model-scope|execution-model-mismatch/.test(execResult.stderr), true);
+  execResult.status === 2 && /review-model-scope/.test(execResult.stderr), true);
 
 const banner = spawnSync(process.execPath, [GATE], {
   input: JSON.stringify({ session_id: 'role-banner', hook_event_name: 'SessionStart', source: 'startup' }),
