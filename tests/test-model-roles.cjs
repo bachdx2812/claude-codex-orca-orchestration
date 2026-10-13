@@ -33,17 +33,25 @@ function check(name, actual, expected) {
   else failures.push(`${name}\n    expected ${JSON.stringify(expected)}\n    actual   ${JSON.stringify(actual)}`);
 }
 
-function dispatch(description, model, subagentType = 'general-purpose', prompt = '') {
+function dispatch(description, model, subagentType = 'general-purpose', prompt = '', sessionId = null) {
   dispatchCounter += 1;
   return spawnSync(process.execPath, [GATE], {
     input: JSON.stringify({
-      session_id: `role-${dispatchCounter}`,
+      session_id: sessionId || `role-${dispatchCounter}`,
       hook_event_name: 'PreToolUse',
       tool_name: 'Agent',
       cwd: ROOT,
       tool_use_id: `toolu_role_${dispatchCounter}`,
       tool_input: { description, model, subagent_type: subagentType, prompt },
     }),
+    encoding: 'utf8',
+    env,
+  });
+}
+
+function submitPrompt(sessionId, prompt) {
+  return spawnSync(process.execPath, [GATE], {
+    input: JSON.stringify({ session_id: sessionId, hook_event_name: 'UserPromptSubmit', prompt }),
     encoding: 'utf8',
     env,
   });
@@ -118,8 +126,49 @@ const markedMutation = dispatch('Implement the parser fix', 'opus', 'kongming',
 check('read-only marker keeps a mutation discussion advice-only on opus', markedMutation.status, 0);
 const markedClassification = gateModule.classifyDispatch(
   'Implement the parser fix', 'kongming', 'Read-only: advice only, no edits.', []);
-check('read-only marker overrides code verbs by contract',
-  [markedClassification.wantsAdvice, markedClassification.wantsExec], [true, false]);
+check('read-only marker preserves code intent alongside the advice contract',
+  [markedClassification.wantsAdvice, markedClassification.wantsExec, markedClassification.adviceOnly],
+  [true, true, true]);
+
+const codexMarkerSession = 'role-marker-codex';
+submitPrompt(codexMarkerSession, '--exec-codex');
+const markedCodexExecution = dispatch('Implement the parser', 'sonnet', 'sonnet-coder',
+  'Read-only: advice only, no edits.', codexMarkerSession);
+check('read-only marker does not bypass explicit Codex execution routing',
+  markedCodexExecution.status === 2 && /route-execution-to-codex/.test(markedCodexExecution.stderr), true);
+
+for (const model of ['sonnet', 'haiku']) {
+  const markedWithoutVerify = dispatch('Implement the parser', model, 'general-purpose',
+    'Read-only: advice only, no edits.');
+  check(`read-only marker does not bypass code routing checks on ${model}`,
+    markedWithoutVerify.status === 2 &&
+      (model === 'sonnet'
+        ? /code-brief-needs-verify/.test(markedWithoutVerify.stderr)
+        : /execution-model-mismatch/.test(markedWithoutVerify.stderr)), true);
+}
+
+const markedVerifyOnOpus = dispatch('Verify the build', 'opus', 'general-purpose',
+  'Read-only: advice only, no edits.');
+check('read-only marker does not bypass verify-model routing',
+  markedVerifyOnOpus.status === 2 && /verify-model/.test(markedVerifyOnOpus.stderr), true);
+
+const markedPlanOnSonnet = dispatch('Plan the auth feature', 'sonnet', 'general-purpose',
+  'Read-only: advice only, no edits.');
+check('read-only marker does not bypass planning-model routing',
+  markedPlanOnSonnet.status === 2 && /route-review/.test(markedPlanOnSonnet.stderr), true);
+
+const fencedMarker = dispatch('Now implement the parser change', 'opus', 'general-purpose',
+  'Context copied from a document:\n```text\nRead-only: old example\n```\nExplain the requested change.');
+check('read-only marker inside a backtick fence does not enable advice routing',
+  fencedMarker.status === 2 && /review-model-scope/.test(fencedMarker.stderr), true);
+const tildeFencedMarker = gateModule.classifyDispatch(
+  'Now implement the parser change', 'general-purpose',
+  '~~~text\nRead-only: old example\n~~~', []);
+check('read-only marker inside a tilde fence is ignored', tildeFencedMarker.wantsAdvice, false);
+const inlineMarker = gateModule.classifyDispatch(
+  'Now implement the parser change', 'general-purpose',
+  'Context says Read-only: only as an inline quotation.', []);
+check('read-only marker must start a line', inlineMarker.adviceOnly, false);
 
 const promptMutation = gateModule.classifyDispatch(
   'Find a way forward', 'kongming', 'Edit hooks/x.cjs and implement the change.', []);

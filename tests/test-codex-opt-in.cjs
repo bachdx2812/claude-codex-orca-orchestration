@@ -79,6 +79,19 @@ function seedState(stateDir, sid, extra = {}) {
   check('default routing does not probe Codex', fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n').filter(Boolean).length : 0, 0);
   const worker = codexWorker(f.env, 'default-worker');
   ok('default Codex worker is denied by codex-not-requested', worker.status === 2 && /codex-not-requested/.test(worker.stderr));
+  for (const [name, command] of [
+    ['bash -c', `bash -c 'orca orchestration worker-start --agent codex --worktree new-child --spec "Implement change. Verify: npm test."'`],
+    ['sh -c', `sh -c 'orca orchestration worker-start --agent codex --worktree new-child --spec "Implement change. Verify: npm test."'`],
+    ['global --json', 'orca --json orchestration worker-start --agent codex --worktree new-child --spec "Implement change. Verify: npm test."'],
+  ]) {
+    const wrapped = gate(f.env, {
+      session_id: `default-worker-${name.replace(/\W+/g, '-')}`,
+      hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_use_id: `toolu_${name}`,
+      cwd: ROOT, tool_input: { command },
+    });
+    ok(`${name} Codex worker is denied by codex-not-requested`,
+      wrapped.status === 2 && /codex-not-requested/.test(wrapped.stderr));
+  }
   ok('Codex refusal explains the task-bound tracked retry exception',
     /--retry-of.*--task equal to the original task id.*no --spec/i.test(worker.stderr));
   prompt(f.env, 'positive-control', '--exec-codex');

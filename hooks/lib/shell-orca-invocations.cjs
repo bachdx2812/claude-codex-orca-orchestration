@@ -57,11 +57,18 @@ const HEREDOC_WORD = /[A-Za-z0-9_]+/y;
 
 const SUDO_ARG_OPTS = new Set(['-u', '-g', '-p', '-h', '-C', '-U', '-r', '-t', '-T']);
 const XARGS_ARG_OPTS = new Set(['-I', '-L', '-n', '-P', '-s', '-d', '-E', '-a']);
+const ORCA_GLOBAL_BOOL_FLAGS = new Set(['--json']);
 
 function basename(w) {
   if (!w) return '';
   const idx = w.lastIndexOf('/');
   return idx === -1 ? w : w.slice(idx + 1);
+}
+
+function normalizeOrcaArgs(rest) {
+  let i = 0;
+  while (i < rest.length && ORCA_GLOBAL_BOOL_FLAGS.has(rest[i])) i += 1;
+  return i === 0 ? rest : [...rest.slice(i), ...rest.slice(0, i)];
 }
 
 /**
@@ -124,8 +131,20 @@ function processSimpleCommand(ctx, words, output = {}) {
     if (!advanced) break;
   }
   if (i >= words.length) return;
+  if ((basename(words[i]) === 'bash' || basename(words[i]) === 'sh') &&
+      words[i + 1] === '-c' && words[i + 2] != null) {
+    for (const invocation of orcaInvocations(words[i + 2])) {
+      ctx.invocations.push({
+        ...invocation,
+        stdoutPiped: invocation.stdoutPiped || output.stdoutPiped === true,
+        stdoutRedirected: invocation.stdoutRedirected || output.stdoutRedirected === true,
+        stdoutCaptured: invocation.stdoutCaptured || output.stdoutCaptured === true,
+      });
+    }
+    return;
+  }
   if (basename(words[i]) !== 'orca') return;
-  const rest = words.slice(i + 1);
+  const rest = normalizeOrcaArgs(words.slice(i + 1));
   ctx.invocations.push({
     sub: deriveSub(rest),
     args: rest,

@@ -154,6 +154,15 @@ check('sudo wrapper is detected',
   subs('sudo orca orchestration worker-start --task t'), ['orchestration worker-start']);
 check('xargs wrapper is detected',
   subs('echo t | xargs -n1 orca orchestration worker-start --task'), ['orchestration worker-start']);
+check('bash -c wrapper is detected',
+  subs('bash -c "orca orchestration worker-start --task t"'), ['orchestration worker-start']);
+check('sh -c wrapper is detected',
+  subs("sh -c 'orca orchestration worker-start --task t'"), ['orchestration worker-start']);
+check('global flag before the subcommand is detected',
+  subs('orca --json orchestration worker-start --task t'), ['orchestration worker-start']);
+check('global flag is normalized after the subcommand for argument consumers',
+  orcaInvocations('orca --json orchestration worker-start --task t')[0].args,
+  ['orchestration', 'worker-start', '--task', 't', '--json']);
 check('bare (  ) grouping is detected',
   subs('( orca orchestration worker-start --task t )'), ['orchestration worker-start']);
 check('{ ; } grouping is detected',

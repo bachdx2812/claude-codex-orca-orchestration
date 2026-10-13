@@ -50,7 +50,9 @@ all `opus`): code written by Codex or Sonnet is reviewed on Opus 5.5. Planning
 and red-team stay on Opus. Unblock/advice dispatches may also use Opus only when their
 description or prompt contains an explicit line starting `Read-only:` (case-insensitive),
 for example `Read-only: advice only, no edits.`. That marker is a read-only contract: even
-when the brief discusses a possible mutation, the agent may analyze it but may not edit.
+when the brief discusses a possible mutation, the review model may analyze it but may not
+edit. The marker is ignored inside triple-backtick or triple-tilde fenced blocks, and it
+does not bypass execution, verification, or planning routing on any other model.
 Without the marker, advice verbs and `advisor`/`kongming` role names receive no exemption;
 mutation briefs follow the code route. **Verify-run work runs existing checks and always runs on
 Sonnet** (`models.verify`, default `{ alias: "sonnet", id: "claude-sonnet-5-5", effort:
@@ -603,8 +605,9 @@ exact-match removal (never a blind restore, so edits you made after installing s
 `hooks/lib/shell-orca-invocations.cjs`'s `orcaInvocations()` is a real linear-time shell
 tokenizer (no backtracking-capable regex; see its own header comment for the design and
 what it replaced), not a regex heuristic — but it is still not a full shell interpreter.
-Three shapes it does not detect, each covered by a code comment at the relevant point in
-the scanner rather than a blanket disclaimer:
+It recognizes direct Orca commands, `bash -c` / `sh -c` command strings, and the global
+`--json` flag before the subcommand. Three shapes it does not detect, each covered by a
+code comment at the relevant point in the scanner rather than a blanket disclaimer:
 
 - **`! orca ...`** — the `!` negation keyword is not in its recognized wrapper list, so a
   negated orca invocation is not detected.

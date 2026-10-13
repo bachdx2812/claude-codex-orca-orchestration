@@ -15,7 +15,8 @@ the SessionStart banner printed each session as the exact current numbers, not t
   verify model, all in-session.
 - Advice on the review model is opt-in: put a line starting `Read-only:` in the Agent/Task
   description or prompt. The marker forbids edits even when the advice discusses code changes;
-  `advisor`/`kongming` role names alone do not grant the advice route.
+  it is ignored inside triple-backtick or triple-tilde fences and does not bypass routing on
+  other models. `advisor`/`kongming` role names alone do not grant the advice route.
 - **Sonnet-first:** Code goes to the configured in-session code model by default. Codex is
   opt-in through `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`.
   Requested but unusable/exhausted Codex falls back to Sonnet. This covers code, builds,

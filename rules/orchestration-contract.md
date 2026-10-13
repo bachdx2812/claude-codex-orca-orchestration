@@ -40,9 +40,11 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
    contains an explicit line starting `Read-only:` (case-insensitive), for example
    `Read-only: advice only, no edits.`. The marker is the sole advice exemption; advice
    verbs and exact `advisor`/`kongming` subagent types do not grant it. Without the marker,
-   mutation briefs follow the execution route. With the marker, even a brief that discusses
-   implementing or editing remains advice-only: the agent is contractually read-only and
-   must analyze the proposed mutation without making it.
+   mutation briefs follow the execution route. On the review model, the marker lets a brief
+   that discusses implementing or editing remain advice-only: the agent is contractually
+   read-only and must analyze the proposed mutation without making it. The marker must start
+   a line outside triple-backtick or triple-tilde fenced blocks. It never suppresses the
+   ordinary execution, verification, or planning gates on other models.
 3. **Code goes to the configured in-session code model first** (`models.code.alias`,
    default `sonnet`). Codex is opt-in only through `--exec-codex`, `--code-model
    codex[:<model>]`, or `defaultCoder: "codex"`. When requested, Codex runs in an Orca
@@ -1066,6 +1068,7 @@ node tests/test-released-groups.cjs                  # released-group accounting
 Every false positive found in real use became a permanent case in these suites: a `>`
 inside a heredoc body, a `>` inside a quoted string, a compound line whose scratch cleanup
 was poisoned by an unrelated echo, a fallback flag that never expired, an `orca` invocation
-hidden inside `$( )`/backticks/an `env`/`exec`/`nohup` wrapper, and an auto-routed banner
+hidden inside `$( )`/backticks/an `env`/`exec`/`nohup` wrapper, one hidden inside
+`bash -c` / `sh -c`, one preceded by Orca's global `--json` flag, and an auto-routed banner
 that once printed the model name as `"undefined"`. A gate that refuses legitimate work
 gets switched off, so its false-positive rate is as load-bearing as what it catches.

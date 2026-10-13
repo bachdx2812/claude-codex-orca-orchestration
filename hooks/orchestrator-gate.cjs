@@ -313,7 +313,7 @@ const REVIEW_NOUN = /\b(diff|pull\s+request|commits?|implementation)\b/i;
 const VERIFY_THEN_EXEC = /\b(?:verify|verification|test|tests|check|checks|ci)\b[^.;]*?\b(?:and|then|also)\s+(?:then\s+)?(?:implement|refactor|migrate|scaffold|fix|write\s+(?:the\s+)?code|codegen|generate\s+(?:code|assets|components))\b/i;
 const PLAN_REVIEW_FIRST_VERB = /^(plan|design|review|audit|red.?team|critique|assess|architect)\b/i;
 const ADVISE_FIRST_VERB = /^(advise|advice|unblock|consult)\b/i;
-const READ_ONLY_MARKER = /^[ \t]*read-only\s*:/im;
+const READ_ONLY_MARKER = /^[ \t]*read-only\s*:/i;
 const MUTATION_INTENT = /\b(?:updat\w*|edit\w*|chang\w*|modif\w*|patch\w*|rewrit\w*|renam\w*|remov\w*|delet\w*|add\w*|creat\w*|appl\w*)\b|\bmake\b[^.;\n]*\bedits?\b|\bwrite\s+(?:the\s+)?(?:module|function|class|component|tests?|code|implementation|endpoint|handler|script|migration|hook|parser|layer|service|feature)\b/i;
 const EXEC_FIRST_VERB = /^(implement|build|refactor|migrate|scaffold|execute|fix|codegen|generate\s+(code|assets|components))\b/i;
 const NEUTRAL_FIRST_VERB = /^(commit|push|merge|publish|rebase|tag|release|deploy|update|write)\b/i;
@@ -344,6 +344,28 @@ const DOC_NOUNS = new Set([
 ]);
 const WRITE_OBJECT_STOP = /^(?:for|of|on|about|in|to|from|with|against)$/i;
 const WRITE_OBJECT_PUNCT = /[,!?;:()[\]{}"'`]/g;
+
+/** A Read-only marker is active only when it starts a line outside Markdown fences. */
+function hasReadOnlyMarker(text) {
+  let fence = null;
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const fenceMatch = /^[ \t]*(`{3,}|~{3,})/.exec(line);
+    if (fence) {
+      if (fenceMatch && fenceMatch[1][0] === fence.char &&
+          fenceMatch[1].length >= fence.length &&
+          line.slice(fenceMatch[0].length).trim() === '') {
+        fence = null;
+      }
+      continue;
+    }
+    if (fenceMatch) {
+      fence = { char: fenceMatch[1][0], length: fenceMatch[1].length };
+      continue;
+    }
+    if (READ_ONLY_MARKER.test(line)) return true;
+  }
+  return false;
+}
 
 function writeCodeObject(desc) {
   const text = String(desc || '');
@@ -452,10 +474,11 @@ function isPlanningReview(description, type, prompt) {
  *      (agents.lookup), which is advisory lookup work and never blocks.
  *
  * Advice is allowed on the review model only when the description or prompt contains an
- * explicit `Read-only:` marker line. The marker is a contract that the agent will not edit,
- * so it wins even when the brief discusses a possible code mutation.
+ * explicit `Read-only:` marker line outside fenced code. The marker is returned separately
+ * from routing intent so plan, verify and off-review-model execution checks remain active.
  *
- * Returns { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning }.
+ * Returns { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, adviceOnly,
+ * planning }.
  */
 function classifyDispatch(description, type, prompt, lookupTypes) {
   const desc = String(description || '').trim();
@@ -487,19 +510,9 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
   const planning = isPlanningReview(desc, t, prompt);
   const reviewVerbPresent = REVIEW_VERB.test(desc);
   const reviewNounPresent = REVIEW_NOUN.test(desc);
-  const adviceOnly = READ_ONLY_MARKER.test(desc) || READ_ONLY_MARKER.test(promptText);
+  const adviceOnly = hasReadOnlyMarker(desc) || hasReadOnlyMarker(promptText);
   const adviceContextMutation = (EXEC_INTENT.test(mutationHay) || MUTATION_INTENT.test(mutationHay)) &&
     (firstIntent === 'advice' || /^(advisor|kongming)$/i.test(t));
-
-  // Advice is a declared read-only contract, not an inference from verbs or role names.
-  // The marker wins even when the brief discusses mutations: the dispatched agent must
-  // analyze those changes without making them.
-  if (adviceOnly) {
-    return {
-      firstIntent, wantsExec: false, wantsPlanReview: false, wantsVerify: false,
-      wantsAdvice: true, planning,
-    };
-  }
 
   // B1: exec intent behind a verify/test first verb is still execution, so it routes to the
   // coder pool, records the author, and requires a verify command — never the verify model.
@@ -535,9 +548,9 @@ function classifyDispatch(description, type, prompt, lookupTypes) {
     (firstIntent !== 'review' && typeWantsVerify) ||
     (!firstIntent && verifyAt >= 0 && (execAt < 0 || verifyAt < execAt) && (planAt < 0 || verifyAt < planAt))
   );
-  const wantsAdvice = false;
+  const wantsAdvice = adviceOnly;
 
-  return { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning };
+  return { firstIntent, wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, adviceOnly, planning };
 }
 
 // Markers that an orca command itself failed, which justifies the in-session fallback.
@@ -1782,8 +1795,8 @@ function onPreToolUse(p, s, cfg) {
     const description = String(input.description || '').trim();
     const type = String(input.subagent_type || '');
     const hay = `${type} ${description}`.trim() || String(input.prompt || '').slice(0, 400);
-    const { wantsExec, wantsPlanReview, wantsVerify, wantsAdvice, planning } =
-      classifyDispatch(description, type, input.prompt, cfg.agents.lookup);
+    const classified = classifyDispatch(description, type, input.prompt, cfg.agents.lookup);
+    const { wantsPlanReview, wantsVerify, adviceOnly, planning } = classified;
     // A lookup role type (agents.lookup, e.g. Explore/scout) is advisory lookup work: it never
     // blocks and never runs on the review/verify model, so it is exempt from review-model-scope
     // below. Only a CONFIGURED lookup subagent_type is exempt; a general-purpose summary that
@@ -1791,13 +1804,17 @@ function onPreToolUse(p, s, cfg) {
     // rule. The wording leg below (LOOKUP_INTENT) drives the lookup-model advice, never the
     // exemption.
     const typeIsLookup = cfg.agents.lookup.some((n) => n.toLowerCase() === type.toLowerCase());
-    const wantsLookup = typeIsLookup || (LOOKUP_INTENT.test(hay) && !wantsExec && !wantsPlanReview);
     const model = String(input.model || '');
     const reviewAlias = cfg.models.review.alias;
     const escalationAlias = cfg.models.escalation.alias;
     const isEscalation = new RegExp(escapeRegex(escalationAlias), 'i').test(model)
       || cfg.agents.escalation.some((n) => n.toLowerCase() === type.toLowerCase());
     const isReviewModel = new RegExp(escapeRegex(reviewAlias), 'i').test(model);
+    // The marker grants one narrow exception: code-shaped advice may run read-only on the
+    // review model. It does not erase plan/verify intent, and it changes nothing off that model.
+    const wantsAdvice = adviceOnly && isReviewModel;
+    const wantsExec = classified.wantsExec && !wantsAdvice;
+    const wantsLookup = typeIsLookup || (LOOKUP_INTENT.test(hay) && !wantsExec && !wantsPlanReview);
 
     // Review of code follows the code's author (operator decision, 2026-10-01): code by an
     // external coder code is reviewed on the mapped model (opus by
@@ -2861,5 +2878,6 @@ module.exports = {
   parseCodeModel, describeOverride, currentExecRoute, escapeRegex, activationApplies,
   hasFlag, flagValue, resolveWorkerStartAgent, liveCodexGroupIds, orcaWorkerHandles,
   isPlanningReview, hasReviewEscalationReason, hasVerifyEscalationReason, classifyDispatch,
+  hasReadOnlyMarker,
   commandHead, formatAge, formatBackgroundShellReminder, pruneBackgroundShells,
 };
