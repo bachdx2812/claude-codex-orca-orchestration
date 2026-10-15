@@ -85,6 +85,46 @@ function deriveSub(rest) {
   return rest.length > 1 ? `${rest[0]} ${rest[1]}` : rest[0];
 }
 
+const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh']);
+const SHELL_ARG_OPTS = new Set(['-o', '+o', '-O', '+O', '--rcfile', '--init-file']);
+const SHELL_CLUSTER_RE = /^[-+][a-zA-Z]+$/;
+
+/**
+ * Script text a shell-like command at words[i] would execute, or null when it
+ * is not one. Covers `<shell> [options] -c <script>` (any `-[a-zA-Z]*c`
+ * cluster, other leading options skipped), `eval <args>`, and a shell fed its
+ * script on stdin (`<<<` here-string / `echo ... | bash`) via `stdin`.
+ */
+function shellPayload(words, i, stdin) {
+  const base = basename(words[i]);
+  if (base === 'eval') return words.slice(i + 1).join(' ');
+  if (!SHELLS.has(base)) return null;
+  let j = i + 1;
+  let hasC = false;
+  while (j < words.length && words[j] !== '--' && /^[-+]/.test(words[j])) {
+    const w = words[j];
+    if (SHELL_ARG_OPTS.has(w)) { j += 2; continue; }
+    if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(w)) hasC = true;
+    else if (!SHELL_CLUSTER_RE.test(w) && !w.startsWith('--')) break;
+    j += 1;
+  }
+  if (j < words.length && words[j] === '--') j += 1;
+  if (hasC) return words[j] != null ? words[j] : null;
+  return typeof stdin === 'string' ? stdin : null;
+}
+
+/** Text an `echo`/`printf` command writes to stdout, or null for other commands. */
+function echoedText(words) {
+  let i = 0;
+  while (i < words.length && ASSIGNMENT_RE.test(words[i])) i += 1;
+  const base = basename(words[i]);
+  if (base !== 'echo' && base !== 'printf') return null;
+  let rest = words.slice(i + 1);
+  while (rest.length && /^-[a-zA-Z]+$/.test(rest[0])) rest = rest.slice(1);
+  if (base === 'printf' && rest.length > 1 && rest[0].includes('%')) rest = rest.slice(1);
+  return rest.join(base === 'printf' ? '\n' : ' ');
+}
+
 /**
  * Strip leading NAME=value assignments and known wrapper commands
  * (env/command/exec/nohup/time/sudo/xargs, each possibly chained) from a
@@ -131,9 +171,9 @@ function processSimpleCommand(ctx, words, output = {}) {
     if (!advanced) break;
   }
   if (i >= words.length) return;
-  if ((basename(words[i]) === 'bash' || basename(words[i]) === 'sh') &&
-      words[i + 1] === '-c' && words[i + 2] != null) {
-    for (const invocation of orcaInvocations(words[i + 2])) {
+  const payload = shellPayload(words, i, output.stdin);
+  if (payload != null) {
+    for (const invocation of orcaInvocations(payload)) {
       ctx.invocations.push({
         ...invocation,
         stdoutPiped: invocation.stdoutPiped || output.stdoutPiped === true,
@@ -301,26 +341,34 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
   let wordOpen = false;
   let stdoutRedirected = false;
   let pendingHeredocs = [];
+  let hereString = null;
+  let hereStringNext = false;
+  let pipedText = null;
   const groupStarts = [];
   const braceGroupStarts = [];
   let depth = mode === 'paren' ? 1 : 0;
 
   const flushWord = () => {
     if (!wordOpen) return;
+    if (hereStringNext) { hereString = curWord; hereStringNext = false; curWord = ''; wordOpen = false; return; }
     words.push(curWord);
     curWord = '';
     wordOpen = false;
     if (words.length === 1 && KEYWORDS.has(words[0])) words.length = 0;
   };
   const flushCommand = ({ stdoutPiped = false } = {}) => {
+    const nextPiped = stdoutPiped && words.length ? echoedText(words) : null;
     if (words.length) {
       processSimpleCommand(ctx, words, {
+        stdin: hereString != null ? hereString : pipedText,
         stdoutPiped: stdoutPiped || inheritedOutput.stdoutPiped === true,
         stdoutRedirected: stdoutRedirected || inheritedOutput.stdoutRedirected === true,
         stdoutCaptured: inheritedOutput.stdoutCaptured === true,
       });
       words = [];
     }
+    hereString = null;
+    pipedText = nextPiped;
     stdoutRedirected = false;
   };
 
@@ -359,6 +407,13 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
       if (mode === 'backtick') { flushWord(); flushCommand(); if (mode !== 'top') ctx.depth -= 1; return i + 1; }
       wordOpen = true;
       i = scanRegion(ctx, i + 1, end, 'backtick', { stdoutCaptured: true });
+      continue;
+    }
+
+    if (c === '<' && s[i + 1] === '<' && s[i + 2] === '<') {
+      flushWord();
+      hereStringNext = true;
+      i += 3;
       continue;
     }
 
