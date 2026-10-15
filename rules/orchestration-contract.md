@@ -49,8 +49,8 @@ a refusal or event needs detail.
 - Every subagent brief: results to `plans/reports/`, reply <= 10 lines + `Status:`.
 - Opus: plans, red-team, unblock advice, final review. Haiku: lookups. Sonnet: code,
   verify-runs, driving the panel.
-- Heartbeat only while an Orca worker is live; never sleep/poll loops.
-- Parallel budget = gate budget; keep `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` equal to it.
+- Heartbeat only while a worker is live; never sleep/poll loops. Keep
+  `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` equal to the gate's parallel budget.
 - Workflows: hooks fire for their agents but the gate never gates them (no routing, `Owns`
   or verify checks). Read-only fan-out only (review, red-team, lookups, research); code goes
   through `Agent` dispatches or Orca workers. Always pass `model` (opus review, haiku lookups).
