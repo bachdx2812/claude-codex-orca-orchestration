@@ -32,6 +32,7 @@ const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
 const HOOKS_DIR = path.join(CLAUDE_DIR, 'hooks', 'orchestration');
 const RULES_FILE = path.join(CLAUDE_DIR, 'rules', 'orchestration-contract.md');
+const DOCS_FILE = path.join(CLAUDE_DIR, 'docs', 'orchestration-contract.md');
 const CONFIG_FILE = path.join(CLAUDE_DIR, 'orchestration.config.json');
 const SETTINGS_FILE = path.join(CLAUDE_DIR, 'settings.json');
 const CLAUDE_MD_FILE = path.join(CLAUDE_DIR, 'CLAUDE.md');
@@ -288,39 +289,55 @@ function uninstallHookFiles(manifest) {
 
 // --- install: rules file ------------------------------------------------------
 
-function installRulesFile(prevManifest) {
-  const src = fs.readFileSync(path.join(REPO_ROOT, 'rules', 'orchestration-contract.md'), 'utf8');
-  const existing = fs.existsSync(RULES_FILE) ? fs.readFileSync(RULES_FILE, 'utf8') : null;
+// Both shipped contract files (summary rules + full docs) share one install/uninstall path.
+function installManagedFile(src, dst, prevRecord) {
+  const content = fs.readFileSync(src, 'utf8');
+  const existing = fs.existsSync(dst) ? fs.readFileSync(dst, 'utf8') : null;
   if (existing === null) {
-    writeText(RULES_FILE, src);
-    return { path: RULES_FILE, createdNew: true, backedUpAt: null };
+    writeText(dst, content);
+    return { path: dst, createdNew: true, backedUpAt: null };
   }
-  if (existing === src) {
+  if (existing === content) {
     // Content matches what this installer ships. On a re-install that is simply because
     // we wrote it ourselves last time - inherit that ownership rather than losing it.
-    const owned = prevManifest ? !!prevManifest.rulesFile?.createdNew : false;
-    return { path: RULES_FILE, createdNew: owned, backedUpAt: null, alreadyCurrent: true };
+    const owned = prevRecord ? !!prevRecord.createdNew : false;
+    return { path: dst, createdNew: owned, backedUpAt: null, alreadyCurrent: true };
   }
   if (!FORCE) {
-    warn(`${RULES_FILE} already exists and differs; leaving it. Re-run with --force to overwrite (a backup is made first).`);
-    return { path: RULES_FILE, createdNew: false, backedUpAt: null, skipped: true };
+    warn(`${dst} already exists and differs; leaving it. Re-run with --force to overwrite (a backup is made first).`);
+    return { path: dst, createdNew: false, backedUpAt: null, skipped: true };
   }
-  const bak = backupPath(RULES_FILE);
-  if (!DRY_RUN) fs.copyFileSync(RULES_FILE, bak);
-  writeText(RULES_FILE, src);
-  return { path: RULES_FILE, createdNew: false, backedUpAt: bak, forced: true };
+  const bak = backupPath(dst);
+  if (!DRY_RUN) fs.copyFileSync(dst, bak);
+  writeText(dst, content);
+  return { path: dst, createdNew: false, backedUpAt: bak, forced: true };
+}
+
+function uninstallManagedFile(src, dst, record) {
+  if (!record || !record.createdNew) return; // never delete a file we did not create
+  const current = fs.existsSync(dst) ? fs.readFileSync(dst, 'utf8') : null;
+  const shipped = (() => { try { return fs.readFileSync(src, 'utf8'); } catch { return null; } })();
+  if (current !== null && shipped !== null && current !== shipped) {
+    warn(`${dst} was edited since install; leaving it in place.`);
+    return;
+  }
+  removeFile(dst);
+}
+
+const RULES_SRC = path.join(REPO_ROOT, 'rules', 'orchestration-contract.md');
+const DOCS_SRC = path.join(REPO_ROOT, 'docs', 'orchestration-contract.md');
+
+function installRulesFile(prevManifest) {
+  return installManagedFile(RULES_SRC, RULES_FILE, prevManifest?.rulesFile);
+}
+
+function installDocsFile(prevManifest) {
+  return installManagedFile(DOCS_SRC, DOCS_FILE, prevManifest?.docsFile);
 }
 
 function uninstallRulesFile(manifest) {
-  const r = manifest.rulesFile;
-  if (!r || !r.createdNew) return; // never delete a file we did not create
-  const current = fs.existsSync(RULES_FILE) ? fs.readFileSync(RULES_FILE, 'utf8') : null;
-  const src = (() => { try { return fs.readFileSync(path.join(REPO_ROOT, 'rules', 'orchestration-contract.md'), 'utf8'); } catch { return null; } })();
-  if (current !== null && src !== null && current !== src) {
-    warn(`${RULES_FILE} was edited since install; leaving it in place.`);
-    return;
-  }
-  removeFile(RULES_FILE);
+  uninstallManagedFile(RULES_SRC, RULES_FILE, manifest.rulesFile);
+  uninstallManagedFile(DOCS_SRC, DOCS_FILE, manifest.docsFile);
 }
 
 // --- install: agent definitions ------------------------------------------------
@@ -748,6 +765,7 @@ function install() {
   log(`${DRY_RUN ? '[dry-run] ' : ''}Installing claude-codex-orca-orchestration...`);
   installHookFiles();
   const rulesFile = installRulesFile(prevManifest);
+  const docsFile = installDocsFile(prevManifest);
   const configFile = installConfig(prevManifest);
   const janitor = installJanitor(prevManifest);
   const settings = installSettings({ pinModels: !NO_PIN }, prevManifest);
@@ -761,6 +779,7 @@ function install() {
     hooksDir: HOOKS_DIR,
     files: HOOK_FILES,
     rulesFile,
+    docsFile,
     configFile,
     janitor,
     settings,
@@ -900,7 +919,7 @@ function check() {
   }
   if (!hasOrca || !hasCodex) {
     warn('Codex opt-in will fall back to the in-session coder without both Orca and a usable Codex quota reading. ' +
-      'See "Coder availability (no Orca / no Codex)" in rules/orchestration-contract.md.');
+      'See "Coder availability (no Orca / no Codex)" in docs/orchestration-contract.md.');
   }
 
   checkCoders(hasOrca);
@@ -929,7 +948,7 @@ function check() {
     log(`  ${present ? 'OK  ' : 'MISS'} ${p}`);
     if (!present) checkFailed = true;
   }
-  for (const p of [RULES_FILE, CONFIG_FILE, SETTINGS_FILE]) {
+  for (const p of [RULES_FILE, DOCS_FILE, CONFIG_FILE, SETTINGS_FILE]) {
     const present = fs.existsSync(p);
     log(`  ${present ? 'OK  ' : 'MISS'} ${p}`);
     if (!present) checkFailed = true;

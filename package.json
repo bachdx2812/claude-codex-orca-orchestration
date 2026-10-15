@@ -13,6 +13,7 @@
   "files": [
     "hooks",
     "rules",
+    "docs",
     "snippets",
     "agents",
     "config",

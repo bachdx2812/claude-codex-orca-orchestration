@@ -289,7 +289,7 @@ check('a reported disconnect skips the same terminal\'s orphan and idle checks',
     orphaned: true, lastOutputAt: NOW - 200000 }, ctx).kind,
   'connection_lost');
 
-const contract = fs.readFileSync(path.join(__dirname, '..', 'rules', 'orchestration-contract.md'), 'utf8');
+const contract = fs.readFileSync(path.join(__dirname, '..', 'docs', 'orchestration-contract.md'), 'utf8');
 check('the contract documents that disconnected terminals skip idle and orphan checks',
   /A reported disconnected terminal skips its idle and orphan checks\./.test(contract), true);
 

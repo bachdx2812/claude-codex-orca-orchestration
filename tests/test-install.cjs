@@ -352,6 +352,62 @@ const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonn
     fs.existsSync(path.join(preDestDir, 'sonnet-coder.md')), true);
 }
 
+// --- contract files: summary -> rules/, full reference -> docs/; skip-unless-force, --------
+// --- backup on force, uninstall removes only owned+unchanged, --check reports both ---------
+{
+  const repo = path.join(__dirname, '..');
+  const SUMMARY = fs.readFileSync(path.join(repo, 'rules', 'orchestration-contract.md'), 'utf8');
+  const FULL = fs.readFileSync(path.join(repo, 'docs', 'orchestration-contract.md'), 'utf8');
+  const SNIPPET = fs.readFileSync(path.join(repo, 'snippets', 'CLAUDE.md.snippet'), 'utf8');
+  check('shipped rules summary is at most 60 lines', SUMMARY.split('\n').length - 1 <= 60, true);
+  check('shipped snippet block is at most 10 lines', SNIPPET.trimEnd().split('\n').length <= 10, true);
+
+  const fresh = run([], 'contract-fresh');
+  const rulesDest = path.join(fresh.home, '.claude', 'rules', 'orchestration-contract.md');
+  const docsDest = path.join(fresh.home, '.claude', 'docs', 'orchestration-contract.md');
+  check('summary is installed to rules/', fs.existsSync(rulesDest) && fs.readFileSync(rulesDest, 'utf8'), SUMMARY);
+  check('full contract is installed to docs/', fs.existsSync(docsDest) && fs.readFileSync(docsDest, 'utf8'), FULL);
+  const chk = run(['--check'], 'contract-fresh');
+  check('--check reports both contract files',
+    chk.stdout.includes(rulesDest) && chk.stdout.includes(docsDest), true);
+  const claudeMd = fs.readFileSync(path.join(fresh.home, '.claude', 'CLAUDE.md'), 'utf8');
+  const block = claudeMd.match(/<!-- orchestration:start -->[\s\S]*<!-- orchestration:end -->/);
+  check('installed CLAUDE.md snippet block is at most 10 lines', !!block && block[0].split('\n').length <= 10, true);
+
+  // Differing files are skipped without --force and backed up with it.
+  fs.writeFileSync(rulesDest, 'my rules\n');
+  fs.writeFileSync(docsDest, 'my docs\n');
+  const skip = run([], 'contract-fresh');
+  check('re-install skips differing rules file', fs.readFileSync(rulesDest, 'utf8'), 'my rules\n');
+  check('re-install skips differing docs file', fs.readFileSync(docsDest, 'utf8'), 'my docs\n');
+  check('skip prints a --force hint', /already exists and differs/.test(skip.stdout), true);
+  const forced = run(['--force'], 'contract-fresh');
+  check('--force overwrites rules file', fs.readFileSync(rulesDest, 'utf8'), SUMMARY);
+  check('--force overwrites docs file', fs.readFileSync(docsDest, 'utf8'), FULL);
+  const baks = (dir) => fs.readdirSync(dir).filter((n) => /orchestration-contract\.md.*\.(bak|backup)|\.bak/.test(n)
+    || (n.startsWith('orchestration-contract.md') && n !== 'orchestration-contract.md'));
+  check('--force backs up rules file', baks(path.dirname(rulesDest)).length > 0, true);
+  check('--force backs up docs file', baks(path.dirname(docsDest)).length > 0, true);
+  check('--force exits successfully', forced.status, 0);
+
+  // Uninstall removes only files this installer created and left unchanged.
+  const owned = run([], 'contract-owned');
+  const oRules = path.join(owned.home, '.claude', 'rules', 'orchestration-contract.md');
+  const oDocs = path.join(owned.home, '.claude', 'docs', 'orchestration-contract.md');
+  fs.writeFileSync(oDocs, 'edited docs\n');
+  run(['--uninstall'], 'contract-owned');
+  check('uninstall removes the unchanged owned rules file', fs.existsSync(oRules), false);
+  check('uninstall keeps an edited docs file', fs.existsSync(oDocs), true);
+
+  const pre = path.join(root, 'contract-pre');
+  fs.mkdirSync(path.join(pre, '.claude', 'rules'), { recursive: true });
+  fs.writeFileSync(path.join(pre, '.claude', 'rules', 'orchestration-contract.md'), 'preexisting\n');
+  run([], 'contract-pre');
+  run(['--uninstall'], 'contract-pre');
+  check('uninstall keeps a pre-existing rules file',
+    fs.readFileSync(path.join(pre, '.claude', 'rules', 'orchestration-contract.md'), 'utf8'), 'preexisting\n');
+}
+
 // Every shipped hooks/lib module must be installed, so a module added to the repo but not to
 // the installer's file list fails here instead of crashing an installed hook at require time.
 {

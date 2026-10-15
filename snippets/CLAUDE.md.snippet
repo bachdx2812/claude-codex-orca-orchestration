@@ -1,30 +1,7 @@
 <!-- orchestration:start -->
 ## Enforced Orchestration Contract
 
-This session's orchestration workflow is mechanically enforced by
-`~/.claude/hooks/orchestration/orchestrator-gate.cjs` (installed by the
-`claude-codex-orca-orchestration` installer), not merely described here. Full contract,
-config reference and escape hatches: `~/.claude/rules/orchestration-contract.md`.
-
-Summary — every value is config-driven (`~/.claude/orchestration.config.json`), so treat
-the SessionStart banner printed each session as the exact current numbers, not this file:
-
-- The main panel orchestrates only: it dispatches and supervises, and does not itself
-  Edit/Write or run mutating shell commands outside `.claude/`, `plans/`, `docs/`, scratch.
-- Planning and review run on the configured review model; verification uses the configured
-  verify model, all in-session.
-- Advice on the review model is opt-in: put a line starting `Read-only:` in the Agent/Task
-  description or prompt. The marker forbids edits even when the advice discusses code changes;
-  it is ignored inside triple-backtick or triple-tilde fences and does not bypass routing on
-  other models. `advisor`/`kongming` role names alone do not grant the advice route.
-- **Sonnet-first:** Code goes to the configured in-session code model by default. Codex is
-  opt-in through `--exec-codex`, `--code-model codex[:<model>]`, or `defaultCoder: "codex"`.
-  Requested but unusable/exhausted Codex falls back to Sonnet. This covers code, builds,
-  refactors, tests, bulk conversions, and fix loops. The operator can override with
-  `--code-model <alias|codex|codex:<model>|auto>` or the `--exec-*` shortcuts.
-- Every code brief names a verify command.
-- A heartbeat daemon must supervise any live Orca worker; `Stop` refuses to end the
-  session with one still live and unwatched.
-
-Escape hatches (operator-only): `ORCHESTRATOR_GATE=off` (env), `--no-orchestrate` (prompt).
+Orchestration is mechanically enforced by `~/.claude/hooks/orchestration/orchestrator-gate.cjs`.
+Rules: `~/.claude/rules/orchestration-contract.md` (full reference: `~/.claude/docs/`).
+The SessionStart banner printed each session carries the live numbers; trust it over any file.
 <!-- orchestration:end -->

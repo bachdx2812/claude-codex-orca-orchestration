@@ -1,7 +1,8 @@
 # AGENT_INSTALL.md
 
 Exact steps for an AI coding agent installing this repo on a teammate's machine.
-Read `rules/orchestration-contract.md` first for what gets enforced and why.
+Read `rules/orchestration-contract.md` (summary) first for what gets enforced and why;
+the full reference is `docs/orchestration-contract.md`.
 
 ## Who does what
 
@@ -27,7 +28,8 @@ configurable in `~/.claude/orchestration.config.json` or through
 `ORCH_CODEX_HANDOFF_USED`.
 
 Operator override: `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto`. Full
-detail: `README.md#who-does-what` and `rules/orchestration-contract.md`.
+detail: `README.md#who-does-what` and `docs/orchestration-contract.md`. Sonnet is the
+default coder; Codex is used only when the operator opts in.
 
 **Subagents and parallel work.** In-session subagents (`Agent` tool) return their result
 directly and are never tracked by these hooks for supervision purposes — no heartbeat
@@ -109,8 +111,9 @@ so `--uninstall` can reverse exactly this and nothing else:
 
 1. Copies `hooks/*.cjs` (+ `hooks/lib/`) to `~/.claude/hooks/orchestration/` — its own
    directory; no other hook is touched.
-2. Copies `rules/orchestration-contract.md` to `~/.claude/rules/` (backs up and asks for
-   `--force` if a different file is already there; never silently overwrites).
+2. Copies the short `rules/orchestration-contract.md` summary to `~/.claude/rules/` and the
+   full `docs/orchestration-contract.md` to `~/.claude/docs/` (each: skipped with a warning
+   if a different file is already there; `--force` backs it up first, then overwrites).
 3. Seeds `~/.claude/orchestration.config.json` from the example, only if absent.
 4. Merges hook entries into `~/.claude/settings.json` (backed up first — only when the
    content actually changes, and only the *first* backup this installer ever makes is
@@ -155,7 +158,7 @@ Expect:
 
 - `node`, `claude` versions printed; `orca`/`codex` presence and, for codex, whether an
   auth file is present (not a guarantee it's valid — `codex login` is the real check).
-- Install status: every hook file, the rules file, the config file, and settings.json
+- Install status: every hook file, the rules and docs contract files, the config file, and settings.json
   present at their recorded paths; the Node path recorded at install still exists, with a
   warning if it sits inside a version-numbered directory (`.../Cellar/node/23.11.0/...`,
   `.../nvm/versions/node/...`) that a later Node upgrade could remove — run `--repair` to
@@ -174,7 +177,7 @@ Expect:
 
 **Verifying the gate is live requires an Orca terminal**, because the default
 `activation: "orca-only"` only governs sessions that carry `ORCA_TERMINAL_HANDLE` (see
-"Activation" in `rules/orchestration-contract.md`) — a plain `claude` session outside Orca
+"Activation" in `docs/orchestration-contract.md`) — a plain `claude` session outside Orca
 is deliberately left ungated. Two ways to confirm:
 
 - Inside an actual Orca-managed terminal: start a fresh Claude Code session there and
@@ -262,7 +265,7 @@ needs a verify command (a Codex `--spec`, or an in-session exec `Agent`/`Task` d
 running in a *shared* workspace must also declare `Owns: <repo-relative paths>` or
 `Owns: n/a <reason>` on its own line, unless it is isolated
 (`--worktree new-child`/`new-top-level`, or Agent `isolation:"worktree"`) — full detail in
-`rules/orchestration-contract.md#parallel-codex-workers-and-file-ownership`.
+`docs/orchestration-contract.md#parallel-codex-workers-and-file-ownership`.
 
 ## 5. Override the coding model from the main panel
 

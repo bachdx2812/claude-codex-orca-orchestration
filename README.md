@@ -448,8 +448,9 @@ two of them, both zero-dependency Node:
 
 Everything either enforces is **configured**, not hard-coded: which model plans/reviews,
 which model escalates to, which model codes, the Codex-quota handoff threshold, the reply
-language, which gates are active. See `rules/orchestration-contract.md` for the full
-contract and `config/orchestration.config.example.json` for every knob.
+language, which gates are active. See `docs/orchestration-contract.md` for the full
+contract (`rules/orchestration-contract.md` is the short always-loaded summary; the installer
+puts them in `~/.claude/rules/` and `~/.claude/docs/`) and `config/orchestration.config.example.json` for every knob.
 
 Exact model versions are listed once, in "Who does what" above. `install.mjs` pins both
 `ANTHROPIC_DEFAULT_OPUS_MODEL` and `ANTHROPIC_DEFAULT_FABLE_MODEL` to the review and
@@ -575,7 +576,7 @@ For every numeric env override — `ORCH_CODEX_HANDOFF_USED`,
 coerced to `0`), and a `null` or other non-number in this file for a numeric key falls
 back to that key's default with a banner warning.
 
-See `rules/orchestration-contract.md#config` for every field.
+See `docs/orchestration-contract.md#config` for every field.
 
 ## Uninstall / rollback
 
@@ -597,7 +598,7 @@ exact-match removal (never a blind restore, so edits you made after installing s
   `--orchestrate` re-enables them. If both appear, the last flag wins. While disabled,
   every prompt and the `SessionStart` banner show when bypass began and how to re-enable.
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` (see
-  `rules/orchestration-contract.md`) let the operator override coding-model routing
+  `docs/orchestration-contract.md`) let the operator override coding-model routing
   without a full bypass.
 - Harness-injected notifications and compaction summaries are never interpreted as fresh
   operator flags, even when they quote an earlier `--no-orchestrate`, `--exec-*`, or
