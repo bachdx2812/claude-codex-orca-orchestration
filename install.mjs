@@ -18,6 +18,7 @@
  * this installer did not create is ever touched.
  */
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -289,46 +290,152 @@ function uninstallHookFiles(manifest) {
 
 // --- install: rules file ------------------------------------------------------
 
+// sha256 of every rules/orchestration-contract.md this repo ever shipped (the full contract,
+// before it moved to docs/). An install made by an older installer has no recorded hash, so a
+// rules file whose content matches one of these is known to be an untouched installer copy
+// and is safe to upgrade in place.
+const LEGACY_RULES_SHA256 = new Set([
+  '7eb648c67d536ac07dce65cf823d3af908bb4436fc09f40719efc31ac91ff1d7',
+  'febe7a51fc1fb8288c38445bf24c9f0608b1b2dac97dd5dde084e38838298032',
+  '3fe9ea928eba9bcb829136165bacad02cb822f17a0b932fd4d4a63f03e18c9fa',
+  'e408c68d55640ca7cbc6020d907036ff22ae2d16ab33b572f9752f998b82a532',
+  '897e666e22322bee4c50dd15c93b823cdc14e8609aa11e393b1ebbf22ed564d6',
+  '9f004cc678f10ef8fd571533d57ccc71286259d3e7a14139cc18a4267e60234a',
+  '9c0e30718d2d104c9c54ffc45337bb017f73088efe4758ea4f8654ab1abab7dc',
+  '8ad812b65d844c155cd1a03e3c500a2d62ba888ed7e334361aaa06fc72eb2c50',
+  '7f5580c335318aca2a31432a0f4b47500332f46d65f16c4883759edaf9616258',
+  '8df5637230c9b811695aaae045910e7b08ef8034f7bc152ee42db47f0a047ee3',
+  'd882853556c594f06e14d2573541b2e8af5593ff1b8fc562067577ab1961a3c3',
+  '891a040682659be4d7f1bbe32dbc186cd55db89878f0ab27bc9fd3a874903b7e',
+  '0e3553cc6e0af2bd79d46a5378dbe495f7603050d4a43633fa0a091aed736181',
+  '43b89ded32dc2550892d1031176ab8e80f42253dbdb24fe7fd46bfba03a62700',
+  '1fe4748bcdd0f50725146af40ef26d693db5d96ba56baa918e8390f026705320',
+  'c25f35c242826817ecb98fa4774a18705b72e206526c54894f5ea1e2bb39feee',
+  '6e10c0bc73f388de3bfba989c56ec2773d35033e9083cacdb78442123a0045e2',
+  'd9f838c5d15cc68f88a0ffb244360144df62bd220401ecc0485d1d463cd720ee',
+  '15f2b436e6368d055a6a40159e94db4295e0be86bf8b974d20d89ef55a31bea8',
+  '45a78ce66a87aa47280f19fa91760ef76793f8826bb7b845573f47e43a6d935e',
+  '7e60b1ce9273d898a8d45a5797b1fca1c8f2baba7302efb02d8ea89facc03609',
+  'c3379d766a2efd4e70014604cf89d5c8fe33326e55116289efcc841a34792832',
+  '192f03a7610699919d5c077e545bd5a79ee0c358f5b4d3332c846ed6fdca8284',
+  '5c00e050b953eefaba0b4b06c471a3056ba504c9de43b9ef6da878874538dd5a',
+  '72b3be8c7313d10a2e5eedcbb6f41cfd4509387cebc4a1f093ffcd50fe9a9988',
+  'ca88d164c718572892db35ce28793a114efccdc60bfe9d2d8e8eb92ff092e370',
+  '9374a8b1f7130662818d100a2666037170e0c32f60625a0449610a0aa564d8f4',
+  'b5d595573a0885f50154633da98708def19e110c299629d5fddb087ac8fc004a',
+  '9b6ec458c7ceb02ae56973cd57b27ca4b3f6c22a3c659b56a0bf17c57d003e09',
+  '5e3a5d49e9da7913789792611ae168f674950866d9cdddc4057160b3263e54a4',
+  'de9cdfafd0304663942cfd0b111de131ea8ea51e79d9401e706e7c12d41a79e4',
+  'ea96e6980fa59f9847e0e92aad527e1445eb729482132a4bd48577bf8225a629',
+  '58993be054dabedec4430199dfa913b32c0e6ccca048bb2ade179a742d461e45',
+  '9860e5bd731dd0ec909f3dd37e4124c17dedd35a1e2a05420a158891d71ce8a5',
+  '8c1b7748fa00d87099c71ddceb02cb3b57d4d2665b606aff7dfb1061d578ef37',
+  'cc52eb2990919f7d5f34459d83ddf31d78460c2db8d88444ae1e861d96df766e',
+  'f080501364d841aeb87ed8ccd9449901b1bdefc90a793d63673c7e8558cd6919',
+  '855011f041569e99f8fec0aec14614d391ec7031ac5e64b924708f3708ba6033',
+  '08c8c9806c379fb5b8770746f6f72e286392635fb7c5a8ea4e64c8d66a7aff8c',
+  '474e6e89b107a5a369211c2fba4805af18a6091ff71ca4e6b67cdc3cbacb8928',
+  'c1e916da792bfd4d329aa61cbf7ef2ca46edd0edb76d36ec7d8ac8a13bb89521',
+  '44379327a2d6ae3c512e3d5b233294ce48872276a628e35d1f5dc851f6fcee14',
+  '749cbb9d68dddbdb6c5f9113b145f86e1b01d5e7ac25c59e844563d2257605e2',
+  '51cf7002acd54bd158759301630615959613e769292e278b7df23da1bbf9fdb1',
+  '91c92d0bd6cd5a1184d766737ed006017644828aaf7ff59509e96b4e53cc0053',
+  'a36e0da601a1e52bb9f6b10a82fd1ed96d598eee0ed1db7d33f555dcb862585e',
+  '83d5584e2dd974037987dff9afc73a5b14e22f40dce378c486d33446136d6922',
+  'e55dd9fe2619db6b158b765f9656e51eff6b593358345fa31d7256979f20d8f7',
+  'a128e3ab4adedc34120522866e6e30f0120a3e849d6cf24868e22475ca6b6f90',
+  '9221e185102ea55515a5c80627a1330bcd3f34a71184558412d6b448ac0e544b',
+  '913f126f55a8e1283b7d34be7a52afce8e13fba4bf2a834577fde02df4caadea',
+  '7ec0e2936cbfa578650398187d49cbd3663dd486631fcce875af4bbab03cb36d',
+  'abd84f3db472c09c301be42df47edfe14a039e22b572bf4e107c3b0b7a8f44e3',
+  '3af1cd2a6fa0a69a785f64d740c19a43644de88d948057a0f79ebebc526d5e03',
+  'e7d0426746d896b51db3289f029fc0348623d1e1036e65ca132875d228b0a0ef',
+  '1a06bd9a5d22add83aa46f6aa41021098fc23beda0acbafae226fb699f085b4d',
+  '420d89c9253b7dc3aad6f0998efb2d5eb6d1a5bd6292f04edd3fc8dbf3e27bff',
+  'e2a8a5582072fac657379065f2112aeacb541a2ae474a620937148ae66a74d67',
+  '5209278ddc954ba6efd73ccf07087928cd7e854ee0d4a94dcf20f79d29ed0980',
+  'bcec76e07002194c512b54191a525d894f981312d5c02b2bb234f30f5b4ba20e',
+  '615445469d5498876907edb153ecb612d0d6e5efa7e8ba72f1d271199201bba6',
+  'b3d634cf150ba4690c5d28c5f6f0aba2d606520bcab830e588354b2ad5d6908e',
+  '6f592b17d16c33f0e13e4c76545d53c53d9b95fbd15cac4829b99ff0ee278312',
+  '60d716bfb6daaae30e19ba2f39c6d690fea0a1efae8098d33a016b3ae4790ab6',
+  'acda889a1aff885183301bb6d5d37e2ba63543cfb3a2ecbc3e6067ed577c47fc',
+  '6fabbe79de5474c0587ffa81d26a5ea9eb5399f0fc61396963bc48f465be0041',
+  '7caf095becd1561beb164b4665cd04e8a467a845e65da445752f62a4a6803924',
+  '9967ba69cecf761867a1823d08b1861572734d7f54c0c157b795c1b656015f47',
+  'dd6dd18e94bdf8174df385e8c3ac980c08dc26e7dff501ca6d386b919f22a618',
+  'a1a312ee9afd2613d727a7ed48a4d4aa0020c1146330b027f8c76789e052b486',
+  'ba945f4e83dba4e7fde4f49c4efa10e63d399d7ddd2ce9b8bed1abd8c83a0497',
+  'b5fb0acfd8307501b814d28fc3f6304749e896c559aa485228c854d00dea673b'
+]);
+
+function sha256Of(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
 // Both shipped contract files (summary rules + full docs) share one install/uninstall path.
-function installManagedFile(src, dst, prevRecord) {
+// The manifest record keeps sha256 of the content we last wrote so a later run can tell
+// "still the file we installed" from "operator edited it", and carries ownership forward.
+function installManagedFile(src, dst, prevRecord, legacyHashes = new Set()) {
   const content = fs.readFileSync(src, 'utf8');
+  const sha256 = sha256Of(content);
   const existing = fs.existsSync(dst) ? fs.readFileSync(dst, 'utf8') : null;
+  const owned = !!prevRecord?.createdNew;
+  const keptBackup = prevRecord?.backedUpAt || null;
   if (existing === null) {
     writeText(dst, content);
-    return { path: dst, createdNew: true, backedUpAt: null };
+    return { path: dst, createdNew: true, backedUpAt: null, sha256 };
   }
   if (existing === content) {
-    // Content matches what this installer ships. On a re-install that is simply because
-    // we wrote it ourselves last time - inherit that ownership rather than losing it.
-    const owned = prevRecord ? !!prevRecord.createdNew : false;
-    return { path: dst, createdNew: owned, backedUpAt: null, alreadyCurrent: true };
+    // Content matches what this installer ships: inherit ownership from the last install.
+    return { path: dst, createdNew: owned, backedUpAt: keptBackup, sha256, alreadyCurrent: true };
+  }
+  const existingHash = sha256Of(existing);
+  const pristine = prevRecord?.sha256 ? existingHash === prevRecord.sha256 : legacyHashes.has(existingHash);
+  if (pristine) {
+    // An older copy we shipped, never edited: upgrade silently, ownership unchanged.
+    writeText(dst, content);
+    return { path: dst, createdNew: owned, backedUpAt: keptBackup, sha256, upgraded: true };
   }
   if (!FORCE) {
     warn(`${dst} already exists and differs; leaving it. Re-run with --force to overwrite (a backup is made first).`);
-    return { path: dst, createdNew: false, backedUpAt: null, skipped: true };
+    return { path: dst, createdNew: owned, backedUpAt: keptBackup, sha256: prevRecord?.sha256 || null, skipped: true };
   }
   const bak = backupPath(dst);
   if (!DRY_RUN) fs.copyFileSync(dst, bak);
   writeText(dst, content);
-  return { path: dst, createdNew: false, backedUpAt: bak, forced: true };
+  return { path: dst, createdNew: owned, backedUpAt: bak, sha256, forced: true };
 }
 
-function uninstallManagedFile(src, dst, record) {
-  if (!record || !record.createdNew) return; // never delete a file we did not create
+// Removes the file only when it is still what we wrote (recorded hash, or the shipped
+// source / a known legacy copy for records without one); a --force backup is restored.
+function uninstallManagedFile(src, dst, record, legacyHashes = new Set()) {
+  if (!record || (!record.createdNew && !record.backedUpAt)) return; // never touch what we did not write
   const current = fs.existsSync(dst) ? fs.readFileSync(dst, 'utf8') : null;
-  const shipped = (() => { try { return fs.readFileSync(src, 'utf8'); } catch { return null; } })();
-  if (current !== null && shipped !== null && current !== shipped) {
-    warn(`${dst} was edited since install; leaving it in place.`);
+  if (current !== null) {
+    const h = sha256Of(current);
+    const shipped = (() => { try { return fs.readFileSync(src, 'utf8'); } catch { return null; } })();
+    const unchanged = record.sha256 ? h === record.sha256 : (current === shipped || legacyHashes.has(h));
+    if (!unchanged) {
+      warn(`${dst} was edited since install; leaving it in place.`);
+      return;
+    }
+  }
+  const bak = record.backedUpAt;
+  if (bak && fs.existsSync(bak)) {
+    if (DRY_RUN) { log(`  [dry-run] would restore ${bak} -> ${dst}`); return; }
+    fs.copyFileSync(bak, dst);
+    removeFile(bak);
     return;
   }
-  removeFile(dst);
+  if (record.createdNew) removeFile(dst);
 }
 
 const RULES_SRC = path.join(REPO_ROOT, 'rules', 'orchestration-contract.md');
 const DOCS_SRC = path.join(REPO_ROOT, 'docs', 'orchestration-contract.md');
 
 function installRulesFile(prevManifest) {
-  return installManagedFile(RULES_SRC, RULES_FILE, prevManifest?.rulesFile);
+  return installManagedFile(RULES_SRC, RULES_FILE, prevManifest?.rulesFile, LEGACY_RULES_SHA256);
 }
 
 function installDocsFile(prevManifest) {
@@ -336,7 +443,7 @@ function installDocsFile(prevManifest) {
 }
 
 function uninstallRulesFile(manifest) {
-  uninstallManagedFile(RULES_SRC, RULES_FILE, manifest.rulesFile);
+  uninstallManagedFile(RULES_SRC, RULES_FILE, manifest.rulesFile, LEGACY_RULES_SHA256);
   uninstallManagedFile(DOCS_SRC, DOCS_FILE, manifest.docsFile);
 }
 

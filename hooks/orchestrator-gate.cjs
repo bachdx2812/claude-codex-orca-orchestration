@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * orchestrator-gate.cjs — enforces the orchestration contract described in
- * rules/orchestration-contract.md, generated from `config/orchestration.config.json`.
+ * docs/orchestration-contract.md, generated from `config/orchestration.config.json`.
  *
  * Contract (defaults; every noun below is config-driven, see hooks/lib/config.cjs):
  *   1. The main panel is an orchestrator only: it dispatches and supervises. It never

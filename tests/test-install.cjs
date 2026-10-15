@@ -384,8 +384,7 @@ const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonn
   const forced = run(['--force'], 'contract-fresh');
   check('--force overwrites rules file', fs.readFileSync(rulesDest, 'utf8'), SUMMARY);
   check('--force overwrites docs file', fs.readFileSync(docsDest, 'utf8'), FULL);
-  const baks = (dir) => fs.readdirSync(dir).filter((n) => /orchestration-contract\.md.*\.(bak|backup)|\.bak/.test(n)
-    || (n.startsWith('orchestration-contract.md') && n !== 'orchestration-contract.md'));
+  const baks = (dir) => fs.readdirSync(dir).filter((n) => n.startsWith('orchestration-contract.md.bak-'));
   check('--force backs up rules file', baks(path.dirname(rulesDest)).length > 0, true);
   check('--force backs up docs file', baks(path.dirname(docsDest)).length > 0, true);
   check('--force exits successfully', forced.status, 0);
@@ -406,6 +405,72 @@ const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonn
   run(['--uninstall'], 'contract-pre');
   check('uninstall keeps a pre-existing rules file',
     fs.readFileSync(path.join(pre, '.claude', 'rules', 'orchestration-contract.md'), 'utf8'), 'preexisting\n');
+
+  // Upgrade from an install made by the previous installer: the rules file is the old full
+  // contract and the manifest has no hash. Skipped when no shipped history is available.
+  const legacy = (() => {
+    try {
+      const { execFileSync } = require('child_process');
+      const revs = execFileSync('git', ['rev-list', '-n', '30', 'HEAD', '--', 'rules/orchestration-contract.md'],
+        { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(Boolean);
+      // Newest commit whose rules file was still the full contract (more than 200 lines).
+      for (const rev of revs) {
+        try {
+          const body = execFileSync('git', ['show', `${rev}:rules/orchestration-contract.md`],
+            { cwd: repo, encoding: 'utf8', maxBuffer: 1e8, stdio: ['ignore', 'pipe', 'ignore'] });
+          if (body.split('\n').length > 200) return body;
+        } catch { /* path absent at this commit */ }
+      }
+    } catch { /* no history */ }
+    return null;
+  })();
+  if (legacy) {
+    const mHome = path.join(root, 'contract-upgrade');
+    const mRules = path.join(mHome, '.claude', 'rules', 'orchestration-contract.md');
+    const mDocs = path.join(mHome, '.claude', 'docs', 'orchestration-contract.md');
+    const mManifest = path.join(mHome, '.claude', 'hooks', 'orchestration', 'install-manifest.json');
+    run([], 'contract-upgrade');
+    // Rewind to the previous installer's state: old full file, ownership recorded, no hash, no docs.
+    fs.writeFileSync(mRules, legacy);
+    fs.rmSync(mDocs);
+    const man = JSON.parse(fs.readFileSync(mManifest, 'utf8'));
+    man.rulesFile = { path: mRules, createdNew: true, backedUpAt: null };
+    delete man.docsFile;
+    fs.writeFileSync(mManifest, JSON.stringify(man));
+    const up = run([], 'contract-upgrade');
+    check('upgrade replaces the legacy full rules file with the summary', fs.readFileSync(mRules, 'utf8'), SUMMARY);
+    check('upgrade installs the full contract to docs/', fs.readFileSync(mDocs, 'utf8'), FULL);
+    check('upgrade does not warn about a skipped file', /already exists and differs/.test(up.stdout), false);
+    const upMan = JSON.parse(fs.readFileSync(mManifest, 'utf8'));
+    check('upgrade keeps rules ownership and records a hash', [upMan.rulesFile.createdNew, !!upMan.rulesFile.sha256], [true, true]);
+    run(['--uninstall'], 'contract-upgrade');
+    check('uninstall after upgrade removes the owned rules file', fs.existsSync(mRules), false);
+    check('uninstall after upgrade removes the owned docs file', fs.existsSync(mDocs), false);
+
+    // An operator-edited legacy file (hash not shipped) is still skipped without --force.
+    const eHome = path.join(root, 'contract-upgrade-edited');
+    const eRules = path.join(eHome, '.claude', 'rules', 'orchestration-contract.md');
+    const eManifest = path.join(eHome, '.claude', 'hooks', 'orchestration', 'install-manifest.json');
+    run([], 'contract-upgrade-edited');
+    fs.writeFileSync(eRules, `${legacy}\nlocal edit\n`);
+    const eman = JSON.parse(fs.readFileSync(eManifest, 'utf8'));
+    eman.rulesFile = { path: eRules, createdNew: true, backedUpAt: null };
+    fs.writeFileSync(eManifest, JSON.stringify(eman));
+    const eUp = run([], 'contract-upgrade-edited');
+    check('an edited legacy rules file is skipped without --force', fs.readFileSync(eRules, 'utf8'), `${legacy}\nlocal edit\n`);
+    check('skipping keeps recorded ownership', JSON.parse(fs.readFileSync(eManifest, 'utf8')).rulesFile.createdNew, true);
+    check('skipping warns', /already exists and differs/.test(eUp.stdout), true);
+  }
+
+  // --force backs the file up; uninstall restores the original operator file.
+  const rHome = path.join(root, 'contract-restore');
+  const rRules = path.join(rHome, '.claude', 'rules', 'orchestration-contract.md');
+  fs.mkdirSync(path.dirname(rRules), { recursive: true });
+  fs.writeFileSync(rRules, 'operator original\n');
+  run(['--force'], 'contract-restore');
+  check('force replaces the operator file', fs.readFileSync(rRules, 'utf8'), SUMMARY);
+  run(['--uninstall'], 'contract-restore');
+  check('uninstall restores the --force backup', fs.readFileSync(rRules, 'utf8'), 'operator original\n');
 }
 
 // Every shipped hooks/lib module must be installed, so a module added to the repo but not to
