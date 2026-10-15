@@ -89,6 +89,54 @@ for (const command of [
   check(`harmless ${command} stays allowed`, pre(command).status, 0);
 }
 
+// Deep eval nesting fails closed (denied) and quickly, not open.
+{
+  const { orcaInvocations } = require(path.join(ROOT, 'hooks', 'lib', 'shell-orca-invocations.cjs'));
+  const deep = 'eval '.repeat(5000) + INNER;
+  const start = Date.now();
+  const found = orcaInvocations(deep);
+  const elapsed = Date.now() - start;
+  ok('5000-deep eval chain is flagged', found.length > 0);
+  ok(`5000-deep eval chain scans quickly (${elapsed}ms)`, elapsed < 200);
+  const r = pre(deep);
+  ok('5000-deep eval chain is denied', r.status === 2 && /codex-not-requested/.test(r.stderr));
+  check('deep eval of a harmless command stays allowed', pre('eval '.repeat(5000) + 'ls').status, 0);
+  const deepBash = 'eval '.repeat(20) + `bash -c ${q(INNER)}`;
+  ok('eval chain wrapping bash -c is denied', pre(deepBash).status === 2);
+}
+
+// More wrapper / stdin forms.
+for (const [name, command] of [
+  ['heredoc into bash', `bash <<EOF\n${INNER}\nEOF`],
+  ['heredoc via cat | bash', `cat <<EOF | bash\n${INNER}\nEOF`],
+  ['tee in pipe', `echo ${q(INNER)} | tee /tmp/x | bash`],
+  ['|& bash', `echo ${q(INNER)} |& bash`],
+  ['builtin eval', `builtin eval ${q(INNER)}`],
+  ['process substitution', `bash <(echo ${q(INNER)})`],
+  ['source /dev/stdin', `source /dev/stdin <<< ${q(INNER)}`],
+  ['timeout wrapper', `timeout 5 bash -c ${q(INNER)}`],
+  ['timeout plain orca', `timeout -s KILL 5 ${INNER}`],
+  ['nice -n wrapper', `nice -n 5 bash -c ${q(INNER)}`],
+  ['nice plain orca', `nice ${INNER}`],
+  ['nohup plain orca', `nohup ${INNER}`],
+  ['command wrapper', `command bash -lc ${q(INNER)}`],
+  ['exec plain orca', `exec ${INNER}`],
+]) {
+  const r = pre(command);
+  ok(`${name} fresh Codex start is denied`, r.status === 2 && /codex-not-requested/.test(r.stderr));
+}
+
+// Stdin is a script only when the shell reads stdin.
+for (const command of [
+  `echo ${q(INNER)} | bash script.sh`,
+  `bash script.sh <<< ${q(INNER)}`,
+  `bash --version <<< ${q(INNER)}`,
+  `bash <<EOF\nls\nEOF`,
+  `cat <<EOF\n${INNER}\nEOF`,
+]) {
+  check(`stdin not executed: ${command.split('\n')[0]}`, pre(command).status, 0);
+}
+
 fs.rmSync(f.root, { recursive: true, force: true });
 if (failures.length) {
   console.error(`FAIL (${failures.length})`);

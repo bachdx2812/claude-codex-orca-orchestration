@@ -24,7 +24,11 @@
  * are skipped verbatim, whatever they contain. Input is capped at 64 KB so a
  * pathological command line cannot make this scan (or its caller) slow, and
  * command-substitution recursion is capped at a fixed depth as a safety
- * valve against adversarial nesting.
+ * valve against adversarial nesting. Shell-wrapper unwrapping (`eval`, `<shell> -c`,
+ * stdin/heredoc/here-string/`<(...)` scripts) has its own shared depth and total-work
+ * budget; once exceeded, a command line that still mentions orca yields a synthetic
+ * fresh Codex dispatch so the gate refuses it (fail closed). Variable indirection
+ * (`x=...; bash -c "$x"`) and shells such as fish/busybox are not unwrapped.
  *
  * Exports `orcaInvocations(cmd)` -> Array<{
  *   sub: string, args: string[], stdoutPiped: boolean,
@@ -39,6 +43,8 @@
 'use strict';
 
 const MAX_LEN = 64 * 1024;
+const MAX_SHELL_DEPTH = 16; // eval / `<shell> -c` / stdin-script nesting we are willing to unwrap
+const MAX_SHELL_WORK = 256 * 1024; // total characters re-scanned through shell unwrapping per command line
 const MAX_DEPTH = 200; // recursion cap for nested $( )/backticks — a safety valve, not a real limit
 
 // Reserved words that act as pure command separators when they are the sole
@@ -93,36 +99,64 @@ const SHELL_CLUSTER_RE = /^[-+][a-zA-Z]+$/;
  * Script text a shell-like command at words[i] would execute, or null when it
  * is not one. Covers `<shell> [options] -c <script>` (any `-[a-zA-Z]*c`
  * cluster, other leading options skipped), `eval <args>`, and a shell fed its
- * script on stdin (`<<<` here-string / `echo ... | bash`) via `stdin`.
+ * script on stdin (here-string / heredoc / pipe / `<(...)`) via `stdin`, which
+ * counts only when the shell has no script-file operand and no -c.
  */
-function shellPayload(words, i, stdin) {
+function shellPayload(ctx, words, i, stdin) {
   const base = basename(words[i]);
   if (base === 'eval') return words.slice(i + 1).join(' ');
-  if (!SHELLS.has(base)) return null;
+  const isDot = base === 'source' || base === '.';
+  if (!SHELLS.has(base) && !isDot) return null;
   let j = i + 1;
   let hasC = false;
-  while (j < words.length && words[j] !== '--' && /^[-+]/.test(words[j])) {
+  let hasS = false;
+  while (!isDot && j < words.length && words[j] !== '--' && /^[-+]/.test(words[j])) {
     const w = words[j];
+    if (w === '--version' || w === '--help') return null;
     if (SHELL_ARG_OPTS.has(w)) { j += 2; continue; }
     if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(w)) hasC = true;
+    else if (/^-[a-zA-Z]*s[a-zA-Z]*$/.test(w)) hasS = true;
     else if (!SHELL_CLUSTER_RE.test(w) && !w.startsWith('--')) break;
     j += 1;
   }
   if (j < words.length && words[j] === '--') j += 1;
   if (hasC) return words[j] != null ? words[j] : null;
-  return typeof stdin === 'string' ? stdin : null;
+  const operand = words[j];
+  const sub = operand != null ? /\u0001(\d+)$/.exec(operand) : null;
+  if (sub && ctx.procSubs[Number(sub[1])] != null) return ctx.procSubs[Number(sub[1])];
+  const readsStdin = operand == null || operand === '-' || operand === '/dev/stdin' || hasS;
+  if (isDot && operand == null) return null;
+  return readsStdin && typeof stdin === 'string' ? stdin : null;
 }
 
-/** Text an `echo`/`printf` command writes to stdout, or null for other commands. */
-function echoedText(words) {
+/**
+ * Text a pass-through command writes to stdout: `echo`/`printf` their words,
+ * `cat` (no file operand) and `tee` their stdin. Null for anything else.
+ */
+function echoedText(words, stdin) {
   let i = 0;
   while (i < words.length && ASSIGNMENT_RE.test(words[i])) i += 1;
   const base = basename(words[i]);
-  if (base !== 'echo' && base !== 'printf') return null;
   let rest = words.slice(i + 1);
+  if (base === 'cat' || base === 'tee') {
+    if (typeof stdin !== 'string') return null;
+    return base === 'cat' && rest.some((w) => !w.startsWith('-') || w === '-') && !rest.includes('-') ? null : stdin;
+  }
+  if (base !== 'echo' && base !== 'printf') return null;
   while (rest.length && /^-[a-zA-Z]+$/.test(rest[0])) rest = rest.slice(1);
   if (base === 'printf' && rest.length > 1 && rest[0].includes('%')) rest = rest.slice(1);
   return rest.join(base === 'printf' ? '\n' : ' ');
+}
+
+/** Synthetic invocation used to fail closed when unwrapping gives up: a fresh Codex dispatch the gate refuses. */
+function unparseableInvocation(output) {
+  return {
+    sub: 'orchestration worker-start',
+    args: ['orchestration', 'worker-start', '--agent', 'codex'],
+    stdoutPiped: output.stdoutPiped === true,
+    stdoutRedirected: output.stdoutRedirected === true,
+    stdoutCaptured: output.stdoutCaptured === true,
+  };
 }
 
 /**
@@ -148,8 +182,25 @@ function processSimpleCommand(ctx, words, output = {}) {
       if (i < words.length && words[i] === '--') i += 1;
       continue;
     }
-    if (base === 'command' || base === 'exec' || base === 'nohup' || base === 'time') {
+    if (base === 'command' || base === 'exec' || base === 'nohup' || base === 'time' || base === 'builtin') {
       i += 1; advanced = true;
+      continue;
+    }
+    if (base === 'timeout') {
+      i += 1; advanced = true;
+      while (i < words.length && words[i].startsWith('-') && words[i] !== '--') {
+        i += words[i] === '-s' || words[i] === '-k' ? 2 : 1;
+      }
+      if (i < words.length && words[i] === '--') i += 1;
+      if (i < words.length) i += 1; // DURATION
+      continue;
+    }
+    if (base === 'nice') {
+      i += 1; advanced = true;
+      while (i < words.length && words[i].startsWith('-') && words[i] !== '--') {
+        i += words[i] === '-n' ? 2 : 1;
+      }
+      if (i < words.length && words[i] === '--') i += 1;
       continue;
     }
     if (base === 'sudo') {
@@ -171,9 +222,16 @@ function processSimpleCommand(ctx, words, output = {}) {
     if (!advanced) break;
   }
   if (i >= words.length) return;
-  const payload = shellPayload(words, i, output.stdin);
+  const payload = shellPayload(ctx, words, i, output.stdin);
   if (payload != null) {
-    for (const invocation of orcaInvocations(payload)) {
+    const shell = ctx.shell;
+    shell.budget.work += payload.length;
+    if (shell.depth >= MAX_SHELL_DEPTH || shell.budget.work > MAX_SHELL_WORK) {
+      // Too deep / too much to unwrap: refuse only when orca could be hiding in there.
+      if (/orca/.test(payload)) ctx.invocations.push(unparseableInvocation(output));
+      return;
+    }
+    for (const invocation of scanCommandLine(payload, { depth: shell.depth + 1, budget: shell.budget })) {
       ctx.invocations.push({
         ...invocation,
         stdoutPiped: invocation.stdoutPiped || output.stdoutPiped === true,
@@ -232,6 +290,23 @@ function groupOutputSemantics(s, start, end) {
     skipTarget(); whitespace();
   }
   return { stdoutPiped: false, stdoutRedirected };
+}
+
+/** Body text of a heredoc whose body starts at `from`, and the index just past its terminator line. */
+function heredocBody(s, from, end, delim, strip) {
+  let i = from;
+  const lines = [];
+  while (i < end) {
+    let lineEnd = s.indexOf('\n', i);
+    const hasNL = lineEnd !== -1 && lineEnd <= end;
+    if (!hasNL) lineEnd = end;
+    let line = s.slice(i, lineEnd);
+    if (line.endsWith('\r')) line = line.slice(0, -1);
+    i = hasNL ? lineEnd + 1 : end;
+    if ((strip ? line.replace(/^\t+/, '') : line) === delim) return { body: lines.join('\n'), next: i };
+    lines.push(line);
+  }
+  return { body: lines.join('\n'), next: end };
 }
 
 /** Skip heredoc bodies queued for the line that just ended, verbatim. */
@@ -344,6 +419,7 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
   let hereString = null;
   let hereStringNext = false;
   let pipedText = null;
+  let heredocCursor = null;
   const groupStarts = [];
   const braceGroupStarts = [];
   let depth = mode === 'paren' ? 1 : 0;
@@ -357,16 +433,21 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
     if (words.length === 1 && KEYWORDS.has(words[0])) words.length = 0;
   };
   const flushCommand = ({ stdoutPiped = false } = {}) => {
-    const nextPiped = stdoutPiped && words.length ? echoedText(words) : null;
-    if (words.length) {
+    if (!words.length) return;
+    const stdinText = hereString != null ? hereString : pipedText;
+    const echoed = echoedText(words, stdinText);
+    ctx.lastEcho = echoed;
+    const nextPiped = stdoutPiped ? echoed : null;
+    {
       processSimpleCommand(ctx, words, {
-        stdin: hereString != null ? hereString : pipedText,
+        stdin: stdinText,
         stdoutPiped: stdoutPiped || inheritedOutput.stdoutPiped === true,
         stdoutRedirected: stdoutRedirected || inheritedOutput.stdoutRedirected === true,
         stdoutCaptured: inheritedOutput.stdoutCaptured === true,
       });
       words = [];
     }
+    heredocCursor = null;
     hereString = null;
     pipedText = nextPiped;
     stdoutRedirected = false;
@@ -434,7 +515,14 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
         const m = HEREDOC_WORD.exec(s);
         if (m) { delim = m[0]; i = HEREDOC_WORD.lastIndex; }
       }
-      if (delim) pendingHeredocs.push({ delim, strip });
+      if (delim) {
+        const lineEnd = s.indexOf('\n', i);
+        const from = heredocCursor != null ? heredocCursor : (lineEnd === -1 ? end : lineEnd + 1);
+        const found = heredocBody(s, from, end, delim, strip);
+        heredocCursor = found.next;
+        hereString = found.body;
+        pendingHeredocs.push({ delim, strip });
+      }
       continue;
     }
 
@@ -444,7 +532,9 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
     if ((c === '<' || c === '>') && s[i + 1] === '(') {
       wordOpen = true;
       curWord += `${c}(...)`;
+      ctx.lastEcho = null;
       i = scanRegion(ctx, i + 2, end, 'paren', { stdoutCaptured: true });
+      if (c === '<' && ctx.lastEcho != null) { ctx.procSubs.push(ctx.lastEcho); curWord += `\u0001${ctx.procSubs.length - 1}`; }
       continue;
     }
 
@@ -521,7 +611,7 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
     if (c === ';') { flushWord(); flushCommand(); i += 1; continue; }
     if (c === '&' && s[i + 1] === '&') { flushWord(); flushCommand(); i += 2; continue; }
     if (c === '|' && s[i + 1] === '|') { flushWord(); flushCommand(); i += 2; continue; }
-    if (c === '|') { flushWord(); flushCommand({ stdoutPiped: true }); i += 1; continue; }
+    if (c === '|') { flushWord(); flushCommand({ stdoutPiped: true }); i += s[i + 1] === '&' ? 2 : 1; continue; }
     if (c === '&') { flushWord(); flushCommand(); i += 1; continue; }
     if (c === ' ' || c === '\t' || c === '\r') { flushWord(); i += 1; continue; }
 
@@ -539,17 +629,28 @@ function scanRegion(ctx, start, end, mode, inheritedOutput = {}) {
 }
 
 /**
+ * Scan one command line. `shell` carries the eval/shell-wrapper nesting depth and
+ * the total unwrap work (`budget`), shared down the whole recursion so no level resets it.
+ */
+function scanCommandLine(cmd, shell) {
+  const s = String(cmd == null ? '' : cmd);
+  const ctx = { s: s.slice(0, MAX_LEN), invocations: [], depth: 0, shell, procSubs: [], lastEcho: null };
+  if (s.length > MAX_LEN && /orca/.test(s.slice(MAX_LEN))) ctx.invocations.push(unparseableInvocation({}));
+  scanRegion(ctx, 0, ctx.s.length, 'top');
+  return ctx.invocations;
+}
+
+/**
  * Every real `orca <sub>` invocation this command line would execute.
- * Never throws: malformed input degrades to an empty result.
+ * Never throws: malformed input degrades to an empty result, except that input
+ * which cannot be unwrapped safely yet mentions orca yields a synthetic fresh
+ * Codex dispatch so the gate refuses it (fail closed).
  */
 function orcaInvocations(cmd) {
   try {
-    const s = String(cmd == null ? '' : cmd).slice(0, MAX_LEN);
-    const ctx = { s, invocations: [], depth: 0 };
-    scanRegion(ctx, 0, s.length, 'top');
-    return ctx.invocations;
-  } catch {
-    return [];
+    return scanCommandLine(cmd, { depth: 0, budget: { work: 0 } });
+  } catch (err) {
+    return /orca/.test(String(cmd == null ? '' : cmd)) && err instanceof RangeError ? [unparseableInvocation({})] : [];
   }
 }
 
