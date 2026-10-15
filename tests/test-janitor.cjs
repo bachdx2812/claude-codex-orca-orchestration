@@ -564,7 +564,7 @@ const gateEnv = {
 };
 function invokeGate(payload, envOverrides = {}) {
   return spawnSync(process.execPath, [GATE], {
-    input: JSON.stringify(payload), encoding: 'utf8', env: { ...gateEnv, ...envOverrides },
+    input: JSON.stringify(payload), encoding: 'utf8', env: { ...gateEnv, ...envOverrides }, timeout: 60000, killSignal: 'SIGKILL',
   });
 }
 function hookContext(result) {

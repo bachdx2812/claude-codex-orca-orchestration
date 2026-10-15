@@ -139,7 +139,7 @@ function spawnGate(payload, env = CODEX_WINS) {
   return spawnSync(process.execPath, [GATE], {
     input: JSON.stringify(payload),
     encoding: 'utf8',
-    env,
+    env, timeout: 60000, killSignal: 'SIGKILL',
   });
 }
 

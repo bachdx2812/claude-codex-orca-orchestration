@@ -300,6 +300,9 @@ function liveQuotaResult(now = Date.now()) {
   const probe = spawnSync(process.execPath, [LIVE_PROBE, codexBin], {
     encoding: 'utf8',
     timeout: LIVE_TIMEOUT_MS,
+    // SIGKILL (not the default SIGTERM) so a wedged probe cannot outlive its deadline;
+    // any error/signal below degrades to "quota unknown".
+    killSignal: 'SIGKILL',
     maxBuffer: 1024 * 1024,
     stdio: ['ignore', 'pipe', 'ignore'],
   });

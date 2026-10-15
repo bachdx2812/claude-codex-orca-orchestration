@@ -113,7 +113,7 @@ async function raceReconcileTest() {
     tool_input: { command: cmd }, tool_use_id: id, ...(extra || {}),
   });
   const runSync = (payload) => require('child_process').spawnSync(process.execPath, [GATE], {
-    input: JSON.stringify(payload), encoding: 'utf8', env,
+    input: JSON.stringify(payload), encoding: 'utf8', env, timeout: 60000, killSignal: 'SIGKILL',
   });
   const runAsync = (payload) => new Promise((resolve) => {
     const child = spawn(process.execPath, [GATE], { env });

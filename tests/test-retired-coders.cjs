@@ -35,7 +35,7 @@ function fixture(name, config = {}) {
   } };
 }
 function gate(env, payload) {
-  return spawnSync(process.execPath, [GATE], { input: JSON.stringify(payload), encoding: 'utf8', env });
+  return spawnSync(process.execPath, [GATE], { input: JSON.stringify(payload), encoding: 'utf8', env, timeout: 60000, killSignal: 'SIGKILL' });
 }
 function prompt(f, sid, text) {
   return gate(f.env, { session_id: sid, hook_event_name: 'UserPromptSubmit', prompt: text });

@@ -23,7 +23,13 @@ const env = {
     !/^(ORCHESTRATOR_GATE|ORCH_|ORCA_TERMINAL_HANDLE|CODEX_HOME|CLAUDE_CODE_)/.test(key))),
   ORCH_STATE_DIR: stateDir,
   ORCH_CONFIG_PATH: configFile,
+  // Hermetic: never reach a real orca/codex (live quota probe, auth, network).
+  ORCA_BIN: path.join(ROOT, 'tests', 'fixtures', 'orca-stub.cjs'),
+  ORCH_CODEX_BIN: path.join(ROOT, 'tests', 'fixtures', 'codex-app-server-stub.cjs'),
+  CODEX_BIN: path.join(ROOT, 'tests', 'fixtures', 'codex-app-server-stub.cjs'),
 };
+// Every gate run gets a hard deadline so a wedged child can never hang the suite.
+const GATE_RUN = { encoding: 'utf8', env, timeout: 60000, killSignal: 'SIGKILL' };
 
 let passed = 0;
 let dispatchCounter = 0;
@@ -44,16 +50,14 @@ function dispatch(description, model, subagentType = 'general-purpose', prompt =
       tool_use_id: `toolu_role_${dispatchCounter}`,
       tool_input: { description, model, subagent_type: subagentType, prompt },
     }),
-    encoding: 'utf8',
-    env,
+    ...GATE_RUN,
   });
 }
 
 function submitPrompt(sessionId, prompt) {
   return spawnSync(process.execPath, [GATE], {
     input: JSON.stringify({ session_id: sessionId, hook_event_name: 'UserPromptSubmit', prompt }),
-    encoding: 'utf8',
-    env,
+    ...GATE_RUN,
   });
 }
 
@@ -189,7 +193,7 @@ check('read-only marker is recognized anywhere in the prompt',
 
 const banner = spawnSync(process.execPath, [GATE], {
   input: JSON.stringify({ session_id: 'role-banner', hook_event_name: 'SessionStart', source: 'startup' }),
-  encoding: 'utf8', env,
+  ...GATE_RUN,
 });
 check('session banner summarizes the role split',
   /code -> sonnet-coder; plan\/red-team\/review\/advice with Read-only: marker -> opus; lookup -> haiku/.test(banner.stdout), true);

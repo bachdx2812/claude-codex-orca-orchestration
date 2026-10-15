@@ -41,7 +41,7 @@ function fixture(name, config = {}, env = {}) {
 }
 
 function gate(env, payload) {
-  return spawnSync(process.execPath, [GATE], { input: JSON.stringify(payload), encoding: 'utf8', env });
+  return spawnSync(process.execPath, [GATE], { input: JSON.stringify(payload), encoding: 'utf8', env, timeout: 60000, killSignal: 'SIGKILL' });
 }
 function prompt(env, sid, text) {
   return gate(env, { session_id: sid, hook_event_name: 'UserPromptSubmit', prompt: text });
