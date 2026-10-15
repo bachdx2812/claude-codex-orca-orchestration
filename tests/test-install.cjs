@@ -352,6 +352,17 @@ const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonn
     fs.existsSync(path.join(preDestDir, 'sonnet-coder.md')), true);
 }
 
+// Every shipped hooks/lib module must be installed, so a module added to the repo but not to
+// the installer's file list fails here instead of crashing an installed hook at require time.
+{
+  const libDir = path.join(__dirname, '..', 'hooks', 'lib');
+  const shipped = fs.readdirSync(libDir).filter((name) => name.endsWith('.cjs')).sort();
+  const inst = run([], 'lib-coverage');
+  const installedLib = path.join(inst.home, '.claude', 'hooks', 'orchestration', 'lib');
+  check('every hooks/lib module is installed',
+    shipped.filter((name) => !fs.existsSync(path.join(installedLib, name))), []);
+}
+
 fs.rmSync(root, { recursive: true, force: true });
 console.log(`${passed} passed, ${failures.length} failed`);
 for (const failure of failures) console.log(`  FAIL ${failure}`);

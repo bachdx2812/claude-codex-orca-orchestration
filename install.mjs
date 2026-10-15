@@ -53,7 +53,7 @@ const HOOK_FILES = [
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
   'lib/terminal-signals.cjs', 'lib/worker-progress-fingerprint.cjs', 'lib/worker-quota-handover.cjs', 'lib/quota-reset-resume.cjs', 'lib/live-probe-cache.cjs',
   'lib/coder-availability.cjs', 'lib/codex-eligibility.cjs', 'lib/codex-priority-tier.cjs',
-  'lib/orca-worker-list-pages.cjs',
+  'lib/orca-worker-list-pages.cjs', 'lib/heartbeat-event-classes.cjs',
 ];
 const RETIRED_HOOK_FILES = [
   'lib/kimi-quota-probe.cjs', 'lib/deepseek-quota-probe.cjs', 'lib/coder-pool-route.cjs',
