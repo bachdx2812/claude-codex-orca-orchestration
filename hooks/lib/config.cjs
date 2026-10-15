@@ -97,6 +97,7 @@ const DEFAULT_CONFIG = {
     maxSeconds: 3600,
     stallSeconds: 900,
     stallSecondsByAgent: {},
+    coalesceDoneSeconds: 300, // 0 = wake on every done worker immediately
   },
   janitor: {
     enabled: true,
@@ -381,6 +382,13 @@ function loadConfig() {
   } else {
     merged.heartbeat.stallSeconds = stallSeconds;
   }
+  const coalesce = configuredNumber(merged.heartbeat.coalesceDoneSeconds);
+  if (!Number.isInteger(coalesce) || coalesce < 0 || coalesce > 86400) {
+    warnings.push(`heartbeat.coalesceDoneSeconds "${merged.heartbeat.coalesceDoneSeconds}" is not an integer 0-86400; using ${DEFAULT_CONFIG.heartbeat.coalesceDoneSeconds}.`);
+    merged.heartbeat.coalesceDoneSeconds = DEFAULT_CONFIG.heartbeat.coalesceDoneSeconds;
+  } else {
+    merged.heartbeat.coalesceDoneSeconds = coalesce;
+  }
   if (!isPlainObject(merged.heartbeat.stallSecondsByAgent)) {
     warnings.push('heartbeat.stallSecondsByAgent must be an object; using the default.');
     merged.heartbeat.stallSecondsByAgent = { ...DEFAULT_CONFIG.heartbeat.stallSecondsByAgent };
@@ -534,6 +542,16 @@ function stallSeconds(cfg) {
     if (Number.isInteger(n) && n >= 1 && n <= 86400) return n;
   }
   return cfg.heartbeat.stallSeconds;
+}
+
+/** Done-notice coalescing window. A blank ORCH_HEARTBEAT_COALESCE_DONE_SECONDS is unset. */
+function coalesceDoneSeconds(cfg) {
+  const envOverride = process.env.ORCH_HEARTBEAT_COALESCE_DONE_SECONDS;
+  if (envOverride !== undefined && envOverride.trim() !== '') {
+    const n = Number(envOverride);
+    if (Number.isInteger(n) && n >= 0 && n <= 86400) return n;
+  }
+  return cfg.heartbeat.coalesceDoneSeconds;
 }
 
 /**
@@ -698,5 +716,5 @@ module.exports = {
   janitorEnabled,
   parallelCoreFraction, maxParallelAgents,
   coderAvailabilityCacheSeconds, reviewModelForCoder, verifyModelAlias,
-  stallSeconds, autoResumeAfterReset, codexAllowPriorityTier,
+  stallSeconds, coalesceDoneSeconds, autoResumeAfterReset, codexAllowPriorityTier,
 };

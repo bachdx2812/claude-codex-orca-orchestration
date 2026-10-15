@@ -50,7 +50,7 @@ const { execFileSync, spawnSync, spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const {
-  loadConfig, stateDir, closeDoneWorktreesEnabled, closeDoneWorktreesMode, stallSeconds, handoffUsed,
+  loadConfig, stateDir, closeDoneWorktreesEnabled, closeDoneWorktreesMode, stallSeconds, coalesceDoneSeconds, handoffUsed,
   codexQuotaCacheSeconds,
   autoResumeAfterReset,
 } = require('./lib/config.cjs');
@@ -68,6 +68,9 @@ const WG = require('./lib/worker-groups.cjs');
 const GATES = require('./lib/parallel-ownership-gates.cjs');
 const WORKER_LIST_PAGES = require('./lib/orca-worker-list-pages.cjs');
 const { acquireLock, releaseLock } = require('./lib/file-lock.cjs');
+const {
+  DONE_WORKER_STATES, FAILED_WORKER_STATES, classifyWorkerTransition, formatDoneSummary,
+} = require('./lib/heartbeat-event-classes.cjs');
 
 const DIR = stateDir();
 const ORCA_BIN = process.env.ORCA_BIN || 'orca';
@@ -95,6 +98,7 @@ const IDLE_SECONDS = arg('idle', cfg.heartbeat.idleSeconds);        // quiet ter
 const INTERVAL_SECONDS = arg('interval', cfg.heartbeat.intervalSeconds);
 const MAX_SECONDS = arg('max', cfg.heartbeat.maxSeconds);           // hard stop so a forgotten daemon dies
 const STALL_SECONDS = stallSeconds(cfg);
+const COALESCE_DONE_SECONDS = coalesceDoneSeconds(cfg);
 const CLOSE_DONE_WORKTREES = closeDoneWorktreesEnabled(cfg);
 // 'remove' | 'remind' | 'off' — in remove mode the done-worktree detector runs
 // `orca worktree rm` itself instead of only reminding the panel.
@@ -145,15 +149,16 @@ const AUTO_CLOSED_FILE = path.join(DIR, `heartbeat-${SESSION}-auto-closed.json`)
 const DONE_AT_FILE = path.join(DIR, `heartbeat-${SESSION}-done-at.json`);
 // Persists, per worktree path, when a remove-mode `orca worktree rm` last failed, so the
 // retry is bounded instead of hammered on every tick (and never silently dropped).
+// Done notices buffered but not yet delivered to the panel: [{at, text, id?}], rewritten
+// atomically on every change so a restarted daemon still delivers them.
+const PENDING_DONE_FILE = path.join(DIR, `heartbeat-${SESSION}-pending.json`);
 const RM_FAILED_FILE = path.join(DIR, `heartbeat-${SESSION}-rm-failed.json`);
 // Orca vocabulary for "the work finished successfully" — distinct from failed/stopped,
 // which keep the panel-decision flow. Auto-release only ever applies to these.
-const DONE_WORKER_STATES = new Set(['succeeded', 'completed']);
 // Orca vocabulary for "the work did not finish successfully" — never auto-closed,
 // regardless of which of workerState/dispatchStatus carries it (review, non-blocking
 // note: a contradictory row such as workerState 'succeeded' with dispatchStatus 'failed'
 // must not auto-close either).
-const FAILED_WORKER_STATES = new Set(['failed', 'stopped', 'cancelled']);
 function isFailedWorker(w) {
   return FAILED_WORKER_STATES.has(w && w.workerState) || FAILED_WORKER_STATES.has(w && w.dispatchStatus);
 }
@@ -236,6 +241,25 @@ function loadPersistedTimestampMap(file) {
   } catch {
     return new Map();
   }
+}
+
+function loadPendingDone() {
+  try {
+    const list = JSON.parse(fs.readFileSync(PENDING_DONE_FILE, 'utf8'));
+    return Array.isArray(list)
+      ? list.filter((e) => e && Number.isFinite(e.at) && typeof e.text === 'string')
+      : [];
+  } catch { return []; }
+}
+
+function savePendingDone(list) {
+  try {
+    if (!list.length) { fs.rmSync(PENDING_DONE_FILE, { force: true }); return; }
+    fs.mkdirSync(DIR, { recursive: true });
+    const tmp = `${PENDING_DONE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(list));
+    fs.renameSync(tmp, PENDING_DONE_FILE);
+  } catch {}
 }
 
 function savePersistedTimestampMap(file, map) {
@@ -1567,6 +1591,7 @@ function actOnDoneWorktree(w, reason, ctx = {}) {
  * wake event otherwise (remind mode, live-terminal fallback, or a failed rm — the failure
  * line first, then the remind line, and only on the first attempt: a bounded retry that
  * fails again just refreshes its timestamp). `rmFailed` maps path -> last failure ms. */
+let bufferDoneNotice = null; // set by main(): takes a done-class text instead of the wake list
 function emitDoneWorktree(w, reason, events, rmFailed, isRetry = false) {
   const act = actOnDoneWorktree(w, reason);
   if (act.kind === 'removed') {
@@ -1584,7 +1609,7 @@ function emitDoneWorktree(w, reason, events, rmFailed, isRetry = false) {
     events.push(act.remind);
     return;
   }
-  if (!isRetry) events.push(act.line);
+  if (!isRetry) (bufferDoneNotice ? bufferDoneNotice(act.line) : events.push(act.line));
 }
 
 /**
@@ -1925,8 +1950,25 @@ function main() {
 
   const deadline = started + MAX_SECONDS * 1000;
 
+  // Buffered done notices (see heartbeat-event-classes.cjs). With coalescing off they wake
+  // immediately like any other event.
+  let pendingDone = loadPendingDone();
+  if (COALESCE_DONE_SECONDS > 0) {
+    bufferDoneNotice = (text, id) => {
+      pendingDone = [...pendingDone, id ? { at: Date.now(), text, id } : { at: Date.now(), text }];
+      savePendingDone(pendingDone);
+    };
+  }
+  /** Worker rows this session owns that are still unfinished (queued/running/idle...). */
+  const countOwnActive = (rows, state) => (rows || []).filter((w) => w && w.workerState !== 'unsupervised' &&
+    !isDoneRow(w) &&
+    (ownTerminalHandles.has(w.agentTerminalHandle) || stateWorkerForRow(w, state))).length;
+
   /** Shared exit path for both the startup done-worktree pass and every later tick. */
-  const flushAndExit = (events, now) => {
+  const flushAndExit = (urgent, now) => {
+    const events = pendingDone.length ? [...urgent, formatDoneSummary(pendingDone)] : urgent;
+    pendingDone = [];
+    savePendingDone(pendingDone);
     console.log(`orca-heartbeat: ${events.length} event(s) after ${Math.round((now - started) / 1000)}s.`);
     for (const e of events) console.log(`  - ${e}`);
     console.log('Act on these now — a worker waiting on a decision is wasted wall-clock.');
@@ -1947,6 +1989,8 @@ function main() {
     processDoneWorktrees(worktrees(), startupEvents, started, ownedWorktreePaths, rmFailed);
     if (startupEvents.length) flushAndExit(startupEvents, Date.now());
   }
+  // A previous daemon died holding done notices: deliver them now unless a worker is still running.
+  if (pendingDone.length && countOwnActive(baseWorkers, sessionState) === 0) flushAndExit([], Date.now());
 
   const tick = () => {
     beat(started);
@@ -1965,8 +2009,12 @@ function main() {
       const cur = snapshotWorkers(ws);
       for (const [id, state] of cur) {
         const before = prevWorkers.get(id);
-        if (before === undefined) events.push(`NEW worker ${id} -> ${state}`);
-        else if (before !== state) events.push(`worker ${id} changed: ${before} -> ${state}`);
+        if (before === state) continue;
+        const text = before === undefined ? `NEW worker ${id} -> ${state}` : `worker ${id} changed: ${before} -> ${state}`;
+        const kind = classifyWorkerTransition(before, state);
+        if (kind === 'info') logInfoLine(text);
+        else if (kind === 'done' && bufferDoneNotice) bufferDoneNotice(text, id);
+        else events.push(text);
       }
       prevWorkers = cur;
       // Bound the persisted done/auto-close maps: entries for workers Orca no longer lists
@@ -2097,12 +2145,12 @@ function main() {
           isHoldingResources(w, !!stateWorkerForRow(w, tickState)?.retained) &&
           baseWorkerState.get(w.dispatchId) !== `${w.workerState}|${w.dispatchStatus}|${w.terminalState}`
       );
-      const newDoneHolding = [...changedFailedOrStopped, ...autoCloseUnknownNew];
-      if (newDoneHolding.length) {
-        events.push(
-          `${newDoneHolding.length} finished worker(s) still holding a terminal: ` +
-          `${newDoneHolding.map((w) => w.dispatchId).join(', ')} — retain if reusable, else release.`
-        );
+      const holdingLine = (list) => `${list.length} finished worker(s) still holding a terminal: ` +
+        `${list.map((w) => w.dispatchId).join(', ')} — retain if reusable, else release.`;
+      if (changedFailedOrStopped.length) events.push(holdingLine(changedFailedOrStopped));
+      if (autoCloseUnknownNew.length) {
+        if (bufferDoneNotice) bufferDoneNotice(holdingLine(autoCloseUnknownNew));
+        else events.push(holdingLine(autoCloseUnknownNew));
       }
       const ctx = {
         baseHandles: baseTermHandles, ownHandles: ownTerminalHandles,
@@ -2343,6 +2391,14 @@ function main() {
     }
 
     if (events.length) { flushAndExit(events, now); return; }
+    if (pendingDone.length) {
+      const oldest = Math.min(...pendingDone.map((e) => e.at));
+      const settled = ws && countOwnActive(ws, loadSessionState()) === 0;
+      if (settled || now - oldest >= COALESCE_DONE_SECONDS * 1000 || Date.now() >= deadline) {
+        flushAndExit([], now);
+        return;
+      }
+    }
 
     if (Date.now() >= deadline) {
       console.log(`orca-heartbeat: quiet for ${MAX_SECONDS}s, no worker state changed. Stopping.`);

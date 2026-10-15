@@ -8,7 +8,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-model-roles.cjs && node tests/test-concurrency.cjs && node tests/test-install.cjs && node tests/test-janitor.cjs && node tests/test-coder-availability.cjs && node tests/test-codex-opt-in.cjs && node tests/test-worker-stall.cjs && node tests/test-released-groups.cjs && node tests/test-orca-worker-list-pages.cjs && node tests/test-worker-list-caller-deadlines.cjs && node tests/test-retired-coders.cjs && node tests/test-shell-wrapper-gating.cjs"
+    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-model-roles.cjs && node tests/test-concurrency.cjs && node tests/test-install.cjs && node tests/test-janitor.cjs && node tests/test-coder-availability.cjs && node tests/test-codex-opt-in.cjs && node tests/test-worker-stall.cjs && node tests/test-released-groups.cjs && node tests/test-orca-worker-list-pages.cjs && node tests/test-worker-list-caller-deadlines.cjs && node tests/test-retired-coders.cjs && node tests/test-shell-wrapper-gating.cjs && node tests/test-heartbeat-coalesce.cjs"
+    "test": "node tests/test-orchestrator-gate.cjs && node tests/test-orchestrator-gate-e2e.cjs && node tests/test-model-roles.cjs && node tests/test-concurrency.cjs && node tests/test-install.cjs && node tests/test-janitor.cjs && node tests/test-coder-availability.cjs && node tests/test-codex-opt-in.cjs && node tests/test-worker-stall.cjs && node tests/test-released-groups.cjs && node tests/test-orca-worker-list-pages.cjs && node tests/test-worker-list-caller-deadlines.cjs && node tests/test-retired-coders.cjs && node tests/test-heartbeat-coalesce.cjs"
   },
   "files": [
     "hooks",

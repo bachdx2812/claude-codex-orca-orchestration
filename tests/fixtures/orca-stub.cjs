@@ -136,7 +136,12 @@ if (args[0] === 'orchestration' && args[1] === 'worker-list') {
   }
   let workers;
   if (process.env.STUB_WORKERS_JSON) {
-    try { workers = JSON.parse(process.env.STUB_WORKERS_JSON); } catch { workers = []; }
+    // A value starting with "@" is a file path re-read on every call, so a test can script
+    // worker transitions between daemon ticks.
+    try {
+      const raw = process.env.STUB_WORKERS_JSON;
+      workers = JSON.parse(raw.startsWith('@') ? fs.readFileSync(raw.slice(1), 'utf8') : raw);
+    } catch { workers = []; }
   } else {
     workers = handle ? [{
       dispatchId: process.env.STUB_DISPATCH_ID || 'ctx_stub_1',
@@ -194,7 +199,10 @@ if (args[0] === 'terminal' && args[1] === 'list') {
   }
   let terminals = [];
   if (process.env.STUB_TERMINALS_JSON) {
-    try { terminals = JSON.parse(process.env.STUB_TERMINALS_JSON); } catch { terminals = []; }
+    try {
+      const raw = process.env.STUB_TERMINALS_JSON;
+      terminals = JSON.parse(raw.startsWith('@') ? fs.readFileSync(raw.slice(1), 'utf8') : raw);
+    } catch { terminals = []; }
   }
   const truncated = process.env.STUB_TERMINALS_TRUNCATED === '1';
   process.stdout.write(JSON.stringify({ result: { terminals, truncated } }));

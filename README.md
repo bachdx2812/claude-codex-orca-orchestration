@@ -145,7 +145,15 @@ scrollback cannot retrigger them. If that fingerprint does not change for
 `heartbeat.stallSeconds` (default 900 seconds), or an agent-specific value in
 `heartbeat.stallSecondsByAgent`, the daemon emits one
 `WORKER STALLED` wake event. Nudge the terminal with `continue`, or stop it and re-dispatch
-the same brief to Sonnet; the daemon never kills it automatically. The report is
+the same brief to Sonnet; the daemon never kills it automatically.
+
+**Wake diet.** Routine transitions (for example queued -> running) are only logged to
+`heartbeat.log`. A normal worker finish is a buffered `done` notice, delivered as one
+`DONE: N worker(s) finished: ...` line when all of the session's workers have finished or
+after `heartbeat.coalesceDoneSeconds` (default 300, `0` = wake on every finish; env
+`ORCH_HEARTBEAT_COALESCE_DONE_SECONDS`). Failures, IDLE, stalls, approvals, exits, orphans,
+rate/usage limits, handovers and any unclassified event still wake immediately, with buffered
+done notices appended. The report is
 persisted once per unchanged episode across daemon restarts and is re-armed by a file or
 meaningful-output change. Disconnected, rate-limited, and usage-exhausted workers keep their
 more specific diagnosis instead of also being labeled stalled. Set `ORCH_STALL_SECONDS` to

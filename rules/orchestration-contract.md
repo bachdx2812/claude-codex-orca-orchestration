@@ -60,7 +60,7 @@ escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
 5. **Every code brief names a verify command** (or `verify: n/a <reason>`) — a Codex
    `--spec` or an in-session code prompt whose intent reads as implementation work must
    let the coder check its own output before reporting done.
-6. **A continuous heartbeat daemon supervises live Orca workers.** `Stop` refuses to end
+6. **A continuous heartbeat daemon supervises live Orca workers (it wakes the panel on actionable events; done notices are batched).** `Stop` refuses to end
    the session while a worker is live and unwatched. The daemon reports a worker whose
    agent process vanished back to a shell prompt immediately as `WORKER EXITED` — the
    common cause is an `--agent claude` worker started in an untrusted worktree stopping
@@ -289,7 +289,8 @@ backup precedes their removal. Help and unknown options never enter the install 
     "idleSeconds": 60,
     "maxSeconds": 3600,
     "stallSeconds": 900,
-    "stallSecondsByAgent": {}
+    "stallSecondsByAgent": {},
+    "coalesceDoneSeconds": 300
   },
   "maxParallelCodexWorkers": 3,
   "ownershipClaimTtlMinutes": 120,
@@ -360,6 +361,17 @@ backup precedes their removal. Help and unknown options never enter the install 
   meaningful terminal output for this long, a supervised worker produces an informational
   stall wake event. `ORCH_STALL_SECONDS` overrides the global value for one process; blank
   is unset and invalid values fall back to config.
+- `heartbeat.coalesceDoneSeconds`: integer 0-86400, default 300. Worker transitions are
+  classified: `info` (e.g. queued -> running) is logged to `heartbeat.log` only and never
+  wakes the panel; `done` (clean finish, done-worktree reminders, unknown-path finished
+  workers) is buffered and delivered as one `DONE: N worker(s) finished: ...` line once all
+  of this session's workers have finished or this many seconds after the oldest buffered
+  notice; `urgent` (failures, IDLE, STALLED, approval, exit, orphan, rate/usage limit,
+  handover, parked, auto-close failures, and any unclassified event) wakes immediately with
+  buffered done notices appended. The buffer persists per session
+  (`heartbeat-<sid>-pending.json`), so a restarted daemon with no active own worker flushes
+  it at once. `0` restores the legacy wake-on-every-done behavior.
+  `ORCH_HEARTBEAT_COALESCE_DONE_SECONDS` overrides it for one process (blank is unset).
 - `heartbeat.stallSecondsByAgent`: object of per-agent integer thresholds 1-86400. These
   take precedence over the global value; the default is `{}`.
 - `disabledGates`: gate ids to skip entirely (e.g. `["code-brief-needs-verify"]`). Unknown
