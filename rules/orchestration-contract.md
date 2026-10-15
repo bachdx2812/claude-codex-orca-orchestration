@@ -40,12 +40,10 @@ a refusal or event needs detail.
 10. **Finish.** Release a finished worker unless reused. Close a worktree
     (`orca worktree rm --worktree path:<path>`) only when its PR is merged/closed and it is
     clean with nothing unpushed. The janitor removes accepted, clean worktrees.
-
 ## Token discipline
 
-- Panel runs on Sonnet and orchestrates only; plan/review reasoning never happens in it.
-- Batch 3+ independent subagents into ONE Workflow (one completion notice); otherwise
-  dispatch them together in one message.
+- Panel runs on Sonnet, orchestrates only. Batch 3+ independent subagents into ONE Workflow (one completion notice); else
+  dispatch together in one message.
 - Every subagent brief: results to `plans/reports/`, reply <= 10 lines + `Status:`.
 - Opus: plans, red-team, unblock advice, final review. Haiku: lookups. Sonnet: code,
   verify-runs, driving the panel.
