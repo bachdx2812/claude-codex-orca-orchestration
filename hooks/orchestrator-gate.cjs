@@ -32,7 +32,7 @@ const os = require('os');
 const {
   loadConfig, gateDisabled, defaultCoder, handoffUsed, stateDir,
   codexQuotaCacheSeconds, maxParallelCodexWorkers, ownershipClaimTtlMinutes, parallelCoreFraction, maxParallelAgents,
-  coderAvailabilityCacheSeconds, reviewModelForCoder, verifyModelAlias, codexAllowPriorityTier,
+  coderAvailabilityCacheSeconds, coalesceDoneSeconds, reviewModelForCoder, verifyModelAlias, codexAllowPriorityTier,
 } = require('./lib/config.cjs');
 const WG = require('./lib/worker-groups.cjs');
 const PAC = require('./lib/parallel-agent-cap.cjs');
@@ -1375,7 +1375,7 @@ function liveWorkerReminderParts(s, cfg, live) {
   parts.push(`${live.length} live worker(s): ${live.map(([k, w]) => `${k}(${w.role})`).join(', ')}.`);
   const hb = heartbeatAlive(s.session_id);
   if (hb) {
-    parts.push(`Heartbeat daemon alive (pid ${hb.pid}, last tick ${Math.round((Date.now() - hb.last_tick) / 1000)}s ago): keep working on other things; it wakes you on actionable events, and done notices are batched until all your workers finish or ${cfg.heartbeat.coalesceDoneSeconds}s.`);
+    parts.push(`Heartbeat daemon alive (pid ${hb.pid}, last tick ${Math.round((Date.now() - hb.last_tick) / 1000)}s ago): keep working on other things; it wakes you on actionable events, and ${coalesceDoneSeconds(cfg) > 0 ? `done notices are batched until all your workers finish or ${coalesceDoneSeconds(cfg)}s` : 'done notices flush immediately'}.`);
   } else {
     parts.push(`NO heartbeat daemon: start it now so no worker waits on you unnoticed: ${heartbeatStartCommand()}.`);
     parts.push(s.last_heartbeat ? `Last manual poll ${stale}s ago.` : `Never polled since dispatch (${stale}s).`);

@@ -262,6 +262,21 @@ function savePendingDone(list) {
   } catch {}
 }
 
+/** Removes other sessions' pending-done files that are over a day old or whose session state
+ * is gone, so an ended session never leaves its buffer behind forever. */
+function sweepStalePendingFiles() {
+  try {
+    const own = path.basename(PENDING_DONE_FILE);
+    for (const name of fs.readdirSync(DIR)) {
+      const m = /^heartbeat-(.+)-pending\.json$/.exec(name);
+      if (!m || name === own) continue;
+      const file = path.join(DIR, name);
+      const old = Date.now() - fs.statSync(file).mtimeMs > 24 * 60 * 60 * 1000;
+      if (old || !fs.existsSync(path.join(DIR, `${m[1]}.json`))) fs.rmSync(file, { force: true });
+    }
+  } catch {}
+}
+
 function savePersistedTimestampMap(file, map) {
   try {
     fs.mkdirSync(DIR, { recursive: true });
@@ -1950,6 +1965,7 @@ function main() {
 
   const deadline = started + MAX_SECONDS * 1000;
 
+  sweepStalePendingFiles();
   // Buffered done notices (see heartbeat-event-classes.cjs). With coalescing off they wake
   // immediately like any other event.
   let pendingDone = loadPendingDone();

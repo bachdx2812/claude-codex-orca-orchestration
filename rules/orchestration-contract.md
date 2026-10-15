@@ -362,13 +362,13 @@ backup precedes their removal. Help and unknown options never enter the install 
   stall wake event. `ORCH_STALL_SECONDS` overrides the global value for one process; blank
   is unset and invalid values fall back to config.
 - `heartbeat.coalesceDoneSeconds`: integer 0-86400, default 300. Worker transitions are
-  classified: `info` (e.g. queued -> running) is logged to `heartbeat.log` only and never
+  classified: `info` (only known in-flight states: queued, created, started, pending, dispatched, running) is logged to `heartbeat.log` only and never
   wakes the panel; `done` (clean finish, done-worktree reminders, unknown-path finished
   workers) is buffered and delivered as one `DONE: N worker(s) finished: ...` line once all
   of this session's workers have finished or this many seconds after the oldest buffered
   notice; `urgent` (failures, IDLE, STALLED, approval, exit, orphan, rate/usage limit,
   handover, parked, auto-close failures, and any unclassified event) wakes immediately with
-  buffered done notices appended. The buffer persists per session
+  buffered done notices appended (any other worker state is urgent). The buffer persists per session
   (`heartbeat-<sid>-pending.json`), so a restarted daemon with no active own worker flushes
   it at once. `0` restores the legacy wake-on-every-done behavior.
   `ORCH_HEARTBEAT_COALESCE_DONE_SECONDS` overrides it for one process (blank is unset).

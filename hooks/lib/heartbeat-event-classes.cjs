@@ -10,6 +10,9 @@
 
 const DONE_WORKER_STATES = new Set(['succeeded', 'completed']);
 const FAILED_WORKER_STATES = new Set(['failed', 'stopped', 'cancelled']);
+// States of a worker that is simply still in flight; only these may be silenced. A state the
+// daemon does not recognise could be a new failure mode, so it must wake the panel.
+const INFO_WORKER_STATES = new Set(['queued', 'created', 'started', 'pending', 'dispatched', 'running']);
 
 /** Splits a `workerState|dispatchStatus|terminalState` triplet (undefined -> all empty). */
 function parseTriplet(triplet) {
@@ -19,14 +22,16 @@ function parseTriplet(triplet) {
 
 /**
  * Classifies one worker's transition. A failed/stopped state always wins (even next to a
- * contradictory "succeeded"), then a clean finish, and everything else (queued -> running,
- * terminal churn) is info.
+ * contradictory "succeeded"), then a clean finish. A known in-flight state (queued -> running,
+ * terminal churn) is info; any other state is urgent.
  */
 function classifyWorkerTransition(before, after) {
   const next = parseTriplet(after);
   if (FAILED_WORKER_STATES.has(next.workerState) || FAILED_WORKER_STATES.has(next.dispatchStatus)) return 'urgent';
   if (DONE_WORKER_STATES.has(next.workerState) || DONE_WORKER_STATES.has(next.dispatchStatus)) return 'done';
-  return 'info';
+  const inFlight = INFO_WORKER_STATES.has(next.workerState) &&
+    (!next.dispatchStatus || INFO_WORKER_STATES.has(next.dispatchStatus));
+  return inFlight ? 'info' : 'urgent';
 }
 
 /**
@@ -40,7 +45,8 @@ function formatDoneSummary(list) {
     if (item && item.id) ids.push(item.id);
     else if (item && item.text) reminders.push(item.text);
   }
-  const head = `DONE: ${ids.length} worker(s) finished${ids.length ? `: ${ids.join(', ')}` : ''}`;
+  if (!ids.length) return `DONE: ${reminders.join('; ')}`;
+  const head = `DONE: ${ids.length} worker(s) finished: ${ids.join(', ')}`;
   return reminders.length ? `${head} (+ ${reminders.join('; ')})` : head;
 }
 
