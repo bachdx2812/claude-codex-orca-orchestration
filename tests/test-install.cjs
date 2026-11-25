@@ -482,6 +482,10 @@ const SHIPPED_AGENT = fs.readFileSync(path.join(__dirname, '..', 'agents', 'sonn
   const installedLib = path.join(inst.home, '.claude', 'hooks', 'orchestration', 'lib');
   check('every hooks/lib module is installed',
     shipped.filter((name) => !fs.existsSync(path.join(installedLib, name))), []);
+  const { files } = JSON.parse(fs.readFileSync(path.join(installedLib, '..', 'install-manifest.json'), 'utf8'));
+  const firstEntry = files.findIndex((rel) => !rel.startsWith('lib/'));
+  check('hook libraries are copied before any entry script',
+    files.slice(firstEntry).filter((rel) => rel.startsWith('lib/')), []);
 }
 
 fs.rmSync(root, { recursive: true, force: true });

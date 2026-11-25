@@ -48,8 +48,9 @@ const JANITOR_PLIST = path.join(HOME, 'Library', 'LaunchAgents', `${JANITOR_LABE
 const AGENT_FILES = ['sonnet-coder.md'];
 
 const GATE_SCRIPT = 'orchestrator-gate.cjs';
+// Copied in this order: libraries first, so a hook firing mid-install never loads a new entry
+// script whose module is not on disk yet.
 const HOOK_FILES = [
-  'orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'orca-janitor.cjs', 'orca-resume-scheduler.cjs',
   'lib/config.cjs', 'lib/exec-route-by-quota.cjs', 'lib/codex-quota-probe.cjs', 'lib/shell-orca-invocations.cjs',
   'lib/worker-groups.cjs', 'lib/ownership.cjs', 'lib/ownership-claims.cjs', 'lib/file-lock.cjs',
   'lib/parallel-ownership-gates.cjs', 'lib/parallel-agent-cap.cjs', 'lib/heartbeat-liveness.cjs',
@@ -57,6 +58,7 @@ const HOOK_FILES = [
   'lib/coder-availability.cjs', 'lib/codex-eligibility.cjs', 'lib/codex-priority-tier.cjs',
   'lib/orca-worker-list-pages.cjs', 'lib/heartbeat-event-classes.cjs',
   'lib/operator-commands.cjs',
+  'orchestrator-gate.cjs', 'orca-heartbeat.cjs', 'orca-janitor.cjs', 'orca-resume-scheduler.cjs',
 ];
 const RETIRED_HOOK_FILES = [
   'lib/kimi-quota-probe.cjs', 'lib/deepseek-quota-probe.cjs', 'lib/coder-pool-route.cjs',
