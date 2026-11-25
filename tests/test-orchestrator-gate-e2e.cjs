@@ -197,6 +197,18 @@ function rmState(sid) {
   }
 }
 
+/** Negative twin: a switch wrapped in prose changes no persisted operator switch. */
+function expectProseIgnored(sid, prompt, env) {
+  const fields = () => {
+    const st = readState(sid) || {};
+    return JSON.stringify([!!st.bypass, st.execAgent || null, !!st.userDesignatedFable]);
+  };
+  const before = fields();
+  invoke(promptSubmit(sid, prompt), env);
+  if (fields() === before) pass += 1;
+  else failures.push(`prose "${prompt}" changed operator switches (${before} -> ${fields()})`);
+}
+
 const ALLOW = 0;
 const DENY = 2;
 
@@ -653,6 +665,9 @@ expect('a neutral first verb still classifies code-reviewer as review work',
   const sid = 'write-verb-author';
   const stateOf = () => JSON.parse(fs.readFileSync(path.join(stateDir, `${sid}.json`), 'utf8'));
   invoke(promptSubmit(sid, 'force the code model --code-model sonnet'), env);
+  checkBool('prose around --code-model changes nothing', JSON.stringify(fs.existsSync(path.join(stateDir, `${sid}.json`))
+    ? stateOf().execAgent : null), 'null');
+  invoke(promptSubmit(sid, '--code-model sonnet'), env);
   expect('an allowed Write+code dispatch on the code model is admitted',
     dispatch({ subagent_type: 'fullstack-developer', description: 'Write the payment module', model: 'sonnet',
       prompt: 'Owns: n/a isolated\nVerify: npm test', isolation: 'worktree' }, sid, { tool_use_id: 'toolu_wva_1' }),
@@ -886,14 +901,16 @@ expect('full fable model id without reason is refused',
 
   const MARKDOWN_SID = `${SID}-ordinary-summary-heading`;
   invoke(promptSubmit(MARKDOWN_SID, '--no-orchestrate'), CODEX_WINS);
-  invoke(promptSubmit(MARKDOWN_SID, 'Summary:\nPlease proceed --orchestrate'), CODEX_WINS);
+  expectProseIgnored(MARKDOWN_SID, 'Summary:\nPlease proceed --orchestrate', CODEX_WINS);
+  invoke(promptSubmit(MARKDOWN_SID, '--orchestrate'), CODEX_WINS);
   const markdownState = readState(MARKDOWN_SID);
   if (markdownState && markdownState.bypass === false) pass += 1;
   else failures.push('an ordinary operator Summary: heading suppressed --orchestrate');
   rmState(MARKDOWN_SID);
 
   const GENUINE_SID = `${SID}-genuine-override`;
-  invoke(promptSubmit(GENUINE_SID, 'Use the configured code model now --exec-sonnet'), CODEX_WINS);
+  expectProseIgnored(GENUINE_SID, 'Use the configured code model now --exec-sonnet', CODEX_WINS);
+  invoke(promptSubmit(GENUINE_SID, '--exec-sonnet'), CODEX_WINS);
   const st3 = readState(GENUINE_SID);
   if (st3 && st3.execAgent === 'claude:sonnet') pass += 1;
   else failures.push('compaction protection prevented a later genuine operator flag');
@@ -1013,7 +1030,8 @@ expect('fable escalation naming opus (xhigh) is allowed',
   const d = (tool_input) => dispatch(tool_input, OSID);
   const code = (model) => d({ subagent_type: 'fullstack-developer', description: 'implement the plan', model,
     prompt: 'Implement it. Verify: npm test (all pass).\nOwns: n/a (pre-existing gate test, unrelated to ownership).' });
-  invoke(promptSubmit(OSID, 'use opus to code this --code-model opus'), CODEX_WINS);
+  expectProseIgnored(OSID, 'use opus to code this --code-model opus', CODEX_WINS);
+  invoke(promptSubmit(OSID, '--code-model opus'), CODEX_WINS);
   expect('--code-model opus: code on opus is allowed (no review-model-scope refusal)', code('opus'), ALLOW, CODEX_WINS);
   expect('--code-model opus: code on sonnet is refused', code('sonnet'), DENY, CODEX_WINS);
   invoke(promptSubmit(OSID, '--code-model=fable'), CODEX_WINS);
@@ -1045,7 +1063,10 @@ expect('fable escalation naming opus (xhigh) is allowed',
   const out = spawnGate(promptSubmit(RS, 'status?'), SONNET_WINS).stdout;
   if (/code -> sonnet, effort medium: Agent subagent_type sonnet-coder \+ model sonnet \[codex requested but quota 97% used \(threshold 95%\); using sonnet\]/.test(out) && !/undefined/.test(out)) pass += 1;
   else failures.push(`auto route to the code model must name model "sonnet", never "undefined": ${out.slice(0, 200)}`);
-  const bare = spawnGate(promptSubmit(RS, 'please --code-model'), CODEX_WINS).stdout;
+  const prose = spawnGate(promptSubmit(RS, 'please --code-model'), CODEX_WINS).stdout;
+  if (/must be sent alone/.test(prose) && !/needs a value/.test(prose)) pass += 1;
+  else failures.push('a --code-model inside prose must only print the sent-alone notice');
+  const bare = spawnGate(promptSubmit(RS, '--code-model'), CODEX_WINS).stdout;
   if (/needs a value/.test(bare)) pass += 1; else failures.push('a bare --code-model must print a notice');
   invoke(promptSubmit(RS, '--code-model codex:openai/gpt-5'), CODEX_WINS);
   { const st = readState(RS); if (!st || st.execAgent == null) pass += 1; else failures.push(`a value with "/" must be rejected, not truncated (${st.execAgent})`); }
@@ -1092,8 +1113,9 @@ expect('in-session execution is refused',
 // Honest, explicit, session-scoped execution-agent preference: --exec-sonnet /
 // --exec-codex. Distinct from claiming Orca is down (no orca-unavailable file
 // exists at this point in the run).
+expectProseIgnored(SID, 'run this --exec-sonnet please');
 expect('--exec-sonnet prompt is accepted',
-  promptSubmit(SID, 'run this --exec-sonnet please'), ALLOW);
+  promptSubmit(SID, '--exec-sonnet'), ALLOW);
 {
   const st = readState(SID);
   if (st && st.execAgent === 'claude:sonnet') pass += 1;
@@ -1153,8 +1175,9 @@ expect('plan/review routing to Opus is unaffected by --exec-sonnet',
   rmState(F7SID);
 }
 
+expectProseIgnored(SID, 'back to --exec-codex');
 expect('--exec-codex prompt reverts the preference',
-  promptSubmit(SID, 'back to --exec-codex'), ALLOW);
+  promptSubmit(SID, '--exec-codex'), ALLOW);
 {
   const st = readState(SID);
   if (st && st.execAgent === 'codex') pass += 1;
@@ -1164,7 +1187,8 @@ expect('exec-intent dispatch is denied again after --exec-codex, no orca-unavail
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet' }), DENY);
 expect('--exec-codex beats a quota that favours the code model',
   dispatch({ subagent_type: 'fullstack-developer', description: 'implement the plan', model: 'sonnet' }), DENY, SONNET_WINS);
-expect('--exec-auto prompt is accepted', promptSubmit(SID, 'ok --exec-auto'), ALLOW);
+expectProseIgnored(SID, 'ok --exec-auto');
+expect('--exec-auto prompt is accepted', promptSubmit(SID, '--exec-auto'), ALLOW);
 {
   const st = readState(SID);
   if (st && st.execAgent == null && st.execAgentSince == null) pass += 1;
@@ -1185,7 +1209,8 @@ expect('auto: Codex at/over 95% used -> code on another model is refused',
   const bypassEdit = (file_path) => mainEdit(file_path, BYPASS_SID);
   const bypassDispatch = (tool_input) => dispatch(tool_input, BYPASS_SID);
 
-  expect('--no-orchestrate is accepted', promptSubmit(BYPASS_SID, '--no-orchestrate for this session'), ALLOW);
+  expectProseIgnored(BYPASS_SID, '--no-orchestrate for this session');
+  expect('--no-orchestrate is accepted', promptSubmit(BYPASS_SID, '--no-orchestrate'), ALLOW);
   {
     const st = readState(BYPASS_SID);
     if (st && !Number.isNaN(Date.parse(st.bypassSince))) pass += 1;
@@ -1209,11 +1234,13 @@ expect('auto: Codex at/over 95% used -> code on another model is refused',
   }
   expect('--orchestrate re-enables the main-panel write gate', bypassEdit(SRC), DENY);
 
+  expectProseIgnored(BYPASS_SID, '--orchestrate then --no-orchestrate');
   expect('last bypass flag wins when --orchestrate comes last',
-    promptSubmit(BYPASS_SID, '--no-orchestrate then --orchestrate'), ALLOW);
+    promptSubmit(BYPASS_SID, '--no-orchestrate --orchestrate'), ALLOW);
   expect('a last --orchestrate leaves gates enabled', bypassEdit(SRC), DENY);
+  expectProseIgnored(BYPASS_SID, '--orchestrate then --no-orchestrate');
   expect('last bypass flag wins when --no-orchestrate comes last',
-    promptSubmit(BYPASS_SID, '--orchestrate then --no-orchestrate'), ALLOW);
+    promptSubmit(BYPASS_SID, '--orchestrate --no-orchestrate'), ALLOW);
   expect('a last --no-orchestrate leaves gates disabled', bypassEdit(SRC), ALLOW);
 
   rmState(BYPASS_SID);

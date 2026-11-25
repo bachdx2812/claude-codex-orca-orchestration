@@ -205,3 +205,5 @@ if (failures.length) {
   process.exit(1);
 }
 console.log(`PASS (${passed} checks)`);
+// Requiring the gate attaches a stdin listener; exit so an open stdin cannot hang the suite.
+process.exit(0);

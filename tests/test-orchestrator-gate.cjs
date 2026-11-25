@@ -19,6 +19,8 @@ const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'orch-unit-state-'));
 process.env.ORCH_STATE_DIR = STATE_DIR;
 process.env.ORCH_CONFIG_PATH = path.join(STATE_DIR, 'no-such-config.json'); // -> defaults
 process.env.ORCH_CODEX_BIN = path.join(__dirname, 'fixtures', 'codex-app-server-stub.cjs');
+// Read once at gate load: eligibility must not depend on a real `orca` on PATH.
+process.env.ORCA_BIN = path.join(__dirname, 'fixtures', 'orca-stub.cjs');
 
 const gate = require('../hooks/orchestrator-gate.cjs');
 const heartbeat = require('../hooks/orca-heartbeat.cjs');

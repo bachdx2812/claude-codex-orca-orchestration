@@ -269,7 +269,15 @@ running in a *shared* workspace must also declare `Owns: <repo-relative paths>` 
 
 ## 5. Override the coding model from the main panel
 
-The operator can pick who writes code for the rest of the session directly from a prompt:
+The operator can pick who writes code for the rest of the session directly from a prompt.
+Every switch counts only when sent alone: the whole one-line message is one or more known
+flags (optional final `.` or `!`), from the operator (no `agent_id`; `source` absent or
+`user`). Anything else around a flag (prose, negation, quotes, pasted or injected text)
+changes nothing. The escalation model is designated only by `--exec-fable`,
+`--code-model fable`, or a message that is only `use fable` / `dùng fable` / `dung fable` (or
+`claude-fable-<version>`). A task notification releases a claim only when it is the whole
+prompt, and only for the first `<tool-use-id>` in its header. Known limit: with no `source`
+field, a program delivering exactly a flag as the whole prompt looks like the operator.
 
 ```
 --code-model opus            # the configured review model, for code work specifically
@@ -281,7 +289,7 @@ The operator can pick who writes code for the rest of the session directly from 
 --code-model auto            # back to automatic routing (same as --exec-auto)
 ```
 
-The last matching flag in a prompt wins; an invalid value (unknown word, or any character
+The last routing flag in a command wins; an invalid value (unknown word, or any character
 outside `[a-z0-9._:-]` — so a stray `/` is rejected, never silently truncated) is ignored
 with a notice and changes nothing. Picking a Claude alias for code work exempts that
 dispatch from the review-model/escalation-model scope gates for code specifically. **With
@@ -316,9 +324,9 @@ never fails `--check` — only missing install artifacts, foreign gates, and Nod
 
 ```bash
 ORCHESTRATOR_GATE=off <your command>     # disables the gate for one invocation/session
-# or, inside a Claude Code prompt:
+# or, inside a Claude Code prompt (each line is a whole message of its own):
 --no-orchestrate
---orchestrate                            # re-enables gates; last bypass flag in the prompt wins
+--orchestrate                            # re-enables gates; last gate flag in a message wins
 --release-claims <toolUseId>             # manually frees one stuck Owns: claim
 --release-claims all                     # manually frees every tracked Owns: claim
 

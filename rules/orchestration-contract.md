@@ -18,8 +18,8 @@ a refusal or event needs detail.
    Codex is opt-in only: `--exec-codex`, `--code-model codex[:<model>]` or
    `defaultCoder: "codex"`, then an Orca worker while usable and under its handoff
    percentage (default 95); unusable/exhausted -> falls back to Sonnet. No Kimi/DeepSeek.
-   Overrides (operator-only): `--code-model <alias|codex|codex:<model>|auto>`,
-   `--exec-sonnet|codex|auto`.
+   Overrides (operator-only, see Escape hatches for syntax): `--code-model <alias|codex|codex:<model>|auto>`,
+   `--exec-sonnet|codex|auto`. `fable` designation: `--exec-fable`, `--code-model fable`, or `use fable` / `dùng fable`.
 4. **Every code brief names a verify command** (or `verify: n/a <reason>`).
 5. **Shared-workspace code briefs declare `Owns: <globs>`** on its own line (or
    `Owns: n/a <reason>`); isolated worktrees need none. Overlapping live claims are refused.
@@ -55,6 +55,6 @@ a refusal or event needs detail.
 
 ## Escape hatches (operator-only - never add them yourself)
 
-`ORCHESTRATOR_GATE=off` (env), `--no-orchestrate` / `--orchestrate` (prompt),
-`--release-claims <id>|all`, cap `0` = unlimited in config/env. Refusals are logged to
-`<ORCH_STATE_DIR>/violations.log`.
+`ORCHESTRATOR_GATE=off` (env), `--no-orchestrate` / `--orchestrate`, `--release-claims <id>|all`, cap `0` = unlimited.
+Prompt switches count only when the whole one-line message is flags (optional final `.`/`!`) or a designation phrase;
+without `source`, a program sending exactly that looks like you. Refusals: `<ORCH_STATE_DIR>/violations.log`.

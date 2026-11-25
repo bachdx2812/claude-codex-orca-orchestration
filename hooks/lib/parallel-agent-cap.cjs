@@ -223,7 +223,7 @@ function formatParallelAgentsRefusal(usage, limit, coreCount, fraction, meta = {
   return `${usage.total}/${limitText} parallel units live on this machine ` +
     `(${limitSource}): ${usage.orcaWorkers} Orca workers, ` +
     `${usage.subagents} subagents${idsPart}. Wait for one to finish and release it, or ask the operator to: ` +
-    'release a specific claim (--release-claims <id>|all, this session only), ' +
+    'release a specific claim (--release-claims <id>|all sent alone as the whole message, this session only), ' +
     `delete a dead session's state file under ${dir}/, ` +
     'or disable this gate (disabledGates: ["max-parallel-agents"]).';
 }
