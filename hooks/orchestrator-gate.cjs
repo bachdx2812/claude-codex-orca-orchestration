@@ -1388,6 +1388,53 @@ function liveWorkerReminderParts(s, cfg, live) {
   return parts;
 }
 
+// Operator-designated escalation model. Only a genuine operator prompt (never a
+// harness-injected turn, see isNonOperatorTurn) that names the escalation alias as a
+// standalone word, `claude-<alias>[-x]`, or --code-model/--exec-<alias> sets the flag, so a
+// model can never grant itself the escalation model. The flag is session-scoped, expires
+// after DESIGNATED_ESCALATION_TTL_MS and is refreshed by each new designating prompt.
+const DESIGNATED_ESCALATION_TTL_MS = 6 * 60 * 60 * 1000;
+function promptDesignatesEscalation(prompt, cfg) {
+  const a = escapeRegex(String(cfg.models.escalation.alias || 'fable'));
+  return new RegExp(`(?:^|[^\\w-])(?:${a}|claude-${a}(?:-[\\w.]+)*|--exec-${a}|--code-model\\s+${a})(?![\\w-])`, 'i').test(prompt);
+}
+function designatedEscalationActive(s, now = Date.now()) {
+  const f = s && s.userDesignatedFable;
+  return !!(f && Number.isFinite(f.at) && now - f.at < DESIGNATED_ESCALATION_TTL_MS);
+}
+// `claude-fable-5-1` style pins: true when the pinned version is older than the configured id.
+function versionOf(id) { const m = /(\d+(?:-\d+)*)\s*$/.exec(String(id || '')); return m ? m[1].split('-').map(Number) : null; }
+function isOlderEscalationPin(model, cfg) {
+  const cur = versionOf(cfg.models.escalation.id); const got = versionOf(model);
+  if (!cur || !got || !/^claude-/i.test(model)) return false;
+  for (let i = 0; i < Math.max(cur.length, got.length); i++) {
+    const a = got[i] || 0, b = cur[i] || 0;
+    if (a !== b) return a < b;
+  }
+  return false;
+}
+
+// Persistent, operator-owned designation: cfg.projects[<abs path>] in the global config
+// (outside any repo) lists fableDesignated roles. A dispatch whose cwd is inside a
+// registered project and whose subagent_type is a plan/review role may use the escalation
+// model without a per-prompt flag. Code/lookup/verify types and other projects stay gated.
+const PROJECT_FABLE_ROLE_TYPES = {
+  plan: ['kongming', 'planner', 'architect'],
+  review: ['kongming', 'code-reviewer', 'reviewer'],
+};
+function projectDesignatesEscalation(cfg, cwd, type) {
+  const projects = cfg && cfg.projects;
+  if (!projects || typeof projects !== 'object' || !cwd) return false;
+  const here = path.resolve(String(cwd));
+  const t = String(type || '').toLowerCase();
+  return Object.entries(projects).some(([root, v]) => {
+    const r = path.resolve(root);
+    if (here !== r && !here.startsWith(r + path.sep)) return false;
+    const roles = Array.isArray(v && v.fableDesignated) ? v.fableDesignated : [];
+    return roles.some((role) => (PROJECT_FABLE_ROLE_TYPES[role] || []).includes(t));
+  });
+}
+
 function onUserPromptSubmit(p, s, cfg) {
   maybeReconcilePendingPlaceholders(p.session_id, p.hook_event_name);
   // CRITICAL: reload fresh under the lock, same reasoning as onPostToolUse — this handler
@@ -1475,6 +1522,12 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   if (s.bypass) {
     process.stdout.write(`${activeOverrideLines(cfg, s).join(' ')}\n`);
     return;
+  }
+
+  if (promptDesignatesEscalation(prompt, cfg)) {
+    s.userDesignatedFable = { at: Date.now() };
+    save(s);
+    logViolation(s, 'allowed', `user-designated ${cfg.models.escalation.alias}`);
   }
 
   // Honest, explicit, session-scoped preference for execution routing. This is NOT the
@@ -1905,7 +1958,15 @@ function onPreToolUse(p, s, cfg) {
         `Current dispatch: subagent_type="${type}" description="${String(input.description || '').slice(0, 80)}".`);
     }
     // The escalation model is reserved for work the review model could not do, for any intent.
-    if (isEscalation && !hasEscalationReason(cfg, input) && !operatorPicked) {
+    const projectDesignated = isEscalation && projectDesignatesEscalation(cfg, p.cwd, type);
+    const designated = projectDesignated || designatedEscalationActive(load(s.session_id));
+    if (isEscalation && designated && isOlderEscalationPin(model, cfg)) {
+      d('escalation-scope',
+        `use the latest ${escalationAlias}: ${cfg.models.escalation.id} (dispatch pinned older "${model}").`);
+    }
+    if (isEscalation && designated && !hasEscalationReason(cfg, input) && !operatorPicked) {
+      logViolation(s, 'allowed', `${projectDesignated ? 'project' : 'user'}-designated ${escalationAlias}`);
+    } else if (isEscalation && !hasEscalationReason(cfg, input) && !operatorPicked) {
       d('escalation-scope',
         `model "${escalationAlias}" is reserved for work "${reviewAlias}" could not do, even at higher effort.\n` +
         `Ladder: model "${reviewAlias}" -> "${reviewAlias}" at high effort (say so in the prompt, or --effort high on Orca) -> "${escalationAlias}".\n` +

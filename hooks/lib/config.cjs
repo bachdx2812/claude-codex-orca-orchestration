@@ -60,7 +60,7 @@ const DEFAULT_CONFIG = {
   activation: 'orca-only', // 'orca-only' | 'always' | 'off'
   models: {
     review: { alias: 'opus', id: 'claude-opus-5-5' },
-    escalation: { alias: 'fable', id: 'claude-fable-5-1' },
+    escalation: { alias: 'fable', id: 'claude-fable-5-2' },
     code: { alias: 'sonnet', id: null, effort: 'medium', agentType: 'sonnet-coder' },
     lookup: { alias: 'haiku', id: null },
     codex: { alias: null, id: 'gpt-5.6-sol' },

@@ -12,7 +12,7 @@ exact current numbers - it now names both the alias and the exact id, e.g.
 planning/red-team on **Opus 5.5** (`claude-opus-5-5`); review — reading code and judging the
 diff — on **Opus 5.5** regardless of which coder wrote it (`models.reviewByCoder`, all `opus`);
 verify-run — running existing checks — on **Sonnet 5.5** (`claude-sonnet-5-5`, `models.verify`);
-escalation on **Fable 5.1** (`claude-fable-5-1`); Codex worker dispatches on
+escalation on **Fable 5.2** (`claude-fable-5-2`); Codex worker dispatches on
 **`gpt-5.6-sol`**.
 
 ## The contract
@@ -290,7 +290,7 @@ backup precedes their removal. Help and unknown options never enter the install 
   "activation": "orca-only",
   "models": {
     "review": { "alias": "opus", "id": "claude-opus-5-5" },
-    "escalation": { "alias": "fable", "id": "claude-fable-5-1" },
+    "escalation": { "alias": "fable", "id": "claude-fable-5-2" },
     "code": { "alias": "sonnet", "id": null, "effort": "medium", "agentType": "sonnet-coder" },
     "lookup": { "alias": "haiku", "id": null },
     "codex": { "alias": null, "id": "gpt-5.6-sol" },
@@ -1107,3 +1107,23 @@ hidden inside `$( )`/backticks/an `env`/`exec`/`nohup` wrapper, one hidden insid
 `bash -c` / `sh -c`, one preceded by Orca's global `--json` flag, and an auto-routed banner
 that once printed the model name as `"undefined"`. A gate that refuses legitimate work
 gets switched off, so its false-positive rate is as load-bearing as what it catches.
+
+## Fable when designated
+
+Default: `escalation-scope` refuses model `fable` unless the dispatch states `escalation: opus failed ... high effort`.
+Two additional, non-model-forgeable grants (logged to `violations.log` as `allowed user-designated fable` /
+`allowed project-designated fable`):
+
+1. **User designation.** `UserPromptSubmit` on a genuine operator prompt (not `<task-notification>`,
+   `[SYSTEM NOTIFICATION`, `<system-reminder>`, session-continuation summaries) matching the alias as a standalone
+   word, `claude-fable-*`, `--exec-fable` or `--code-model fable` sets `userDesignatedFable.at` in session state.
+   Valid 6 hours (`DESIGNATED_ESCALATION_TTL_MS`), refreshed by each designating prompt.
+2. **Project designation.** Global config (outside any repo):
+   `"projects": { "/abs/project": { "fableDesignated": ["plan","review"], "model": "claude-fable-5-2" } }`.
+   When the dispatch cwd is inside that path and subagent_type is plan (`kongming`, `planner`, `architect`) or review
+   (`kongming`, `code-reviewer`, `reviewer`), fable passes with no prompt flag. Code, lookup, verify types and other
+   projects stay gated.
+
+While either grant applies, a dispatch pinned to a `claude-fable-*` version older than `models.escalation.id`
+(now `claude-fable-5-2`) is refused: "use the latest fable". Alias `fable` resolves through
+`ANTHROPIC_DEFAULT_FABLE_MODEL` in `~/.claude/settings.json` (kept in sync with `models.escalation.id`).
