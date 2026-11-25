@@ -40,7 +40,8 @@ quota probe. When requested Codex is exhausted or unusable, code falls back to S
 ### Override from the main panel
 
 `--code-model opus|sonnet|haiku|fable|codex|codex:<model>|auto` (session-scoped, last flag
-wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`). The compact per-prompt
+wins; shortcuts `--exec-sonnet`, `--exec-codex`, `--exec-auto`; send the flags alone as the
+whole one-line message, see "Escape hatches"). The compact per-prompt
 routing line shows the current coder and why. Active overrides also show when
 they were set and how to return to `defaultCoder`, both per prompt and in the
 `SessionStart` banner.
@@ -593,16 +594,21 @@ exact-match removal (never a blind restore, so edits you made after installing s
 
 - `ORCHESTRATOR_GATE=off` (env var) disables every gate for that session, for CI or
   headless `claude -p`.
-- A standalone `--no-orchestrate` flag in an operator prompt disables the gates for that
+- `--no-orchestrate`, sent alone as the whole message, disables the gates for that
   session;
   `--orchestrate` re-enables them. If both appear, the last flag wins. While disabled,
   every prompt and the `SessionStart` banner show when bypass began and how to re-enable.
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` (see
   `docs/orchestration-contract.md`) let the operator override coding-model routing
   without a full bypass.
-- Harness-injected notifications and compaction summaries are never interpreted as fresh
-  operator flags, even when they quote an earlier `--no-orchestrate`, `--exec-*`, or
-  `--code-model` prompt.
+- Prompt switches count only when the **whole one-line message** is one or more known flags
+  (optional final `.` or `!`), from the operator (no `agent_id`; `source` absent or `user`).
+  Prose, negations, quotes, pasted blocks, mail, notifications and briefs that mention a flag
+  change nothing. The escalation model is designated only by `--exec-fable`,
+  `--code-model fable`, or a message that is only `use fable` / `dùng fable` / `dung fable`
+  (or `claude-fable-<version>`). A task notification releases a claim only when it is the whole
+  prompt, and only for the first `<tool-use-id>` in its header. Known limit: with no `source`
+  field, a program delivering exactly a flag as the whole prompt looks like the operator.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees a stuck `Owns:`
   claim OR a stuck `max-parallel-agents` registration; `maxParallelCodexWorkers: 0`
   (config) or `ORCH_MAX_PARALLEL_CODEX_WORKERS=0` (env) makes the parallel-Codex-worker cap

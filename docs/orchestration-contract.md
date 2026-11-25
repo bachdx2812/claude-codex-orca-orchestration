@@ -205,7 +205,8 @@ enforcing, never toward silently disabling itself.
 
 ## Overriding the coding model from the main panel
 
-The operator (only) can pick who writes code for the rest of the session:
+The operator (only) can pick who writes code for the rest of the session (each switch is
+sent alone, see "Operator command syntax" below):
 
 ```
 --code-model opus          # the configured review model, for code work specifically
@@ -217,7 +218,7 @@ The operator (only) can pick who writes code for the rest of the session:
 --code-model auto          # back to defaultCoder (same as --exec-auto)
 ```
 
-The last matching flag in a prompt wins. An invalid value (unknown word, or anything
+The last routing flag in a command wins. An invalid value (unknown word, or anything
 outside `[a-z0-9._:-]`, so a slash or space is never silently truncated) is ignored with a
 notice; nothing changes. Picking a Claude alias for code work exempts that dispatch from
 the review-model/escalation-model scope gates for code specifically — the operator asked
@@ -229,6 +230,35 @@ the time it was set and the command that returns routing to `defaultCoder`.
 active**, in-session code still runs on the configured code model, not Codex — the
 fallback exists precisely because Orca cannot be reached, so it cannot honor "use Codex"
 either, regardless of what the operator's standing override says.
+
+## Operator command syntax
+
+Every prompt-driven switch is honoured only from a standalone operator message
+(`hooks/lib/operator-commands.cjs`):
+
+- The payload `source` is absent or `user`, there is no `agent_id`, and the trimmed,
+  NFC-normalised prompt is **one line**.
+- The **whole** message is one or more known flags separated by spaces or tabs, optionally
+  followed by one `.` or `!`. Flags: `--no-orchestrate`, `--orchestrate`,
+  `--code-model <v>` / `--code-model=<v>`, `--exec-sonnet`, `--exec-codex`, `--exec-auto`,
+  `--exec-fable` (the configured escalation alias), `--release-claims <id>|all` (also `=`;
+  ids use `A-Za-z0-9_#:.-` and do not start with `-`; a final `.` is read as punctuation),
+  and the retired `--exec-kimi` / `--exec-deepseek` (notice only). Flags are
+  case-insensitive; the last gate flag and the last routing flag win.
+- Anything else in the message (prose, negation, quotes, backticks, mail headers,
+  notifications, reminders, pasted blocks, worker briefs, slash commands, a second line)
+  changes nothing, whether the flag would loosen or tighten. An operator-looking prompt that
+  mentions a flag this way gets a short "nothing changed" notice.
+- Escalation designation: `--exec-fable`, `--code-model fable` (space form, and only when it
+  is the winning routing flag; `--code-model=fable` picks the coder without designating), or a
+  message that is only `use X`, `dùng X` or `dung X` (optional final `.`/`!`), where `X` is
+  the alias or `claude-<alias>` with an optional numeric version.
+- Claim release from a notification: `source` absent, no `agent_id`, and the trimmed prompt
+  starts with `<task-notification>` and ends with `</task-notification>`. Only the first
+  `<tool-use-id>` before `<summary>`, `<result>`, `<note>` or the closing tag counts; the TTL
+  and `--release-claims` are the safety nets.
+- Known limit: when the CLI sends no `source` field, a program that delivers exactly a flag
+  (or a whole genuine-looking notification) as the entire prompt cannot be told apart.
 
 ## Coder availability (no Orca / no Codex)
 
@@ -919,7 +949,8 @@ below), delete a dead session's state file under the real, `ORCH_STATE_DIR`-awar
 A registered `Agent`/`Task` dispatch releases exactly like an ownership claim does: a
 foreground dispatch frees it at the matching `PostToolUse`; a background
 (`run_in_background: true`) dispatch survives that same-turn launch-return event and is
-instead released by a matching `<task-notification><tool-use-id>`, a fixed 120-minute TTL
+instead released by a matching `<task-notification><tool-use-id>` (see "Operator command
+syntax"), a fixed 120-minute TTL
 (distinct from the configurable `ownershipClaimTtlMinutes` — this is "is the dispatch still
 running at all," not a file-ownership lock), or the operator's `--release-claims <id>` /
 `--release-claims all`. `--release-claims all` clears every kind at once (`agentClaims`,
@@ -1056,12 +1087,11 @@ processes racing the same session id can otherwise silently drop each other's wr
 
 - `ORCHESTRATOR_GATE=off` in the environment disables every gate for that session,
   regardless of config.
-- `--no-orchestrate` in an operator prompt disables the gates for the session;
-  `--orchestrate` turns them back on. If both appear, the last flag wins. Harness-injected
-  turns (task notifications, cross-session messages, system reminders) and compaction
-  summaries never count as the operator's own prompt, so quoted flags cannot toggle
-  bypass or execution routing. While bypass is active, every prompt and the `SessionStart`
-  banner show when it began and name `--orchestrate` as the recovery command.
+- `--no-orchestrate`, sent alone as the whole message, disables the gates for the session;
+  `--orchestrate` turns them back on. If both appear, the last flag wins. Quoted or embedded
+  flags, harness-injected turns and compaction summaries cannot toggle bypass or execution
+  routing (see "Operator command syntax"). While bypass is active, every prompt and the
+  `SessionStart` banner show when it began and name `--orchestrate` as the recovery command.
 - `--exec-sonnet` / `--exec-codex` / `--exec-auto` and `--code-model <value>` toggle only
   execution routing, honestly — narrower than a full bypass.
 - `--release-claims <toolUseId>` / `--release-claims all` manually frees one or every
@@ -1114,10 +1144,10 @@ Default: `escalation-scope` refuses model `fable` unless the dispatch states `es
 Two additional, non-model-forgeable grants (logged to `violations.log` as `allowed user-designated fable` /
 `allowed project-designated fable`):
 
-1. **User designation.** `UserPromptSubmit` on a genuine operator prompt (not `<task-notification>`,
-   `[SYSTEM NOTIFICATION`, `<system-reminder>`, session-continuation summaries) matching the alias as a standalone
-   word, `claude-fable-*`, `--exec-fable` or `--code-model fable` sets `userDesignatedFable.at` in session state.
-   Valid 6 hours (`DESIGNATED_ESCALATION_TTL_MS`), refreshed by each designating prompt.
+1. **User designation.** A standalone operator command (see "Operator command syntax"): `--exec-fable`,
+   `--code-model fable`, or a message that is only `use fable` / `dùng fable` / `dung fable` (or `claude-fable-*`
+   with a numeric version) sets `userDesignatedFable.at` in session state. A mere mention never designates.
+   Valid 6 hours (`DESIGNATED_ESCALATION_TTL_MS`), refreshed by each designating command.
 2. **Project designation.** Global config (outside any repo):
    `"projects": { "/abs/project": { "fableDesignated": ["plan","review"], "model": "claude-fable-5-2" } }`.
    When the dispatch cwd is inside that path and subagent_type is plan (`kongming`, `planner`, `architect`) or review

@@ -10,7 +10,7 @@
  *      the escalation model only after the review model failed, even at higher effort.
  *   3. Execution and token-heavy work goes to the configured in-session code model by
  *      default. Codex Orca workers are opt-in, or the operator may explicitly pick
- *      another model with --code-model.
+ *      another model with --code-model (sent alone as the whole message).
  *   4. Everything is delegated, parallel wherever ownership allows.
  *   5. Parallel external coder workers hit rate limits; the heartbeat must detect that and retry
  *      with backoff rather than leaving a worker wedged.
@@ -734,6 +734,7 @@ function parseCodeModel(cfg, v) {
 // a previous regex-based detector was replaced - it had a plausible catastrophic-
 // backtracking shape on adversarial input, among other correctness gaps).
 const { orcaInvocations } = require('./lib/shell-orca-invocations.cjs');
+const OPERATOR = require('./lib/operator-commands.cjs');
 
 function describeOverride(cfg, o) {
   if (o === 'codex') return 'Codex in an Orca worker';
@@ -1294,6 +1295,8 @@ function onSessionStart(p, s, cfg) {
     `    ${code[0].toUpperCase()}${code.slice(1)} -> ${codeModelDispatchText(cfg)}.\n` +
     `  Operator-only override from the main panel: --code-model <${[review, code, lookup, escalation, 'codex', 'codex:<model>', 'auto'].join('|')}>\n` +
     '  (session-scoped, last flag wins; --exec-sonnet / --exec-codex are shortcuts, --exec-auto = --code-model auto).\n' +
+    '  Operator switches count only when sent alone as the whole one-line message (flags, optional final . or !).\n' +
+    `  Designate ${escalation}: --exec-${escalation} | --code-model ${escalation} | a message that is only "use ${escalation}" / "dùng ${escalation}".\n` +
     '- Codex is opt-in: --exec-codex | --code-model codex[:<model>] | defaultCoder:"codex".\n' +
     '  If Orca itself is unreachable: `touch ~/.claude/orchestrator-gate/orca-unavailable` (15 min) permits in-session code\n' +
     `  (even an external-coder override falls back to "${code}" while that flag is active).\n` +
@@ -1311,14 +1314,12 @@ function onSessionStart(p, s, cfg) {
 // it must never toggle a session-wide flag: a subagent report that merely quoted
 // "--no-orchestrate" once switched every gate off.
 const HARNESS_INJECTED_TURN = /<task-notification>|<cross-session-message|\[SYSTEM NOTIFICATION|<system-reminder>/i;
-function isNonOperatorTurn(prompt) {
+function isNonOperatorTurn(prompt, source) {
+  if (source !== undefined && source !== 'user') return true;
   if (HARNESS_INJECTED_TURN.test(prompt) || /^\s*This session is being continued\b/i.test(prompt)) return true;
   return /(?:^|\n)\s*Summary:(?=\s)/i.test(prompt) &&
     /\b(previous|prior|earlier)\s+(conversation|session|prompts?)\b/i.test(prompt);
 }
-// A flag counts only as a standalone token, not inside backticks or a longer word.
-const operatorFlag = (prompt, flag) => new RegExp(`(^|\\s)${flag}(?=\\s|$)`, 'i').test(prompt);
-
 function commandHead(command) {
   return String(command || '').trim().split(/\r?\n/, 1)[0].replace(/\s+/g, ' ').slice(0, 100) || '(empty command)';
 }
@@ -1388,16 +1389,11 @@ function liveWorkerReminderParts(s, cfg, live) {
   return parts;
 }
 
-// Operator-designated escalation model. Only a genuine operator prompt (never a
-// harness-injected turn, see isNonOperatorTurn) that names the escalation alias as a
-// standalone word, `claude-<alias>[-x]`, or --code-model/--exec-<alias> sets the flag, so a
-// model can never grant itself the escalation model. The flag is session-scoped, expires
-// after DESIGNATED_ESCALATION_TTL_MS and is refreshed by each new designating prompt.
+// Operator-designated escalation model. Only a standalone operator command (see
+// lib/operator-commands.cjs) sets the flag, so a model can never grant itself the
+// escalation model. The flag is session-scoped, expires after
+// DESIGNATED_ESCALATION_TTL_MS and is refreshed by each new designating command.
 const DESIGNATED_ESCALATION_TTL_MS = 6 * 60 * 60 * 1000;
-function promptDesignatesEscalation(prompt, cfg) {
-  const a = escapeRegex(String(cfg.models.escalation.alias || 'fable'));
-  return new RegExp(`(?:^|[^\\w-])(?:${a}|claude-${a}(?:-[\\w.]+)*|--exec-${a}|--code-model\\s+${a})(?![\\w-])`, 'i').test(prompt);
-}
 function designatedEscalationActive(s, now = Date.now()) {
   const f = s && s.userDesignatedFable;
   return !!(f && Number.isFinite(f.at) && now - f.at < DESIGNATED_ESCALATION_TTL_MS);
@@ -1456,20 +1452,14 @@ function onUserPromptSubmitLocked(p, s, cfg) {
 
   // Background-Agent ownership claims: best-effort release when a <task-notification>
   // names the id of the dispatch that just finished. This reads harness-injected content
-  // ON PURPOSE (the opposite of the operator-flag rule right below) — a task-notification
-  // is never the operator's own text, but it is exactly the signal this release path exists
-  // to react to. TTL and --release-claims remain the safety nets when no id is found here.
-  if (/<task-notification\b/i.test(raw)) {
+  // ON PURPOSE (the opposite of the operator commands below) — a task-notification is never
+  // the operator's own text, but it is exactly the signal this release path exists to react
+  // to. TTL and --release-claims remain the safety nets when no id is found.
+  const finished = OPERATOR.finishedToolUseId(p);
+  if (finished) {
     let releasedAny = false;
-    // Only an id that appears INSIDE the notification's own <tool-use-id> tag identifies the
-    // dispatch that just finished. Matching anywhere in the whole block (the pre-fix
-    // behavior) also matched ids mentioned in the notification's free-text <result> body —
-    // e.g. a finished task's own result text naming a still-running sibling task's id —
-    // which wrongly released that sibling's claim while its work was still in flight.
-    for (const m of raw.matchAll(/<tool-use-id>\s*(toolu_[A-Za-z0-9_-]+|agent_[A-Za-z0-9_-]+)\s*<\/tool-use-id>/gi)) {
-      if (s.agentClaims[m[1]]) { delete s.agentClaims[m[1]]; releasedAny = true; }
-      if (s.agents && s.agents[m[1]]) { delete s.agents[m[1]]; releasedAny = true; }
-      if (s.backgroundShells && s.backgroundShells[m[1]]) { delete s.backgroundShells[m[1]]; releasedAny = true; }
+    for (const registry of [s.agentClaims, s.agents, s.backgroundShells]) {
+      if (registry && registry[finished]) { delete registry[finished]; releasedAny = true; }
     }
     if (releasedAny) save(s);
   }
@@ -1480,7 +1470,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   // tool call can still be in flight when another operator prompt is submitted, and its
   // eventual PostToolUse needs the reservation to transfer Owns/cap metadata to the worker.
   // Stop remains the safe backstop for unresolved Bash reservations.
-  if (!isNonOperatorTurn(raw)) {
+  if (!isNonOperatorTurn(raw, p.source)) {
     let purgedAny = false;
     for (const [id, a] of Object.entries(s.agents || {})) {
       if (a && a.background === false) { delete s.agents[id]; purgedAny = true; }
@@ -1488,7 +1478,7 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (purgedAny) save(s);
   }
 
-  const nonOperatorTurn = isNonOperatorTurn(raw);
+  const nonOperatorTurn = isNonOperatorTurn(raw, p.source);
   const live = liveWorkers(s);
   const activeHandoverIds = new Set(live.flatMap(([key, worker]) => [
     key, worker.group, worker.dispatchId, worker.taskId, worker.terminalHandle,
@@ -1501,14 +1491,14 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     if (notificationParts.length) process.stdout.write(`${notificationParts.join(' ')}\n`);
     return;
   }
-  const prompt = raw;
-  const promptLower = prompt.toLowerCase();
-  const bypassFlags = ['--no-orchestrate', '--orchestrate']
-    .map((flag) => [flag, operatorFlag(prompt, flag) ? promptLower.lastIndexOf(flag) : -1])
-    .filter(([, index]) => index >= 0)
-    .sort((a, b) => b[1] - a[1]);
-  if (bypassFlags.length) {
-    s.bypass = bypassFlags[0][0] === '--no-orchestrate';
+  const alias = cfg.models.escalation.alias;
+  const command = OPERATOR.parseOperatorCommand(p, alias);
+  const mentioned = command || p.agent_id !== undefined ? [] : OPERATOR.mentionedFlags(raw, alias);
+  if (mentioned.length) {
+    process.stdout.write(`orchestrator-gate: nothing changed. ${mentioned.join(', ')} must be sent alone as the whole message.\n`);
+  }
+  if (command && command.bypass !== null) {
+    s.bypass = command.bypass;
     s.bypassSince = s.bypass ? new Date().toISOString() : null;
     save(s);
     process.stdout.write(s.bypass
@@ -1524,10 +1514,10 @@ function onUserPromptSubmitLocked(p, s, cfg) {
     return;
   }
 
-  if (promptDesignatesEscalation(prompt, cfg)) {
+  if (command && command.designates) {
     s.userDesignatedFable = { at: Date.now() };
     save(s);
-    logViolation(s, 'allowed', `user-designated ${cfg.models.escalation.alias}`);
+    logViolation(s, 'allowed', `user-designated ${alias}`);
   }
 
   // Honest, explicit, session-scoped preference for execution routing. This is NOT the
@@ -1535,28 +1525,20 @@ function onUserPromptSubmitLocked(p, s, cfg) {
   // self-expire — the operator sets it once and reverts it once, both by hand.
   // --code-model <value> lets the operator pick the coding model directly; --exec-sonnet /
   // --exec-codex is a shortcut for the external coder. Whichever routing flag
-  // appears last in the prompt wins.
-  const flagAt = (f) => (operatorFlag(prompt, f) ? promptLower.lastIndexOf(f) : -1);
-  const cm = [...prompt.matchAll(/(^|\s)--code-model(?:=|\s+)(\S+)/gi)].pop();
-  const bareCm = !cm && /(^|\s)--code-model(?:=)?\s*$/i.test(prompt);
-  if (bareCm) {
-    process.stdout.write(`orchestrator-gate: --code-model needs a value (${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | auto); nothing changed.\n`);
+  // appears last in the command wins.
+  const models = `${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${alias} | codex | codex:<model> | auto`;
+  if (command && command.bareCodeModel) {
+    process.stdout.write(`orchestrator-gate: --code-model needs a value (${models}); nothing changed.\n`);
   }
-  if (operatorFlag(prompt, '--exec-kimi')) {
-    process.stdout.write('orchestrator-gate: --exec-kimi is retired (Kimi/DeepSeek removed); nothing changed.\n');
+  for (const flag of command ? command.retired : []) {
+    process.stdout.write(`orchestrator-gate: ${flag} is retired (Kimi/DeepSeek removed); nothing changed.\n`);
   }
-  if (operatorFlag(prompt, '--exec-deepseek')) {
-    process.stdout.write('orchestrator-gate: --exec-deepseek is retired (Kimi/DeepSeek removed); nothing changed.\n');
-  }
-  const cmAt = cm ? cm.index + cm[1].length : -1;
-  const lastFlag = ['--exec-sonnet', '--exec-codex', '--exec-auto']
-    .map((f) => [f, flagAt(f)]).concat(cm ? [['--code-model', cmAt]] : [])
-    .filter(([, i]) => i >= 0).sort((a, b) => b[1] - a[1]).map(([f]) => f)[0];
+  const routing = command && command.routing;
   let override;
-  if (lastFlag === '--exec-sonnet') override = `claude:${cfg.models.code.alias}`;
-  else if (lastFlag === '--exec-codex') override = 'codex';
-  else if (lastFlag === '--exec-auto') override = null;
-  else if (lastFlag === '--code-model') override = parseCodeModel(cfg, cm[2]);
+  if (routing && routing.flag === '--exec-sonnet') override = `claude:${cfg.models.code.alias}`;
+  else if (routing && routing.flag === '--exec-codex') override = 'codex';
+  else if (routing && routing.flag === '--exec-auto') override = null;
+  else if (routing) override = parseCodeModel(cfg, routing.value);
   if (override !== undefined && override !== 'invalid') {
     s.execAgent = override;
     s.execAgentSince = override === null ? null : new Date().toISOString();
@@ -1565,15 +1547,13 @@ function onUserPromptSubmitLocked(p, s, cfg) {
       ? `orchestrator-gate: coding model back to default (${defaultCoder(cfg)}).\n`
       : `orchestrator-gate: coding model set by the operator for this session: ${describeOverride(cfg, override)}. Revert with --code-model auto.\n`);
   } else if (override === 'invalid') {
-    process.stdout.write(`orchestrator-gate: ignored --code-model ${cm[2]} (use ${cfg.models.review.alias} | ${cfg.models.code.alias} | ${cfg.models.lookup.alias} | ${cfg.models.escalation.alias} | codex | codex:<model> | auto).\n`);
+    process.stdout.write(`orchestrator-gate: ignored --code-model ${routing.value} (use ${models}).\n`);
   }
 
   // Operator-only manual release of a stuck ownership claim (foreground release is
   // automatic at PostToolUse; background release is best-effort via <task-notification> or
   // the ownershipClaimTtlMinutes safety net — this is the deliberate manual override).
-  const rc = prompt.match(/(^|\s)--release-claims(?:=|\s+)(\S+)/i);
-  if (rc) {
-    const target = rc[2];
+  for (const target of command ? command.releases : []) {
     let released = 0;
     if (target.toLowerCase() === 'all') {
       // Clears every source of a live claim/registration (item 12, extended for
@@ -1768,7 +1748,7 @@ function onPreToolUse(p, s, cfg) {
       const retryingSessionCodexDispatch = agent === 'codex' && allowedTrackedCodexRetry(inv, s);
       if (agent !== 'codex' || codexRequested(cfg, s) || retryingSessionCodexDispatch) continue;
       d('codex-not-requested', 'Codex is opt-in. Code goes to sonnet-coder in-session. ' +
-        'Operator only: --exec-codex / --code-model codex[:<model>] / defaultCoder:"codex". ' +
+        'Operator only: --exec-codex / --code-model codex[:<model>] (sent alone as the whole message) / defaultCoder:"codex". ' +
         'A --retry-of is allowed only with --task equal to the original task id, no --spec, ' +
         'for a Codex dispatch this session started while opted in.');
     }
@@ -1987,7 +1967,7 @@ function onPreToolUse(p, s, cfg) {
           'If Orca genuinely cannot open a worker, declare the fallback first:\n' +
           '  date -u +%Y-%m-%dT%H:%M:%SZ > ~/.claude/orchestrator-gate/orca-unavailable\n' +
           `That declaration expires after ${Math.round(ORCA_DOWN_TTL_SECONDS / 60)} minutes, on purpose.\n` +
-          'The operator (only) can pick the coding model with --code-model <alias|codex|codex:<model>|auto>.');
+          'The operator (only) can pick the coding model with --code-model <alias|codex|codex:<model>|auto>, sent alone as the whole message.');
       }
       if (!model.toLowerCase().includes(String(wantAlias || '').toLowerCase())) {
         const redispatch = wantAlias === cfg.models.code.alias
